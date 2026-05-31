@@ -1,2 +1,17 @@
 # Minimum supported Rust version; lets clippy avoid suggesting newer-than-MSRV idioms.
 msrv = "1.95"
+
+# Domain nouns that look like code to `doc_markdown` but are plain prose here.
+# The trailing ".." keeps clippy's built-in defaults (OpenGL, OpenSSL, …).
+doc-valid-idents = [
+    "OTel",
+    "OTLP",
+    "OpenTelemetry",
+    "SpecQL",
+    "FraiseQL",
+    "PostgreSQL",
+    "SQLite",
+    "JSON-RPC",
+    "GitHub",
+    "..",
+]

@@ -17,3 +17,28 @@ workspace = true
 
 [features]
 default = []
+# OTLP span export pipeline. Off by default so library embedders (e.g.
+# specql-platform) don't pay the dependency weight; the CLI turns it on.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:tracing-subscriber",
+]
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.17"
+tracing = "0.1.44"
+
+# --- otel feature only ---
+opentelemetry = { version = "0.32.0", optional = true }
+opentelemetry-otlp = { version = "0.32.0", optional = true }
+opentelemetry_sdk = { version = "0.32.1", optional = true }
+tracing-opentelemetry = { version = "0.33.0", optional = true }
+tracing-subscriber = { version = "0.3.23", features = ["registry", "std"], optional = true }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3.23", features = ["std", "fmt", "registry"] }

@@ -1,0 +1,285 @@
+//! [`IpcMigrationAdapter`]: a [`MigrationAdapter`] backed by an external process.
+
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::process::Stdio;
+
+use async_trait::async_trait;
+use fraisier_core::adapter_axes::{
+    AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, MigrationAdapter,
+    MigrationOutcome, PreflightReport, Revision, VerifyReport,
+};
+use serde::de::DeserializeOwned;
+use tokio::io::{AsyncReadExt as _, BufReader};
+use tokio::process::Command;
+
+use crate::{framing, protocol};
+
+/// One request per spawn, so a fixed id is unambiguous.
+const REQUEST_ID: u64 = 1;
+
+/// A [`MigrationAdapter`] that speaks the JSON-RPC adapter protocol to an external
+/// `fraisier-adapter-<name>` process over stdio.
+///
+/// Each trait call spawns the configured program, writes one framed JSON-RPC
+/// request to its stdin, reads one framed response from its stdout, and lets the
+/// child exit — giving per-call crash isolation. Secrets are injected as child
+/// environment variables via [`IpcMigrationAdapter::with_env`] (the core sets
+/// `env[logical] = value` here; PRD review Decision 5), never in the JSON params.
+///
+/// # Example
+/// ```no_run
+/// # use fraisier_core::adapter_axes::MigrationAdapter;
+/// # use fraisier_ipc::IpcMigrationAdapter;
+/// # async fn run() -> Result<(), fraisier_core::adapter_axes::AdapterError> {
+/// let adapter = IpcMigrationAdapter::new("fraisier-adapter-sqlx", "sqlx")
+///     .with_env("DATABASE_URL", "postgres://localhost/app");
+/// let desc = adapter.describe().await?;
+/// println!("{} speaks protocol v{}", desc.name, desc.protocol_version);
+/// # Ok(())
+/// # }
+/// ```
+pub struct IpcMigrationAdapter {
+    program: OsString,
+    args: Vec<OsString>,
+    envs: BTreeMap<OsString, OsString>,
+    name: String,
+}
+
+impl IpcMigrationAdapter {
+    /// Create an adapter that spawns `program`, labelled `name` in errors and traces.
+    #[must_use]
+    pub fn new(program: impl Into<OsString>, name: impl Into<String>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            envs: BTreeMap::new(),
+            name: name.into(),
+        }
+    }
+
+    /// Set the arguments passed to the spawned program (builder style).
+    #[must_use]
+    pub fn with_args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        self.args = args.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set an environment variable on the spawned process (builder style). This
+    /// is how the core injects a resolved secret value under its logical name.
+    #[must_use]
+    pub fn with_env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.envs.insert(key.into(), value.into());
+        self
+    }
+
+    /// Build an error tagged with this adapter and operation.
+    fn fail(
+        &self,
+        kind: AdapterErrorKind,
+        operation: &str,
+        message: String,
+        stderr: Option<String>,
+    ) -> AdapterError {
+        AdapterError {
+            adapter: Some(self.name.clone()),
+            operation: Some(operation.to_owned()),
+            stderr,
+            ..AdapterError::new(kind, message)
+        }
+    }
+
+    /// Spawn the adapter, send one `method` request with `params`, and decode the
+    /// result as `R`.
+    async fn call<R: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<R, AdapterError> {
+        let request = serde_json::json!({ "jsonrpc": "2.0", "id": REQUEST_ID, "method": method, "params": params });
+        let body = serde_json::to_vec(&request).map_err(|e| {
+            self.fail(
+                AdapterErrorKind::Protocol,
+                method,
+                format!("failed to encode request: {e}"),
+                None,
+            )
+        })?;
+
+        let mut child = Command::new(&self.program)
+            .args(&self.args)
+            .envs(&self.envs)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                self.fail(
+                    AdapterErrorKind::Execution,
+                    method,
+                    format!(
+                        "failed to spawn adapter '{}': {e}",
+                        self.program.to_string_lossy()
+                    ),
+                    None,
+                )
+            })?;
+
+        // Send the request, then signal EOF by dropping stdin. The request is
+        // small (well under a pipe buffer), so writing before reading is safe.
+        {
+            let mut stdin = child.stdin.take().expect("stdin is piped");
+            framing::write_message(&mut stdin, &body)
+                .await
+                .map_err(|e| {
+                    self.fail(
+                        AdapterErrorKind::Protocol,
+                        method,
+                        format!("failed to send request: {e}"),
+                        None,
+                    )
+                })?;
+        }
+
+        let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+        let mut stderr = child.stderr.take().expect("stderr is piped");
+
+        // Read the response and drain stderr concurrently to avoid a pipe-fill deadlock.
+        let mut stderr_buf = String::new();
+        let (message, _) = tokio::join!(
+            framing::read_message(&mut stdout),
+            stderr.read_to_string(&mut stderr_buf),
+        );
+        let stderr_opt = (!stderr_buf.trim().is_empty()).then(|| stderr_buf.clone());
+
+        child.wait().await.map_err(|e| {
+            self.fail(
+                AdapterErrorKind::Execution,
+                method,
+                format!("failed to await adapter exit: {e}"),
+                stderr_opt.clone(),
+            )
+        })?;
+
+        let body = message
+            .map_err(|e| {
+                self.fail(
+                    AdapterErrorKind::Protocol,
+                    method,
+                    format!("failed to read response: {e}"),
+                    stderr_opt.clone(),
+                )
+            })?
+            .ok_or_else(|| {
+                self.fail(
+                    AdapterErrorKind::Protocol,
+                    method,
+                    "adapter produced no response".to_owned(),
+                    stderr_opt.clone(),
+                )
+            })?;
+
+        let response: protocol::Response = serde_json::from_slice(&body).map_err(|e| {
+            self.fail(
+                AdapterErrorKind::Protocol,
+                method,
+                format!("invalid JSON-RPC response: {e}"),
+                stderr_opt.clone(),
+            )
+        })?;
+
+        if let Some(id) = response.id {
+            if id != REQUEST_ID {
+                return Err(self.fail(
+                    AdapterErrorKind::Protocol,
+                    method,
+                    format!("response id {id} did not match request id {REQUEST_ID}"),
+                    stderr_opt,
+                ));
+            }
+        }
+
+        if let Some(err) = response.error {
+            let message = if let Some(data) = &err.data {
+                format!("{} (data: {data})", err.message)
+            } else {
+                err.message
+            };
+            return Err(AdapterError {
+                adapter: Some(self.name.clone()),
+                operation: Some(method.to_owned()),
+                stderr: stderr_opt,
+                ..AdapterError::remote(err.code, message)
+            });
+        }
+
+        let result = response.result.ok_or_else(|| {
+            self.fail(
+                AdapterErrorKind::Protocol,
+                method,
+                "response had neither result nor error".to_owned(),
+                stderr_opt.clone(),
+            )
+        })?;
+
+        serde_json::from_value(result).map_err(|e| {
+            self.fail(
+                AdapterErrorKind::Protocol,
+                method,
+                format!("failed to decode result: {e}"),
+                stderr_opt,
+            )
+        })
+    }
+}
+
+#[async_trait]
+impl MigrationAdapter for IpcMigrationAdapter {
+    async fn describe(&self) -> Result<AdapterDescription, AdapterError> {
+        self.call("describe", serde_json::json!({})).await
+    }
+
+    async fn current_revision(&self, ctx: &AdapterCtx) -> Result<Option<Revision>, AdapterError> {
+        self.call("current_revision", serde_json::json!({ "ctx": ctx }))
+            .await
+    }
+
+    async fn up(
+        &self,
+        ctx: &AdapterCtx,
+        target: Option<Revision>,
+    ) -> Result<MigrationOutcome, AdapterError> {
+        self.call("up", serde_json::json!({ "ctx": ctx, "target": target }))
+            .await
+    }
+
+    async fn down_to(
+        &self,
+        ctx: &AdapterCtx,
+        target: Revision,
+    ) -> Result<MigrationOutcome, AdapterError> {
+        self.call(
+            "down_to",
+            serde_json::json!({ "ctx": ctx, "target": target }),
+        )
+        .await
+    }
+
+    async fn verify(&self, ctx: &AdapterCtx) -> Result<VerifyReport, AdapterError> {
+        self.call("verify", serde_json::json!({ "ctx": ctx })).await
+    }
+
+    async fn preflight(&self, ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {
+        self.call("preflight", serde_json::json!({ "ctx": ctx }))
+            .await
+    }
+
+    async fn post_migrate(&self, ctx: &AdapterCtx) -> Result<(), AdapterError> {
+        self.call("post_migrate", serde_json::json!({ "ctx": ctx }))
+            .await
+    }
+}

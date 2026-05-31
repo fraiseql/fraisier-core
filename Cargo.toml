@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fraisier-saga", "crates/fraisier-core"]
+members = ["crates/fraisier-saga", "crates/fraisier-core", "crates/fraisier-ipc"]
 
 [workspace.package]
 version = "1.0.0-alpha.1"

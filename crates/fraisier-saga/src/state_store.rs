@@ -147,6 +147,10 @@ pub enum StateStoreError {
     /// A backend-specific failure that does not fit the other variants.
     #[error("state store backend error: {0}")]
     Backend(String),
+    /// The SQLite backend reported a database error.
+    #[cfg(feature = "sqlite")]
+    #[error("state store database error: {0}")]
+    Database(#[from] sqlx::Error),
 }
 
 /// Proof that the per-`(fraise, environment)` lock is held.
@@ -174,6 +178,17 @@ impl LockGuard {
         Self {
             key,
             flock: Some(flock),
+        }
+    }
+
+    /// A guard for a backend whose lock is a database row rather than an `flock`;
+    /// `release_lock` deletes the row.
+    #[cfg(feature = "sqlite")]
+    const fn lease(key: FraiseKey) -> Self {
+        Self {
+            key,
+            #[cfg(unix)]
+            flock: None,
         }
     }
 }
@@ -372,6 +387,151 @@ impl StateStore for FilesystemStateStore {
     }
 }
 
+/// The embedded SQLite schema, applied idempotently on connect. One table per
+/// concept: `locks` (atomic per-pair mutual exclusion via a `PRIMARY KEY`),
+/// `deployment_state` (append-only snapshots), and `events` (append-only log).
+#[cfg(feature = "sqlite")]
+const SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS locks (
+    key         TEXT PRIMARY KEY,
+    fraise      TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    acquired_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS deployment_state (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    key         TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_deployment_state_key ON deployment_state(key);
+CREATE TABLE IF NOT EXISTS events (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    key     TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_key ON events(key);
+";
+
+/// A [`StateStore`] backed by SQLite via `sqlx` (runtime queries, no compile-time
+/// query macros, per PRD §9.2).
+///
+/// Recommended for multi-host deploys: the lock is an atomic row insert under a
+/// `PRIMARY KEY`, so two writers contending for the same pair cannot both win.
+/// The same try-lock contract as the filesystem backend holds — acquisition
+/// never blocks; a contended lock returns [`StateStoreError::Locked`].
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Clone)]
+pub struct SqliteStateStore {
+    pool: sqlx::SqlitePool,
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteStateStore {
+    /// Open (creating if necessary) a SQLite store at `path` and apply the schema.
+    ///
+    /// # Errors
+    /// Returns [`StateStoreError::Database`] if the database cannot be opened or
+    /// the schema cannot be applied.
+    pub async fn connect(path: impl AsRef<Path>) -> Result<Self, StateStoreError> {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new().connect_with(options).await?;
+        sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+        Ok(Self { pool })
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[async_trait]
+impl StateStore for SqliteStateStore {
+    async fn acquire_lock(&self, key: &FraiseKey) -> Result<LockGuard, StateStoreError> {
+        let result = sqlx::query(
+            "INSERT INTO locks (key, fraise, environment, acquired_at) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(key.slug())
+        .bind(key.fraise())
+        .bind(key.environment())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(_) => Ok(LockGuard::lease(key.clone())),
+            Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+                Err(StateStoreError::Locked {
+                    key: key.to_string(),
+                })
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn release_lock(&self, guard: LockGuard) -> Result<(), StateStoreError> {
+        sqlx::query("DELETE FROM locks WHERE key = ?1")
+            .bind(guard.key().slug())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn record_state(
+        &self,
+        key: &FraiseKey,
+        state: &DeploymentState,
+    ) -> Result<(), StateStoreError> {
+        let payload = serde_json::to_string(state)?;
+        sqlx::query("INSERT INTO deployment_state (key, payload, recorded_at) VALUES (?1, ?2, ?3)")
+            .bind(key.slug())
+            .bind(payload)
+            .bind(state.recorded_at.to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn current_state(
+        &self,
+        key: &FraiseKey,
+    ) -> Result<Option<DeploymentState>, StateStoreError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT payload FROM deployment_state WHERE key = ?1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(key.slug())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(payload,)| serde_json::from_str(&payload).map_err(StateStoreError::from))
+            .transpose()
+    }
+
+    async fn record_event(
+        &self,
+        key: &FraiseKey,
+        event: &SagaEvent,
+    ) -> Result<(), StateStoreError> {
+        let payload = serde_json::to_string(event)?;
+        sqlx::query("INSERT INTO events (key, payload) VALUES (?1, ?2)")
+            .bind(key.slug())
+            .bind(payload)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn events(&self, key: &FraiseKey) -> Result<Vec<SagaEvent>, StateStoreError> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT payload FROM events WHERE key = ?1 ORDER BY id ASC")
+                .bind(key.slug())
+                .fetch_all(&self.pool)
+                .await?;
+        rows.into_iter()
+            .map(|(payload,)| serde_json::from_str(&payload).map_err(StateStoreError::from))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DeploymentState, FilesystemStateStore, FraiseKey, StateStore, StateStoreError};
@@ -501,6 +661,38 @@ mod tests {
     #[tokio::test]
     async fn filesystem_records_and_reads_events_in_order() {
         let (_dir, store) = filesystem_store();
+        records_and_reads_events_in_order(&store).await;
+    }
+
+    // --- sqlite backend instantiation (Cycle 1.4): same harness, different backend ---
+
+    #[cfg(feature = "sqlite")]
+    async fn sqlite_store() -> (tempfile::TempDir, super::SqliteStateStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = super::SqliteStateStore::connect(dir.path().join("state.db"))
+            .await
+            .expect("open sqlite store");
+        (dir, store)
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_persists_and_returns_latest_state() {
+        let (_dir, store) = sqlite_store().await;
+        persists_and_returns_latest_state(&store).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_lock_excludes_concurrent_acquisition() {
+        let (_dir, store) = sqlite_store().await;
+        lock_excludes_concurrent_acquisition(&store).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_records_and_reads_events_in_order() {
+        let (_dir, store) = sqlite_store().await;
         records_and_reads_events_in_order(&store).await;
     }
 }

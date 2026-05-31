@@ -70,7 +70,7 @@ The honestly-disclosed trade: more architectural work in week 1, less adapter-po
 
 - **G9**: Three-axis adapter contract (migration / service / health) plus an artifact axis and a load-balancer axis for multi-host.
 - **G10**: Webhook server (socket-activated on systemd, standalone HTTP elsewhere).
-- **G11**: Forward-compatibility lint on Confiture migrations (the integration moat: fraisier owns Confiture, so blue-green safety can be enforced at config-time).
+- **G11**: Forward-compatibility lint, surfaced via the migration adapter's `preflight` capability. Confiture implements it natively (`migrate preflight`: reversibility, non-transactional statements, duplicate versions, checksum integrity); the `command` adapter declines (no `preflight` capability advertised); other framework adapters implement it as their ecosystems allow. The moat is making it a first-class, advertisable contract every migration adapter can opt into — not a Confiture-unique trick. Enforced at config-time so blue-green safety is checked before deploy.
 
 ### 3.3 Non-goals (this release)
 
@@ -116,7 +116,7 @@ The honestly-disclosed trade: more architectural work in week 1, less adapter-po
 | Self-upgrade restart | v0.31 coordinated restart | ✅ Required |
 | Scheduled install | v0.30/v0.32 features | ✅ Required |
 | Observability | logs only | ✅ OpenTelemetry traces + structured logs |
-| Forward-compat migration lint | (none) | ✅ With Confiture |
+| Forward-compat migration lint | (none) | ✅ Via the migration adapter's `preflight` capability (Confiture native; `command` declines) |
 
 Rows marked ✅ ship in v1.0.0-beta.1. ⏳ indicates designed-in but deferred. Anything not in this matrix is out of scope.
 
@@ -224,6 +224,8 @@ Five distinct axes, each with its own trait:
 
 In-process trait adapters live in the core for axes where the surface is stable and the ecosystem is small (artifact, service, health, LB). For **migration** — where the long tail is largest — adapters are external processes discovered via PATH, speaking **JSON-RPC over stdio**.
 
+**The convergence rule (Phase 1 review):** the in-process `MigrationAdapter` trait and the IPC protocol are *the same shape* — the IPC adapter is a transport that implements the same trait by serializing each call. This is enforced mechanically: **every argument and return type on every adapter trait method is `Serialize + Deserialize`.** A method that would require a non-serializable type is a wrong method, not a missing capability. This is the only constraint that prevents the in-process and IPC paths from drifting over the project's lifetime.
+
 Protocol shape:
 
 ```
@@ -232,7 +234,7 @@ Response:  {"jsonrpc":"2.0","id":1,"result":{"revision":"20260531_abc123"}}
 Error:     {"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"...","data":{...}}}
 ```
 
-Methods: `current_revision`, `up`, `down_to`, `verify`, `post_migrate`, `describe` (returns adapter capabilities).
+Methods: `describe` (capability + protocol-version handshake), `current_revision`, `up`, `down_to`, `verify`, `preflight` (forward-compat lint — Phase 1 review Decision 4), `post_migrate`. `preflight` and `post_migrate` are optional: an adapter advertises support via `describe.capabilities`. Secrets are passed to subprocess adapters via environment variables (the core sets `env[logical] = value` at spawn), never in JSON params or argv (Phase 1 review Decision 5).
 
 Discovery: binaries on PATH matching `fraisier-adapter-<name>`. Selected by `migration.adapter = "<name>"` in config. The core spawns the binary as a child process, communicates over stdin/stdout, terminates on completion.
 
@@ -249,7 +251,7 @@ Benefits:
 | Axis | Adapter | Notes |
 |---|---|---|
 | Artifact | `ReleaseArtifact`, `GitArtifact`, `LocalArtifact` | Three sources |
-| Migration | `ConfitureMigration` | Native, not via IPC (intimate integration: forward-compat lint, blue-green prep) |
+| Migration | `ConfitureMigration` | Native, not via IPC. Wraps the `confiture migrate <subcommand>` CLI. Note: Confiture exposes **no** `current_revision`/`down_to`/`post_migrate` subcommands — the adapter derives `current_revision` from `migrate status --format json`, implements `down_to(target)` by computing `--steps N` from that status, and treats `post_migrate` as configured hooks. Connection-model translation (Confiture takes `--config <yaml>`, not a DSN) per Phase 1 review §3. Forward-compat lint via `migrate preflight`; blue-green prep. |
 | Migration | `CommandMigration` | Universal escape hatch |
 | Service | `SystemdService`, `RcService`, `DockerComposeService` | All three |
 | Health | `HttpHealth` | |
@@ -299,6 +301,11 @@ adapter = "confiture"
 database_url_env = "FRAISEQL_DATABASE_URL"
 migrations_path = "./migrations"
 forward_compatible_lint = true
+# `database_url_env` is the *source* env var name. The core exposes it to the
+# adapter as `AdapterCtx.env_secrets["DATABASE_URL"] = "FRAISEQL_DATABASE_URL"`;
+# the adapter resolves the value via `ctx.secret("DATABASE_URL")`. For IPC
+# adapters the core reads the source var and re-exposes the value under the
+# logical name `DATABASE_URL` on the spawned child (Phase 1 review Decision 5).
 
 [service]
 adapter = "systemd"

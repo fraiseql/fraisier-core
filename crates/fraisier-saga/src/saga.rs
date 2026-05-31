@@ -1,21 +1,22 @@
 //! The saga driver: runs an ordered list of compensable [`Step`]s, persisting
 //! progress and rolling back in reverse on failure.
 //!
-//! # Stability — NOT FROZEN
+//! # Stability
 //!
-//! This is a Phase 1 **skeleton**. The shapes here (`Saga`, `Step`,
-//! `StepContext`, `SagaOutcome`) exist to prove the engine composes over the
-//! [`StateStore`](crate::state_store::StateStore) and emits events/spans; they
-//! are expected to change as the deploy layer (`fraisier-core`) is built and as
-//! the adapter contract is settled. Nothing here is part of any frozen API.
+//! Frozen as of the Phase 1 owner review: [`Saga`], [`Step`], [`StepContext`],
+//! [`SagaError`], and [`SagaOutcome`] are the load-bearing engine API. The types
+//! expected to grow as the deploy layer matures ([`StepContext`], [`SagaError`],
+//! [`SagaOutcome`]) are `#[non_exhaustive]`, so that growth stays additive
+//! rather than breaking.
 
 use async_trait::async_trait;
 
 use crate::events::{instrument_state_transition, SagaEvent, SagaState};
 use crate::state_store::{DeploymentState, FraiseKey, StateStore, StateStoreError};
 
-/// Engine-level errors. NOT FROZEN (see the module docs).
+/// Engine-level errors.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SagaError {
     /// A forward step reported failure; triggers rollback.
     #[error("step '{step}' failed: {message}")]
@@ -30,12 +31,23 @@ pub enum SagaError {
     Store(#[from] StateStoreError),
 }
 
-/// Context passed to each [`Step`]. Skeleton — will gain shared deploy state,
-/// the resolved revision, and adapter handles as the deploy layer is built.
+/// Context passed to each [`Step`].
+///
+/// `#[non_exhaustive]` because the deploy layer will add shared state, the
+/// resolved revision, and adapter handles; construct via [`StepContext::new`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StepContext {
     /// The `(fraise, environment)` pair this run targets.
     pub key: FraiseKey,
+}
+
+impl StepContext {
+    /// Create a context for one `(fraise, environment)` pair.
+    #[must_use]
+    pub const fn new(key: FraiseKey) -> Self {
+        Self { key }
+    }
 }
 
 /// One compensable unit of work in a saga: a forward action and its undo.
@@ -64,8 +76,9 @@ pub trait Step: Send + Sync {
     async fn compensate(&self, ctx: &StepContext) -> Result<(), SagaError>;
 }
 
-/// How a saga run ended. NOT FROZEN.
+/// How a saga run ended.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SagaOutcome {
     /// Every step ran forward and the run committed.
     Committed,
@@ -86,8 +99,8 @@ pub enum SagaOutcome {
 
 /// Drives a sequence of [`Step`]s atomically over a [`StateStore`].
 ///
-/// Skeleton — NOT FROZEN. Construct with [`Saga::new`], append steps with
-/// [`Saga::with_step`], and execute with [`Saga::run`].
+/// Construct with [`Saga::new`], append steps with [`Saga::with_step`], and
+/// execute with [`Saga::run`].
 pub struct Saga<S: StateStore> {
     store: S,
     key: FraiseKey,
@@ -136,9 +149,7 @@ impl<S: StateStore> Saga<S> {
     }
 
     async fn execute(&self) -> Result<SagaOutcome, SagaError> {
-        let ctx = StepContext {
-            key: self.key.clone(),
-        };
+        let ctx = StepContext::new(self.key.clone());
         let mut from = SagaState::Idle;
         let mut completed: Vec<&dyn Step> = Vec::new();
 

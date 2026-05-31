@@ -100,8 +100,19 @@ impl IpcMigrationAdapter {
         method: &str,
         params: serde_json::Value,
     ) -> Result<R, AdapterError> {
+        let (body, stderr) = self.transact(method, &params).await?;
+        self.decode_response(method, &body, stderr)
+    }
+
+    /// Spawn the child, send the framed request, and return the framed response
+    /// body together with any captured stderr.
+    async fn transact(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<(Vec<u8>, Option<String>), AdapterError> {
         let request = serde_json::json!({ "jsonrpc": "2.0", "id": REQUEST_ID, "method": method, "params": params });
-        let body = serde_json::to_vec(&request).map_err(|e| {
+        let request = serde_json::to_vec(&request).map_err(|e| {
             self.fail(
                 AdapterErrorKind::Protocol,
                 method,
@@ -118,13 +129,11 @@ impl IpcMigrationAdapter {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| {
+                let program = self.program.to_string_lossy();
                 self.fail(
                     AdapterErrorKind::Execution,
                     method,
-                    format!(
-                        "failed to spawn adapter '{}': {e}",
-                        self.program.to_string_lossy()
-                    ),
+                    format!("failed to spawn adapter '{program}': {e}"),
                     None,
                 )
             })?;
@@ -133,7 +142,7 @@ impl IpcMigrationAdapter {
         // small (well under a pipe buffer), so writing before reading is safe.
         {
             let mut stdin = child.stdin.take().expect("stdin is piped");
-            framing::write_message(&mut stdin, &body)
+            framing::write_message(&mut stdin, &request)
                 .await
                 .map_err(|e| {
                     self.fail(
@@ -154,14 +163,14 @@ impl IpcMigrationAdapter {
             framing::read_message(&mut stdout),
             stderr.read_to_string(&mut stderr_buf),
         );
-        let stderr_opt = (!stderr_buf.trim().is_empty()).then(|| stderr_buf.clone());
+        let stderr = (!stderr_buf.trim().is_empty()).then_some(stderr_buf);
 
         child.wait().await.map_err(|e| {
             self.fail(
                 AdapterErrorKind::Execution,
                 method,
                 format!("failed to await adapter exit: {e}"),
-                stderr_opt.clone(),
+                stderr.clone(),
             )
         })?;
 
@@ -171,7 +180,7 @@ impl IpcMigrationAdapter {
                     AdapterErrorKind::Protocol,
                     method,
                     format!("failed to read response: {e}"),
-                    stderr_opt.clone(),
+                    stderr.clone(),
                 )
             })?
             .ok_or_else(|| {
@@ -179,16 +188,26 @@ impl IpcMigrationAdapter {
                     AdapterErrorKind::Protocol,
                     method,
                     "adapter produced no response".to_owned(),
-                    stderr_opt.clone(),
+                    stderr.clone(),
                 )
             })?;
+        Ok((body, stderr))
+    }
 
-        let response: protocol::Response = serde_json::from_slice(&body).map_err(|e| {
+    /// Parse a JSON-RPC response body into `R`, mapping a JSON-RPC error (or a
+    /// missing/ill-formed result) to an [`AdapterError`].
+    fn decode_response<R: DeserializeOwned>(
+        &self,
+        method: &str,
+        body: &[u8],
+        stderr: Option<String>,
+    ) -> Result<R, AdapterError> {
+        let response: protocol::Response = serde_json::from_slice(body).map_err(|e| {
             self.fail(
                 AdapterErrorKind::Protocol,
                 method,
                 format!("invalid JSON-RPC response: {e}"),
-                stderr_opt.clone(),
+                stderr.clone(),
             )
         })?;
 
@@ -198,21 +217,20 @@ impl IpcMigrationAdapter {
                     AdapterErrorKind::Protocol,
                     method,
                     format!("response id {id} did not match request id {REQUEST_ID}"),
-                    stderr_opt,
+                    stderr,
                 ));
             }
         }
 
         if let Some(err) = response.error {
-            let message = if let Some(data) = &err.data {
-                format!("{} (data: {data})", err.message)
-            } else {
-                err.message
-            };
+            let message = err.data.map_or_else(
+                || err.message.clone(),
+                |data| format!("{} (data: {data})", err.message),
+            );
             return Err(AdapterError {
                 adapter: Some(self.name.clone()),
                 operation: Some(method.to_owned()),
-                stderr: stderr_opt,
+                stderr,
                 ..AdapterError::remote(err.code, message)
             });
         }
@@ -222,16 +240,15 @@ impl IpcMigrationAdapter {
                 AdapterErrorKind::Protocol,
                 method,
                 "response had neither result nor error".to_owned(),
-                stderr_opt.clone(),
+                stderr.clone(),
             )
         })?;
-
         serde_json::from_value(result).map_err(|e| {
             self.fail(
                 AdapterErrorKind::Protocol,
                 method,
                 format!("failed to decode result: {e}"),
-                stderr_opt,
+                stderr,
             )
         })
     }

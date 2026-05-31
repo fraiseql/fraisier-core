@@ -11,11 +11,13 @@
 //!
 //! ## Stability
 //!
-//! Phase 1 is foundational and the public surface is **not frozen**. The
-//! [`StateStore`] trait and the [`SagaEvent`] / [`SagaState`] types are designed
-//! deliberately (the trait against the hardest backend — Postgres with N writers —
-//! per PRD risk row), but the saga *driver* API is a working skeleton and will
-//! change before the day-3 trait freeze.
+//! The [`StateStore`] trait and the [`SagaEvent`] / [`SagaState`] types are
+//! designed against the hardest backend (Postgres with N writers, per PRD risk
+//! row). The saga *driver* API ([`Saga`], [`Step`], etc.) was stabilised at the
+//! Phase 1 owner review; types expected to grow are `#[non_exhaustive]`.
+//!
+//! [`Saga`]: crate::saga::Saga
+//! [`Step`]: crate::saga::Step
 //!
 //! [`StateStore`]: crate::state_store::StateStore
 //! [`SagaEvent`]: crate::events::SagaEvent

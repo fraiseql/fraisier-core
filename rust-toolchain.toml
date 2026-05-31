@@ -1,0 +1,6 @@
+[toolchain]
+# "stable" is 1.95.0 in this environment and already installed; the MSRV floor is
+# enforced separately via `rust-version` in the workspace manifest.
+channel = "stable"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

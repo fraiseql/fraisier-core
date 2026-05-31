@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/fraisier-saga"]
+
+[workspace.package]
+version = "1.0.0-alpha.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+# NOTE: repository/homepage are placeholders pending the real crates.io coordinates.
+repository = "https://github.com/fraiseql/fraisier"
+homepage = "https://fraiseql.dev"
+authors = ["Lionel Hamayon <evolution.digitale@gmail.com>"]
+keywords = ["deploy", "migration", "orchestration", "saga", "postgres"]
+categories = ["development-tools"]
+rust-version = "1.95"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Strict per the global methodology: deny all + pedantic + cargo, warn nursery.
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Reason: cosmetic for an engine crate whose types intentionally echo their module.
+module_name_repetitions = "allow"
+# Reason: transitive version skew (sqlx / tokio / opentelemetry pull duplicate
+# sub-crates) is outside our control; denying it would fail CI for upstream churn.
+multiple_crate_versions = "allow"

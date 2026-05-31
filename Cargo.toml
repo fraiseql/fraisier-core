@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/fraisier-saga", "crates/fraisier-core", "crates/fraisier-ipc"]
+# Exploratory spikes are standalone crates, not held to the production lint bar.
+exclude = ["spikes"]
 
 [workspace.package]
 version = "1.0.0-alpha.1"

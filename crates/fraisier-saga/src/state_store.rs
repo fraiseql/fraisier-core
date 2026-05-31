@@ -1,0 +1,506 @@
+//! Pluggable state persistence for the saga engine.
+//!
+//! [`StateStore`] is the seam that lets the engine run against a filesystem
+//! today and Postgres tomorrow without touching the saga logic. The trait is
+//! **deliberately designed against the hardest backend** — Postgres with many
+//! concurrent writers and advisory locks (PRD risk row) — even though only the
+//! filesystem (this cycle) and SQLite (the `sqlite` feature) backends ship in
+//! v1.0.0-beta.1.
+//!
+//! ## Concurrency contract
+//!
+//! - [`StateStore::acquire_lock`] is a *non-blocking try-lock*: it either takes
+//!   the per-`(fraise, environment)` lock immediately or returns
+//!   [`StateStoreError::Locked`]. It never waits. This maps cleanly onto a
+//!   filesystem `flock(LOCK_EX | LOCK_NB)`, a SQLite row insert under a unique
+//!   constraint, and a Postgres `pg_try_advisory_lock` (see
+//!   [`FraiseKey::advisory_key`]).
+//! - The lock provides cross-deploy serialization (PRD §9.4): at most one
+//!   in-flight saga per pair.
+//! - [`StateStore::release_lock`] must be called to release a lock. Filesystem
+//!   locks also release if the [`LockGuard`] is dropped (the OS closes the fd);
+//!   database-backed leases do not, so dropping a guard without releasing leaks
+//!   the lock until a future TTL reaper recovers it. Callers should always
+//!   release explicitly.
+//! - `record_state` is append-only; `current_state` returns the most recently
+//!   recorded state for the pair (ordering is by append order, not wall clock).
+
+use std::hash::{Hash as _, Hasher as _};
+use std::path::{Path, PathBuf};
+
+use async_trait::async_trait;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+use crate::events::{SagaEvent, SagaState};
+
+/// Identifies one deployable in one environment — the unit of locking and state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FraiseKey {
+    fraise: String,
+    environment: String,
+}
+
+impl FraiseKey {
+    /// Construct a key from a fraise (deployable) name and an environment.
+    #[must_use]
+    pub fn new(fraise: impl Into<String>, environment: impl Into<String>) -> Self {
+        Self {
+            fraise: fraise.into(),
+            environment: environment.into(),
+        }
+    }
+
+    /// The fraise (deployable) name.
+    #[must_use]
+    pub fn fraise(&self) -> &str {
+        &self.fraise
+    }
+
+    /// The target environment.
+    #[must_use]
+    pub fn environment(&self) -> &str {
+        &self.environment
+    }
+
+    /// A stable 64-bit identity for the pair, suitable as a Postgres advisory-lock
+    /// key (`pg_try_advisory_lock($1)`).
+    ///
+    /// It is a deterministic hash — never a per-process random one — precisely so
+    /// that every writer across every host derives the *same* lock key for the
+    /// same pair, which is what makes the Postgres backend correct.
+    #[must_use]
+    pub fn advisory_key(&self) -> i64 {
+        i64::from_ne_bytes(self.stable_hash().to_ne_bytes())
+    }
+
+    /// A stable, filesystem-safe `<sanitized>-<hash>` slug for file names. The
+    /// hash suffix keeps distinct pairs from colliding after sanitization.
+    fn slug(&self) -> String {
+        let sanitized: String = format!("{}__{}", self.fraise, self.environment)
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        format!("{sanitized}-{:016x}", self.stable_hash())
+    }
+
+    fn stable_hash(&self) -> u64 {
+        // `DefaultHasher::new` uses fixed keys, so this is stable across processes.
+        let mut hasher = std::hash::DefaultHasher::new();
+        self.fraise.hash(&mut hasher);
+        0u8.hash(&mut hasher); // domain separator: ("a","bc") must differ from ("ab","c")
+        self.environment.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+impl std::fmt::Display for FraiseKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.fraise, self.environment)
+    }
+}
+
+/// A persisted snapshot of where a deploy is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentState {
+    /// The saga lifecycle state at the time of recording.
+    pub state: SagaState,
+    /// The deploy's revision identifier, once one has been established.
+    pub revision: Option<String>,
+    /// When this snapshot was recorded (informational; ordering uses append order).
+    pub recorded_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl DeploymentState {
+    /// Snapshot `state` / `revision`, stamping `recorded_at` with the current time.
+    #[must_use]
+    pub fn new(state: SagaState, revision: Option<String>) -> Self {
+        Self {
+            state,
+            revision,
+            recorded_at: chrono::Utc::now(),
+        }
+    }
+}
+
+/// Errors returned by a [`StateStore`].
+#[derive(Debug, thiserror::Error)]
+pub enum StateStoreError {
+    /// Another writer already holds the lock for this pair.
+    #[error("the deploy {key} is already locked by another writer")]
+    Locked {
+        /// The contended `(fraise, environment)` pair, rendered for humans.
+        key: String,
+    },
+    /// An underlying I/O operation failed.
+    #[error("state store I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// A record could not be (de)serialized.
+    #[error("state store (de)serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+    /// A backend-specific failure that does not fit the other variants.
+    #[error("state store backend error: {0}")]
+    Backend(String),
+}
+
+/// Proof that the per-`(fraise, environment)` lock is held.
+///
+/// Return it to [`StateStore::release_lock`] to release the lock. For the
+/// filesystem backend the OS also releases on drop; for database-backed leases
+/// it does not (see the module-level concurrency contract).
+pub struct LockGuard {
+    key: FraiseKey,
+    /// Held only by the filesystem backend; the live `flock` is released when
+    /// this is dropped or explicitly unlocked. `None` for lease-based backends.
+    #[cfg(unix)]
+    flock: Option<nix::fcntl::Flock<std::fs::File>>,
+}
+
+impl LockGuard {
+    /// The `(fraise, environment)` pair this guard protects.
+    #[must_use]
+    pub const fn key(&self) -> &FraiseKey {
+        &self.key
+    }
+
+    #[cfg(unix)]
+    const fn from_flock(key: FraiseKey, flock: nix::fcntl::Flock<std::fs::File>) -> Self {
+        Self {
+            key,
+            flock: Some(flock),
+        }
+    }
+}
+
+impl std::fmt::Debug for LockGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockGuard")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Pluggable persistence and locking for saga runs.
+///
+/// Implementations must be safe to share across tasks (`Send + Sync`). See the
+/// module docs for the concurrency contract every backend upholds.
+#[async_trait]
+pub trait StateStore: Send + Sync {
+    /// Try to take the lock for `key` without blocking.
+    ///
+    /// # Errors
+    /// Returns [`StateStoreError::Locked`] if another writer holds the lock, or
+    /// a backend error if the attempt itself fails.
+    async fn acquire_lock(&self, key: &FraiseKey) -> Result<LockGuard, StateStoreError>;
+
+    /// Release a previously acquired lock.
+    ///
+    /// # Errors
+    /// Returns a backend error if the release operation fails.
+    async fn release_lock(&self, guard: LockGuard) -> Result<(), StateStoreError>;
+
+    /// Append a new state snapshot for `key`.
+    ///
+    /// # Errors
+    /// Returns a backend or serialization error if the snapshot cannot be stored.
+    async fn record_state(
+        &self,
+        key: &FraiseKey,
+        state: &DeploymentState,
+    ) -> Result<(), StateStoreError>;
+
+    /// Return the most recently recorded state for `key`, or `None` if there is none.
+    ///
+    /// # Errors
+    /// Returns a backend or deserialization error if stored state cannot be read.
+    async fn current_state(
+        &self,
+        key: &FraiseKey,
+    ) -> Result<Option<DeploymentState>, StateStoreError>;
+
+    /// Append an event to `key`'s event log.
+    ///
+    /// # Errors
+    /// Returns a backend or serialization error if the event cannot be stored.
+    async fn record_event(&self, key: &FraiseKey, event: &SagaEvent)
+        -> Result<(), StateStoreError>;
+
+    /// Return `key`'s events in insertion order.
+    ///
+    /// # Errors
+    /// Returns a backend or deserialization error if the log cannot be read.
+    async fn events(&self, key: &FraiseKey) -> Result<Vec<SagaEvent>, StateStoreError>;
+}
+
+/// A [`StateStore`] backed by a directory of JSON-lines files — one set of files
+/// per `(fraise, environment)` pair — with `flock`-based locking.
+///
+/// This is the default backend for single-host deploys. Locking requires a Unix
+/// `flock(2)`; the backend is therefore Unix-only.
+#[derive(Debug, Clone)]
+pub struct FilesystemStateStore {
+    root: PathBuf,
+}
+
+impl FilesystemStateStore {
+    /// Open (creating if necessary) a filesystem state store rooted at `root`.
+    ///
+    /// # Errors
+    /// Returns [`StateStoreError::Io`] if the root directory cannot be created.
+    pub fn new(root: impl AsRef<Path>) -> Result<Self, StateStoreError> {
+        let root = root.as_ref().to_path_buf();
+        std::fs::create_dir_all(&root)?;
+        Ok(Self { root })
+    }
+
+    fn lock_path(&self, key: &FraiseKey) -> PathBuf {
+        self.root.join(format!("{}.lock", key.slug()))
+    }
+
+    fn state_path(&self, key: &FraiseKey) -> PathBuf {
+        self.root.join(format!("{}.state.jsonl", key.slug()))
+    }
+
+    fn events_path(&self, key: &FraiseKey) -> PathBuf {
+        self.root.join(format!("{}.events.jsonl", key.slug()))
+    }
+}
+
+/// Read and deserialize every non-empty line of a JSON-lines file. A missing
+/// file is treated as empty.
+fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>, StateStoreError> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).map_err(StateStoreError::from))
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Append one JSON-serialized record as a line to a JSON-lines file.
+fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<(), StateStoreError> {
+    use std::io::Write as _;
+    let line = serde_json::to_string(value)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
+#[async_trait]
+impl StateStore for FilesystemStateStore {
+    async fn acquire_lock(&self, key: &FraiseKey) -> Result<LockGuard, StateStoreError> {
+        let path = self.lock_path(key);
+        #[cfg(unix)]
+        {
+            use nix::errno::Errno;
+            use nix::fcntl::{Flock, FlockArg};
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false) // the lock file is a pure mutex; never clobber it
+                .open(path)?;
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(flock) => Ok(LockGuard::from_flock(key.clone(), flock)),
+                Err((_file, Errno::EWOULDBLOCK)) => Err(StateStoreError::Locked {
+                    key: key.to_string(),
+                }),
+                Err((_file, errno)) => {
+                    Err(StateStoreError::Backend(format!("flock failed: {errno}")))
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(StateStoreError::Backend(
+                "the filesystem state store requires a Unix flock".to_owned(),
+            ))
+        }
+    }
+
+    async fn release_lock(&self, guard: LockGuard) -> Result<(), StateStoreError> {
+        #[cfg(unix)]
+        if let Some(flock) = guard.flock {
+            flock.unlock().map_err(|(_file, errno)| {
+                StateStoreError::Backend(format!("flock unlock failed: {errno}"))
+            })?;
+        }
+        #[cfg(not(unix))]
+        drop(guard);
+        Ok(())
+    }
+
+    async fn record_state(
+        &self,
+        key: &FraiseKey,
+        state: &DeploymentState,
+    ) -> Result<(), StateStoreError> {
+        append_jsonl(&self.state_path(key), state)
+    }
+
+    async fn current_state(
+        &self,
+        key: &FraiseKey,
+    ) -> Result<Option<DeploymentState>, StateStoreError> {
+        let mut states: Vec<DeploymentState> = read_jsonl(&self.state_path(key))?;
+        Ok(states.pop())
+    }
+
+    async fn record_event(
+        &self,
+        key: &FraiseKey,
+        event: &SagaEvent,
+    ) -> Result<(), StateStoreError> {
+        append_jsonl(&self.events_path(key), event)
+    }
+
+    async fn events(&self, key: &FraiseKey) -> Result<Vec<SagaEvent>, StateStoreError> {
+        read_jsonl(&self.events_path(key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeploymentState, FilesystemStateStore, FraiseKey, StateStore, StateStoreError};
+    use crate::events::{SagaEvent, SagaState};
+
+    // --- backend-contract harness: the same assertions run against every backend ---
+
+    pub(super) async fn persists_and_returns_latest_state(store: &dyn StateStore) {
+        let key = FraiseKey::new("checkout", "production");
+        assert!(
+            store
+                .current_state(&key)
+                .await
+                .expect("query empty")
+                .is_none(),
+            "a fresh key has no state"
+        );
+
+        store
+            .record_state(
+                &key,
+                &DeploymentState::new(
+                    SagaState::Running("migrate".to_owned()),
+                    Some("rev-1".to_owned()),
+                ),
+            )
+            .await
+            .expect("record first");
+        store
+            .record_state(
+                &key,
+                &DeploymentState::new(SagaState::Committed, Some("rev-2".to_owned())),
+            )
+            .await
+            .expect("record second");
+
+        let latest = store
+            .current_state(&key)
+            .await
+            .expect("query")
+            .expect("some state");
+        assert_eq!(latest.state, SagaState::Committed, "latest wins");
+        assert_eq!(latest.revision.as_deref(), Some("rev-2"));
+
+        // Distinct keys do not bleed into one another.
+        let other = FraiseKey::new("checkout", "staging");
+        assert!(store
+            .current_state(&other)
+            .await
+            .expect("query other")
+            .is_none());
+    }
+
+    pub(super) async fn lock_excludes_concurrent_acquisition(store: &dyn StateStore) {
+        let key = FraiseKey::new("checkout", "production");
+        let held = store
+            .acquire_lock(&key)
+            .await
+            .expect("first acquire succeeds");
+
+        let contended = store.acquire_lock(&key).await;
+        assert!(
+            matches!(contended, Err(StateStoreError::Locked { .. })),
+            "a second acquisition of a held lock is rejected, got {contended:?}"
+        );
+
+        // A different pair locks independently.
+        let other = FraiseKey::new("checkout", "staging");
+        let other_held = store.acquire_lock(&other).await.expect("independent pair");
+        store.release_lock(other_held).await.expect("release other");
+
+        store.release_lock(held).await.expect("release");
+        let reacquired = store
+            .acquire_lock(&key)
+            .await
+            .expect("re-acquire after release");
+        store.release_lock(reacquired).await.expect("final release");
+    }
+
+    pub(super) async fn records_and_reads_events_in_order(store: &dyn StateStore) {
+        let key = FraiseKey::new("checkout", "production");
+        let first = SagaEvent::StateTransition {
+            from: SagaState::Idle,
+            to: SagaState::Running("preflight".to_owned()),
+        };
+        let second = SagaEvent::StateTransition {
+            from: SagaState::Running("preflight".to_owned()),
+            to: SagaState::Committed,
+        };
+        store
+            .record_event(&key, &first)
+            .await
+            .expect("record first event");
+        store
+            .record_event(&key, &second)
+            .await
+            .expect("record second event");
+
+        let events = store.events(&key).await.expect("read events");
+        assert_eq!(
+            events,
+            vec![first, second],
+            "events return in insertion order"
+        );
+    }
+
+    // --- filesystem backend instantiation (Cycle 1.3) ---
+
+    fn filesystem_store() -> (tempfile::TempDir, FilesystemStateStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FilesystemStateStore::new(dir.path()).expect("open filesystem store");
+        (dir, store)
+    }
+
+    #[tokio::test]
+    async fn filesystem_persists_and_returns_latest_state() {
+        let (_dir, store) = filesystem_store();
+        persists_and_returns_latest_state(&store).await;
+    }
+
+    #[tokio::test]
+    async fn filesystem_lock_excludes_concurrent_acquisition() {
+        let (_dir, store) = filesystem_store();
+        lock_excludes_concurrent_acquisition(&store).await;
+    }
+
+    #[tokio::test]
+    async fn filesystem_records_and_reads_events_in_order() {
+        let (_dir, store) = filesystem_store();
+        records_and_reads_events_in_order(&store).await;
+    }
+}

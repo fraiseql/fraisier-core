@@ -22,6 +22,7 @@
 //! [`SagaState`]: crate::events::SagaState
 
 pub mod events;
+pub mod state_store;
 
 #[cfg(feature = "otel")]
 pub mod otel;

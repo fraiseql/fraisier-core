@@ -29,3 +29,4 @@
 //! embedder layer (see the crate README).
 
 pub mod adapter_axes;
+pub mod multi_host;

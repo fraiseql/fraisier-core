@@ -105,8 +105,11 @@ impl fmt::Display for AdapterErrorKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[error("[{kind}] {message}")]
 pub struct AdapterError {
-    /// The error kind (maps to a JSON-RPC code).
+    /// The error kind.
     pub kind: AdapterErrorKind,
+    /// The JSON-RPC error code. Defaults to the kind's code, but a remote
+    /// (IPC) adapter's own code is preserved here so it survives the boundary.
+    pub code: i32,
     /// A human-readable description.
     pub message: String,
     /// The adapter that produced the error, when known.
@@ -123,10 +126,20 @@ impl AdapterError {
     pub fn new(kind: AdapterErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
+            code: kind.code(),
             message: message.into(),
             adapter: None,
             operation: None,
             stderr: None,
+        }
+    }
+
+    /// An error reported by a remote (IPC) adapter, preserving its JSON-RPC code.
+    #[must_use]
+    pub fn remote(code: i32, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            ..Self::new(AdapterErrorKind::Remote, message)
         }
     }
 
@@ -173,7 +186,7 @@ impl AdapterError {
     /// The JSON-RPC error code for this error.
     #[must_use]
     pub const fn code(&self) -> i32 {
-        self.kind.code()
+        self.code
     }
 }
 

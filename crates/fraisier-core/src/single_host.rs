@@ -94,6 +94,7 @@ pub struct SingleHostDeploy {
     host: HostId,
     ctx: AdapterCtx,
     target: Option<Revision>,
+    forward_compatible_lint: bool,
     artifact: Arc<dyn ArtifactAdapter>,
     migration: Arc<dyn MigrationAdapter>,
     service: Arc<dyn ServiceAdapter>,
@@ -108,6 +109,7 @@ impl std::fmt::Debug for SingleHostDeploy {
             .field("environment", &self.environment)
             .field("host", &self.host)
             .field("target", &self.target)
+            .field("forward_compatible_lint", &self.forward_compatible_lint)
             .finish_non_exhaustive()
     }
 }
@@ -171,6 +173,7 @@ pub struct SingleHostDeployBuilder {
     host: HostId,
     ctx: Option<AdapterCtx>,
     target: Option<Revision>,
+    forward_compatible_lint: bool,
     artifact: Option<Arc<dyn ArtifactAdapter>>,
     migration: Option<Arc<dyn MigrationAdapter>>,
     service: Option<Arc<dyn ServiceAdapter>>,
@@ -185,6 +188,9 @@ impl SingleHostDeployBuilder {
             host,
             ctx: None,
             target: None,
+            // Default on: forward-compat preflight runs whenever the adapter
+            // advertises it, unless the operator opts out (PRD G11 / Decision 4).
+            forward_compatible_lint: true,
             artifact: None,
             migration: None,
             service: None,
@@ -204,6 +210,16 @@ impl SingleHostDeployBuilder {
     #[must_use]
     pub fn target(mut self, target: Revision) -> Self {
         self.target = Some(target);
+        self
+    }
+
+    /// Whether to run the migration adapter's forward-compatibility `preflight`
+    /// lint before deploying (default `true`). When `false`, the preflight step is
+    /// skipped even if the adapter advertises the capability — the operator's
+    /// opt-out from `[migration].forward_compatible_lint`.
+    #[must_use]
+    pub const fn forward_compatible_lint(mut self, enabled: bool) -> Self {
+        self.forward_compatible_lint = enabled;
         self
     }
 
@@ -261,6 +277,7 @@ impl SingleHostDeployBuilder {
             host: self.host,
             ctx,
             target: self.target,
+            forward_compatible_lint: self.forward_compatible_lint,
         })
     }
 }
@@ -280,6 +297,7 @@ struct DeployShared {
     ctx: AdapterCtx,
     host: HostId,
     target: Option<Revision>,
+    forward_compatible_lint: bool,
     artifact: Arc<dyn ArtifactAdapter>,
     migration: Arc<dyn MigrationAdapter>,
     service: Arc<dyn ServiceAdapter>,
@@ -337,6 +355,7 @@ impl DeployShared {
             ctx,
             host: deploy.host.clone(),
             target: deploy.target.clone(),
+            forward_compatible_lint: deploy.forward_compatible_lint,
             artifact: Arc::clone(&deploy.artifact),
             migration: Arc::clone(&deploy.migration),
             service: Arc::clone(&deploy.service),
@@ -371,6 +390,11 @@ impl DeployShared {
     }
 
     async fn run_preflight(&self) -> Result<(), SagaError> {
+        // Operator opt-out (`[migration].forward_compatible_lint = false`): skip the
+        // forward-compat lint entirely — no describe, no preflight call.
+        if !self.forward_compatible_lint {
+            return Ok(());
+        }
         let described = self
             .migration
             .describe()
@@ -924,6 +948,44 @@ mod tests {
             "a forward deploy must call up(None) and commit; got {outcome:?}",
         );
         assert!(drain(&trail).iter().any(|e| e == "up"), "up was reached");
+    }
+
+    #[tokio::test]
+    async fn forward_compatible_lint_disabled_skips_the_preflight_step() {
+        // Opting out (`forward_compatible_lint(false)`) skips the preflight step
+        // entirely — no `describe`, no `preflight` — even when the adapter
+        // advertises preflight and *would* block. The deploy proceeds to commit.
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let mut migration = FakeMigration::healthy(&trail);
+        migration.preflight_blocking = true; // would roll back at preflight if it ran
+        let plan = SingleHostDeploy::builder("checkout", "production", HostId::new("localhost"))
+            .artifact(Arc::new(FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            }))
+            .migration(Arc::new(migration))
+            .service(Arc::new(FakeService {
+                trail: trail.clone(),
+            }))
+            .health(Arc::new(FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            }))
+            .forward_compatible_lint(false)
+            .build()
+            .expect("all adapters provided");
+
+        let outcome = plan.run(store).await.expect("run");
+        assert!(
+            matches!(outcome, SagaOutcome::Committed),
+            "the lint opt-out lets the deploy commit despite a blocking preflight; got {outcome:?}",
+        );
+        let trail = drain(&trail);
+        assert!(
+            !trail.iter().any(|e| e == "describe" || e == "preflight"),
+            "the preflight step made no adapter call: {trail:?}",
+        );
     }
 
     #[tokio::test]

@@ -61,6 +61,9 @@ pub struct ResolvedDeploy {
     pub host: HostId,
     /// The shared adapter context.
     pub ctx: AdapterCtx,
+    /// Whether to run the migration adapter's forward-compatibility `preflight`
+    /// lint (`[migration].forward_compatible_lint`, default `true`).
+    pub forward_compatible_lint: bool,
     /// The artifact adapter.
     pub artifact: Arc<dyn ArtifactAdapter>,
     /// The migration adapter (in-process or IPC).
@@ -229,6 +232,14 @@ pub fn build(
     let mut env_secrets = BTreeMap::new();
     let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
 
+    // Default on: the forward-compat lint runs whenever the adapter advertises it,
+    // unless the operator opts out in the config.
+    let forward_compatible_lint = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.forward_compatible_lint)
+        .unwrap_or(true);
+
     let mut ctx = AdapterCtx::new(fraise.clone(), environment.clone());
     ctx.host = Some(host.clone());
     ctx.workdir = PathBuf::from(".");
@@ -244,6 +255,7 @@ pub fn build(
         environment,
         host,
         ctx,
+        forward_compatible_lint,
         artifact,
         migration,
         service,

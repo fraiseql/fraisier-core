@@ -278,6 +278,7 @@ pub(crate) async fn deploy(
         resolved.host.clone(),
     )
     .context(resolved.ctx)
+    .forward_compatible_lint(resolved.forward_compatible_lint)
     .artifact(resolved.artifact)
     .migration(resolved.migration)
     .service(resolved.service)

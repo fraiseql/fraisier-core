@@ -8,6 +8,7 @@ members = [
     "crates/fraisier-adapter-support",
     "crates/fraisier-adapter-command",
     "crates/fraisier-adapter-systemd",
+    "crates/fraisier-adapter-http",
 ]
 # Exploratory spikes are standalone crates, not held to the production lint bar.
 exclude = ["spikes"]

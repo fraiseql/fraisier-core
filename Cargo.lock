@@ -478,6 +478,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fraisier-adapter-nginx"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "async-trait",
+ "fraisier-adapter-support",
+ "fraisier-core",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "fraisier-adapter-support"
 version = "1.0.0-alpha.1"
 dependencies = [

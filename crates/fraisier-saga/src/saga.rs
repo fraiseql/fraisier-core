@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 
-use crate::events::{instrument_state_transition, SagaEvent, SagaState};
+use crate::events::{instrument_deploy_run, instrument_state_transition, SagaEvent, SagaState};
 use crate::state_store::{DeploymentState, FraiseKey, StateStore, StateStoreError};
 
 /// Engine-level errors.
@@ -133,6 +133,14 @@ impl<S: StateStore> Saga<S> {
     /// persistence). A *business* failure that rolls back cleanly is reported as
     /// a successful `Ok(SagaOutcome::RolledBack)`, not an `Err`.
     pub async fn run(&self) -> Result<SagaOutcome, SagaError> {
+        use tracing::Instrument as _;
+        // One root span per run, held across the whole run, so every transition
+        // span nests beneath it and the deploy exports as a single trace.
+        let span = instrument_deploy_run(self.key.fraise(), self.key.environment());
+        self.run_inner().instrument(span).await
+    }
+
+    async fn run_inner(&self) -> Result<SagaOutcome, SagaError> {
         let guard = self.store.acquire_lock(&self.key).await?;
         let outcome = self.execute().await;
         match self.store.release_lock(guard).await {
@@ -303,6 +311,75 @@ mod tests {
             .expect("query")
             .expect("state");
         assert_eq!(latest.state, SagaState::Committed);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deploy_run_is_one_trace_with_transitions_nested() {
+        use std::collections::HashMap;
+        use tracing::span::{Attributes, Id};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
+        use tracing_subscriber::registry::LookupSpan;
+        use tracing_subscriber::Registry;
+
+        // Capture each span's (name, parent-name) so we can assert the tree shape.
+        type SpanNames = Arc<Mutex<HashMap<u64, String>>>;
+        type SpanEdges = Arc<Mutex<Vec<(String, Option<String>)>>>;
+        #[derive(Clone, Default)]
+        struct SpanTree {
+            names: SpanNames,
+            edges: SpanEdges,
+        }
+        impl<S> Layer<S> for SpanTree
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+                let name = attrs.metadata().name().to_owned();
+                let parent = attrs
+                    .parent()
+                    .cloned()
+                    .or_else(|| ctx.current_span().id().cloned())
+                    .and_then(|pid| {
+                        self.names
+                            .lock()
+                            .expect("lock")
+                            .get(&pid.into_u64())
+                            .cloned()
+                    });
+                self.names
+                    .lock()
+                    .expect("lock")
+                    .insert(id.into_u64(), name.clone());
+                self.edges.lock().expect("lock").push((name, parent));
+            }
+        }
+
+        let tree = SpanTree::default();
+        let edges = tree.edges.clone();
+        let _guard = tracing::subscriber::set_default(Registry::default().with(tree));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FilesystemStateStore::new(dir.path()).expect("store");
+        let trail: Trail = Trail::default();
+        Saga::new(store, "checkout", "production")
+            .with_step(RecordingStep::ok("preflight", &trail))
+            .with_step(RecordingStep::ok("migrate", &trail))
+            .run()
+            .await
+            .expect("run");
+
+        let edges = edges.lock().expect("lock").clone();
+        let deploy_roots = edges.iter().filter(|(n, _)| n == "saga.deploy").count();
+        assert_eq!(deploy_roots, 1, "exactly one root deploy span: {edges:?}");
+        let transitions = || edges.iter().filter(|(n, _)| n == "saga.state_transition");
+        assert!(
+            transitions().next().is_some(),
+            "transitions were emitted: {edges:?}"
+        );
+        assert!(
+            transitions().all(|(_, parent)| parent.as_deref() == Some("saga.deploy")),
+            "every transition nests under the one saga.deploy root: {edges:?}",
+        );
     }
 
     #[tokio::test]

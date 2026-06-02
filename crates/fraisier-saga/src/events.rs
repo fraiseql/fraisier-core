@@ -78,13 +78,29 @@ pub enum SagaEvent {
     },
 }
 
-/// Open a span recording a saga state transition under the `deploy.*` OTel
-/// attribute convention (see the module docs).
+/// Open the root span for one saga run, named `saga.deploy`.
 ///
-/// Hold the returned [`tracing::Span`] for the duration of the work performed in
-/// the destination state, so adapter-call spans nest beneath it. When the `otel`
-/// feature is enabled and a pipeline is installed via [`crate::otel`], the span
-/// is exported; otherwise it is a cheap no-op unless another subscriber is set.
+/// Hold it (via [`tracing::Instrument`]) for the whole run so every
+/// state-transition span nests beneath it and the run exports as a **single
+/// trace per deploy** rather than one disconnected trace per transition. When the
+/// `otel` feature is enabled and a pipeline is installed via [`crate::otel`], the
+/// span is exported; otherwise it is a cheap no-op unless another subscriber is set.
+#[must_use]
+pub fn instrument_deploy_run(fraise: &str, environment: &str) -> tracing::Span {
+    tracing::info_span!(
+        "saga.deploy",
+        deploy.fraise = fraise,
+        deploy.environment = environment,
+    )
+}
+
+/// Open a span recording a saga state transition.
+///
+/// Uses the `deploy.*` OTel attribute convention (see the module docs) and nests
+/// under the current [`instrument_deploy_run`] span, so it appears within that
+/// deploy's trace. When the `otel` feature is enabled and a pipeline is installed
+/// via [`crate::otel`], the span is exported; otherwise it is a cheap no-op unless
+/// another subscriber is set.
 #[must_use]
 pub fn instrument_state_transition(
     fraise: &str,

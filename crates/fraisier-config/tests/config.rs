@@ -338,3 +338,52 @@ nonsense = true
     // The toml parser's message names the offending key.
     assert!(err.to_string().contains("nonsense"), "got: {err}");
 }
+
+#[test]
+fn release_without_active_path_warns_but_stays_valid() {
+    // The PRD §7.1 example omits active_path: a warning, not an error.
+    let cfg = DeployConfig::from_toml_str(PRD_7_1).expect("parses");
+    let report = cfg.validate();
+    assert!(report.ok(), "active_path is a warning, not an error");
+    assert!(report
+        .issues
+        .iter()
+        .any(|i| i.path == "artifact.active_path" && i.severity == Severity::Warning));
+}
+
+#[test]
+fn active_path_and_staging_dir_parse() {
+    let toml = r#"
+[deploy]
+name = "checkout"
+environment = "staging"
+
+[artifact]
+source = "release"
+release_url = "https://example.com/app.tar.gz"
+checksum_url = "https://example.com/app.tar.gz.sha256"
+active_path = "/var/lib/app/current"
+staging_dir = "/var/lib/app/staging"
+
+[migration]
+adapter = "command"
+
+[service]
+adapter = "systemd"
+unit = "x.service"
+
+[health]
+adapter = "http"
+url = "http://127.0.0.1:8080/health"
+"#;
+    let cfg = DeployConfig::load(toml).expect("valid (active_path set → no warning)");
+    let artifact = cfg.artifact.expect("artifact");
+    assert_eq!(
+        artifact.active_path.as_deref(),
+        Some(std::path::Path::new("/var/lib/app/current"))
+    );
+    assert_eq!(
+        artifact.staging_dir.as_deref(),
+        Some(std::path::Path::new("/var/lib/app/staging"))
+    );
+}

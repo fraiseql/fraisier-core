@@ -219,6 +219,8 @@ impl Overlay for ArtifactSection {
             repo: prefer(self.repo, over.repo),
             reference: prefer(self.reference, over.reference),
             path: prefer(self.path, over.path),
+            active_path: prefer(self.active_path, over.active_path),
+            staging_dir: prefer(self.staging_dir, over.staging_dir),
         }
     }
 }

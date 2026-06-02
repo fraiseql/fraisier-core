@@ -197,6 +197,19 @@ fn validate_artifact(cfg: &DeployConfig, report: &mut ValidationReport) {
             format!("unknown artifact source '{other}' (expected one of: release, git, local)"),
         ),
     }
+    // `active_path` is what activation swaps to the new artifact; a deploy that
+    // activates one (release/local) cannot complete without it. Warn rather than
+    // error so the PRD example (which omits it) still validates; the artifact
+    // adapter hard-errors at activate time.
+    if matches!(artifact.source.as_deref(), Some("release" | "local"))
+        && artifact.active_path.is_none()
+    {
+        report.warn(
+            "artifact.active_path",
+            "no active_path set; activation will fail at deploy time \
+             (it is the symlink swapped to the newly-staged artifact)",
+        );
+    }
 }
 
 fn validate_migration(cfg: &DeployConfig, report: &mut ValidationReport) {

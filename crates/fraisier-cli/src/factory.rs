@@ -105,6 +105,16 @@ fn settings_map(config: &DeployConfig, app_version: Option<&str>) -> BTreeMap<St
             artifact.checksum_url.as_deref(),
         );
         put_str(&mut settings, "sha256", artifact.checksum.as_deref());
+        put_path(
+            &mut settings,
+            "active_path",
+            artifact.active_path.as_deref(),
+        );
+        put_path(
+            &mut settings,
+            "staging_dir",
+            artifact.staging_dir.as_deref(),
+        );
     }
     if let Some(version) = app_version {
         settings.insert("version".to_owned(), Value::String(version.to_owned()));
@@ -125,6 +135,12 @@ fn settings_map(config: &DeployConfig, app_version: Option<&str>) -> BTreeMap<St
 fn put_str(map: &mut BTreeMap<String, Value>, key: &str, value: Option<&str>) {
     if let Some(value) = value {
         map.insert(key.to_owned(), Value::String(value.to_owned()));
+    }
+}
+
+fn put_path(map: &mut BTreeMap<String, Value>, key: &str, value: Option<&std::path::Path>) {
+    if let Some(value) = value {
+        map.insert(key.to_owned(), Value::String(value.display().to_string()));
     }
 }
 

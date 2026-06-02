@@ -146,6 +146,14 @@ pub struct ArtifactSection {
     /// `local`: the path to the already-built artifact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
+    /// The symlink an activate swaps to point at the newly-staged artifact (the
+    /// host's "current" path). Required at activate time for `release`/`local`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_path: Option<PathBuf>,
+    /// Where versioned artifacts are staged before activation. Defaults to
+    /// `<workdir>/.fraisier-staging` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging_dir: Option<PathBuf>,
 }
 
 /// The `[migration]` section.

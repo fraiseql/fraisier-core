@@ -200,6 +200,10 @@ pub struct ServiceSection {
     /// default is used when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compose_file: Option<PathBuf>,
+    /// `systemd`: drive the **user** manager (`systemctl --user`) instead of the
+    /// system manager. Ignored by the other service adapters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<bool>,
 }
 
 /// The `[health]` section.

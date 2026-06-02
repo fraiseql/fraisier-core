@@ -479,3 +479,57 @@ url = "http://127.0.0.1:8080/health"
         Some(std::path::Path::new("/var/lib/app/staging"))
     );
 }
+
+const WITH_SERVICE_USER: &str = r#"
+[deploy]
+name = "app"
+environment = "prod"
+
+[artifact]
+source = "release"
+release_url = "https://example.com/app-{version}.tar.gz"
+checksum_url = "https://example.com/app-{version}.tar.gz.sha256"
+
+[migration]
+adapter = "command"
+
+[service]
+adapter = "systemd"
+unit = "app.service"
+user = true
+
+[health]
+adapter = "http"
+url = "http://127.0.0.1:8080/health"
+"#;
+
+#[test]
+fn service_user_parses_and_validates_for_systemd() {
+    let cfg = DeployConfig::from_toml_str(WITH_SERVICE_USER).expect("parses");
+    assert_eq!(cfg.service.as_ref().expect("service").user, Some(true));
+    // user = true on systemd is valid (no error, no warning about it).
+    let report = cfg.validate();
+    assert!(report.ok(), "systemd + user is valid: {report}");
+    assert!(
+        !report.issues.iter().any(|i| i.path == "service.user"),
+        "no service.user issue for systemd: {report}",
+    );
+}
+
+#[test]
+fn service_user_on_a_non_systemd_adapter_warns() {
+    // The rc adapter ignores `user`; setting it should warn, not silently no-op.
+    let toml = WITH_SERVICE_USER.replace(
+        "adapter = \"systemd\"\nunit = \"app.service\"",
+        "adapter = \"rc\"\nname = \"app\"",
+    );
+    let cfg = DeployConfig::from_toml_str(&toml).expect("parses");
+    let report = cfg.validate();
+    assert!(report.ok(), "a warning does not invalidate: {report}");
+    let issue = report
+        .issues
+        .iter()
+        .find(|i| i.path == "service.user")
+        .expect("a service.user warning");
+    assert_eq!(issue.severity, Severity::Warning);
+}

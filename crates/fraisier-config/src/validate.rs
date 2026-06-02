@@ -268,6 +268,13 @@ fn validate_service(cfg: &DeployConfig, report: &mut ValidationReport) {
              (the service within the Compose project)",
         );
     }
+    if service.user == Some(true) && service.adapter.as_deref() != Some("systemd") {
+        report.warn(
+            "service.user",
+            "user = true only applies to the systemd adapter (systemctl --user); \
+             it is ignored by this adapter",
+        );
+    }
 }
 
 fn validate_health(cfg: &DeployConfig, report: &mut ValidationReport) {

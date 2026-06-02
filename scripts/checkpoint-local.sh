@@ -197,19 +197,9 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
 PY
 
-# In user mode the adapter spawns bare `systemctl`, so redirect it to the user
-# manager via a wrapper (the config schema does not yet expose `[service].user`).
-# In system mode the real `systemctl` is exactly what we want.
-if [ "$MODE" = user ]; then
-  cat > "$WORK/systemctl-user" <<'SH'
-#!/bin/sh
-exec systemctl --user "$@"
-SH
-  chmod +x "$WORK/systemctl-user"
-  SYSTEMCTL_BIN="$WORK/systemctl-user"
-else
-  SYSTEMCTL_BIN="$(command -v systemctl)"
-fi
+# user mode drives the user manager via `[service].user = true` in the config
+# (the systemd adapter emits `systemctl --user`); system mode omits it.
+if [ "$MODE" = user ]; then SERVICE_USER="user = true"; else SERVICE_USER=""; fi
 
 cat > "$UNIT_FILE" <<EOF
 [Unit]
@@ -248,6 +238,7 @@ migrations_path = "$WORK/migrations"
 [service]
 adapter = "systemd"
 unit = "$UNIT"
+$SERVICE_USER
 
 [health]
 adapter = "http"
@@ -266,7 +257,6 @@ DSN="sqlite://$WORK/app.db?mode=rwc"
 deploy() { # <app-version>
   PATH="$SQLX_DIR:$PATH" \
   FRAISIER_CHECKPOINT_DSN="$DSN" \
-  FRAISIER_SYSTEMCTL_BIN="$SYSTEMCTL_BIN" \
   OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:$OTLP_HTTP_PORT" \
     "$FRAISIER" --json deploy \
       --config "$WORK/fraisier.toml" \

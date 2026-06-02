@@ -135,6 +135,9 @@ fn settings_map(config: &DeployConfig, app_version: Option<&str>) -> BTreeMap<St
             "compose_file",
             service.compose_file.as_deref(),
         );
+        if let Some(user) = service.user {
+            settings.insert("user".to_owned(), Value::Bool(user));
+        }
     }
     if let Some(health) = &config.health {
         put_str(&mut settings, "url", health.url.as_deref());
@@ -351,5 +354,34 @@ fn build_migration(
             }
             Ok(Arc::new(adapter))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarize;
+    use fraisier_config::DeployConfig;
+
+    /// `[service].user` reaches the shared settings the systemd adapter reads
+    /// `user` from (it drives `systemctl --user`).
+    #[test]
+    fn service_user_is_plumbed_into_the_adapter_settings() {
+        let toml = r#"
+[deploy]
+name = "app"
+environment = "prod"
+
+[service]
+adapter = "systemd"
+unit = "app.service"
+user = true
+"#;
+        let config = DeployConfig::from_toml_str(toml).expect("parses");
+        let summary = summarize(&config, None, None).expect("summarize");
+        assert!(
+            summary.settings_keys.iter().any(|k| k == "user"),
+            "user is in the assembled settings: {:?}",
+            summary.settings_keys,
+        );
     }
 }

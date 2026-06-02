@@ -4,6 +4,7 @@ members = [
     "crates/fraisier-saga",
     "crates/fraisier-core",
     "crates/fraisier-config",
+    "crates/fraisier-cli",
     "crates/fraisier-ipc",
     "crates/fraisier-adapter-confiture",
     "crates/fraisier-adapter-support",

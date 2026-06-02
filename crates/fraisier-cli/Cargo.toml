@@ -1,0 +1,45 @@
+[package]
+name = "fraisier-cli"
+description = "The fraisier command-line binary: deploy, validate-config, status, and adapter discovery over the in-process and IPC adapter paths."
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "fraisier"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.51", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
+
+# Vocabulary, engine, config, and the IPC transport. Per the crate-graph rule the
+# CLI is the layer that depends on *both* fraisier-core and fraisier-ipc and wires
+# in-process vs IPC adapter selection.
+fraisier-core = { path = "../fraisier-core", version = "1.0.0-alpha.1" }
+fraisier-config = { path = "../fraisier-config", version = "1.0.0-alpha.1" }
+fraisier-saga = { path = "../fraisier-saga", version = "1.0.0-alpha.1" }
+fraisier-ipc = { path = "../fraisier-ipc", version = "1.0.0-alpha.1" }
+
+# In-process adapters selected by name from the config.
+fraisier-adapter-confiture = { path = "../fraisier-adapter-confiture", version = "1.0.0-alpha.1" }
+fraisier-adapter-command = { path = "../fraisier-adapter-command", version = "1.0.0-alpha.1" }
+fraisier-adapter-systemd = { path = "../fraisier-adapter-systemd", version = "1.0.0-alpha.1" }
+fraisier-adapter-http = { path = "../fraisier-adapter-http", version = "1.0.0-alpha.1" }
+fraisier-artifact-release = { path = "../fraisier-artifact-release", version = "1.0.0-alpha.1" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -14,6 +14,13 @@
 //! - [`HealthAdapter`](adapter_axes::HealthAdapter) — verify a host is serving
 //! - [`LbAdapter`](adapter_axes::LbAdapter) — drain/reattach a host at the load balancer
 //!
+//! ## Deploy composition
+//!
+//! [`single_host`] composes the axes into the single-host deploy flow (PRD §5.2),
+//! wrapping each axis as a saga [`Step`](fraisier_saga::saga::Step) with atomic
+//! rollback and a durable release ledger for artifact rollback. [`multi_host`]
+//! reserves the multi-host plan shape (executed in Phase 4).
+//!
 //! ## The convergence rule
 //!
 //! Every adapter trait argument and return type is `Serialize + Deserialize`. That
@@ -30,3 +37,4 @@
 
 pub mod adapter_axes;
 pub mod multi_host;
+pub mod single_host;

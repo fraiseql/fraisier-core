@@ -429,8 +429,10 @@ name = "fraisier-core"
 version = "1.0.0-alpha.1"
 dependencies = [
  "async-trait",
+ "fraisier-saga",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]

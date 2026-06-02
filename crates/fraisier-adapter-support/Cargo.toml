@@ -1,0 +1,23 @@
+[package]
+name = "fraisier-adapter-support"
+description = "Shared building blocks for fraisier in-process adapters: a subprocess runner and an async retry helper."
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fraisier-core = { path = "../fraisier-core", version = "1.0.0-alpha.1" }
+tokio = { version = "1.52.3", features = ["process", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread", "time"] }

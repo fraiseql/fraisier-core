@@ -290,12 +290,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "fraisier-adapter-command"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "async-trait",
+ "fraisier-adapter-support",
+ "fraisier-core",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "fraisier-adapter-confiture"
 version = "1.0.0-alpha.1"
 dependencies = [
  "async-trait",
  "fraisier-core",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "fraisier-adapter-support"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "fraisier-core",
  "tokio",
 ]
 

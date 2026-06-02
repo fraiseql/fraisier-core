@@ -1,0 +1,25 @@
+[package]
+name = "fraisier-adapter-systemd"
+description = "systemd service adapter for fraisier: restart/status via the `systemctl` CLI behind the ServiceAdapter trait."
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+fraisier-core = { path = "../fraisier-core", version = "1.0.0-alpha.1" }
+fraisier-adapter-support = { path = "../fraisier-adapter-support", version = "1.0.0-alpha.1" }
+serde_json = "1.0.150"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread"] }

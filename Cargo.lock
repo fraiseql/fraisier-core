@@ -466,6 +466,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fraisier-adapter-docker-compose"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "async-trait",
+ "fraisier-adapter-support",
+ "fraisier-core",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "fraisier-adapter-http"
 version = "1.0.0-alpha.1"
 dependencies = [
@@ -540,6 +551,7 @@ dependencies = [
  "clap",
  "fraisier-adapter-command",
  "fraisier-adapter-confiture",
+ "fraisier-adapter-docker-compose",
  "fraisier-adapter-http",
  "fraisier-adapter-rc",
  "fraisier-adapter-systemd",

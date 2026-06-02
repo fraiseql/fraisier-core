@@ -249,6 +249,8 @@ impl Overlay for ServiceSection {
             adapter: prefer(self.adapter, over.adapter),
             unit: prefer(self.unit, over.unit),
             name: prefer(self.name, over.name),
+            compose_service: prefer(self.compose_service, over.compose_service),
+            compose_file: prefer(self.compose_file, over.compose_file),
         }
     }
 }

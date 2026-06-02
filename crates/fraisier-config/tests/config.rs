@@ -397,6 +397,53 @@ url = "http://127.0.0.1:8080/health"
 }
 
 #[test]
+fn docker_compose_service_requires_a_compose_service() {
+    let toml = |service: &str| {
+        format!(
+            r#"
+[deploy]
+name = "checkout"
+environment = "staging"
+
+[artifact]
+source = "release"
+release_url = "https://example.com/app.tar.gz"
+checksum_url = "https://example.com/app.tar.gz.sha256"
+
+[migration]
+adapter = "command"
+
+{service}
+
+[health]
+adapter = "http"
+url = "http://127.0.0.1:8080/health"
+"#
+        )
+    };
+
+    // docker-compose without compose_service → a located error.
+    let cfg = DeployConfig::from_toml_str(&toml("[service]\nadapter = \"docker-compose\""))
+        .expect("parses");
+    assert!(cfg
+        .validate()
+        .issues
+        .iter()
+        .any(|i| i.path == "service.compose_service" && i.severity == Severity::Error));
+
+    // docker-compose with compose_service (compose_file optional) → clean.
+    let cfg = DeployConfig::from_toml_str(&toml(
+        "[service]\nadapter = \"docker-compose\"\ncompose_service = \"web\"",
+    ))
+    .expect("parses");
+    assert!(
+        cfg.validate().ok(),
+        "docker-compose with compose_service should validate: {}",
+        cfg.validate()
+    );
+}
+
+#[test]
 fn active_path_and_staging_dir_parse() {
     let toml = r#"
 [deploy]

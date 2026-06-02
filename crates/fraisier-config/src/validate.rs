@@ -259,6 +259,15 @@ fn validate_service(cfg: &DeployConfig, report: &mut ValidationReport) {
             "the rc adapter requires name (the rc.d service name)",
         );
     }
+    if service.adapter.as_deref() == Some("docker-compose")
+        && !is_set(service.compose_service.as_ref())
+    {
+        report.error(
+            "service.compose_service",
+            "the docker-compose adapter requires compose_service \
+             (the service within the Compose project)",
+        );
+    }
 }
 
 fn validate_health(cfg: &DeployConfig, report: &mut ValidationReport) {

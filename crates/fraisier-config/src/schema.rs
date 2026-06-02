@@ -193,6 +193,13 @@ pub struct ServiceSection {
     /// `rc`: the rc.d service name (the `service <name> …` argument).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// `docker-compose`: the service within the Compose project to manage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose_service: Option<String>,
+    /// `docker-compose`: the Compose file path (`-f`). Optional; the Compose
+    /// default is used when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose_file: Option<PathBuf>,
 }
 
 /// The `[health]` section.

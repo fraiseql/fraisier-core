@@ -251,6 +251,34 @@ pub trait StateStore: Send + Sync {
     /// # Errors
     /// Returns a backend or deserialization error if the log cannot be read.
     async fn events(&self, key: &FraiseKey) -> Result<Vec<SagaEvent>, StateStoreError>;
+
+    /// Store an opaque, last-writer-wins snapshot for `key`, replacing any prior
+    /// one.
+    ///
+    /// Unlike [`record_state`](StateStore::record_state) (an append-only
+    /// lifecycle log), this is a single mutable cell whose contents the **engine
+    /// never interprets** — it is a durable slot the *caller* defines. The deploy
+    /// layer uses it to persist its release ledger (which artifact and revision
+    /// are live), so a later process can find the rollback target; future
+    /// multi-host coordination can reuse it for per-host progress.
+    ///
+    /// # Errors
+    /// Returns a backend or serialization error if the snapshot cannot be stored.
+    async fn record_snapshot(
+        &self,
+        key: &FraiseKey,
+        snapshot: &serde_json::Value,
+    ) -> Result<(), StateStoreError>;
+
+    /// Return the latest snapshot stored for `key` via
+    /// [`record_snapshot`](StateStore::record_snapshot), or `None` if none was.
+    ///
+    /// # Errors
+    /// Returns a backend or deserialization error if the snapshot cannot be read.
+    async fn current_snapshot(
+        &self,
+        key: &FraiseKey,
+    ) -> Result<Option<serde_json::Value>, StateStoreError>;
 }
 
 /// A [`StateStore`] backed by a directory of JSON-lines files — one set of files
@@ -285,6 +313,20 @@ impl FilesystemStateStore {
     fn events_path(&self, key: &FraiseKey) -> PathBuf {
         self.root.join(format!("{}.events.jsonl", key.slug()))
     }
+
+    fn snapshot_path(&self, key: &FraiseKey) -> PathBuf {
+        self.root.join(format!("{}.snapshot.json", key.slug()))
+    }
+}
+
+/// Write `value` to `path` atomically: serialize to a sibling temp file, then
+/// rename over the target so a reader never observes a half-written snapshot.
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StateStoreError> {
+    let bytes = serde_json::to_vec(value)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Read and deserialize every non-empty line of a JSON-lines file. A missing
@@ -385,6 +427,25 @@ impl StateStore for FilesystemStateStore {
     async fn events(&self, key: &FraiseKey) -> Result<Vec<SagaEvent>, StateStoreError> {
         read_jsonl(&self.events_path(key))
     }
+
+    async fn record_snapshot(
+        &self,
+        key: &FraiseKey,
+        snapshot: &serde_json::Value,
+    ) -> Result<(), StateStoreError> {
+        write_json_atomic(&self.snapshot_path(key), snapshot)
+    }
+
+    async fn current_snapshot(
+        &self,
+        key: &FraiseKey,
+    ) -> Result<Option<serde_json::Value>, StateStoreError> {
+        match std::fs::read(self.snapshot_path(key)) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 /// The embedded SQLite schema, applied idempotently on connect. One table per
@@ -411,6 +472,10 @@ CREATE TABLE IF NOT EXISTS events (
     payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_key ON events(key);
+CREATE TABLE IF NOT EXISTS snapshots (
+    key     TEXT PRIMARY KEY,
+    payload TEXT NOT NULL
+);
 ";
 
 /// A [`StateStore`] backed by SQLite via `sqlx` (runtime queries, no compile-time
@@ -530,6 +595,35 @@ impl StateStore for SqliteStateStore {
             .map(|(payload,)| serde_json::from_str(&payload).map_err(StateStoreError::from))
             .collect()
     }
+
+    async fn record_snapshot(
+        &self,
+        key: &FraiseKey,
+        snapshot: &serde_json::Value,
+    ) -> Result<(), StateStoreError> {
+        let payload = serde_json::to_string(snapshot)?;
+        sqlx::query(
+            "INSERT INTO snapshots (key, payload) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET payload = excluded.payload",
+        )
+        .bind(key.slug())
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn current_snapshot(
+        &self,
+        key: &FraiseKey,
+    ) -> Result<Option<serde_json::Value>, StateStoreError> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT payload FROM snapshots WHERE key = ?1")
+            .bind(key.slug())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|(payload,)| serde_json::from_str(&payload).map_err(StateStoreError::from))
+            .transpose()
+    }
 }
 
 #[cfg(test)]
@@ -638,6 +732,46 @@ mod tests {
         );
     }
 
+    pub(super) async fn snapshot_is_last_writer_wins(store: &dyn StateStore) {
+        let key = FraiseKey::new("checkout", "production");
+        assert!(
+            store
+                .current_snapshot(&key)
+                .await
+                .expect("query empty")
+                .is_none(),
+            "a fresh key has no snapshot"
+        );
+
+        store
+            .record_snapshot(&key, &serde_json::json!({ "active": "rev-1" }))
+            .await
+            .expect("record first snapshot");
+        store
+            .record_snapshot(&key, &serde_json::json!({ "active": "rev-2" }))
+            .await
+            .expect("overwrite snapshot");
+
+        let latest = store
+            .current_snapshot(&key)
+            .await
+            .expect("query")
+            .expect("some snapshot");
+        assert_eq!(
+            latest,
+            serde_json::json!({ "active": "rev-2" }),
+            "the latest write wins; the slot is not append-only"
+        );
+
+        // Distinct keys keep distinct snapshots.
+        let other = FraiseKey::new("checkout", "staging");
+        assert!(store
+            .current_snapshot(&other)
+            .await
+            .expect("query other")
+            .is_none());
+    }
+
     // --- filesystem backend instantiation (Cycle 1.3) ---
 
     fn filesystem_store() -> (tempfile::TempDir, FilesystemStateStore) {
@@ -662,6 +796,12 @@ mod tests {
     async fn filesystem_records_and_reads_events_in_order() {
         let (_dir, store) = filesystem_store();
         records_and_reads_events_in_order(&store).await;
+    }
+
+    #[tokio::test]
+    async fn filesystem_snapshot_is_last_writer_wins() {
+        let (_dir, store) = filesystem_store();
+        snapshot_is_last_writer_wins(&store).await;
     }
 
     // --- sqlite backend instantiation (Cycle 1.4): same harness, different backend ---
@@ -694,5 +834,12 @@ mod tests {
     async fn sqlite_records_and_reads_events_in_order() {
         let (_dir, store) = sqlite_store().await;
         records_and_reads_events_in_order(&store).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_snapshot_is_last_writer_wins() {
+        let (_dir, store) = sqlite_store().await;
+        snapshot_is_last_writer_wins(&store).await;
     }
 }

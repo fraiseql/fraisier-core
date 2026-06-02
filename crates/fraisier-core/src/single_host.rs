@@ -644,6 +644,10 @@ mod tests {
         }
     }
 
+    // Reason: each bool is an independent failure-injection toggle for a distinct
+    // test scenario; a two-variant enum per flag (the lint's suggestion) would be
+    // more ceremony than signal for a test fake.
+    #[allow(clippy::struct_excessive_bools)]
     struct FakeMigration {
         trail: Trail,
         capabilities: Vec<String>,
@@ -651,6 +655,11 @@ mod tests {
         preflight_blocking: bool,
         fail_up: bool,
         verify_ok: bool,
+        /// Mirror the real sqlx adapter: a forward deploy must call `up(None)`, so
+        /// a non-null target reaching `up` is an error (the adapter has no
+        /// `run_to`). Guards the [`run_migrate`] contract that `self.target` is
+        /// `None` unless an operator explicitly pinned one.
+        decline_targeted_up: bool,
     }
 
     impl FakeMigration {
@@ -662,6 +671,7 @@ mod tests {
                 preflight_blocking: false,
                 fail_up: false,
                 verify_ok: true,
+                decline_targeted_up: false,
             }
         }
     }
@@ -689,9 +699,14 @@ mod tests {
         async fn up(
             &self,
             _ctx: &AdapterCtx,
-            _target: Option<Revision>,
+            target: Option<Revision>,
         ) -> Result<MigrationOutcome, AdapterError> {
             log(&self.trail, "up");
+            if self.decline_targeted_up && target.is_some() {
+                return Err(exec_error(
+                    "this adapter applies all pending migrations; a targeted up is unsupported",
+                ));
+            }
             if self.fail_up {
                 return Err(exec_error("up failed"));
             }
@@ -877,6 +892,38 @@ mod tests {
         let record: DeployRecord = serde_json::from_value(snapshot).expect("decode");
         assert_eq!(record.active.expect("active").artifact.id, "v-new");
         assert_eq!(record.revision, Some(Revision::new("rev-new")));
+    }
+
+    #[tokio::test]
+    async fn forward_deploy_applies_all_pending_migrations_with_no_target() {
+        // A forward deploy must call `up(None)` — apply everything pending. The
+        // real sqlx reference adapter has no `run_to` and declines any targeted
+        // `up` (-32013); `run_migrate` forwards `self.target`, which the CLI
+        // deploy path never sets. This locks that contract: against an adapter
+        // that errors on a non-null target, a deploy with no target still commits.
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let mut migration = FakeMigration::healthy(&trail);
+        migration.decline_targeted_up = true;
+        let plan = deploy(
+            &trail,
+            FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            },
+            migration,
+            FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            },
+        );
+
+        let outcome = plan.run(store).await.expect("run");
+        assert!(
+            matches!(outcome, SagaOutcome::Committed),
+            "a forward deploy must call up(None) and commit; got {outcome:?}",
+        );
+        assert!(drain(&trail).iter().any(|e| e == "up"), "up was reached");
     }
 
     #[tokio::test]

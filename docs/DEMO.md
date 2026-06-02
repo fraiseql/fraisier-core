@@ -32,6 +32,38 @@ whole thing back atomically.
   dropdb fraisier_demo
   ```
 
+- **External IPC adapter (sqlx) end-to-end** — `crates/fraisier-cli/tests/e2e_ipc_sqlx.rs`
+  drives the **real `fraisier` binary** against a `fraisier.toml` whose
+  `[migration].adapter = "sqlx"`, discovering the external
+  [`fraisier-adapter-sqlx`](../../fraisier-adapter-sqlx) reference adapter on
+  `PATH` and running it over the JSON-RPC IPC protocol — the migration axis lives
+  in a *separate process*, the rest of the deploy (artifact, health, service) runs
+  in-process exactly as above. Two deploys: v1 commits (migration `0001` applied
+  over IPC); v2 applies `0002`, fails its health check, and the saga rolls back —
+  re-activating v1's artifact from the ledger and reverting `0002` by driving the
+  adapter's `down_to` over the wire. This proves three things the in-process tests
+  cannot: a forward deploy calls `up(None)` (the adapter has no `run_to` and
+  declines a targeted `up`), the DSN reaches the adapter only as the injected
+  `DATABASE_URL` env var resolved from a differently-named source var, and rollback
+  is real IPC compensation.
+
+  The sqlx adapter is a separate repo, so build its binary first; the test then
+  finds it (or skips with a diagnostic if it is genuinely absent):
+
+  ```sh
+  ( cd ../fraisier-adapter-sqlx && cargo build )   # produces the adapter binary
+  cargo test -p fraisier-cli --test e2e_ipc_sqlx   # or set FRAISIER_SQLX_ADAPTER_BIN
+  ```
+
+  To drive it by hand, put the adapter on `PATH` and deploy normally:
+
+  ```sh
+  PATH="$PWD/../fraisier-adapter-sqlx/target/debug:$PATH" \
+    fraisier adapter list                          # → sqlx
+  PATH="…:$PATH" SQLX_DATABASE_URL="sqlite:///srv/app.db?mode=rwc" \
+    fraisier deploy --config fraisier.toml --app-version v1 --state-dir ./state
+  ```
+
 ## Driving it from the CLI
 
 ```sh
@@ -77,6 +109,17 @@ expected_status = 200
 The deploy reads the DSN from the env var named by `database_url_env` — set
 `FRAISEQL_DATABASE_URL=postgres://…` in the deploy environment; it is never
 written to config, argv, or JSON (Decision 5).
+
+To run migrations through the external sqlx IPC adapter instead of in-process
+Confiture, swap the `[migration]` block — everything else is unchanged, and the
+adapter is discovered on `PATH` as `fraisier-adapter-sqlx`:
+
+```toml
+[migration]
+adapter = "sqlx"                              # spawned over IPC, found on PATH
+database_url_env = "FRAISEQL_DATABASE_URL"    # resolved → injected as DATABASE_URL
+migrations_path = "./migrations"
+```
 
 ## Observability (OpenTelemetry → Jaeger)
 

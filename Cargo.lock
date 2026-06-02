@@ -401,6 +401,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fraisier-artifact-release"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "async-trait",
+ "fraisier-adapter-support",
+ "fraisier-core",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "fraisier-core"
 version = "1.0.0-alpha.1"
 dependencies = [

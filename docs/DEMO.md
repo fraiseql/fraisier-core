@@ -123,29 +123,66 @@ migrations_path = "./migrations"
 
 ## Observability (OpenTelemetry → Jaeger)
 
-Every saga state transition is a span. OTLP export is behind the `otel` feature on
-`fraisier-saga` (off by default for the library, so embedders pay nothing). To see
-a deploy as a trace:
+Every saga state transition is a span. OTLP export is behind the `otel` feature
+(off by default, so the stock binary and library embedders pay nothing). Build the
+CLI with it, then point the standard `OTEL_EXPORTER_OTLP_ENDPOINT` at a collector;
+the CLI installs the exporter when that variable (or `FRAISIER_OTEL`) is set.
+Transport is OTLP over **HTTP/protobuf**, so the endpoint is the collector's
+**4318** port (not the 4317 gRPC port), and the `/v1/traces` path is appended for
+you:
 
 ```sh
-docker run -d --name jaeger -p 16686:16686 -p 4317:4317 jaegertracing/all-in-one
-cargo build -p fraisier-saga --features otel        # verified to compile
-# point OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 and run the deploy
-# open http://localhost:16686 and find the `fraiseql/production` trace
+docker run -d --name jaeger -e COLLECTOR_OTLP_ENABLED=true \
+  -p 16686:16686 -p 4318:4318 jaegertracing/all-in-one
+cargo build --features otel --bin fraisier
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
+  fraisier deploy --config fraisier.toml --app-version 2.0.0 --state-dir ./state
+# open http://localhost:16686 and find the `fraiseql/checkpoint` trace (service "fraisier")
 ```
 
-## Owner-run validation checkpoint (real host)
+## §10.3 validation checkpoint (real systemd / real host)
 
-The reproducible tests above cover the engineering. The PRD §10.3 checkpoint —
-three consecutive production deploys of fraiseql v2 on a Hetzner-class host, a
-forced-failure rollback at each phase, and the trace rendered in Jaeger — is a
-manual, infra-bound validation to run before promoting `fraisier-core` →
-`fraisier v1.0.0-beta.1`. Steps:
+The reproducible tests above cover the in-process engineering. The PRD §10.3 gate
+validates the parts the tests fake — the real `systemctl`, real symlink
+activation, and real OTLP export — and is what stands between here and promoting
+`fraisier-core` → `fraisier v1.0.0-beta.1` (and the `v1.0.0-alpha.1-week2` tag). It
+is split into two runnable scripts so cost stops blocking it:
 
-1. Provision the host; install the `fraisier` binary and the `confiture` CLI.
-2. Drop the sample `fraisier.toml` (above) with the host's real `active_path`,
-   `unit`, health `url`, and `FRAISEQL_DATABASE_URL`.
-3. `fraisier deploy … --app-version <v>` three times; confirm `status` after each.
-4. Force a failure (bad health endpoint, or a migration with a missing `.down`);
-   confirm the rollback restores the prior release and revision.
-5. Confirm the trace renders in Jaeger.
+### (a) Local — `scripts/checkpoint-local.sh` (zero spend, no root)
+
+Runs a real deploy against your own user systemd manager: real
+`systemctl --user restart`/`is-active`, real filesystem symlink activation, the
+sqlx adapter over real IPC, a forced-failure rollback, and real OTLP→Jaeger export
+(local container). v1 commits; v2 ships an unhealthy release and rolls back, with
+the app's health a function of the *currently symlinked + restarted* release, so a
+pass proves the symlink swap and the restart are both load-bearing.
+
+```sh
+scripts/checkpoint-local.sh           # builds both binaries, runs Jaeger, tears down
+KEEP_JAEGER=1 scripts/checkpoint-local.sh   # leave the trace up to inspect
+```
+
+It validates the adapter logic and the observability pipeline with no spend. It
+does **not** cover a genuinely remote host, the network path, or a system (pid-1)
+systemd manager — that is (b).
+
+### (b) Remote — `scripts/checkpoint-hetzner.sh` (a few cents, auto-teardown)
+
+Provisions a throwaway Hetzner host, installs the toolchain, and runs the *same*
+scenario in **system** systemd mode (real pid-1 manager, as root) over the network.
+The host is always deleted on exit. Requires the `hcloud` CLI and a registered SSH
+key; it asks for confirmation before provisioning.
+
+```sh
+scripts/checkpoint-hetzner.sh --ssh-key <your-hcloud-key>          # provision → run → delete
+scripts/checkpoint-hetzner.sh --ssh-key <key> --keep               # leave the host up
+```
+
+### Final production sign-off (operator judgement)
+
+With the host up (`--keep`), run the genuinely production-shaped matrix before
+tagging: three consecutive deploys of the **real** fraiseql v2 artifact against a
+real Postgres (Confiture, or sqlx/Postgres); a forced failure at **each** saga
+phase (migrate / release / health / verify — per-phase rollback is unit-proven in
+Cycle 1.8, this is the real-host confirmation); and the `fraiseql/production` trace
+rendered in Jaeger (`ssh -L 16686:localhost:16686 root@<ip>`).

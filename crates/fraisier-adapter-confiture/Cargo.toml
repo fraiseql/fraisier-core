@@ -1,0 +1,25 @@
+[package]
+name = "fraisier-adapter-confiture"
+description = "In-process Confiture migration adapter for fraisier: wraps the `confiture migrate` CLI behind the frozen MigrationAdapter trait."
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+fraisier-core = { path = "../fraisier-core", version = "1.0.0-alpha.1" }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["process", "fs"] }
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread", "sync"] }

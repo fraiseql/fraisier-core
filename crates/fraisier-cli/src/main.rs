@@ -108,6 +108,10 @@ enum AdapterCommand {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Install the OTLP export pipeline before any work so every saga span is
+    // exported; the guard is held for the whole process and flushes on drop.
+    #[cfg(feature = "otel")]
+    let _otel_guard = init_otel();
     match dispatch(&cli).await {
         Ok(output) => {
             render(&output, cli.json);
@@ -138,6 +142,33 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::Adapter(AdapterCommand::List) => Ok(commands::adapter_list()),
         Command::Adapter(AdapterCommand::Describe { name }) => {
             commands::adapter_describe(name).await
+        }
+    }
+}
+
+/// Install the OTLP span exporter when configured, returning a guard that flushes
+/// on drop. Returns `None` (a silent no-op) unless `OTEL_EXPORTER_OTLP_ENDPOINT` /
+/// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (the standard OTel variables) or
+/// `FRAISIER_OTEL` is set, so the `otel`-enabled binary stays quiet until pointed
+/// at a collector.
+///
+/// We pass `None` and let the OTLP exporter resolve the endpoint from the standard
+/// environment itself — that way a base `OTEL_EXPORTER_OTLP_ENDPOINT` gets the
+/// `/v1/traces` signal path appended per the OTel spec (an explicit override would
+/// be used verbatim and silently miss the path).
+#[cfg(feature = "otel")]
+fn init_otel() -> Option<fraisier_saga::otel::OtelGuard> {
+    let configured = std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some()
+        || std::env::var_os("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").is_some()
+        || std::env::var_os("FRAISIER_OTEL").is_some();
+    if !configured {
+        return None;
+    }
+    match fraisier_saga::otel::install(None) {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            eprintln!("warning: OpenTelemetry export disabled: {error}");
+            None
         }
     }
 }

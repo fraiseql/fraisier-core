@@ -16,6 +16,14 @@ rust-version.workspace = true
 name = "fraisier"
 path = "src/main.rs"
 
+[features]
+default = []
+# Export saga spans over OTLP/HTTP (Jaeger, etc.). Off by default so the stock
+# binary stays lean; the PRD §10.3 checkpoint builds with it. Enables the
+# export pipeline in fraisier-saga and is initialised in `main` when an OTLP
+# endpoint is configured in the environment.
+otel = ["fraisier-saga/otel"]
+
 [lints]
 workspace = true
 

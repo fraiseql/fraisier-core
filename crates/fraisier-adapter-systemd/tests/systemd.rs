@@ -7,14 +7,24 @@
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use fraisier_adapter_systemd::SystemdService;
 use fraisier_core::adapter_axes::{AdapterCtx, AdapterErrorKind, HostId, ServiceAdapter};
 use serde_json::json;
 
+/// Per-call discriminator so concurrent tests in this binary never share a path
+/// (each test removes its own file at the end; a shared path would let one test
+/// delete the binary another is still spawning).
+static FAKE_SEQ: AtomicU32 = AtomicU32::new(0);
+
 /// Write a fake `systemctl` to a unique temp path and return it.
 fn fake_systemctl() -> PathBuf {
-    let path = std::env::temp_dir().join(format!("fraisier-fake-systemctl-{}", std::process::id()));
+    let unique = FAKE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "fraisier-fake-systemctl-{}-{unique}",
+        std::process::id(),
+    ));
     let script = "#!/bin/sh\n\
         case \"$1\" in --user) shift;; esac\n\
         verb=\"$1\"; unit=\"$2\"\n\

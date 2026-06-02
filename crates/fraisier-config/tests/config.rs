@@ -352,6 +352,51 @@ fn release_without_active_path_warns_but_stays_valid() {
 }
 
 #[test]
+fn rc_service_requires_a_name() {
+    let base = |service: &str| {
+        format!(
+            r#"
+[deploy]
+name = "checkout"
+environment = "staging"
+
+[artifact]
+source = "release"
+release_url = "https://example.com/app.tar.gz"
+checksum_url = "https://example.com/app.tar.gz.sha256"
+
+[migration]
+adapter = "command"
+
+{service}
+
+[health]
+adapter = "http"
+url = "http://127.0.0.1:8080/health"
+"#
+        )
+    };
+
+    // rc without a name → a located error.
+    let cfg = DeployConfig::from_toml_str(&base("[service]\nadapter = \"rc\"")).expect("parses");
+    let report = cfg.validate();
+    assert!(report
+        .issues
+        .iter()
+        .any(|i| i.path == "service.name" && i.severity == Severity::Error));
+
+    // rc with a name → clean.
+    let cfg =
+        DeployConfig::from_toml_str(&base("[service]\nadapter = \"rc\"\nname = \"fraiseql\""))
+            .expect("parses");
+    assert!(
+        cfg.validate().ok(),
+        "rc with a name should validate: {}",
+        cfg.validate()
+    );
+}
+
+#[test]
 fn active_path_and_staging_dir_parse() {
     let toml = r#"
 [deploy]

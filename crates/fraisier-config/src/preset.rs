@@ -102,6 +102,7 @@ impl SpecqlPreset {
             service: Some(ServiceSection {
                 adapter: Some(PRESET_SERVICE_ADAPTER.to_owned()),
                 unit: name.as_ref().map(|n| format!("{n}.service")),
+                ..ServiceSection::default()
             }),
             health: Some(HealthSection {
                 adapter: Some(PRESET_HEALTH_ADAPTER.to_owned()),
@@ -247,6 +248,7 @@ impl Overlay for ServiceSection {
         Self {
             adapter: prefer(self.adapter, over.adapter),
             unit: prefer(self.unit, over.unit),
+            name: prefer(self.name, over.name),
         }
     }
 }

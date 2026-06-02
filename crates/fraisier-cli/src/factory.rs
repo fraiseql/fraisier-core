@@ -121,6 +121,7 @@ fn settings_map(config: &DeployConfig, app_version: Option<&str>) -> BTreeMap<St
     }
     if let Some(service) = &config.service {
         put_str(&mut settings, "unit", service.unit.as_deref());
+        put_str(&mut settings, "name", service.name.as_deref());
     }
     if let Some(health) = &config.health {
         put_str(&mut settings, "url", health.url.as_deref());
@@ -254,9 +255,10 @@ fn build_artifact(config: &DeployConfig) -> Result<Arc<dyn ArtifactAdapter>> {
 fn build_service(config: &DeployConfig) -> Result<Arc<dyn ServiceAdapter>> {
     match config.service.as_ref().and_then(|s| s.adapter.as_deref()) {
         Some("systemd") => Ok(Arc::new(fraisier_adapter_systemd::SystemdService::new())),
+        Some("rc") => Ok(Arc::new(fraisier_adapter_rc::RcService::new())),
         Some(other) => bail!(
-            "service adapter '{other}' is not available in this build (only 'systemd' ships in \
-             Phase 1)"
+            "service adapter '{other}' is not available in this build \
+             (built-in: 'systemd', 'rc')"
         ),
         None => bail!("[service].adapter is required"),
     }

@@ -190,6 +190,9 @@ pub struct ServiceSection {
     /// `systemd`: the unit name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
+    /// `rc`: the rc.d service name (the `service <name> …` argument).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// The `[health]` section.

@@ -38,6 +38,7 @@ fraisier-ipc = { path = "../fraisier-ipc", version = "1.0.0-alpha.1" }
 fraisier-adapter-confiture = { path = "../fraisier-adapter-confiture", version = "1.0.0-alpha.1" }
 fraisier-adapter-command = { path = "../fraisier-adapter-command", version = "1.0.0-alpha.1" }
 fraisier-adapter-systemd = { path = "../fraisier-adapter-systemd", version = "1.0.0-alpha.1" }
+fraisier-adapter-rc = { path = "../fraisier-adapter-rc", version = "1.0.0-alpha.1" }
 fraisier-adapter-http = { path = "../fraisier-adapter-http", version = "1.0.0-alpha.1" }
 fraisier-artifact-release = { path = "../fraisier-artifact-release", version = "1.0.0-alpha.1" }
 

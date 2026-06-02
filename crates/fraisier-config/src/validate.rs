@@ -253,6 +253,12 @@ fn validate_service(cfg: &DeployConfig, report: &mut ValidationReport) {
             "the systemd adapter requires unit (the .service unit name)",
         );
     }
+    if service.adapter.as_deref() == Some("rc") && !is_set(service.name.as_ref()) {
+        report.error(
+            "service.name",
+            "the rc adapter requires name (the rc.d service name)",
+        );
+    }
 }
 
 fn validate_health(cfg: &DeployConfig, report: &mut ValidationReport) {

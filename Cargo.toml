@@ -10,6 +10,7 @@ members = [
     "crates/fraisier-adapter-support",
     "crates/fraisier-adapter-command",
     "crates/fraisier-adapter-systemd",
+    "crates/fraisier-adapter-rc",
     "crates/fraisier-adapter-http",
     "crates/fraisier-adapter-nginx",
     "crates/fraisier-artifact-release",

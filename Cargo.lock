@@ -490,6 +490,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fraisier-adapter-rc"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "async-trait",
+ "fraisier-adapter-support",
+ "fraisier-core",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "fraisier-adapter-support"
 version = "1.0.0-alpha.1"
 dependencies = [
@@ -530,6 +541,7 @@ dependencies = [
  "fraisier-adapter-command",
  "fraisier-adapter-confiture",
  "fraisier-adapter-http",
+ "fraisier-adapter-rc",
  "fraisier-adapter-systemd",
  "fraisier-artifact-release",
  "fraisier-config",

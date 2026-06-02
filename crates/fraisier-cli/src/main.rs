@@ -13,6 +13,8 @@
 #![allow(clippy::redundant_pub_crate)]
 
 mod commands;
+#[cfg(test)]
+mod e2e;
 mod factory;
 
 use std::path::PathBuf;

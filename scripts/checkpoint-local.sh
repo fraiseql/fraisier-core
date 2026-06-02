@@ -93,6 +93,10 @@ if [ -z "$CONTAINER" ]; then
 fi
 say "container runtime: $CONTAINER"
 
+# Remove our own leftover Jaeger (e.g. from a prior KEEP_JAEGER run) before the
+# port check, so a re-run is not blocked by a container we manage.
+$CONTAINER rm -f "$JAEGER_NAME" >/dev/null 2>&1 || true
+
 port_free() { ! { ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null; } | grep -q ":$1 "; }
 for p in "$ARTIFACT_PORT" "$HEALTH_PORT" "$JAEGER_UI_PORT" "$OTLP_HTTP_PORT"; do
   port_free "$p" || die "port $p is already in use (a leftover run?). Free it and retry."
@@ -333,7 +337,13 @@ curl -fsS "http://localhost:$JAEGER_UI_PORT/api/traces?service=fraisier&limit=50
   | grep -q '"spans"' || die "no traces for service 'fraisier'"
 ok "saga spans exported to Jaeger (service=fraisier)"
 
+# Render the deploy traces inline (headless-friendly — no UI needed).
+"$REPO_ROOT/scripts/show-trace.sh" --jaeger "http://localhost:$JAEGER_UI_PORT" || true
+
 say "CHECKPOINT (a) PASSED [$MODE systemd] — real systemd, real symlink activation,"
 say "sqlx-over-IPC, forced-failure rollback, and OTLP→Jaeger export, no spend."
-[ "$KEEP_JAEGER" = "1" ] && say "inspect the trace at http://localhost:$JAEGER_UI_PORT (search service 'fraisier')"
+if [ "$KEEP_JAEGER" = "1" ]; then
+  say "Jaeger left up. Re-inspect headless with:"
+  say "  scripts/show-trace.sh --jaeger http://localhost:$JAEGER_UI_PORT"
+fi
 exit 0

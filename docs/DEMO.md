@@ -137,7 +137,14 @@ docker run -d --name jaeger -e COLLECTOR_OTLP_ENABLED=true \
 cargo build --features otel --bin fraisier
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
   fraisier deploy --config fraisier.toml --app-version 2.0.0 --state-dir ./state
-# open http://localhost:16686 and find the `fraiseql/checkpoint` trace (service "fraisier")
+```
+
+Then inspect the trace — open `http://localhost:16686`, or on a **headless host**
+render it as text straight from Jaeger's API (no browser):
+
+```sh
+scripts/show-trace.sh                          # one tree per deploy, rollback marked
+scripts/show-trace.sh --jaeger http://host:16686 --service fraisier
 ```
 
 ## §10.3 validation checkpoint (real systemd / real host)
@@ -185,4 +192,5 @@ tagging: three consecutive deploys of the **real** fraiseql v2 artifact against 
 real Postgres (Confiture, or sqlx/Postgres); a forced failure at **each** saga
 phase (migrate / release / health / verify — per-phase rollback is unit-proven in
 Cycle 1.8, this is the real-host confirmation); and the `fraiseql/production` trace
-rendered in Jaeger (`ssh -L 16686:localhost:16686 root@<ip>`).
+rendered in Jaeger — headless, run `scripts/show-trace.sh` on the host (or tunnel
+the API with `ssh -L 16686:localhost:16686 root@<ip>` and run it locally).

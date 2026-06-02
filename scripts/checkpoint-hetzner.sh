@@ -188,8 +188,8 @@ Next, for the full PRD §10.3 production sign-off (operator judgement, infra-bou
   * force a failure at each saga phase (migrate / release / health / verify) and
     confirm the rollback — per-phase rollback is unit-proven (Cycle 1.8); this is
     the real-host confirmation;
-  * open the Jaeger UI (tunnel: ssh -L 16686:localhost:16686 root@<ip>) and confirm
-    the fraiseql/production trace renders.
+  * confirm the fraiseql/production trace renders — headless, run
+    scripts/show-trace.sh on the host (or tunnel: ssh -L 16686:localhost:16686 root@<ip>).
 Only then tag v1.0.0-alpha.1-week2 / rename to fraisier v1.0.0-beta.1.
 NEXT
 exit 0

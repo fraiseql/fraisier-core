@@ -2,7 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use fraisier_core::adapter_axes::{
@@ -17,6 +18,23 @@ use crate::{framing, protocol};
 
 /// One request per spawn, so a fixed id is unambiguous.
 const REQUEST_ID: u64 = 1;
+
+/// Default per-call timeout: an adapter that does not answer within this is killed
+/// so a hung subprocess can never wedge a deploy.
+const DEFAULT_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Render an exit status for an error message.
+fn describe_exit(status: ExitStatus) -> String {
+    status.code().map_or_else(
+        || "after a signal".to_owned(),
+        |code| format!("with status {code}"),
+    )
+}
+
+/// `Some(buf)` if `buf` has non-whitespace content, else `None`.
+fn stderr_opt(buf: String) -> Option<String> {
+    (!buf.trim().is_empty()).then_some(buf)
+}
 
 /// A [`MigrationAdapter`] that speaks the JSON-RPC adapter protocol to an external
 /// `fraisier-adapter-<name>` process over stdio.
@@ -44,6 +62,7 @@ pub struct IpcMigrationAdapter {
     args: Vec<OsString>,
     envs: BTreeMap<OsString, OsString>,
     name: String,
+    timeout: Duration,
 }
 
 impl IpcMigrationAdapter {
@@ -55,7 +74,16 @@ impl IpcMigrationAdapter {
             args: Vec::new(),
             envs: BTreeMap::new(),
             name: name.into(),
+            timeout: DEFAULT_TIMEOUT,
         }
+    }
+
+    /// Override the per-call timeout (builder style). An adapter that does not
+    /// respond within it is killed and the call fails.
+    #[must_use]
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Set the arguments passed to the spawned program (builder style).
@@ -93,6 +121,21 @@ impl IpcMigrationAdapter {
         }
     }
 
+    /// Classify a spawn failure: a missing binary ("not found on PATH") reads very
+    /// differently from any other spawn error, and operators hit the former most.
+    fn spawn_error(&self, method: &str, error: &std::io::Error) -> AdapterError {
+        let program = self.program.to_string_lossy();
+        let message = if error.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "adapter '{program}' (name '{}') was not found on PATH",
+                self.name
+            )
+        } else {
+            format!("failed to spawn adapter '{program}': {error}")
+        };
+        self.fail(AdapterErrorKind::Execution, method, message, None)
+    }
+
     /// Spawn the adapter, send one `method` request with `params`, and decode the
     /// result as `R`.
     async fn call<R: DeserializeOwned>(
@@ -128,15 +171,7 @@ impl IpcMigrationAdapter {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| {
-                let program = self.program.to_string_lossy();
-                self.fail(
-                    AdapterErrorKind::Execution,
-                    method,
-                    format!("failed to spawn adapter '{program}': {e}"),
-                    None,
-                )
-            })?;
+            .map_err(|e| self.spawn_error(method, &e))?;
 
         // Send the request, then signal EOF by dropping stdin. The request is
         // small (well under a pipe buffer), so writing before reading is safe.
@@ -157,15 +192,36 @@ impl IpcMigrationAdapter {
         let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
         let mut stderr = child.stderr.take().expect("stderr is piped");
 
-        // Read the response and drain stderr concurrently to avoid a pipe-fill deadlock.
+        // Read the response and drain stderr concurrently (avoids a pipe-fill
+        // deadlock), bounded by the call timeout so a hung adapter cannot wedge a
+        // deploy.
         let mut stderr_buf = String::new();
-        let (message, _) = tokio::join!(
-            framing::read_message(&mut stdout),
-            stderr.read_to_string(&mut stderr_buf),
-        );
-        let stderr = (!stderr_buf.trim().is_empty()).then_some(stderr_buf);
+        let exchange = async {
+            tokio::join!(
+                framing::read_message(&mut stdout),
+                stderr.read_to_string(&mut stderr_buf),
+            )
+        };
+        let message = match tokio::time::timeout(self.timeout, exchange).await {
+            Ok((message, _)) => message,
+            Err(_elapsed) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let program = self.program.to_string_lossy();
+                return Err(self.fail(
+                    AdapterErrorKind::Execution,
+                    method,
+                    format!(
+                        "adapter '{program}' did not respond within {:?} and was killed",
+                        self.timeout
+                    ),
+                    stderr_opt(stderr_buf),
+                ));
+            }
+        };
+        let stderr = stderr_opt(stderr_buf);
 
-        child.wait().await.map_err(|e| {
+        let status = child.wait().await.map_err(|e| {
             self.fail(
                 AdapterErrorKind::Execution,
                 method,
@@ -184,10 +240,14 @@ impl IpcMigrationAdapter {
                 )
             })?
             .ok_or_else(|| {
+                let program = self.program.to_string_lossy();
                 self.fail(
-                    AdapterErrorKind::Protocol,
+                    AdapterErrorKind::Execution,
                     method,
-                    "adapter produced no response".to_owned(),
+                    format!(
+                        "adapter '{program}' exited {} without sending a response",
+                        describe_exit(status)
+                    ),
                     stderr.clone(),
                 )
             })?;

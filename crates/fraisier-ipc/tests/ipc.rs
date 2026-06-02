@@ -3,7 +3,9 @@
 
 #![cfg(unix)]
 
-use fraisier_core::adapter_axes::{AdapterCtx, MigrationAdapter};
+use std::time::Duration;
+
+use fraisier_core::adapter_axes::{AdapterCtx, AdapterErrorKind, MigrationAdapter};
 use fraisier_ipc::IpcMigrationAdapter;
 
 /// A POSIX-shell adapter fixture: it drains the framed request from stdin, then
@@ -38,4 +40,47 @@ async fn remote_error_is_mapped_to_adapter_error() {
         .expect_err("remote error surfaces as Err");
     assert_eq!(err.code, -32010, "the remote JSON-RPC code is preserved");
     assert!(err.message.contains("migrations dir not found"));
+}
+
+#[tokio::test]
+async fn missing_adapter_is_reported_as_not_found_on_path() {
+    let adapter = IpcMigrationAdapter::new("fraisier-adapter-surely-not-real-9999", "ghost");
+    let err = adapter.describe().await.expect_err("spawn fails");
+    assert_eq!(err.kind, AdapterErrorKind::Execution);
+    assert!(
+        err.message.contains("not found on PATH"),
+        "got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn crash_without_response_carries_exit_status_and_stderr() {
+    // Drains the request, writes to stderr, exits non-zero — no framed response.
+    let adapter = IpcMigrationAdapter::new("sh", "crasher")
+        .with_args(["-c", "cat >/dev/null; echo boom >&2; exit 3"]);
+    let err = adapter.describe().await.expect_err("crash surfaces as Err");
+    assert!(
+        err.message.contains("without sending a response") && err.message.contains("status 3"),
+        "got: {}",
+        err.message
+    );
+    assert_eq!(err.stderr.as_deref().map(str::trim), Some("boom"));
+}
+
+#[tokio::test]
+async fn hung_adapter_is_killed_on_timeout() {
+    // Never responds; the short timeout must kill it rather than block forever.
+    let adapter = IpcMigrationAdapter::new("sh", "sleeper")
+        .with_args(["-c", "sleep 30"])
+        .with_timeout(Duration::from_millis(200));
+    let err = adapter
+        .describe()
+        .await
+        .expect_err("timeout surfaces as Err");
+    assert!(
+        err.message.contains("did not respond within"),
+        "got: {}",
+        err.message
+    );
 }

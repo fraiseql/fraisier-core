@@ -27,6 +27,23 @@ async fn describe_round_trips_over_ipc() {
 }
 
 #[tokio::test]
+async fn null_result_decodes_as_none() {
+    // A present `result: null` is a legitimate response (e.g. current_revision
+    // with nothing applied), distinct from a missing result — the client must not
+    // misread it as "response had neither result nor error".
+    let body = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
+    let adapter = IpcMigrationAdapter::new("sh", "fixture")
+        .with_args(["-c", FIXTURE_SCRIPT])
+        .with_env("FIXTURE_BODY", body);
+
+    let revision = adapter
+        .current_revision(&AdapterCtx::new("checkout", "production"))
+        .await
+        .expect("a null result is Ok(None), not an error");
+    assert!(revision.is_none());
+}
+
+#[tokio::test]
 async fn remote_error_is_mapped_to_adapter_error() {
     let body =
         r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32010,"message":"migrations dir not found"}}"#;

@@ -472,7 +472,7 @@ Single deploy execution is sequential by design at the saga level. Multi-host fa
 - [ ] Multi-host deploy against a 3-host fixture cluster (rolling strategy) succeeds, including forced-failure rollback at each phase.
 - [ ] ~~At least one Python `fraises.yaml` from Python fraisier's test corpus deploys identically through the Rust binary~~ — withdrawn with the `fraises.yaml` compat layer (2026-06-02). The IPC-adapter coverage it implied is met by the reference adapters below.
 - [ ] specql-platform embeds `fraisier-saga` and deploys a fixture app via library call.
-- [ ] IPC adapter protocol exercised against at least three external adapters (sqlx reference, one Python adapter, one community-contributed if available).
+- [x] IPC adapter protocol exercised against an external adapter over a real subprocess (the `fraisier-adapter-sqlx` reference, Cycle 2.2). *(Revised 2026-06-02 from "at least three (sqlx + Python + community)" — the Python adapters were withdrawn; a non-Rust adapter remains the open way to prove the protocol is genuinely language-agnostic, deferred until a real non-Rust consumer exists.)*
 - [ ] OTel traces visible in a Jaeger or Tempo instance for every deploy.
 
 ### 10.2 Quality acceptance

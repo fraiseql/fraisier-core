@@ -234,6 +234,27 @@ mod tests {
 
     type Trail = Arc<Mutex<Vec<String>>>;
 
+    /// Install a process-global default subscriber once, so the `saga.*` span
+    /// callsites are always evaluated as *interested*.
+    ///
+    /// `tracing`'s callsite interest cache is process-global. Without a global
+    /// default, a saga test that runs with no subscriber can cache
+    /// `Interest::never` for the `saga.deploy` / `saga.state_transition`
+    /// callsites; the span-capture test below then sees zero (or unparented)
+    /// spans depending on which test hit the callsite first — a
+    /// concurrency-dependent flake. A no-op global default keeps the callsites
+    /// interested; capture tests still layer their own subscriber via the
+    /// thread-local `set_default`, which takes precedence on their thread.
+    fn init_global_subscriber() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::registry::Registry::default(),
+            );
+        });
+    }
+
     /// A step that records each call on a shared trail; forward optionally fails.
     struct RecordingStep {
         name: String,
@@ -287,6 +308,7 @@ mod tests {
 
     #[tokio::test]
     async fn noop_steps_progress_idle_to_committed() {
+        init_global_subscriber();
         let dir = tempfile::tempdir().expect("tempdir");
         let store = FilesystemStateStore::new(dir.path()).expect("store");
         let trail: Trail = Trail::default();
@@ -354,6 +376,7 @@ mod tests {
             }
         }
 
+        init_global_subscriber();
         let tree = SpanTree::default();
         let edges = tree.edges.clone();
         let _guard = tracing::subscriber::set_default(Registry::default().with(tree));
@@ -384,6 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_failure_rolls_back_completed_steps() {
+        init_global_subscriber();
         let dir = tempfile::tempdir().expect("tempdir");
         let store = FilesystemStateStore::new(dir.path()).expect("store");
         let trail: Trail = Trail::default();

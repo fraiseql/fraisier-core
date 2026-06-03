@@ -185,12 +185,42 @@ scripts/checkpoint-hetzner.sh --ssh-key <your-hcloud-key>          # provision �
 scripts/checkpoint-hetzner.sh --ssh-key <key> --keep               # leave the host up
 ```
 
-### Final production sign-off (operator judgement)
+### Final production sign-off — `scripts/checkpoint-matrix.sh` (operator judgement)
 
-With the host up (`--keep`), run the genuinely production-shaped matrix before
-tagging: three consecutive deploys of the **real** fraiseql v2 artifact against a
-real Postgres (Confiture, or sqlx/Postgres); a forced failure at **each** saga
-phase (migrate / release / health / verify — per-phase rollback is unit-proven in
-Cycle 1.8, this is the real-host confirmation); and the `fraiseql/production` trace
-rendered in Jaeger — headless, run `scripts/show-trace.sh` on the host (or tunnel
-the API with `ssh -L 16686:localhost:16686 root@<ip>` and run it locally).
+The production matrix is scripted and self-asserting. It runs against a real
+engine (real systemd, real symlink activation, the migration adapter over IPC,
+real OTLP→Jaeger) in two parts:
+
+- **Part A** (always; zero-spend locally) — three consecutive successful deploys
+  and a forced, deterministic failure at each *forceable* saga phase, each
+  asserted to roll back cleanly to the healthy baseline:
+  - `migrate` — a deploy carrying invalid SQL → `down_to(previous)`;
+  - `release` — a deploy whose app won't start (surfaces at the `restart` step;
+    the saga compensates the completed `activate` step, re-activating the prior);
+  - `health` — a deploy that starts but reports unhealthy.
+  `verify` is asserted to *pass*; a verify-phase **failure** is not inducible by
+  natural config (it is a post-migration success report — sqlx reads
+  `_sqlx_migrations.success`, confiture reflects its `failed_count`), so its
+  rollback is left to the unit tests (`fraisier-saga/tests/rollback.rs`,
+  `single_host.rs`) rather than faked on the host.
+- **Part B** (`--real-config`) — PRD §10.3 criterion 1: N consecutive deploys of
+  **your** real `fraisier.toml` (real fraiseql v2 artifact + real Postgres via
+  Confiture or sqlx), each asserted to commit. Export the DSN env var your
+  `[migration].database_url_env` names; the script drives your config as-is.
+
+```sh
+# locally (user systemd, sqlx/SQLite, no spend): exercises Part A end-to-end
+scripts/checkpoint-matrix.sh
+
+# on the --keep'd Hetzner host (pid-1 systemd) + your real criterion-1 deploys
+export FRAISEQL_DATABASE_URL=postgres://…          # whatever your config names
+scripts/checkpoint-matrix.sh --systemd system \
+  --real-config /path/to/fraiseql.toml \
+  --real-version v2.0.0 --real-version v2.0.0 --real-version v2.0.0
+```
+
+The deploy phases are `preflight → fetch → migrate → activate → restart → health
+→ verify` (`release` is split into `activate` + `restart` so a failed restart
+re-activates the prior release rather than stranding `current` — a gap this matrix
+surfaced). Render the trace headless with `scripts/show-trace.sh` on the host (or
+tunnel the API: `ssh -L 16686:localhost:16686 root@<ip>` and run it locally).

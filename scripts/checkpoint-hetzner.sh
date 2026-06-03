@@ -22,7 +22,7 @@
 # Usage:
 #   scripts/checkpoint-hetzner.sh --ssh-key <name> [--ssh-identity <file>]
 #                                 [--yes] [--keep]
-#                                 [--type cpx11] [--location nbg1]
+#                                 [--type cpx22] [--location nbg1]
 #
 # Flags:
 #   --ssh-key <name>      the hcloud ssh-key to inject (or env FRAISIER_HETZNER_SSH_KEY)
@@ -33,7 +33,9 @@
 #   --yes                 skip the interactive confirmation
 #   --keep                do NOT delete the host afterwards (prints the ssh command);
 #                         use this to run the operator's full §10.3 production matrix
-#   --type <t>            server type (default cpx11 — ~€0.007/hour)
+#   --type <t>            server type (default cpx22, 4 GB — ≈ €0.008/hour). Note
+#                         the older cpx11/cpx21 are US-only (ash/hil); the cpx2x
+#                         line is the x86 option in the EU locations.
 #   --location <loc>      hcloud location (default nbg1)
 #
 set -euo pipefail
@@ -45,7 +47,7 @@ SSH_KEY="${FRAISIER_HETZNER_SSH_KEY:-}"
 SSH_IDENTITY="${FRAISIER_SSH_IDENTITY:-}"
 ASSUME_YES=0
 KEEP=0
-TYPE="cpx11"
+TYPE="cpx22"
 LOCATION="nbg1"
 IMAGE="debian-12"
 
@@ -90,7 +92,7 @@ NAME="fraisier-checkpoint-$STAMP"
 cat <<INFO
 About to provision a throwaway Hetzner host for the §10.3 checkpoint:
   name:     $NAME
-  type:     $TYPE   (≈ €0.007/hour; a run is ~15–25 min ⇒ a few cents)
+  type:     $TYPE   (billed by the hour; a run is ~15–25 min ⇒ a few cents)
   image:    $IMAGE
   location: $LOCATION
   ssh-key:  $SSH_KEY

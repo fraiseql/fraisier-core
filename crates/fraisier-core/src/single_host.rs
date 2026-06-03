@@ -148,7 +148,8 @@ impl SingleHostDeploy {
             .with_step(shared.step(Phase::Preflight))
             .with_step(shared.step(Phase::Fetch))
             .with_step(shared.step(Phase::Migrate))
-            .with_step(shared.step(Phase::Release))
+            .with_step(shared.step(Phase::Activate))
+            .with_step(shared.step(Phase::Restart))
             .with_step(shared.step(Phase::Health))
             .with_step(shared.step(Phase::Verify));
 
@@ -328,7 +329,12 @@ enum Phase {
     Preflight,
     Fetch,
     Migrate,
-    Release,
+    // `Release` is split into `Activate` then `Restart` so each step is a single
+    // compensable mutation: if `Restart` fails, the saga compensates the completed
+    // `Activate` step (re-activating + restarting the prior release) rather than
+    // leaving `current` stranded on a release that never came up.
+    Activate,
+    Restart,
     Health,
     Verify,
 }
@@ -340,7 +346,8 @@ impl Phase {
             Self::Preflight => "preflight",
             Self::Fetch => "fetch",
             Self::Migrate => "migrate",
-            Self::Release => "release",
+            Self::Activate => "activate",
+            Self::Restart => "restart",
             Self::Health => "health",
             Self::Verify => "verify",
         }
@@ -485,7 +492,7 @@ impl DeployShared {
         }
     }
 
-    async fn run_release(&self) -> Result<(), SagaError> {
+    async fn run_activate(&self) -> Result<(), SagaError> {
         let staged = self
             .runtime
             .lock()
@@ -493,37 +500,43 @@ impl DeployShared {
             .staged
             .clone()
             .ok_or_else(|| SagaError::StepFailed {
-                step: "release".to_owned(),
+                step: "activate".to_owned(),
                 message: "no staged artifact to activate (fetch did not run)".to_owned(),
             })?;
         self.artifact
             .activate(&self.ctx, &self.host, &staged)
             .await
-            .map_err(|e| Self::failed("release", &e))?;
+            .map_err(|e| Self::failed("activate", &e))
+    }
+
+    async fn run_restart(&self) -> Result<(), SagaError> {
         self.service
             .restart(&self.ctx, &self.host)
             .await
-            .map_err(|e| Self::failed("release", &e))?;
-        Ok(())
+            .map_err(|e| Self::failed("restart", &e))
     }
 
-    async fn undo_release(&self) -> Result<(), SagaError> {
+    /// Compensation for the `Activate` step. Reached whenever a step at or after
+    /// `Activate` fails (a failed `Restart`, an unhealthy release, a failed
+    /// verify), so a release that activated but never came up healthy is undone
+    /// rather than left live: re-activate the prior release, then restart it
+    /// (PRD §5.4: restore artifact, then restart). A first-ever deploy has no
+    /// prior to restore — the saga surfaces that as `PartialRollback`.
+    async fn undo_activate(&self) -> Result<(), SagaError> {
         match &self.prior.active {
             Some(previous) => {
-                // Re-activate the prior release, then restart, so the old version
-                // is what comes back up (PRD §5.4: restore artifact, then restart).
                 self.artifact
                     .activate(&self.ctx, &self.host, previous)
                     .await
-                    .map_err(|e| Self::failed("release", &e))?;
+                    .map_err(|e| Self::failed("activate", &e))?;
                 self.service
                     .restart(&self.ctx, &self.host)
                     .await
-                    .map_err(|e| Self::failed("release", &e))?;
+                    .map_err(|e| Self::failed("activate", &e))?;
                 Ok(())
             }
             None => Err(SagaError::StepFailed {
-                step: "release".to_owned(),
+                step: "activate".to_owned(),
                 message: "cannot roll back artifact activation: no previously-active artifact is \
                           recorded (a failed first-ever deploy has no prior release to restore)"
                     .to_owned(),
@@ -581,7 +594,8 @@ impl Step for DeployStep {
             Phase::Preflight => self.shared.run_preflight().await,
             Phase::Fetch => self.shared.run_fetch().await,
             Phase::Migrate => self.shared.run_migrate().await,
-            Phase::Release => self.shared.run_release().await,
+            Phase::Activate => self.shared.run_activate().await,
+            Phase::Restart => self.shared.run_restart().await,
             Phase::Health => self.shared.run_health().await,
             Phase::Verify => self.shared.run_verify().await,
         }
@@ -590,9 +604,14 @@ impl Step for DeployStep {
     async fn compensate(&self, _ctx: &StepContext) -> Result<(), SagaError> {
         match self.phase {
             Phase::Migrate => self.shared.undo_migrate().await,
-            Phase::Release => self.shared.undo_release().await,
+            // Undoing the activation re-points + restarts the prior release; the
+            // restart step itself has nothing to undo (its compensation is the
+            // Activate step's, run next in reverse order).
+            Phase::Activate => self.shared.undo_activate().await,
             // Inert steps have nothing to undo.
-            Phase::Preflight | Phase::Fetch | Phase::Health | Phase::Verify => Ok(()),
+            Phase::Preflight | Phase::Fetch | Phase::Restart | Phase::Health | Phase::Verify => {
+                Ok(())
+            }
         }
     }
 }
@@ -780,12 +799,25 @@ mod tests {
 
     struct FakeService {
         trail: Trail,
+        /// Number of upcoming `restart` calls to fail before succeeding. `1` fails
+        /// the new release's restart while letting the rollback's restart of the
+        /// prior release succeed.
+        fail_restarts: Arc<Mutex<usize>>,
     }
 
     #[async_trait]
     impl ServiceAdapter for FakeService {
         async fn restart(&self, _ctx: &AdapterCtx, _host: &HostId) -> Result<(), AdapterError> {
             log(&self.trail, "restart");
+            let fail = {
+                let mut remaining = self.fail_restarts.lock().expect("fail_restarts");
+                let fail = *remaining > 0;
+                *remaining = remaining.saturating_sub(1);
+                fail
+            };
+            if fail {
+                return Err(exec_error("restart failed"));
+            }
             Ok(())
         }
 
@@ -833,6 +865,7 @@ mod tests {
             .migration(Arc::new(migration))
             .service(Arc::new(FakeService {
                 trail: trail.clone(),
+                fail_restarts: Arc::new(Mutex::new(0)),
             }))
             .health(Arc::new(health))
             .build()
@@ -967,6 +1000,7 @@ mod tests {
             .migration(Arc::new(migration))
             .service(Arc::new(FakeService {
                 trail: trail.clone(),
+                fail_restarts: Arc::new(Mutex::new(0)),
             }))
             .health(Arc::new(FakeHealth {
                 trail: trail.clone(),
@@ -1120,6 +1154,60 @@ mod tests {
         assert!(
             matches!(outcome, SagaOutcome::PartialRollback { .. }),
             "a first-deploy rollback with no prior release is a PartialRollback, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_failure_reactivates_the_prior_release() {
+        // Regression for the run_release atomicity gap: `activate` had already
+        // swapped the symlink before `restart` ran, so a failed restart must not
+        // strand `current` on the bad release. Splitting activate/restart into
+        // separate saga steps means a restart failure compensates the completed
+        // Activate step — re-activating + restarting the PRIOR release — then
+        // reverts the migration. Availability is restored, outcome RolledBack.
+        let (_dir, store) = store();
+        seed_prior(&store).await;
+        let trail = Trail::default();
+        let plan = SingleHostDeploy::builder("checkout", "production", HostId::new("localhost"))
+            .artifact(Arc::new(FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            }))
+            .migration(Arc::new(FakeMigration::healthy(&trail)))
+            .service(Arc::new(FakeService {
+                trail: trail.clone(),
+                fail_restarts: Arc::new(Mutex::new(1)), // the new release fails to start
+            }))
+            .health(Arc::new(FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            }))
+            .build()
+            .expect("all adapters provided");
+
+        let outcome = plan.run(store).await.expect("run completes with rollback");
+        assert!(
+            matches!(&outcome, SagaOutcome::RolledBack { failed_step, .. } if failed_step == "restart"),
+            "got {outcome:?}"
+        );
+
+        // Forward: activate the new release, restart (fails). Compensate the
+        // completed Activate step: re-activate + restart the PRIOR release, then
+        // down_to the prior revision. `current` lands back on the prior release.
+        assert_eq!(
+            drain(&trail),
+            vec![
+                "describe",
+                "preflight",
+                "stage",
+                "current_revision",
+                "up",
+                "activate:v-new",
+                "restart",
+                "activate:v-old",
+                "restart",
+                "down_to:rev-prev",
+            ]
         );
     }
 

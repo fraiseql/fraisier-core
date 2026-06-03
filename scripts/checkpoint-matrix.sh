@@ -241,10 +241,10 @@ PY
 cat > "$UNIT_FILE" <<EOF
 [Unit]
 Description=fraisier §10.3 matrix app
-# The matrix deploys many times within seconds; disable systemd's start rate
-# limit (default 5/10s) so a rollback restart isn't refused as "started too
-# often". A real deploy cadence never approaches this; this is a fixture concern.
-StartLimitIntervalSec=0
+# Note: this unit deliberately keeps systemd's default start rate limit. The
+# matrix deploys many times within seconds, which would trip it (5/10s) — the
+# systemd adapter's reset-failed-before-restart is what keeps the rollback
+# restart from being refused. Removing that fix should make this matrix fail.
 
 [Service]
 Type=notify

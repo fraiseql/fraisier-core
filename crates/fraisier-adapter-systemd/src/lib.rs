@@ -124,6 +124,12 @@ impl SystemdService {
 #[async_trait]
 impl ServiceAdapter for SystemdService {
     async fn restart(&self, ctx: &AdapterCtx, _host: &HostId) -> Result<(), AdapterError> {
+        // Clear any leftover failed state and the start rate-limit counter first,
+        // so the restart is not refused as "start request repeated too quickly".
+        // This matters most for a rollback restart that follows a just-failed
+        // start (systemd's default StartLimitBurst is per-unit). Best-effort: a
+        // reset-failed error (e.g. unit not loaded) must not block the restart.
+        let _ = self.systemctl(ctx, "reset-failed", "restart").await;
         let captured = self.systemctl(ctx, "restart", "restart").await?;
         if captured.succeeded() {
             return Ok(());

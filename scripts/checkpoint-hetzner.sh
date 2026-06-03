@@ -15,20 +15,26 @@
 # Prerequisites:
 #   * hcloud CLI, authenticated for a project (`hcloud context active`) or HCLOUD_TOKEN
 #   * an SSH key registered in that project (`hcloud ssh-key list`) whose private
-#     half is loaded in your agent / at ~/.ssh/id_ed25519
+#     half is either loaded in your agent / at ~/.ssh/id_ed25519, or passed
+#     explicitly via --ssh-identity (recommended if you keep a dedicated key)
 #   * rsync, ssh
 #
 # Usage:
-#   scripts/checkpoint-hetzner.sh --ssh-key <name> [--yes] [--keep]
+#   scripts/checkpoint-hetzner.sh --ssh-key <name> [--ssh-identity <file>]
+#                                 [--yes] [--keep]
 #                                 [--type cpx11] [--location nbg1]
 #
 # Flags:
-#   --ssh-key <name>  the hcloud ssh-key to inject (or env FRAISIER_HETZNER_SSH_KEY)
-#   --yes             skip the interactive confirmation
-#   --keep            do NOT delete the host afterwards (prints the ssh command);
-#                     use this to run the operator's full §10.3 production matrix
-#   --type <t>        server type (default cpx11 — ~€0.007/hour)
-#   --location <loc>  hcloud location (default nbg1)
+#   --ssh-key <name>      the hcloud ssh-key to inject (or env FRAISIER_HETZNER_SSH_KEY)
+#   --ssh-identity <file> use ONLY this private key for ssh/rsync (adds
+#                         -i <file> -o IdentitiesOnly=yes, so the agent's other
+#                         keys are never offered — keeps a dedicated key isolated).
+#                         Or env FRAISIER_SSH_IDENTITY.
+#   --yes                 skip the interactive confirmation
+#   --keep                do NOT delete the host afterwards (prints the ssh command);
+#                         use this to run the operator's full §10.3 production matrix
+#   --type <t>            server type (default cpx11 — ~€0.007/hour)
+#   --location <loc>      hcloud location (default nbg1)
 #
 set -euo pipefail
 
@@ -36,6 +42,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SQLX_REPO="${FRAISIER_SQLX_REPO:-$(cd "$REPO_ROOT/.." && pwd)/fraisier-adapter-sqlx}"
 
 SSH_KEY="${FRAISIER_HETZNER_SSH_KEY:-}"
+SSH_IDENTITY="${FRAISIER_SSH_IDENTITY:-}"
 ASSUME_YES=0
 KEEP=0
 TYPE="cpx11"
@@ -44,11 +51,12 @@ IMAGE="debian-12"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --ssh-key)  SSH_KEY="$2"; shift 2;;
-    --yes)      ASSUME_YES=1; shift;;
-    --keep)     KEEP=1; shift;;
-    --type)     TYPE="$2"; shift 2;;
-    --location) LOCATION="$2"; shift 2;;
+    --ssh-key)      SSH_KEY="$2"; shift 2;;
+    --ssh-identity) SSH_IDENTITY="$2"; shift 2;;
+    --yes)          ASSUME_YES=1; shift;;
+    --keep)         KEEP=1; shift;;
+    --type)         TYPE="$2"; shift 2;;
+    --location)     LOCATION="$2"; shift 2;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
@@ -69,6 +77,8 @@ hcloud server list >/dev/null 2>&1 \
 [ -n "$SSH_KEY" ] || die "no SSH key. Pass --ssh-key <name> (see 'hcloud ssh-key list')."
 hcloud ssh-key describe "$SSH_KEY" >/dev/null 2>&1 \
   || die "ssh-key '$SSH_KEY' not found in this project (see 'hcloud ssh-key list')."
+[ -z "$SSH_IDENTITY" ] || [ -f "$SSH_IDENTITY" ] \
+  || die "--ssh-identity '$SSH_IDENTITY' is not a readable file."
 
 # A unique-per-run name. Pass a stamp in so the script stays deterministic.
 STAMP="${FRAISIER_RUN_STAMP:-$(date +%s)}"
@@ -120,6 +130,9 @@ IP="$(hcloud server ip "$NAME")"
 ok "server $NAME at $IP"
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes)
+# A dedicated key: use ONLY it, so the agent's other identities are never offered
+# to the throwaway host (honours strict per-service key separation).
+[ -n "$SSH_IDENTITY" ] && SSH_OPTS+=(-i "$SSH_IDENTITY" -o IdentitiesOnly=yes)
 # Commands are literal/single-quoted or piped via stdin heredocs, so client-side
 # expansion of "$@" is exactly what we want here.
 # shellcheck disable=SC2029

@@ -27,17 +27,20 @@
 #
 #   PART B — criterion 1: fraiseql v2 deploys successfully 3× in production
 #     Runs only with --real-config. Drives N consecutive deploys of YOUR real
-#     fraisier.toml (real artifact + real Postgres via Confiture or sqlx) and
+#     fraisier.toml (real artifact + real Postgres via your configured migration
+#     adapter — Confiture for the fraiseql production path) and
 #     asserts each commits. The script never synthesises migrations here — it
 #     drives your config as-is, so "provide artifact + DSN and run it" means:
 #     point --real-config at your fraiseql deploy config and export the DSN env
 #     var its [migration].database_url_env names.
 #
-# Part A's migration store is sqlx (SQLite by default; point --matrix-dsn at a
-# throwaway Postgres URL to run the forced-failure matrix against real Postgres —
-# the fixture migrations are dialect-neutral). Part A is what runs green locally
-# with zero spend; on the --keep'd Hetzner host use --systemd system to confirm
-# the same matrix under the pid-1 manager.
+# Part A's migration store is the reference sqlx adapter, which is SQLite-only
+# (it keeps its own tests hermetic — a temp file, no server). --matrix-dsn lets
+# you choose the SQLite path; a real-Postgres migration store is the production
+# fraiseql path (Confiture), exercised by Part B against your real config — not by
+# this synthetic Part A. Part A is what runs green locally with zero spend; on the
+# --keep'd Hetzner host use --systemd system to confirm the same matrix under the
+# pid-1 manager.
 #
 # Usage:
 #   scripts/checkpoint-matrix.sh [--systemd user|system]

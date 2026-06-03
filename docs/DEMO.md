@@ -175,15 +175,24 @@ systemd manager — that is (b).
 
 ### (b) Remote — `scripts/checkpoint-hetzner.sh` (a few cents, auto-teardown)
 
-Provisions a throwaway Hetzner host, installs the toolchain, and runs the *same*
-scenario in **system** systemd mode (real pid-1 manager, as root) over the network.
-The host is always deleted on exit. Requires the `hcloud` CLI and a registered SSH
-key; it asks for confirmation before provisioning.
+Provisions a throwaway Hetzner host, installs the toolchain, and runs a checkpoint
+in **system** systemd mode (real pid-1 manager, as root) over the network. The host
+is always deleted on exit. Requires the `hcloud` CLI and a registered SSH key; it
+asks for confirmation before provisioning (`--yes` to skip).
 
 ```sh
-scripts/checkpoint-hetzner.sh --ssh-key <your-hcloud-key>          # provision → run → delete
+scripts/checkpoint-hetzner.sh --ssh-key <your-hcloud-key>          # the two-deploy scenario
+scripts/checkpoint-hetzner.sh --ssh-key <key> --matrix             # the production matrix, Part A
 scripts/checkpoint-hetzner.sh --ssh-key <key> --keep               # leave the host up
 ```
+
+Default scenario is the two-deploy `checkpoint-local.sh` (committed + rolled_back).
+`--matrix` instead runs the full production matrix **Part A** (per-phase forced-
+failure rollback + three consecutive deploys) on the remote pid-1 manager — this is
+what exercises the `activate`/`restart` split and the `reset-failed`-before-restart
+fix under a *real* rate-limited systemd. The remote matrix store is the reference
+sqlx adapter (SQLite); criterion 1 against real Postgres is Part B below (`--keep`,
+then drive your real config).
 
 ### Final production sign-off — `scripts/checkpoint-matrix.sh` (operator judgement)
 
@@ -204,9 +213,11 @@ real OTLP→Jaeger) in two parts:
   rollback is left to the unit tests (`fraisier-saga/tests/rollback.rs`,
   `single_host.rs`) rather than faked on the host.
 - **Part B** (`--real-config`) — PRD §10.3 criterion 1: N consecutive deploys of
-  **your** real `fraisier.toml` (real fraiseql v2 artifact + real Postgres via
-  Confiture or sqlx), each asserted to commit. Export the DSN env var your
-  `[migration].database_url_env` names; the script drives your config as-is.
+  **your** real `fraisier.toml` (real fraiseql v2 artifact + real Postgres via your
+  configured migration adapter — Confiture on the fraiseql production path; the
+  reference sqlx adapter is SQLite-only), each asserted to commit. Export the DSN
+  env var your `[migration].database_url_env` names; the script drives your config
+  as-is.
 
 ```sh
 # locally (user systemd, sqlx/SQLite, no spend): exercises Part A end-to-end

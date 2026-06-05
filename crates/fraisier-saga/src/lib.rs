@@ -29,3 +29,13 @@ pub mod state_store;
 
 #[cfg(feature = "otel")]
 pub mod otel;
+
+/// Compile the embedding guide's runnable example as a doctest so it cannot rot.
+///
+/// The guide (`docs/guides/embedding-fraisier-saga.md`) shows a third-party app
+/// authoring its own compensating steps over the public engine API. Including it
+/// under `#[cfg(doctest)]` runs its example via `cargo test --doc` without adding
+/// it to the rendered crate docs.
+#[cfg(doctest)]
+#[doc = include_str!("../../../docs/guides/embedding-fraisier-saga.md")]
+pub struct EmbeddingGuide;

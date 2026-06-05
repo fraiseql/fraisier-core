@@ -15,6 +15,7 @@ members = [
     "crates/fraisier-adapter-http",
     "crates/fraisier-adapter-nginx",
     "crates/fraisier-artifact-release",
+    "crates/fraisier-artifact-pull",
 ]
 # Exploratory spikes are standalone crates, not held to the production lint bar.
 # examples/training-field is test scaffolding (a deploy fixture), kept out of the

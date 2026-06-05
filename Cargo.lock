@@ -533,6 +533,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fraisier-artifact-pull"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "async-trait",
+ "fraisier-adapter-support",
+ "fraisier-core",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "fraisier-artifact-release"
 version = "1.0.0-alpha.1"
 dependencies = [

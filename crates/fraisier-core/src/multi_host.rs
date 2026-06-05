@@ -24,20 +24,32 @@
 //!
 //! Migration runs **once** against the shared database (not per host). The
 //! per-host work (drain → activate → restart → health → reattach) happens in the
-//! rollout phase, in strategy order. Within a batch, hosts advance concurrently;
-//! batches run in order so the rest of the fleet stays live (PRD §5.5).
+//! rollout phase, in strategy order. A *batch* is one saga step: its hosts advance
+//! concurrently, and batches run in order so the rest of the fleet stays live
+//! (PRD §5.5). Modelling each batch as a step lets the saga reverse the rollout in
+//! batch order on failure, exactly as the contract requires.
+//!
+//! # The release ledger
+//!
+//! Like the single-host composition, every committed deploy records what it made
+//! live — here a [`MultiHostRecord`] mapping each host to its active
+//! [`StagedArtifact`] plus the migration revision. A later deploy reads that
+//! record as its rollback target: restoring a host means re-activating *its* prior
+//! artifact. A failed first-ever deploy has no such record, so restoring a host it
+//! had already activated is impossible and surfaces as
+//! [`SagaOutcome::PartialRollback`].
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use fraisier_saga::saga::{Saga, SagaError, SagaOutcome, Step, StepContext};
-use fraisier_saga::state_store::{StateStore, StateStoreError};
+use fraisier_saga::state_store::{FraiseKey, StateStore, StateStoreError};
 use serde_json::Value;
 
 use crate::adapter_axes::{
-    AdapterCtx, AdapterError, ArtifactAdapter, HealthAdapter, HostId, LbAdapter, MigrationAdapter,
-    Revision, ServiceAdapter, Severity, StagedArtifact,
+    AdapterCtx, AdapterError, ArtifactAdapter, HealthAdapter, HostId, LbAdapter, LbMembership,
+    MigrationAdapter, Revision, ServiceAdapter, Severity, StagedArtifact,
 };
 
 /// One host in a multi-host deploy's inventory.
@@ -181,6 +193,27 @@ impl MultiHostPlan {
     }
 }
 
+/// The durable record of what a committed multi-host deploy made live.
+///
+/// This is the rollback target a *later* deploy reads back from the state store's
+/// snapshot slot — the multi-host analogue of the single-host `DeployRecord`, but
+/// keyed per host because each host carries its own active artifact.
+///
+/// # Example
+/// ```
+/// # use fraisier_core::multi_host::MultiHostRecord;
+/// let record = MultiHostRecord::default();
+/// assert!(record.active.is_empty() && record.revision.is_none());
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MultiHostRecord {
+    /// The artifact left active on each host, kept whole (with its path) so a
+    /// future deploy can re-activate it on rollback.
+    pub active: BTreeMap<HostId, StagedArtifact>,
+    /// The migration revision live after the deploy committed.
+    pub revision: Option<Revision>,
+}
+
 /// Errors from running a [`MultiHostDeploy`].
 ///
 /// As with the single-host deploy, a *business* failure that rolls back cleanly
@@ -254,23 +287,59 @@ impl MultiHostDeploy {
 
     /// Run the multi-host deploy over `store`, returning how the saga ended.
     ///
-    /// The store is cloned into the saga, so it must be `Clone` (both shipped
-    /// backends are).
+    /// Reads the prior [`MultiHostRecord`] (the rollback target) before running
+    /// and, on [`SagaOutcome::Committed`], records the new one. The store is cloned
+    /// into the saga, so it must be `Clone` (both shipped backends are).
     ///
     /// # Errors
-    /// [`MultiHostError`] for infrastructure failures (engine or state store). A
-    /// clean rollback is `Ok(SagaOutcome::RolledBack)`, and an unrecoverable one is
-    /// `Ok(SagaOutcome::PartialRollback)`.
+    /// [`MultiHostError`] for infrastructure failures (engine, state store, or
+    /// ledger (de)serialization). A clean rollback is `Ok(SagaOutcome::RolledBack)`,
+    /// and an unrecoverable one is `Ok(SagaOutcome::PartialRollback)`.
     pub async fn run<S: StateStore + Clone>(
         &self,
         store: S,
     ) -> Result<SagaOutcome, MultiHostError> {
-        let shared = Arc::new(RolloutShared::new(self));
-        let saga = Saga::new(store, self.fraise.clone(), self.environment.clone())
-            .with_step(shared.step(Phase::Preflight))
-            .with_step(shared.step(Phase::Fetch));
+        let key = FraiseKey::new(self.fraise.clone(), self.environment.clone());
 
-        Ok(saga.run().await?)
+        let prior = match store.current_snapshot(&key).await? {
+            Some(value) => serde_json::from_value(value)?,
+            None => MultiHostRecord::default(),
+        };
+
+        let shared = Arc::new(RolloutShared::new(self, prior));
+        let mut saga = Saga::new(store.clone(), self.fraise.clone(), self.environment.clone())
+            .with_step(shared.step(StepKind::Preflight))
+            .with_step(shared.step(StepKind::Fetch))
+            .with_step(shared.step(StepKind::Migrate));
+        for (index, batch) in plan_batches(self.plan.strategy(), self.plan.inventory().hosts())
+            .into_iter()
+            .enumerate()
+        {
+            saga = saga.with_step(shared.rollout_step(index + 1, batch));
+        }
+
+        let outcome = shared.finalize(saga.run().await?);
+
+        if matches!(outcome, SagaOutcome::Committed) {
+            let record = shared.committed_record();
+            store
+                .record_snapshot(&key, &serde_json::to_value(&record)?)
+                .await?;
+        }
+        Ok(outcome)
+    }
+}
+
+/// Split the inventory into the batches a strategy advances together: one batch of
+/// every host for [`RolloutStrategy::AllAtOnce`]; consecutive chunks of `n`
+/// (at least one) for [`RolloutStrategy::Rolling`].
+fn plan_batches(strategy: RolloutStrategy, inventory: &[HostEntry]) -> Vec<Vec<HostEntry>> {
+    match strategy {
+        RolloutStrategy::AllAtOnce => vec![inventory.to_vec()],
+        RolloutStrategy::Rolling(size) => inventory
+            .chunks(size.max(1))
+            .map(<[HostEntry]>::to_vec)
+            .collect(),
     }
 }
 
@@ -405,56 +474,83 @@ impl MultiHostDeployBuilder {
 }
 
 /// The rollout state shared by every step: the adapters, the base call context,
-/// the inventory/strategy, and the in-run captures (`runtime`).
+/// the inventory, the durable rollback target (`prior`), and the in-run captures.
 struct RolloutShared {
     ctx: AdapterCtx,
     inventory: Vec<HostEntry>,
-    #[allow(dead_code)] // Reason: consumed by the rollout phase (Cycle 4.2).
-    strategy: RolloutStrategy,
-    #[allow(dead_code)] // Reason: consumed by the migrate phase (Cycle 4.2).
     target: Option<Revision>,
     forward_compatible_lint: bool,
     artifact: Arc<dyn ArtifactAdapter>,
     migration: Arc<dyn MigrationAdapter>,
     service: Arc<dyn ServiceAdapter>,
-    #[allow(dead_code)] // Reason: consumed by the rollout phase (Cycle 4.2).
     health: Arc<dyn HealthAdapter>,
-    #[allow(dead_code)] // Reason: consumed by the rollout phase (Cycle 4.2).
     lb: Arc<dyn LbAdapter>,
-    /// State captured during this run, read back during later phases.
+    /// The previously-committed release — the per-host rollback target. Immutable
+    /// for the run.
+    prior: MultiHostRecord,
+    /// State captured while the deploy runs forward, read back during compensation
+    /// and commit.
     runtime: Mutex<RolloutRuntime>,
 }
 
 /// State captured while a multi-host deploy runs forward.
 #[derive(Default)]
 struct RolloutRuntime {
-    /// The artifact staged on each host by `fetch`, keyed by host.
+    /// The artifact staged on each host by `fetch` and activated by the rollout.
     staged: BTreeMap<HostId, StagedArtifact>,
+    /// The revision live immediately before `migrate` ran `up` — the target
+    /// `down_to` returns the database to on rollback.
+    previous_revision: Option<Revision>,
+    /// The revision live after `up` — recorded into the new ledger on commit.
+    new_revision: Option<Revision>,
+    /// How far each host advanced through the rollout, so a restore touches only
+    /// the steps that actually happened.
+    progress: BTreeMap<HostId, HostProgress>,
+    /// Set when a *rollback* step could not fully restore a host: the run then
+    /// reports [`SagaOutcome::PartialRollback`] rather than a clean rollback.
+    unrecoverable: Option<String>,
+}
+
+/// How far one host got through `drain → activate → restart → health → reattach`.
+#[derive(Default, Clone)]
+struct HostProgress {
+    /// The LB membership captured when the host was drained (`Some` once drained).
+    drained: Option<LbMembership>,
+    /// Whether the new artifact was activated on this host.
+    activated: bool,
+    /// Whether the host was reattached (fully advanced, back in the pool).
+    reattached: bool,
 }
 
 /// Which deploy phase a [`RolloutStep`] represents.
-#[derive(Clone, Copy)]
-enum Phase {
+enum StepKind {
     Preflight,
     Fetch,
+    Migrate,
+    /// A rollout batch: a stable step name plus the hosts it advances together.
+    Rollout {
+        name: String,
+        batch: Vec<HostEntry>,
+    },
 }
 
-impl Phase {
+impl StepKind {
     /// The stable step name used in saga state, events, and spans.
-    const fn step_name(self) -> &'static str {
+    fn step_name(&self) -> &str {
         match self {
             Self::Preflight => "preflight",
             Self::Fetch => "fetch",
+            Self::Migrate => "migrate",
+            Self::Rollout { name, .. } => name,
         }
     }
 }
 
 impl RolloutShared {
-    fn new(deploy: &MultiHostDeploy) -> Self {
+    fn new(deploy: &MultiHostDeploy, prior: MultiHostRecord) -> Self {
         Self {
             ctx: deploy.ctx.clone(),
             inventory: deploy.plan.inventory().hosts().to_vec(),
-            strategy: deploy.plan.strategy(),
             target: deploy.target.clone(),
             forward_compatible_lint: deploy.forward_compatible_lint,
             artifact: Arc::clone(&deploy.artifact),
@@ -462,15 +558,27 @@ impl RolloutShared {
             service: Arc::clone(&deploy.service),
             health: Arc::clone(&deploy.health),
             lb: Arc::clone(&deploy.lb),
+            prior,
             runtime: Mutex::new(RolloutRuntime::default()),
         }
     }
 
-    fn step(self: &Arc<Self>, phase: Phase) -> Box<dyn Step> {
+    fn step(self: &Arc<Self>, kind: StepKind) -> Box<dyn Step> {
         Box::new(RolloutStep {
             shared: Arc::clone(self),
-            phase,
+            kind,
         })
+    }
+
+    fn rollout_step(self: &Arc<Self>, index: usize, batch: Vec<HostEntry>) -> Box<dyn Step> {
+        self.step(StepKind::Rollout {
+            name: format!("rollout-{index}"),
+            batch,
+        })
+    }
+
+    fn runtime(&self) -> MutexGuard<'_, RolloutRuntime> {
+        self.runtime.lock().expect("rollout runtime mutex poisoned")
     }
 
     /// Map an adapter error into a saga step failure, preserving its detail.
@@ -490,6 +598,37 @@ impl RolloutShared {
         ctx.settings
             .insert("address".to_owned(), Value::String(entry.address.clone()));
         ctx
+    }
+
+    /// Map the saga outcome onto the run's own findings: a clean rollback that left
+    /// at least one host unrecoverable is reported as a [`SagaOutcome::PartialRollback`].
+    fn finalize(&self, outcome: SagaOutcome) -> SagaOutcome {
+        let unrecoverable = self.runtime().unrecoverable.take();
+        match (outcome, unrecoverable) {
+            (
+                SagaOutcome::RolledBack {
+                    failed_step,
+                    reason,
+                },
+                Some(detail),
+            ) => SagaOutcome::PartialRollback {
+                reason: format!(
+                    "rollback after '{failed_step}' failed left a host unrecoverable: {detail} \
+                         (original failure: {reason})"
+                ),
+            },
+            (other, _) => other,
+        }
+    }
+
+    /// The ledger entry to persist on a successful commit: the artifact now active
+    /// on each host (the staged one), plus the new migration revision.
+    fn committed_record(&self) -> MultiHostRecord {
+        let runtime = self.runtime();
+        MultiHostRecord {
+            active: runtime.staged.clone(),
+            revision: runtime.new_revision.clone(),
+        }
     }
 
     /// The migration forward-compatibility lint, gated exactly like the single-host
@@ -597,35 +736,258 @@ impl RolloutShared {
                 ),
             });
         }
-        self.runtime.lock().expect("rollout runtime").staged = staged;
+        self.runtime().staged = staged;
         Ok(())
+    }
+
+    /// Migrate **once** against the shared database. Captures the live revision
+    /// before `up` so a rollback has an exact `down_to` target.
+    async fn run_migrate(&self) -> Result<(), SagaError> {
+        let previous = self
+            .migration
+            .current_revision(&self.ctx)
+            .await
+            .map_err(|e| Self::failed("migrate", &e))?;
+        self.runtime().previous_revision = previous;
+
+        let outcome = self
+            .migration
+            .up(&self.ctx, self.target.clone())
+            .await
+            .map_err(|e| Self::failed("migrate", &e))?;
+
+        // Scope the guard so it drops before the function tail (no lock held across
+        // the return).
+        {
+            let mut runtime = self.runtime();
+            runtime.new_revision = outcome.to.or_else(|| runtime.previous_revision.clone());
+        }
+        Ok(())
+    }
+
+    /// Roll the single shared-database migration back to the pre-deploy revision.
+    async fn undo_migrate(&self) -> Result<(), SagaError> {
+        let previous = self.runtime().previous_revision.clone();
+        match previous {
+            Some(target) => self
+                .migration
+                .down_to(&self.ctx, target)
+                .await
+                .map(|_| ())
+                .map_err(|e| Self::failed("migrate", &e)),
+            None => Err(SagaError::StepFailed {
+                step: "migrate".to_owned(),
+                message: "cannot roll back the initial migration: there is no prior revision to \
+                          return the database to (a failed first-ever deploy has no committed \
+                          state to restore)"
+                    .to_owned(),
+            }),
+        }
+    }
+
+    /// Advance one batch: every host through `drain → activate → restart → health
+    /// → reattach`, concurrently. If any host fails, this batch's own hosts are
+    /// restored before the failure is surfaced (the saga then rolls back the
+    /// earlier batches and the migration); a restore that itself fails is recorded
+    /// as unrecoverable.
+    async fn run_rollout(&self, batch: &[HostEntry]) -> Result<(), SagaError> {
+        let advances = batch.iter().map(|entry| self.advance_host(entry));
+        let errors: Vec<String> = futures::future::join_all(advances)
+            .await
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|e| e.to_string())
+            .collect();
+        if errors.is_empty() {
+            return Ok(());
+        }
+        if let Err(restore_err) = self.restore_batch(batch).await {
+            self.runtime()
+                .unrecoverable
+                .get_or_insert_with(|| restore_err.to_string());
+        }
+        Err(SagaError::StepFailed {
+            step: "rollout".to_owned(),
+            message: format!(
+                "{} host(s) failed to advance: {}",
+                errors.len(),
+                errors.join("; ")
+            ),
+        })
+    }
+
+    /// Advance a single host through the rollout sequence, recording how far it got
+    /// so a later restore can undo exactly those steps.
+    async fn advance_host(&self, entry: &HostEntry) -> Result<(), SagaError> {
+        let ctx = self.host_ctx(entry);
+        let host = &entry.host;
+
+        let membership = self
+            .lb
+            .drain(&ctx, host)
+            .await
+            .map_err(|e| Self::failed("rollout", &e))?;
+        self.runtime()
+            .progress
+            .entry(host.clone())
+            .or_default()
+            .drained = Some(membership.clone());
+
+        let staged =
+            self.runtime()
+                .staged
+                .get(host)
+                .cloned()
+                .ok_or_else(|| SagaError::StepFailed {
+                    step: "rollout".to_owned(),
+                    message: format!("no staged artifact recorded for host {host}"),
+                })?;
+        self.artifact
+            .activate(&ctx, host, &staged)
+            .await
+            .map_err(|e| Self::failed("rollout", &e))?;
+        self.runtime()
+            .progress
+            .entry(host.clone())
+            .or_default()
+            .activated = true;
+
+        self.service
+            .restart(&ctx, host)
+            .await
+            .map_err(|e| Self::failed("rollout", &e))?;
+
+        let status = self
+            .health
+            .check(&ctx, host)
+            .await
+            .map_err(|e| Self::failed("rollout", &e))?;
+        if !status.healthy {
+            let detail = status.detail.map(|d| format!(": {d}")).unwrap_or_default();
+            return Err(SagaError::StepFailed {
+                step: "rollout".to_owned(),
+                message: format!("host {host} reported unhealthy after restart{detail}"),
+            });
+        }
+
+        self.lb
+            .reattach(&ctx, host, &membership)
+            .await
+            .map_err(|e| Self::failed("rollout", &e))?;
+        self.runtime()
+            .progress
+            .entry(host.clone())
+            .or_default()
+            .reattached = true;
+        Ok(())
+    }
+
+    /// Restore every host in a batch concurrently, reporting all that could not be
+    /// fully restored.
+    async fn restore_batch(&self, batch: &[HostEntry]) -> Result<(), SagaError> {
+        let restores = batch.iter().map(|entry| self.restore_host(entry));
+        let errors: Vec<String> = futures::future::join_all(restores)
+            .await
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|e| e.to_string())
+            .collect();
+        if errors.is_empty() {
+            return Ok(());
+        }
+        Err(SagaError::StepFailed {
+            step: "rollout".to_owned(),
+            message: format!(
+                "{} host(s) could not be restored: {}",
+                errors.len(),
+                errors.join("; ")
+            ),
+        })
+    }
+
+    /// Restore one host to its pre-deploy state: take it back out of the pool if it
+    /// had been reattached, re-activate the prior artifact + restart if the new one
+    /// had been activated, then restore the LB membership captured at drain. A host
+    /// that was never drained was never touched, so nothing is undone.
+    async fn restore_host(&self, entry: &HostEntry) -> Result<(), SagaError> {
+        let ctx = self.host_ctx(entry);
+        let host = &entry.host;
+        let progress = self
+            .runtime()
+            .progress
+            .get(host)
+            .cloned()
+            .unwrap_or_default();
+        let Some(prior_membership) = progress.drained else {
+            return Ok(());
+        };
+
+        if progress.reattached {
+            self.lb
+                .drain(&ctx, host)
+                .await
+                .map_err(|e| Self::failed("rollout", &e))?;
+        }
+
+        if progress.activated {
+            let prior_artifact =
+                self.prior
+                    .active
+                    .get(host)
+                    .cloned()
+                    .ok_or_else(|| SagaError::StepFailed {
+                        step: "rollout".to_owned(),
+                        message: format!(
+                            "cannot restore host {host}: no prior artifact is recorded (a failed \
+                         first-ever deploy has no prior release to re-activate)"
+                        ),
+                    })?;
+            self.artifact
+                .activate(&ctx, host, &prior_artifact)
+                .await
+                .map_err(|e| Self::failed("rollout", &e))?;
+            self.service
+                .restart(&ctx, host)
+                .await
+                .map_err(|e| Self::failed("rollout", &e))?;
+        }
+
+        self.lb
+            .reattach(&ctx, host, &prior_membership)
+            .await
+            .map_err(|e| Self::failed("rollout", &e))
     }
 }
 
-/// One deploy phase: a thin adapter from a [`Phase`] to the shared rollout logic.
+/// One deploy phase: a thin adapter from a [`StepKind`] to the shared rollout
+/// logic.
 struct RolloutStep {
     shared: Arc<RolloutShared>,
-    phase: Phase,
+    kind: StepKind,
 }
 
 #[async_trait]
 impl Step for RolloutStep {
     fn name(&self) -> &str {
-        self.phase.step_name()
+        self.kind.step_name()
     }
 
     async fn forward(&self, _ctx: &StepContext) -> Result<(), SagaError> {
-        match self.phase {
-            Phase::Preflight => self.shared.run_preflight().await,
-            Phase::Fetch => self.shared.run_fetch().await,
+        match &self.kind {
+            StepKind::Preflight => self.shared.run_preflight().await,
+            StepKind::Fetch => self.shared.run_fetch().await,
+            StepKind::Migrate => self.shared.run_migrate().await,
+            StepKind::Rollout { batch, .. } => self.shared.run_rollout(batch).await,
         }
     }
 
     async fn compensate(&self, _ctx: &StepContext) -> Result<(), SagaError> {
-        // Preflight and fetch are non-mutating (a reachability probe, an artifact
-        // staged but never activated), so they have nothing to undo.
-        match self.phase {
-            Phase::Preflight | Phase::Fetch => Ok(()),
+        match &self.kind {
+            // Preflight and fetch are non-mutating (a reachability probe, an
+            // artifact staged but never activated), so they have nothing to undo.
+            StepKind::Preflight | StepKind::Fetch => Ok(()),
+            StepKind::Migrate => self.shared.undo_migrate().await,
+            StepKind::Rollout { batch, .. } => self.shared.restore_batch(batch).await,
         }
     }
 }
@@ -633,8 +995,8 @@ impl Step for RolloutStep {
 #[cfg(test)]
 mod tests {
     use super::{
-        HostEntry, HostInventory, MultiHostBuildError, MultiHostDeploy, MultiHostPlan,
-        RolloutStrategy,
+        plan_batches, HostEntry, HostInventory, MultiHostBuildError, MultiHostDeploy,
+        MultiHostPlan, MultiHostRecord, RolloutStrategy,
     };
     use crate::adapter_axes::{
         AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, ArtifactAdapter,
@@ -644,8 +1006,8 @@ mod tests {
     };
     use async_trait::async_trait;
     use fraisier_saga::saga::SagaOutcome;
-    use fraisier_saga::state_store::FilesystemStateStore;
-    use std::collections::BTreeSet;
+    use fraisier_saga::state_store::{FilesystemStateStore, FraiseKey, StateStore};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Mutex};
 
     /// An ordered log of every adapter call (`op:host`), shared across the fakes.
@@ -655,7 +1017,7 @@ mod tests {
         trail.lock().expect("trail").push(entry.into());
     }
 
-    fn drain(trail: &Trail) -> Vec<String> {
+    fn drain_trail(trail: &Trail) -> Vec<String> {
         trail.lock().expect("trail").clone()
     }
 
@@ -670,8 +1032,7 @@ mod tests {
             .map_or_else(|| "<none>".to_owned(), |h| h.as_str().to_owned())
     }
 
-    /// Failure-injection knobs, shared by reference across the fakes. Each set
-    /// names the hosts whose call of that axis should fail.
+    /// Failure-injection knobs, shared by reference across the fakes.
     #[derive(Clone, Default)]
     struct Faults {
         /// Hosts whose `service.status` errors (i.e. unreachable at preflight).
@@ -680,11 +1041,23 @@ mod tests {
         stage_fail: BTreeSet<String>,
         /// Whether `preflight` reports a blocking issue.
         preflight_blocking: bool,
+        /// Whether the single `migrate` `up` errors.
+        migrate_fail: bool,
+        /// Hosts whose `lb.drain` errors.
+        drain_fail: BTreeSet<String>,
+        /// Hosts whose activation of the *new* artifact errors.
+        activate_fail: BTreeSet<String>,
+        /// Hosts that report unhealthy after restart.
+        health_unhealthy: BTreeSet<String>,
+        /// How many `restart` calls to fail per host before succeeding. `1` fails
+        /// the new release's restart but lets a rollback restart succeed; a larger
+        /// value also fails the rollback restart (forcing `PartialRollback`).
+        restart_fail: BTreeMap<String, usize>,
     }
 
     impl Faults {
-        fn hits(set: &BTreeSet<String>, host: &str) -> bool {
-            set.contains(host)
+        fn hits(set: &BTreeSet<String>, host: &HostId) -> bool {
+            set.contains(host.as_str())
         }
     }
 
@@ -701,10 +1074,10 @@ mod tests {
             host: &HostId,
         ) -> Result<StagedArtifact, AdapterError> {
             log(&self.trail, format!("stage:{host}"));
-            if Faults::hits(&self.faults.stage_fail, host.as_str()) {
+            assert_eq!(host_of(ctx), host.as_str(), "stage ctx targets the host");
+            if Faults::hits(&self.faults.stage_fail, host) {
                 return Err(exec_error("stage failed"));
             }
-            assert_eq!(host_of(ctx), host.as_str(), "stage ctx targets the host");
             Ok(StagedArtifact {
                 artifact: ArtifactRef {
                     id: "v-new".to_owned(),
@@ -724,6 +1097,11 @@ mod tests {
                 &self.trail,
                 format!("activate:{host}:{}", staged.artifact.id),
             );
+            // Only the forward activation of the *new* artifact can be faulted;
+            // re-activating the prior artifact on rollback always succeeds.
+            if staged.artifact.id == "v-new" && Faults::hits(&self.faults.activate_fail, host) {
+                return Err(exec_error("activate failed"));
+            }
             Ok(())
         }
 
@@ -763,10 +1141,17 @@ mod tests {
 
         async fn up(
             &self,
-            _ctx: &AdapterCtx,
+            ctx: &AdapterCtx,
             _target: Option<Revision>,
         ) -> Result<MigrationOutcome, AdapterError> {
             log(&self.trail, "up");
+            assert!(
+                ctx.host.is_none(),
+                "migrate runs against the shared DB, host-agnostic"
+            );
+            if self.faults.migrate_fail {
+                return Err(exec_error("migration up failed"));
+            }
             Ok(MigrationOutcome {
                 from: Some(Revision::new("rev-prev")),
                 to: Some(Revision::new("rev-new")),
@@ -814,12 +1199,25 @@ mod tests {
     struct FakeService {
         trail: Trail,
         faults: Arc<Faults>,
+        /// Remaining `restart` failures per host (decremented per call).
+        restart_remaining: Mutex<BTreeMap<String, usize>>,
     }
 
     #[async_trait]
     impl ServiceAdapter for FakeService {
         async fn restart(&self, _ctx: &AdapterCtx, host: &HostId) -> Result<(), AdapterError> {
             log(&self.trail, format!("restart:{host}"));
+            let left = {
+                let remaining = self.restart_remaining.lock().expect("restart_remaining");
+                remaining.get(host.as_str()).copied().unwrap_or(0)
+            };
+            if left > 0 {
+                self.restart_remaining
+                    .lock()
+                    .expect("restart_remaining")
+                    .insert(host.as_str().to_owned(), left - 1);
+                return Err(exec_error("restart failed"));
+            }
             Ok(())
         }
 
@@ -829,7 +1227,7 @@ mod tests {
             host: &HostId,
         ) -> Result<ServiceStatus, AdapterError> {
             log(&self.trail, format!("status:{host}"));
-            if Faults::hits(&self.faults.status_fail, host.as_str()) {
+            if Faults::hits(&self.faults.status_fail, host) {
                 return Err(exec_error("host unreachable"));
             }
             Ok(ServiceStatus {
@@ -841,6 +1239,7 @@ mod tests {
 
     struct FakeHealth {
         trail: Trail,
+        faults: Arc<Faults>,
     }
 
     #[async_trait]
@@ -852,7 +1251,7 @@ mod tests {
         ) -> Result<HealthStatus, AdapterError> {
             log(&self.trail, format!("check:{host}"));
             Ok(HealthStatus {
-                healthy: true,
+                healthy: !Faults::hits(&self.faults.health_unhealthy, host),
                 detail: None,
             })
         }
@@ -860,6 +1259,7 @@ mod tests {
 
     struct FakeLb {
         trail: Trail,
+        faults: Arc<Faults>,
     }
 
     #[async_trait]
@@ -870,9 +1270,12 @@ mod tests {
             host: &HostId,
         ) -> Result<LbMembership, AdapterError> {
             log(&self.trail, format!("drain:{host}"));
+            if Faults::hits(&self.faults.drain_fail, host) {
+                return Err(exec_error("drain failed"));
+            }
             Ok(LbMembership {
                 state: LbState::InPool,
-                weight: None,
+                weight: Some(100),
             })
         }
 
@@ -912,12 +1315,15 @@ mod tests {
         .service(Arc::new(FakeService {
             trail: trail.clone(),
             faults: Arc::clone(faults),
+            restart_remaining: Mutex::new(faults.restart_fail.clone()),
         }))
         .health(Arc::new(FakeHealth {
             trail: trail.clone(),
+            faults: Arc::clone(faults),
         }))
         .lb(Arc::new(FakeLb {
             trail: trail.clone(),
+            faults: Arc::clone(faults),
         }))
         .build()
         .expect("all adapters provided")
@@ -929,53 +1335,190 @@ mod tests {
         (dir, store)
     }
 
-    /// Whether `trail` contains every `op:host` in `expected`, regardless of the
-    /// order concurrent calls happened to interleave in.
+    fn key() -> FraiseKey {
+        FraiseKey::new("checkout", "production")
+    }
+
+    /// Seed a prior committed multi-host release so rollback has per-host targets.
+    async fn seed_prior(store: &FilesystemStateStore) {
+        let mut active = BTreeMap::new();
+        for name in ["web-1", "web-2", "web-3"] {
+            active.insert(
+                HostId::new(name),
+                StagedArtifact {
+                    artifact: ArtifactRef {
+                        id: "v-old".to_owned(),
+                        checksum: None,
+                    },
+                    path: format!("/staging/{name}/v-old").into(),
+                },
+            );
+        }
+        let prior = MultiHostRecord {
+            active,
+            revision: Some(Revision::new("rev-old")),
+        };
+        store
+            .record_snapshot(&key(), &serde_json::to_value(&prior).expect("encode"))
+            .await
+            .expect("seed prior ledger");
+    }
+
+    /// The position of the first trail entry equal to `needle`.
+    fn pos(trail: &[String], needle: &str) -> usize {
+        trail
+            .iter()
+            .position(|e| e == needle)
+            .unwrap_or_else(|| panic!("missing {needle:?} in {trail:?}"))
+    }
+
+    /// Whether `trail` contains every entry in `expected`, regardless of order.
     fn contains_all(trail: &[String], expected: &[&str]) -> bool {
         expected.iter().all(|e| trail.iter().any(|t| t == e))
     }
 
+    fn count(trail: &[String], needle: &str) -> usize {
+        trail.iter().filter(|e| e.as_str() == needle).count()
+    }
+
+    #[test]
+    fn batches_follow_the_strategy() {
+        let hosts = inventory().hosts().to_vec();
+
+        let all = plan_batches(RolloutStrategy::AllAtOnce, &hosts);
+        assert_eq!(all.len(), 1, "all-at-once is a single batch");
+        assert_eq!(all[0].len(), 3);
+
+        let one = plan_batches(RolloutStrategy::Rolling(1), &hosts);
+        assert_eq!(one.len(), 3, "rolling(1) is one host per batch");
+
+        let two = plan_batches(RolloutStrategy::Rolling(2), &hosts);
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].len(), 2);
+        assert_eq!(two[1].len(), 1, "the last batch holds the remainder");
+
+        // A zero batch size is clamped to one rather than looping forever.
+        assert_eq!(plan_batches(RolloutStrategy::Rolling(0), &hosts).len(), 3);
+    }
+
     #[tokio::test]
-    async fn preflight_probes_every_host_then_fetch_stages_every_host() {
+    async fn rolling_one_migrates_once_then_cycles_each_host_in_order() {
         let (_dir, store) = store();
         let trail = Trail::default();
         let faults = Arc::new(Faults::default());
         let plan = deploy(&trail, &faults, RolloutStrategy::Rolling(1));
 
+        let outcome = plan.run(store.clone()).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+
+        let trail = drain_trail(&trail);
+        // Migration runs exactly once against the shared DB, not per host.
+        assert_eq!(count(&trail, "up"), 1, "migrate-once: {trail:?}");
+        assert_eq!(count(&trail, "current_revision"), 1);
+
+        // Each host cycles drain → activate → restart → health → reattach in order.
+        for name in ["web-1", "web-2", "web-3"] {
+            let drain = pos(&trail, &format!("drain:{name}"));
+            let activate = pos(&trail, &format!("activate:{name}:v-new"));
+            let restart = pos(&trail, &format!("restart:{name}"));
+            let check = pos(&trail, &format!("check:{name}"));
+            let reattach = pos(&trail, &format!("reattach:{name}"));
+            assert!(
+                drain < activate && activate < restart && restart < check && check < reattach,
+                "host {name} advances in order: {trail:?}"
+            );
+        }
+        // Batches run strictly in inventory order: each host fully reattaches
+        // before the next host is drained (rolling(1) keeps the rest live).
+        assert!(pos(&trail, "reattach:web-1") < pos(&trail, "drain:web-2"));
+        assert!(pos(&trail, "reattach:web-2") < pos(&trail, "drain:web-3"));
+
+        // The committed ledger records each host's now-active artifact + revision.
+        let snapshot = store
+            .current_snapshot(&key())
+            .await
+            .expect("query")
+            .expect("ledger recorded");
+        let record: MultiHostRecord = serde_json::from_value(snapshot).expect("decode");
+        assert_eq!(record.revision, Some(Revision::new("rev-new")));
+        assert_eq!(record.active.len(), 3);
+        assert!(record
+            .active
+            .values()
+            .all(|staged| staged.artifact.id == "v-new"));
+    }
+
+    #[tokio::test]
+    async fn all_at_once_migrates_once_and_advances_every_host() {
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let faults = Arc::new(Faults::default());
+        let plan = deploy(&trail, &faults, RolloutStrategy::AllAtOnce);
+
         let outcome = plan.run(store).await.expect("run");
         assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
 
-        let trail = drain(&trail);
-        // The forward-compat lint runs once against the shared DB (not per host).
-        assert_eq!(trail.iter().filter(|e| *e == "describe").count(), 1);
-        assert_eq!(trail.iter().filter(|e| *e == "preflight").count(), 1);
-        // Every host is probed for reachability and staged.
+        let trail = drain_trail(&trail);
+        assert_eq!(count(&trail, "up"), 1, "migrate-once: {trail:?}");
         assert!(
             contains_all(
                 &trail,
                 &[
-                    "status:web-1",
-                    "status:web-2",
-                    "status:web-3",
-                    "stage:web-1",
-                    "stage:web-2",
-                    "stage:web-3",
+                    "drain:web-1",
+                    "drain:web-2",
+                    "drain:web-3",
+                    "activate:web-1:v-new",
+                    "activate:web-2:v-new",
+                    "activate:web-3:v-new",
+                    "reattach:web-1",
+                    "reattach:web-2",
+                    "reattach:web-3",
                 ]
             ),
-            "every host probed + staged: {trail:?}"
+            "every host advanced: {trail:?}"
         );
-        // Preflight precedes fetch: the last status comes before the first stage.
-        let last_status = trail
-            .iter()
-            .rposition(|e| e.starts_with("status:"))
-            .expect("status");
-        let first_stage = trail
-            .iter()
-            .position(|e| e.starts_with("stage:"))
-            .expect("stage");
+    }
+
+    #[tokio::test]
+    async fn a_host_failure_rolls_back_advanced_hosts_then_the_migration_once() {
+        // web-2's new release fails to restart (once); the rollback restart of the
+        // prior release succeeds. A prior ledger is seeded so the restore has
+        // per-host targets, so the whole deploy rolls back cleanly.
+        let (_dir, store) = store();
+        seed_prior(&store).await;
+        let trail = Trail::default();
+        let faults = Arc::new(Faults {
+            restart_fail: BTreeMap::from([("web-2".to_owned(), 1)]),
+            ..Faults::default()
+        });
+        let plan = deploy(&trail, &faults, RolloutStrategy::Rolling(1));
+
+        let outcome = plan.run(store).await.expect("run completes with rollback");
+        let SagaOutcome::RolledBack { failed_step, .. } = &outcome else {
+            panic!("expected RolledBack, got {outcome:?}");
+        };
+        assert_eq!(failed_step, "rollout-2", "the second batch (web-2) failed");
+
+        let trail = drain_trail(&trail);
+        // The migration rolled back exactly once, to the pre-deploy revision.
+        assert_eq!(count(&trail, "down_to:rev-prev"), 1, "{trail:?}");
+        // web-2 self-healed: re-activate the prior artifact + restart it.
         assert!(
-            last_status < first_stage,
-            "preflight precedes fetch: {trail:?}"
+            contains_all(&trail, &["activate:web-2:v-old", "reattach:web-2"]),
+            "web-2 restored to prior: {trail:?}"
+        );
+        // web-1 (the earlier, fully-advanced batch) was restored in reverse: it is
+        // drained back out, re-activated to the prior artifact, and reattached.
+        assert!(
+            contains_all(&trail, &["activate:web-1:v-old", "reattach:web-1"]),
+            "web-1 restored to prior: {trail:?}"
+        );
+        // The restored migration is the very last mutation (reverse order: hosts
+        // first, then the single shared DB).
+        let down = pos(&trail, "down_to:rev-prev");
+        assert!(
+            pos(&trail, "activate:web-1:v-old") < down,
+            "hosts restore before the DB: {trail:?}"
         );
     }
 
@@ -998,13 +1541,12 @@ mod tests {
             panic!("expected RolledBack, got {outcome:?}");
         };
         assert_eq!(failed_step, "preflight");
-        // The message names every unreachable host, not just the first.
         assert!(
             reason.contains("web-2") && reason.contains("web-3"),
             "names hosts: {reason}"
         );
 
-        let trail = drain(&trail);
+        let trail = drain_trail(&trail);
         assert!(
             !trail.iter().any(|e| e.starts_with("stage:")),
             "fetch never ran after preflight failed: {trail:?}"
@@ -1026,11 +1568,11 @@ mod tests {
             matches!(&outcome, SagaOutcome::RolledBack { failed_step, .. } if failed_step == "preflight"),
             "got {outcome:?}"
         );
-        let trail = drain(&trail);
+        let trail = drain_trail(&trail);
         assert_eq!(
             trail,
             vec!["describe", "preflight"],
-            "no host was probed: {trail:?}"
+            "no host probed: {trail:?}"
         );
     }
 

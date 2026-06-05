@@ -7,6 +7,9 @@
 //!   exit code). Used by the shell-out adapters (`command`, `systemd`).
 //! - [`retry_on_err`] — retry an async fallible operation with a fixed delay.
 //!   Used by the network adapters (`http` health, `release` artifact download).
+//! - [`Transport`] — run a shell-out command locally or on a remote host over
+//!   `ssh`. The single-host adapters dispatch through it so a multi-host rollout
+//!   can run the same commands on each host (see the [`transport`] module).
 //!
 //! These deliberately do *not* encode any axis-specific policy: error-kind
 //! selection and result interpretation stay in each adapter.
@@ -16,6 +19,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use fraisier_core::adapter_axes::{AdapterError, AdapterErrorKind};
+
+pub mod transport;
+
+pub use transport::{SshTransport, Transport};
 
 /// The captured result of a finished subprocess.
 ///

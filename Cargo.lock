@@ -516,6 +516,8 @@ name = "fraisier-adapter-support"
 version = "1.0.0-alpha.1"
 dependencies = [
  "fraisier-core",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 

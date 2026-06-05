@@ -167,9 +167,10 @@ fn validate_artifact(cfg: &DeployConfig, report: &mut ValidationReport) {
             "artifact.source",
             "[artifact].source is required (one of: release, pull, git, local)",
         ),
-        // `release` (orchestrator HTTP fetch) and `pull` (host fetches via curl)
-        // take the same URL + checksum fields.
-        Some(source @ ("release" | "pull")) => {
+        // `release` (orchestrator HTTP fetch), `pull` (host fetches via curl),
+        // and `release-ipc` (host runs the release adapter over ssh/IPC) take the
+        // same URL + checksum fields.
+        Some(source @ ("release" | "pull" | "release-ipc")) => {
             if !is_set(artifact.release_url.as_ref()) {
                 report.error(
                     "artifact.release_url",
@@ -198,15 +199,20 @@ fn validate_artifact(cfg: &DeployConfig, report: &mut ValidationReport) {
         }
         Some(other) => report.error(
             "artifact.source",
-            format!("unknown artifact source '{other}' (expected one of: release, git, local)"),
+            format!(
+                "unknown artifact source '{other}' \
+                 (expected one of: release, pull, release-ipc, git, local)"
+            ),
         ),
     }
     // `active_path` is what activation swaps to the new artifact; a deploy that
-    // activates one (release/local) cannot complete without it. Warn rather than
-    // error so the PRD example (which omits it) still validates; the artifact
-    // adapter hard-errors at activate time.
-    if matches!(artifact.source.as_deref(), Some("release" | "local"))
-        && artifact.active_path.is_none()
+    // activates one (release/local/release-ipc) cannot complete without it. Warn
+    // rather than error so the PRD example (which omits it) still validates; the
+    // artifact adapter hard-errors at activate time.
+    if matches!(
+        artifact.source.as_deref(),
+        Some("release" | "local" | "release-ipc")
+    ) && artifact.active_path.is_none()
     {
         report.warn(
             "artifact.active_path",
@@ -351,9 +357,9 @@ fn validate_hosts(cfg: &DeployConfig, report: &mut ValidationReport) {
 
 /// In a multi-host deploy the service axis runs on each host over SSH. The
 /// `release`/`local` artifact adapters and the `nginx` LB adapter still do
-/// local-filesystem work, so warn the operator they act where fraisier runs (and
-/// point `release`/`local` at the host-pull `source = "pull"`, which *does* stage
-/// per host).
+/// local-filesystem work, so warn the operator they act where fraisier runs. The
+/// genuinely-remote artifact sources (`pull` via curl, `release-ipc` via the
+/// adapter over ssh) stage on each host and are not warned.
 fn warn_local_only_axes(cfg: &DeployConfig, report: &mut ValidationReport) {
     if let Some(source) = cfg.artifact.as_ref().and_then(|a| a.source.as_deref()) {
         if matches!(source, "release" | "local") {
@@ -361,8 +367,9 @@ fn warn_local_only_axes(cfg: &DeployConfig, report: &mut ValidationReport) {
                 "artifact.source",
                 format!(
                     "multi-host: the '{source}' artifact adapter stages on the host running \
-                     fraisier, not on each remote host — use source = \"pull\" to have each host \
-                     fetch + activate its own release over SSH"
+                     fraisier, not on each remote host — use source = \"pull\" (curl over SSH) \
+                     or source = \"release-ipc\" (the release adapter run on each host over SSH) \
+                     to stage + activate per host"
                 ),
             );
         }

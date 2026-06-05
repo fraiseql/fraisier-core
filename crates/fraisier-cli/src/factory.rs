@@ -24,6 +24,7 @@ use fraisier_core::adapter_axes::{
     AdapterCtx, ArtifactAdapter, HealthAdapter, HostId, LbAdapter, MigrationAdapter, ServiceAdapter,
 };
 use fraisier_core::multi_host::{MultiHostPlan, RolloutStrategy};
+use fraisier_ipc::{Launcher, SshLauncher};
 use serde_json::Value;
 
 /// The logical secret name every migration adapter resolves the DSN under.
@@ -181,6 +182,40 @@ fn build_transport(config: &DeployConfig) -> Transport {
     Transport::ssh(ssh)
 }
 
+/// Build the IPC adapter **launcher** (the `source = "release-ipc"` analog of
+/// [`build_transport`]): an `ssh` launcher reaching each host for a multi-host
+/// config (with `ControlMaster` connection reuse across the deploy's per-host
+/// calls), or [`Launcher::Local`] for a single-host one. Reads the same `[ssh]`
+/// parameters as the shell transport so both remote mechanisms share one config.
+fn build_launcher(config: &DeployConfig) -> Launcher {
+    if config.hosts.is_none() {
+        return Launcher::Local;
+    }
+    let mut ssh = SshLauncher::new();
+    if let Some(cfg) = &config.ssh {
+        if let Some(user) = &cfg.user {
+            ssh = ssh.with_user(user.clone());
+        }
+        if let Some(port) = cfg.port {
+            ssh = ssh.with_port(port);
+        }
+        if let Some(identity) = &cfg.identity_path {
+            ssh = ssh.with_identity(identity.clone());
+        }
+        if !cfg.options.is_empty() {
+            ssh = ssh.with_options(cfg.options.clone());
+        }
+    }
+    // ControlMaster amortises connection setup across a deploy's stage/activate/
+    // current calls per host. The socket dir must exist; if it can't be created,
+    // fall back to one connection per call rather than failing the deploy.
+    let control_dir = std::env::temp_dir().join("fraisier-ssh-cm");
+    if std::fs::create_dir_all(&control_dir).is_ok() {
+        ssh = ssh.with_control_dir(control_dir);
+    }
+    Launcher::ssh(ssh)
+}
+
 fn put_str(map: &mut BTreeMap<String, Value>, key: &str, value: Option<&str>) {
     if let Some(value) = value {
         map.insert(key.to_owned(), Value::String(value.to_owned()));
@@ -259,7 +294,8 @@ pub fn build(
     // Local for a single-host config; an `[ssh]`-configured remote transport only
     // when `[hosts]` is present (host-pull artifact + service then run per host).
     let transport = build_transport(config);
-    let artifact = build_artifact(config, &transport)?;
+    let launcher = build_launcher(config);
+    let artifact = build_artifact(config, &transport, &launcher)?;
     let service = build_service(config, &transport)?;
     let health = build_health(config)?;
 
@@ -354,9 +390,10 @@ pub fn build_multi_host(
     let plan = MultiHostPlan::new(inventory, strategy);
 
     let transport = build_transport(config);
+    let launcher = build_launcher(config);
     let settings = settings_map(config, app_version);
 
-    let artifact = build_artifact(config, &transport)?;
+    let artifact = build_artifact(config, &transport, &launcher)?;
     let service = build_service(config, &transport)?;
     let health = build_health(config)?;
     let lb = build_lb(config)?;
@@ -482,17 +519,34 @@ pub fn summarize_multi_host(
 fn build_artifact(
     config: &DeployConfig,
     transport: &Transport,
+    launcher: &Launcher,
 ) -> Result<Arc<dyn ArtifactAdapter>> {
     match config.artifact.as_ref().and_then(|a| a.source.as_deref()) {
         Some("release") => Ok(Arc::new(fraisier_artifact_release::ReleaseArtifact::new())),
-        // Host-pull: each host fetches + activates its own release over the
-        // transport (Local for single-host, Ssh per host for multi-host).
+        // Host-pull: each host fetches + activates its own release by shelling out
+        // (curl/ln) over the transport (Local single-host, Ssh per host).
         Some("pull") => Ok(Arc::new(
             fraisier_artifact_pull::PullArtifact::new().with_transport(transport.clone()),
         )),
+        // IPC-over-SSH: run the rich in-process release adapter ON each host as a
+        // JSON-RPC subprocess launched over ssh (Local subprocess single-host).
+        Some("release-ipc") => {
+            let program = config
+                .artifact
+                .as_ref()
+                .and_then(|a| a.adapter_bin.as_deref())
+                .map_or_else(
+                    || std::ffi::OsString::from("fraisier-adapter-release"),
+                    |path| path.as_os_str().to_owned(),
+                );
+            Ok(Arc::new(
+                fraisier_ipc::IpcArtifactAdapter::new(program, "release")
+                    .with_launcher(launcher.clone()),
+            ))
+        }
         Some(other) => bail!(
             "artifact source '{other}' is not available in this build \
-             (built-in: 'release', 'pull')"
+             (built-in: 'release', 'pull', 'release-ipc')"
         ),
         None => bail!("[artifact].source is required"),
     }
@@ -597,8 +651,63 @@ fn build_migration(
 
 #[cfg(test)]
 mod tests {
-    use super::summarize;
+    use super::{build_multi_host, summarize, summarize_multi_host};
     use fraisier_config::DeployConfig;
+
+    /// A complete multi-host config selecting the IPC-over-SSH artifact source.
+    const MULTI_HOST_IPC: &str = r#"
+[deploy]
+name = "app"
+environment = "prod"
+
+[hosts]
+strategy = "rolling"
+rolling_batch_size = 1
+inventory = [ { name = "web-1", address = "10.0.0.1" } ]
+
+[ssh]
+user = "deploy"
+
+[artifact]
+source = "release-ipc"
+release_url = "https://x/app-{version}.tar.gz"
+checksum = "abc"
+active_path = "/srv/app/current"
+adapter_bin = "/usr/local/bin/fraisier-adapter-release"
+
+[migration]
+adapter = "command"
+
+[service]
+adapter = "systemd"
+unit = "app.service"
+
+[health]
+adapter = "http"
+url = "http://{host.address}:8080/health"
+
+[lb]
+adapter = "nginx"
+config_path = "/etc/nginx/nginx.conf"
+"#;
+
+    /// `source = "release-ipc"` builds an artifact adapter for a multi-host deploy
+    /// and the summary renders it over an ssh launcher.
+    #[test]
+    fn release_ipc_artifact_builds_for_multi_host() {
+        let config = DeployConfig::from_toml_str(MULTI_HOST_IPC).expect("parses");
+        // Building constructs the IpcArtifactAdapter over the ssh launcher; a
+        // missing/typo'd source would `bail!`.
+        let _ = build_multi_host(&config, Some("1.2.3")).expect("builds multi-host");
+
+        let summary = summarize_multi_host(&config, Some("1.2.3")).expect("summary");
+        assert_eq!(summary.artifact, "release-ipc");
+        assert!(
+            summary.transport.starts_with("ssh"),
+            "{}",
+            summary.transport
+        );
+    }
 
     /// `[service].user` reaches the shared settings the systemd adapter reads
     /// `user` from (it drives `systemctl --user`).

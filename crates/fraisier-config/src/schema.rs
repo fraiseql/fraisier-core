@@ -158,6 +158,10 @@ pub struct ArtifactSection {
     /// `<workdir>/.fraisier-staging` when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staging_dir: Option<PathBuf>,
+    /// `release-ipc`: the path to (or `PATH` name of) the artifact IPC adapter
+    /// binary run on each host. Defaults to `fraisier-adapter-release`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_bin: Option<PathBuf>,
 }
 
 /// The `[migration]` section.

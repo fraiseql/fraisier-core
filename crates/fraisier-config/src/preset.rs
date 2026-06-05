@@ -223,6 +223,7 @@ impl Overlay for ArtifactSection {
             path: prefer(self.path, over.path),
             active_path: prefer(self.active_path, over.active_path),
             staging_dir: prefer(self.staging_dir, over.staging_dir),
+            adapter_bin: prefer(self.adapter_bin, over.adapter_bin),
         }
     }
 }

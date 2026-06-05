@@ -183,6 +183,7 @@ asks for confirmation before provisioning (`--yes` to skip).
 ```sh
 scripts/checkpoint-hetzner.sh --ssh-key <your-hcloud-key>          # the two-deploy scenario
 scripts/checkpoint-hetzner.sh --ssh-key <key> --matrix             # the production matrix, Part A
+scripts/checkpoint-hetzner.sh --ssh-key <key> --training           # the Confiture-on-Postgres training field
 scripts/checkpoint-hetzner.sh --ssh-key <key> --keep               # leave the host up
 ```
 
@@ -235,3 +236,25 @@ The deploy phases are `preflight → fetch → migrate → activate → restart 
 re-activates the prior release rather than stranding `current` — a gap this matrix
 surfaced). Render the trace headless with `scripts/show-trace.sh` on the host (or
 tunnel the API: `ssh -L 16686:localhost:16686 root@<ip>` and run it locally).
+
+### Training field — `scripts/checkpoint-training.sh` (Confiture-on-Postgres proof)
+
+The matrix above drives the **sqlx** adapter over IPC against **SQLite**. The
+training field drives the **in-process Confiture adapter against a real Postgres**,
+inside the real deploy saga — the path no other checkpoint covers. It deploys the
+tiny DB-backed `examples/training-field` app (whose `/health` is 200 only when the
+Confiture-migrated `notes` table is queryable) and asserts three consecutive
+commits plus a forced failure at each forceable phase (migrate / restart / health),
+each rolling back to the healthy baseline. Postgres and Jaeger run as throwaway
+containers, so it is self-contained in either systemd mode.
+
+```sh
+# locally (user systemd + containerised Postgres, zero spend)
+scripts/checkpoint-training.sh --systemd user
+
+# genuinely-remote, pid-1 systemd (provisions a host, installs Confiture, runs it)
+scripts/checkpoint-hetzner.sh --training --ssh-key <key>
+```
+
+This proves the Confiture-on-Postgres pipeline and de-risks Part B; it is **not**
+§10.3 criterion 1 (which names fraiseql v2). See `examples/training-field/README.md`.

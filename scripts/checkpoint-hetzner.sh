@@ -21,7 +21,7 @@
 #
 # Usage:
 #   scripts/checkpoint-hetzner.sh --ssh-key <name> [--ssh-identity <file>]
-#                                 [--yes] [--keep] [--matrix]
+#                                 [--yes] [--keep] [--matrix | --training]
 #                                 [--type cpx22] [--location nbg1]
 #
 # Flags:
@@ -43,6 +43,13 @@
 #                         (fraiseql v2 vs real Postgres, via Confiture) is Part B:
 #                         --keep, then run checkpoint-matrix.sh --real-config with
 #                         your real deploy config — this host has no real artifact.
+#   --training            run the training-field checkpoint (checkpoint-training.sh)
+#                         instead: the in-process Confiture migration adapter
+#                         against a real (throwaway, containerised) Postgres, inside
+#                         the real deploy saga, on pid-1 systemd — three consecutive
+#                         deploys + forced migrate/restart/health rollbacks. This is
+#                         the genuinely-remote Confiture-on-Postgres proof. Installs
+#                         Confiture (>=0.22) on the host.
 #   --keep                do NOT delete the host afterwards (prints the ssh command);
 #                         use this to run the operator's full §10.3 production matrix
 #   --type <t>            server type (default cpx22, 4 GB — ≈ €0.008/hour). Note
@@ -60,6 +67,7 @@ SSH_IDENTITY="${FRAISIER_SSH_IDENTITY:-}"
 ASSUME_YES=0
 KEEP=0
 MATRIX=0
+TRAINING=0
 TYPE="cpx22"
 LOCATION="nbg1"
 IMAGE="debian-12"
@@ -70,12 +78,14 @@ while [ $# -gt 0 ]; do
     --ssh-identity) SSH_IDENTITY="$2"; shift 2;;
     --yes)          ASSUME_YES=1; shift;;
     --matrix)       MATRIX=1; shift;;
+    --training)     TRAINING=1; shift;;
     --keep)         KEEP=1; shift;;
     --type)         TYPE="$2"; shift 2;;
     --location)     LOCATION="$2"; shift 2;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
+[ "$MATRIX" = 1 ] && [ "$TRAINING" = 1 ] && { echo "choose one of --matrix / --training" >&2; exit 2; }
 
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  ✓\033[0m %s\n' "$*"; }
@@ -110,7 +120,7 @@ About to provision a throwaway Hetzner host for the §10.3 checkpoint:
   image:    $IMAGE
   location: $LOCATION
   ssh-key:  $SSH_KEY
-  scenario: $( [ "$MATRIX" = 1 ] && echo "production matrix Part A (per-phase rollback + 3 consecutive)" || echo "two-deploy checkpoint-local.sh (committed + rolled_back)" )
+  scenario: $( if [ "$MATRIX" = 1 ]; then echo "production matrix Part A (per-phase rollback + 3 consecutive)"; elif [ "$TRAINING" = 1 ]; then echo "training field (Confiture + real Postgres, in-saga)"; else echo "two-deploy checkpoint-local.sh (committed + rolled_back)"; fi )
 The host is deleted automatically on exit$( [ "$KEEP" = 1 ] && echo " — DISABLED by --keep" ).
 INFO
 if [ "$ASSUME_YES" != 1 ]; then
@@ -195,6 +205,22 @@ REMOTE
 ok "dependencies installed"
 
 # --------------------------------------------------------------------------
+# Training mode also needs Confiture (>=0.22) on PATH for the in-process adapter.
+# --------------------------------------------------------------------------
+if [ "$TRAINING" = 1 ]; then
+  say "installing Confiture (>=0.22) on the host"
+  remote 'bash -s' <<'REMOTE'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get install -y -qq python3-pip >/dev/null
+# Debian's Python is externally-managed (PEP 668); this is a throwaway host.
+pip3 install --break-system-packages --quiet 'fraiseql-confiture>=0.22' >/dev/null
+confiture --version
+REMOTE
+  ok "Confiture installed"
+fi
+
+# --------------------------------------------------------------------------
 # Ship the two repos (sibling layout the checkpoint expects) and run it
 # --------------------------------------------------------------------------
 say "syncing repositories"
@@ -218,6 +244,20 @@ REMOTE
   ok "remote matrix passed"
   say "CHECKPOINT (b) PASSED — production matrix Part A on a real remote host,"
   say "pid-1 systemd, real network, OTLP→Jaeger."
+elif [ "$TRAINING" = 1 ]; then
+  say "running the training-field checkpoint on the host (Confiture + Postgres, system systemd)"
+  # checkpoint-training.sh manages its own throwaway Postgres + Jaeger containers,
+  # so it is self-contained in system mode. Confiture (installed above) is on PATH
+  # via pip's /usr/local/bin console script.
+  remote 'bash -s' <<'REMOTE'
+set -euo pipefail
+export PATH="$HOME/.cargo/bin:$PATH"
+cd /root/fraisier-core
+./scripts/checkpoint-training.sh --systemd system
+REMOTE
+  ok "remote training-field checkpoint passed"
+  say "CHECKPOINT (b) PASSED — Confiture-on-Postgres deploy matrix on a real remote"
+  say "host, pid-1 systemd, real network, OTLP→Jaeger."
 else
   say "running the checkpoint on the host (system systemd, real network, OTLP→Jaeger)"
   # Reuse the *same* tested scenario as checkpoint-local.sh, in system mode. Piped
@@ -247,6 +287,15 @@ literal §10.3 criterion 1 — fraiseql v2 deploying 3× in production vs real P
     (export the DSN env its [migration].database_url_env names; Confiture path
     needs Confiture >= 0.20.0). This host has no real fraiseql v2 artifact.
 Only then tag v1.0.0-alpha.1-week2 / rename to fraisier v1.0.0-beta.1.
+NEXT
+elif [ "$TRAINING" = 1 ]; then
+  cat <<'NEXT'
+
+Training-field checkpoint confirmed on real infra: the in-process Confiture
+adapter ran against a real Postgres inside the deploy saga (3 consecutive
+deploys + forced migrate/restart/health rollbacks), pid-1 systemd. This proves
+the Confiture-on-Postgres pipeline; it is NOT §10.3 criterion 1 (fraiseql v2).
+Next: drive the real fraiseql v2 artifact via checkpoint-matrix.sh --real-config.
 NEXT
 else
   cat <<NEXT

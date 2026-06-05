@@ -1,0 +1,3094 @@
+{
+  "_content_hash": "f5d1037b1bd189d94fa4133fac2baeb2",
+  "enums": [],
+  "input_types": [
+    {
+      "description": "Filter operations for EmailAddress",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Email domain equals (e.g., 'example.com')",
+          "field_type": "String",
+          "name": "domainEq"
+        },
+        {
+          "description": "Email domain in list",
+          "field_type": "[String!]!",
+          "name": "domainIn"
+        },
+        {
+          "description": "Email domain ends with suffix (e.g., '.edu')",
+          "field_type": "String",
+          "name": "domainEndswith"
+        },
+        {
+          "description": "Local part (before @) starts with prefix",
+          "field_type": "String",
+          "name": "localPartStartswith"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "domainEndswith": {
+            "mysql": "SUBSTRING_INDEX($field, '@', -1) LIKE CONCAT('%', ?)",
+            "postgres": "SPLIT_PART($field, '@', 2) LIKE '%' || $1",
+            "sqlite": "SUBSTR($field, INSTR($field, '@') + 1) LIKE '%' || ?",
+            "sqlserver": "SUBSTRING($field, CHARINDEX('@', $field) + 1, LEN($field)) LIKE '%' + ?"
+          },
+          "domainEq": {
+            "mysql": "SUBSTRING_INDEX($field, '@', -1) = ?",
+            "postgres": "SPLIT_PART($field, '@', 2) = $1",
+            "sqlite": "SUBSTR($field, INSTR($field, '@') + 1) = ?",
+            "sqlserver": "SUBSTRING($field, CHARINDEX('@', $field) + 1, LEN($field)) = ?"
+          },
+          "domainIn": {
+            "mysql": "SUBSTRING_INDEX($field, '@', -1) IN ($params)",
+            "postgres": "SPLIT_PART($field, '@', 2) IN ($params)",
+            "sqlite": "SUBSTR($field, INSTR($field, '@') + 1) IN ($params)",
+            "sqlserver": "SUBSTRING($field, CHARINDEX('@', $field) + 1, LEN($field)) IN ($params)"
+          },
+          "localPartStartswith": {
+            "mysql": "SUBSTRING_INDEX($field, '@', 1) LIKE CONCAT(?, '%')",
+            "postgres": "SPLIT_PART($field, '@', 1) LIKE $1 || '%'",
+            "sqlite": "SUBSTR($field, 1, INSTR($field, '@') - 1) LIKE ? || '%'",
+            "sqlserver": "SUBSTRING($field, 1, CHARINDEX('@', $field) - 1) LIKE ? + '%'"
+          }
+        }
+      },
+      "name": "EmailAddressWhereInput"
+    },
+    {
+      "description": "Filter operations for PhoneNumber",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Country code equals",
+          "field_type": "String",
+          "name": "countryCodeEq"
+        },
+        {
+          "description": "Country code in list",
+          "field_type": "[String!]!",
+          "name": "countryCodeIn"
+        },
+        {
+          "description": "Is valid E.164 format",
+          "field_type": "Boolean",
+          "name": "isValid"
+        },
+        {
+          "description": "Type equals (mobile, fixed, etc.)",
+          "field_type": "String",
+          "name": "typeEq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "countryCodeEq": {
+            "mysql": "SUBSTRING_INDEX($field, '-', 1) = ?",
+            "postgres": "SPLIT_PART($field, '-', 1) = $1",
+            "sqlite": "SUBSTR($field, 1, INSTR($field, '-') - 1) = ?",
+            "sqlserver": "SUBSTRING($field, 1, CHARINDEX('-', $field) - 1) = ?"
+          },
+          "countryCodeIn": {
+            "mysql": "SUBSTRING_INDEX($field, '-', 1) IN ($params)",
+            "postgres": "SPLIT_PART($field, '-', 1) IN ($params)",
+            "sqlite": "SUBSTR($field, 1, INSTR($field, '-') - 1) IN ($params)",
+            "sqlserver": "SUBSTRING($field, 1, CHARINDEX('-', $field) - 1) IN ($params)"
+          }
+        }
+      },
+      "name": "PhoneNumberWhereInput"
+    },
+    {
+      "description": "Filter operations for URL",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Protocol equals (http, https, etc.)",
+          "field_type": "String",
+          "name": "protocolEq"
+        },
+        {
+          "description": "Host equals",
+          "field_type": "String",
+          "name": "hostEq"
+        },
+        {
+          "description": "Path starts with",
+          "field_type": "String",
+          "name": "pathStartswith"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "hostEq": {
+            "mysql": "SUBSTRING(SUBSTRING($field, LOCATE('://', $field) + 3), 1, LOCATE('/', SUBSTRING($field, LOCATE('://', $field) + 3)) - 1) = ?",
+            "postgres": "SPLIT_PART(SPLIT_PART($field, '://', 2), '/', 1) = $1",
+            "sqlite": "SUBSTR($field, INSTR($field, '://') + 3, INSTR(SUBSTR($field, INSTR($field, '://') + 3), '/') - 1) = ?",
+            "sqlserver": "SUBSTRING(SUBSTRING($field, CHARINDEX('://', $field) + 3), 1, CHARINDEX('/', SUBSTRING($field, CHARINDEX('://', $field) + 3)) - 1) = ?"
+          },
+          "pathStartswith": {
+            "mysql": "SUBSTRING(SUBSTRING($field, LOCATE('://', $field) + 3), LOCATE('/', SUBSTRING($field, LOCATE('://', $field) + 3)), LOCATE('?', SUBSTRING($field, LOCATE('://', $field) + 3)) - LOCATE('/', SUBSTRING($field, LOCATE('://', $field) + 3))) LIKE CONCAT(?, '%')",
+            "postgres": "SPLIT_PART(SPLIT_PART($field, '://', 2), '?', 1) LIKE $1 || '%'",
+            "sqlite": "SUBSTR(SUBSTR($field, INSTR($field, '://') + 3), INSTR(SUBSTR($field, INSTR($field, '://') + 3), '/')) LIKE ? || '%'",
+            "sqlserver": "SUBSTRING($field, CHARINDEX('/', $field, CHARINDEX('://', $field) + 3), CHARINDEX('?', $field) - CHARINDEX('/', $field, CHARINDEX('://', $field) + 3)) LIKE ? + '%'"
+          },
+          "protocolEq": {
+            "mysql": "SUBSTRING($field, 1, LOCATE('://', $field) - 1) = ?",
+            "postgres": "SPLIT_PART($field, '://', 1) = $1",
+            "sqlite": "SUBSTR($field, 1, INSTR($field, '://') - 1) = ?",
+            "sqlserver": "SUBSTRING($field, 1, CHARINDEX('://', $field) - 1) = ?"
+          }
+        }
+      },
+      "name": "URLWhereInput"
+    },
+    {
+      "description": "Filter operations for DomainName",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "TLD equals",
+          "field_type": "String",
+          "name": "tldEq"
+        },
+        {
+          "description": "TLD in list",
+          "field_type": "[String!]!",
+          "name": "tldIn"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "tldEq": {
+            "mysql": "SUBSTRING($field, LOCATE('.', REVERSE($field)) + 1) = ?",
+            "postgres": "RIGHT($field, LENGTH($field) - STRPOS($field, '.') + 1) = $1",
+            "sqlite": "SUBSTR($field, INSTR($field, '.') + 1) = ?",
+            "sqlserver": "SUBSTRING($field, CHARINDEX('.', REVERSE($field)) + 1, LEN($field)) = ?"
+          },
+          "tldIn": {
+            "mysql": "SUBSTRING($field, LOCATE('.', REVERSE($field)) + 1) IN ($params)",
+            "postgres": "RIGHT($field, LENGTH($field) - STRPOS($field, '.') + 1) IN ($params)",
+            "sqlite": "SUBSTR($field, INSTR($field, '.') + 1) IN ($params)",
+            "sqlserver": "SUBSTRING($field, CHARINDEX('.', REVERSE($field)) + 1, LEN($field)) IN ($params)"
+          }
+        }
+      },
+      "name": "DomainNameWhereInput"
+    },
+    {
+      "description": "Filter operations for Hostname",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Is fully qualified domain name",
+          "field_type": "Boolean",
+          "name": "isFqdn"
+        },
+        {
+          "description": "Label depth equals",
+          "field_type": "Float",
+          "name": "depthEq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "depthEq": {
+            "mysql": "(LENGTH($field) - LENGTH(REPLACE($field, '.', '')) + 1) = ?",
+            "postgres": "(LENGTH($field) - LENGTH(REPLACE($field, '.', '')) + 1) = $1",
+            "sqlite": "(LENGTH($field) - LENGTH(REPLACE($field, '.', '')) + 1) = ?",
+            "sqlserver": "(LEN($field) - LEN(REPLACE($field, '.', '')) + 1) = ?"
+          },
+          "isFqdn": {
+            "mysql": "CASE WHEN LOCATE('.', $field) > 0 THEN 1 ELSE 0 END = ?",
+            "postgres": "CASE WHEN POSITION('.' IN $field) > 0 THEN true ELSE false END = $1",
+            "sqlite": "CASE WHEN INSTR($field, '.') > 0 THEN 1 ELSE 0 END = ?",
+            "sqlserver": "CASE WHEN CHARINDEX('.', $field) > 0 THEN 1 ELSE 0 END = ?"
+          }
+        }
+      },
+      "name": "HostnameWhereInput"
+    },
+    {
+      "description": "Filter operations for PostalCode",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Country code equals",
+          "field_type": "String",
+          "name": "countryEq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "countryEq": {
+            "mysql": "SUBSTRING($field, 1, 2) = ?",
+            "postgres": "SUBSTRING($field FROM 1 FOR 2) = $1",
+            "sqlite": "SUBSTR($field, 1, 2) = ?",
+            "sqlserver": "SUBSTRING($field, 1, 2) = ?"
+          }
+        }
+      },
+      "name": "PostalCodeWhereInput"
+    },
+    {
+      "description": "Filter operations for Latitude",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Latitude within range (degrees)",
+          "field_type": "FloatRange",
+          "name": "withinRange"
+        },
+        {
+          "description": "Hemisphere equals (North/South)",
+          "field_type": "String",
+          "name": "hemisphereEq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "hemisphereEq": {
+            "mysql": "$field LIKE CONCAT(?, '%')",
+            "postgres": "$field LIKE $1 || '%'",
+            "sqlite": "$field LIKE ? || '%'",
+            "sqlserver": "$field LIKE ? + '%'"
+          },
+          "withinRange": {
+            "mysql": "$field BETWEEN ? AND ?",
+            "postgres": "$field BETWEEN $1 AND $2",
+            "sqlite": "$field BETWEEN ? AND ?",
+            "sqlserver": "$field BETWEEN ? AND ?"
+          }
+        }
+      },
+      "name": "LatitudeWhereInput"
+    },
+    {
+      "description": "Filter operations for Longitude",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Longitude within range (degrees)",
+          "field_type": "FloatRange",
+          "name": "withinRange"
+        },
+        {
+          "description": "Hemisphere equals (East/West)",
+          "field_type": "String",
+          "name": "hemisphereEq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "hemisphereEq": {
+            "mysql": "$field LIKE CONCAT(?, '%')",
+            "postgres": "$field LIKE $1 || '%'",
+            "sqlite": "$field LIKE ? || '%'",
+            "sqlserver": "$field LIKE ? + '%'"
+          },
+          "withinRange": {
+            "mysql": "$field BETWEEN ? AND ?",
+            "postgres": "$field BETWEEN $1 AND $2",
+            "sqlite": "$field BETWEEN ? AND ?",
+            "sqlserver": "$field BETWEEN ? AND ?"
+          }
+        }
+      },
+      "name": "LongitudeWhereInput"
+    },
+    {
+      "description": "Filter operations for Coordinates",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Distance within radius (km)",
+          "field_type": "FloatRange",
+          "name": "distanceWithin"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "distanceWithin": {
+            "mysql": "ST_Distance_Sphere(\n                ST_GeomFromText(CONCAT('POINT(', JSON_EXTRACT($field, '$.lng'), ' ', JSON_EXTRACT($field, '$.lat'), ')')),\n                ST_GeomFromText(CONCAT('POINT(', ?, ' ', ?, ')'))\n            ) <= ? * 1000",
+            "postgres": "ST_DWithin(\n                ST_GeomFromText('POINT(' || ($field->>'lng') || ' ' || ($field->>'lat') || ')'),\n                ST_GeomFromText('POINT($1 $2)'),\n                $3 * 1000\n            )",
+            "sqlite": "111.111 * DEGREES(ACOS(LEAST(1, GREATEST(-1,\n                COS(RADIANS(90 - json_extract($field, '$.lat'))) *\n                COS(RADIANS(90 - ?)) *\n                COS(RADIANS(json_extract($field, '$.lng') - ?)) +\n                SIN(RADIANS(90 - json_extract($field, '$.lat'))) *\n                SIN(RADIANS(90 - ?))\n            )))) <= ?",
+            "sqlserver": "geography::Point(JSON_VALUE($field, '$.lat'), JSON_VALUE($field, '$.lng'), 4326)\n                .STDistance(geography::Point(?, ?, 4326)) <= ? * 1000"
+          }
+        }
+      },
+      "name": "CoordinatesWhereInput"
+    },
+    {
+      "description": "Filter operations for Timezone",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Timezone equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "TimezoneWhereInput"
+    },
+    {
+      "description": "Filter operations for LocaleCode",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Locale code equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "LocaleCodeWhereInput"
+    },
+    {
+      "description": "Filter operations for LanguageCode",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Language code equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "LanguageCodeWhereInput"
+    },
+    {
+      "description": "Filter operations for CountryCode",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Country code equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "CountryCodeWhereInput"
+    },
+    {
+      "description": "Filter operations for IBAN",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Country equals",
+          "field_type": "String",
+          "name": "countryEq"
+        },
+        {
+          "description": "Check digit equals",
+          "field_type": "String",
+          "name": "checkDigitEq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "countryEq": {
+            "mysql": "SUBSTRING($field, 1, 2) = ?",
+            "postgres": "SUBSTRING($field FROM 1 FOR 2) = $1",
+            "sqlite": "SUBSTR($field, 1, 2) = ?",
+            "sqlserver": "SUBSTRING($field, 1, 2) = ?"
+          }
+        }
+      },
+      "name": "IBANWhereInput"
+    },
+    {
+      "description": "Filter operations for CUSIP",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Issuer code equals",
+          "field_type": "String",
+          "name": "issuerEq"
+        }
+      ],
+      "metadata": {
+        "operators": {}
+      },
+      "name": "CUSIPWhereInput"
+    },
+    {
+      "description": "Filter operations for ISIN",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Country equals",
+          "field_type": "String",
+          "name": "countryEq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "countryEq": {
+            "mysql": "SUBSTRING($field, 1, 2) = ?",
+            "postgres": "SUBSTRING($field FROM 1 FOR 2) = $1",
+            "sqlite": "SUBSTR($field, 1, 2) = ?",
+            "sqlserver": "SUBSTRING($field, 1, 2) = ?"
+          }
+        }
+      },
+      "name": "ISINWhereInput"
+    },
+    {
+      "description": "Filter operations for SEDOL",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Check digit equals",
+          "field_type": "String",
+          "name": "checkDigitEq"
+        }
+      ],
+      "metadata": {
+        "operators": {}
+      },
+      "name": "SEDOLWhereInput"
+    },
+    {
+      "description": "Filter operations for LEI",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Country equals",
+          "field_type": "String",
+          "name": "countryEq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "countryEq": {
+            "mysql": "SUBSTRING($field, 1, 2) = ?",
+            "postgres": "SUBSTRING($field FROM 1 FOR 2) = $1",
+            "sqlite": "SUBSTR($field, 1, 2) = ?",
+            "sqlserver": "SUBSTRING($field, 1, 2) = ?"
+          }
+        }
+      },
+      "name": "LEIWhereInput"
+    },
+    {
+      "description": "Filter operations for MIC",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Country equals",
+          "field_type": "String",
+          "name": "countryEq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "countryEq": {
+            "mysql": "SUBSTRING($field, 1, 2) = ?",
+            "postgres": "SUBSTRING($field FROM 1 FOR 2) = $1",
+            "sqlite": "SUBSTR($field, 1, 2) = ?",
+            "sqlserver": "SUBSTRING($field, 1, 2) = ?"
+          }
+        }
+      },
+      "name": "MICWhereInput"
+    },
+    {
+      "description": "Filter operations for CurrencyCode",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Currency code equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "CurrencyCodeWhereInput"
+    },
+    {
+      "description": "Filter operations for Money",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Currency equals",
+          "field_type": "String",
+          "name": "currencyEq"
+        },
+        {
+          "description": "Amount within range",
+          "field_type": "FloatRange",
+          "name": "amountWithinRange"
+        }
+      ],
+      "metadata": {
+        "operators": {}
+      },
+      "name": "MoneyWhereInput"
+    },
+    {
+      "description": "Filter operations for ExchangeCode",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Exchange code equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "ExchangeCodeWhereInput"
+    },
+    {
+      "description": "Filter operations for ExchangeRate",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Exchange rate within range",
+          "field_type": "FloatRange",
+          "name": "withinRange"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "withinRange": {
+            "mysql": "$field BETWEEN ? AND ?",
+            "postgres": "$field BETWEEN $1 AND $2",
+            "sqlite": "$field BETWEEN ? AND ?",
+            "sqlserver": "$field BETWEEN ? AND ?"
+          }
+        }
+      },
+      "name": "ExchangeRateWhereInput"
+    },
+    {
+      "description": "Filter operations for StockSymbol",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Stock symbol equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "StockSymbolWhereInput"
+    },
+    {
+      "description": "Filter operations for Slug",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Slug equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "SlugWhereInput"
+    },
+    {
+      "description": "Filter operations for SemanticVersion",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Semantic version equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "SemanticVersionWhereInput"
+    },
+    {
+      "description": "Filter operations for HashSHA256",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Hash equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "HashSHA256WhereInput"
+    },
+    {
+      "description": "Filter operations for APIKey",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "API key equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "APIKeyWhereInput"
+    },
+    {
+      "description": "Filter operations for LicensePlate",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Country equals",
+          "field_type": "String",
+          "name": "countryEq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "countryEq": {
+            "mysql": "SUBSTRING($field, 1, 2) = ?",
+            "postgres": "SUBSTRING($field FROM 1 FOR 2) = $1",
+            "sqlite": "SUBSTR($field, 1, 2) = ?",
+            "sqlserver": "SUBSTRING($field, 1, 2) = ?"
+          }
+        }
+      },
+      "name": "LicensePlateWhereInput"
+    },
+    {
+      "description": "Filter operations for VIN",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "World Manufacturer Identifier equals",
+          "field_type": "String",
+          "name": "wmiEq"
+        },
+        {
+          "description": "Manufacturer code equals",
+          "field_type": "String",
+          "name": "manufacturerEq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "wmiEq": {
+            "mysql": "SUBSTRING($field, 1, 3) = ?",
+            "postgres": "SUBSTRING($field FROM 1 FOR 3) = $1",
+            "sqlite": "SUBSTR($field, 1, 3) = ?",
+            "sqlserver": "SUBSTRING($field, 1, 3) = ?"
+          }
+        }
+      },
+      "name": "VINWhereInput"
+    },
+    {
+      "description": "Filter operations for TrackingNumber",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Carrier equals",
+          "field_type": "String",
+          "name": "carrierEq"
+        }
+      ],
+      "metadata": {
+        "operators": {}
+      },
+      "name": "TrackingNumberWhereInput"
+    },
+    {
+      "description": "Filter operations for ContainerNumber",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Owner code equals",
+          "field_type": "String",
+          "name": "ownerCodeEq"
+        }
+      ],
+      "metadata": {
+        "operators": {}
+      },
+      "name": "ContainerNumberWhereInput"
+    },
+    {
+      "description": "Filter operations for IPAddress",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "In subnet",
+          "field_type": "String",
+          "name": "inSubnet"
+        }
+      ],
+      "metadata": {
+        "operators": {}
+      },
+      "name": "IPAddressWhereInput"
+    },
+    {
+      "description": "Filter operations for IPv4",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "IPv4 equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "IPv4WhereInput"
+    },
+    {
+      "description": "Filter operations for IPv6",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "IPv6 equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "IPv6WhereInput"
+    },
+    {
+      "description": "Filter operations for CIDR",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "CIDR equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "CIDRWhereInput"
+    },
+    {
+      "description": "Filter operations for Port",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Port number equals",
+          "field_type": "Float",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "PortWhereInput"
+    },
+    {
+      "description": "Filter operations for AirportCode",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Airport code equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "AirportCodeWhereInput"
+    },
+    {
+      "description": "Filter operations for PortCode",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Port code equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "PortCodeWhereInput"
+    },
+    {
+      "description": "Filter operations for FlightNumber",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Airline code equals",
+          "field_type": "String",
+          "name": "airlineCodeEq"
+        }
+      ],
+      "metadata": {
+        "operators": {}
+      },
+      "name": "FlightNumberWhereInput"
+    },
+    {
+      "description": "Filter operations for Markdown",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Is valid Markdown format",
+          "field_type": "Boolean",
+          "name": "validFormat"
+        }
+      ],
+      "metadata": {
+        "operators": {}
+      },
+      "name": "MarkdownWhereInput"
+    },
+    {
+      "description": "Filter operations for HTML",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Is valid HTML/XML",
+          "field_type": "Boolean",
+          "name": "validXml"
+        }
+      ],
+      "metadata": {
+        "operators": {}
+      },
+      "name": "HTMLWhereInput"
+    },
+    {
+      "description": "Filter operations for MimeType",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "MIME type equals",
+          "field_type": "String",
+          "name": "eq"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "eq": {
+            "mysql": "$field = ?",
+            "postgres": "$field = $1",
+            "sqlite": "$field = ?",
+            "sqlserver": "$field = ?"
+          }
+        }
+      },
+      "name": "MimeTypeWhereInput"
+    },
+    {
+      "description": "Filter operations for Color",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Color format equals",
+          "field_type": "String",
+          "name": "formatEq"
+        }
+      ],
+      "metadata": {
+        "operators": {}
+      },
+      "name": "ColorWhereInput"
+    },
+    {
+      "description": "Filter operations for Image",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Image format equals",
+          "field_type": "String",
+          "name": "formatEq"
+        }
+      ],
+      "metadata": {
+        "operators": {}
+      },
+      "name": "ImageWhereInput"
+    },
+    {
+      "description": "Filter operations for File",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "File size within range (bytes)",
+          "field_type": "FloatRange",
+          "name": "sizeWithinRange"
+        }
+      ],
+      "metadata": {
+        "operators": {}
+      },
+      "name": "FileWhereInput"
+    },
+    {
+      "description": "Filter operations for DateRange",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Date range overlaps",
+          "field_type": "String",
+          "name": "overlaps"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "overlaps": {
+            "mysql": "JSON_EXTRACT($field, '$.start') < ? AND JSON_EXTRACT($field, '$.end') > ?",
+            "postgres": "($field->>'start')::timestamp < $2::timestamp AND ($field->>'end')::timestamp > $1::timestamp",
+            "sqlite": "json_extract($field, '$.start') < ? AND json_extract($field, '$.end') > ?",
+            "sqlserver": "JSON_VALUE($field, '$.start') < ? AND JSON_VALUE($field, '$.end') > ?"
+          }
+        }
+      },
+      "name": "DateRangeWhereInput"
+    },
+    {
+      "description": "Filter operations for Duration",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Duration within range (seconds)",
+          "field_type": "FloatRange",
+          "name": "withinRange"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "withinRange": {
+            "mysql": "$field BETWEEN ? AND ?",
+            "postgres": "$field BETWEEN $1 AND $2",
+            "sqlite": "$field BETWEEN ? AND ?",
+            "sqlserver": "$field BETWEEN ? AND ?"
+          }
+        }
+      },
+      "name": "DurationWhereInput"
+    },
+    {
+      "description": "Filter operations for Percentage",
+      "fields": [
+        {
+          "description": "Equals",
+          "field_type": "String",
+          "name": "eq"
+        },
+        {
+          "description": "Not equals",
+          "field_type": "String",
+          "name": "neq"
+        },
+        {
+          "description": "In list",
+          "field_type": "[String!]!",
+          "name": "in"
+        },
+        {
+          "description": "Not in list",
+          "field_type": "[String!]!",
+          "name": "nin"
+        },
+        {
+          "description": "Contains substring",
+          "field_type": "String",
+          "name": "contains"
+        },
+        {
+          "description": "Is null",
+          "field_type": "Boolean",
+          "name": "isnull"
+        },
+        {
+          "description": "Percentage within range (0-100)",
+          "field_type": "FloatRange",
+          "name": "withinRange"
+        }
+      ],
+      "metadata": {
+        "operators": {
+          "withinRange": {
+            "mysql": "$field BETWEEN ? AND ?",
+            "postgres": "$field BETWEEN $1 AND $2",
+            "sqlite": "$field BETWEEN ? AND ?",
+            "sqlserver": "$field BETWEEN ? AND ?"
+          }
+        }
+      },
+      "name": "PercentageWhereInput"
+    }
+  ],
+  "interfaces": [],
+  "mutations": [],
+  "naming_convention": "preserve",
+  "queries": [
+    {
+      "arguments": [
+        {
+          "arg_type": "Int",
+          "default_value": 100,
+          "name": "limit",
+          "nullable": true
+        }
+      ],
+      "auto_params": {
+        "has_limit": true,
+        "has_offset": true,
+        "has_order_by": true,
+        "has_where": true
+      },
+      "description": "Get all users.",
+      "jsonb_column": "data",
+      "name": "users",
+      "nullable": false,
+      "return_type": "User",
+      "returns_list": true,
+      "sql_source": "v_users"
+    },
+    {
+      "arguments": [
+        {
+          "arg_type": "Int",
+          "name": "id",
+          "nullable": false
+        }
+      ],
+      "auto_params": {
+        "has_limit": false,
+        "has_offset": false,
+        "has_order_by": false,
+        "has_where": false
+      },
+      "description": "Get a user by ID.",
+      "jsonb_column": "data",
+      "name": "user",
+      "nullable": true,
+      "return_type": "User",
+      "returns_list": false,
+      "sql_source": "v_users"
+    },
+    {
+      "arguments": [
+        {
+          "arg_type": "Int",
+          "default_value": 100,
+          "name": "limit",
+          "nullable": true
+        },
+        {
+          "arg_type": "Int",
+          "name": "author_id",
+          "nullable": true
+        }
+      ],
+      "auto_params": {
+        "has_limit": true,
+        "has_offset": true,
+        "has_order_by": true,
+        "has_where": true
+      },
+      "description": "Get all posts, optionally filtered by author.",
+      "jsonb_column": "data",
+      "name": "posts",
+      "nullable": false,
+      "return_type": "Post",
+      "returns_list": true,
+      "sql_source": "v_posts"
+    },
+    {
+      "arguments": [
+        {
+          "arg_type": "Int",
+          "name": "id",
+          "nullable": false
+        }
+      ],
+      "auto_params": {
+        "has_limit": false,
+        "has_offset": false,
+        "has_order_by": false,
+        "has_where": false
+      },
+      "description": "Get a post by ID.",
+      "jsonb_column": "data",
+      "name": "post",
+      "nullable": true,
+      "return_type": "Post",
+      "returns_list": false,
+      "sql_source": "v_posts"
+    }
+  ],
+  "schema_format_version": 1,
+  "security": {
+    "lookup_data": {
+      "countries": {
+        "AR": {
+          "continent": "South America",
+          "in_eu": false,
+          "in_schengen": false,
+          "name": "Argentina",
+          "region": "Americas"
+        },
+        "AU": {
+          "continent": "Oceania",
+          "in_eu": false,
+          "in_schengen": false,
+          "name": "Australia",
+          "region": "Oceania"
+        },
+        "BE": {
+          "continent": "Europe",
+          "in_eu": true,
+          "in_schengen": true,
+          "name": "Belgium",
+          "region": "EU"
+        },
+        "BR": {
+          "continent": "South America",
+          "in_eu": false,
+          "in_schengen": false,
+          "name": "Brazil",
+          "region": "Americas"
+        },
+        "CA": {
+          "continent": "North America",
+          "in_eu": false,
+          "in_schengen": false,
+          "name": "Canada",
+          "region": "Americas"
+        },
+        "CH": {
+          "continent": "Europe",
+          "in_eu": false,
+          "in_schengen": true,
+          "name": "Switzerland",
+          "region": "EU"
+        },
+        "CN": {
+          "continent": "Asia",
+          "in_eu": false,
+          "in_schengen": false,
+          "name": "China",
+          "region": "Asia"
+        },
+        "DE": {
+          "continent": "Europe",
+          "in_eu": true,
+          "in_schengen": true,
+          "name": "Germany",
+          "region": "EU"
+        },
+        "EG": {
+          "continent": "Africa",
+          "in_eu": false,
+          "in_schengen": false,
+          "name": "Egypt",
+          "region": "Africa"
+        },
+        "ES": {
+          "continent": "Europe",
+          "in_eu": true,
+          "in_schengen": true,
+          "name": "Spain",
+          "region": "EU"
+        },
+        "FR": {
+          "continent": "Europe",
+          "in_eu": true,
+          "in_schengen": true,
+          "name": "France",
+          "region": "EU"
+        },
+        "GB": {
+          "continent": "Europe",
+          "in_eu": false,
+          "in_schengen": false,
+          "name": "United Kingdom",
+          "region": "EU"
+        },
+        "IN": {
+          "continent": "Asia",
+          "in_eu": false,
+          "in_schengen": false,
+          "name": "India",
+          "region": "Asia"
+        },
+        "IT": {
+          "continent": "Europe",
+          "in_eu": true,
+          "in_schengen": true,
+          "name": "Italy",
+          "region": "EU"
+        },
+        "JP": {
+          "continent": "Asia",
+          "in_eu": false,
+          "in_schengen": false,
+          "name": "Japan",
+          "region": "Asia"
+        },
+        "MX": {
+          "continent": "North America",
+          "in_eu": false,
+          "in_schengen": false,
+          "name": "Mexico",
+          "region": "Americas"
+        },
+        "NL": {
+          "continent": "Europe",
+          "in_eu": true,
+          "in_schengen": true,
+          "name": "Netherlands",
+          "region": "EU"
+        },
+        "NZ": {
+          "continent": "Oceania",
+          "in_eu": false,
+          "in_schengen": false,
+          "name": "New Zealand",
+          "region": "Oceania"
+        },
+        "PL": {
+          "continent": "Europe",
+          "in_eu": true,
+          "in_schengen": true,
+          "name": "Poland",
+          "region": "EU"
+        },
+        "SG": {
+          "continent": "Asia",
+          "in_eu": false,
+          "in_schengen": false,
+          "name": "Singapore",
+          "region": "Asia"
+        },
+        "US": {
+          "continent": "North America",
+          "in_eu": false,
+          "in_schengen": false,
+          "name": "United States",
+          "region": "Americas"
+        },
+        "ZA": {
+          "continent": "Africa",
+          "in_eu": false,
+          "in_schengen": false,
+          "name": "South Africa",
+          "region": "Africa"
+        }
+      },
+      "currencies": {
+        "AUD": {
+          "decimal_places": 2,
+          "name": "Australian Dollar",
+          "symbol": "A$"
+        },
+        "CAD": {
+          "decimal_places": 2,
+          "name": "Canadian Dollar",
+          "symbol": "C$"
+        },
+        "CHF": {
+          "decimal_places": 2,
+          "name": "Swiss Franc",
+          "symbol": "₣"
+        },
+        "CNY": {
+          "decimal_places": 2,
+          "name": "Chinese Yuan",
+          "symbol": "¥"
+        },
+        "EUR": {
+          "decimal_places": 2,
+          "name": "Euro",
+          "symbol": "€"
+        },
+        "GBP": {
+          "decimal_places": 2,
+          "name": "British Pound",
+          "symbol": "£"
+        },
+        "INR": {
+          "decimal_places": 2,
+          "name": "Indian Rupee",
+          "symbol": "₹"
+        },
+        "JPY": {
+          "decimal_places": 0,
+          "name": "Japanese Yen",
+          "symbol": "¥"
+        },
+        "MXN": {
+          "decimal_places": 2,
+          "name": "Mexican Peso",
+          "symbol": "$"
+        },
+        "USD": {
+          "decimal_places": 2,
+          "name": "US Dollar",
+          "symbol": "$"
+        }
+      },
+      "languages": {
+        "DE": {
+          "family": "Indo-European",
+          "name": "German",
+          "script": "Latin"
+        },
+        "EN": {
+          "family": "Indo-European",
+          "name": "English",
+          "script": "Latin"
+        },
+        "ES": {
+          "family": "Indo-European",
+          "name": "Spanish",
+          "script": "Latin"
+        },
+        "FR": {
+          "family": "Indo-European",
+          "name": "French",
+          "script": "Latin"
+        },
+        "IT": {
+          "family": "Indo-European",
+          "name": "Italian",
+          "script": "Latin"
+        },
+        "JA": {
+          "family": "Japonic",
+          "name": "Japanese",
+          "script": "Japanese"
+        },
+        "KO": {
+          "family": "Koreanic",
+          "name": "Korean",
+          "script": "Hangul"
+        },
+        "PT": {
+          "family": "Indo-European",
+          "name": "Portuguese",
+          "script": "Latin"
+        },
+        "RU": {
+          "family": "Indo-European",
+          "name": "Russian",
+          "script": "Cyrillic"
+        },
+        "VI": {
+          "family": "Austroasiatic",
+          "name": "Vietnamese",
+          "script": "Latin"
+        },
+        "ZH": {
+          "family": "Sino-Tibetan",
+          "name": "Chinese",
+          "script": "Han"
+        }
+      },
+      "timezones": {
+        "AEST": {
+          "has_dst": false,
+          "offset_minutes": 600,
+          "region": "Oceania"
+        },
+        "CDT": {
+          "has_dst": false,
+          "offset_minutes": -300,
+          "region": "Americas"
+        },
+        "CEST": {
+          "has_dst": false,
+          "offset_minutes": 120,
+          "region": "Europe"
+        },
+        "CET": {
+          "has_dst": true,
+          "offset_minutes": 60,
+          "region": "Europe"
+        },
+        "CST": {
+          "has_dst": true,
+          "offset_minutes": -360,
+          "region": "Americas"
+        },
+        "EDT": {
+          "has_dst": false,
+          "offset_minutes": -240,
+          "region": "Americas"
+        },
+        "EST": {
+          "has_dst": true,
+          "offset_minutes": -300,
+          "region": "Americas"
+        },
+        "GMT": {
+          "has_dst": false,
+          "offset_minutes": 0,
+          "region": "Europe"
+        },
+        "IST": {
+          "has_dst": false,
+          "offset_minutes": 330,
+          "region": "Asia"
+        },
+        "JST": {
+          "has_dst": false,
+          "offset_minutes": 540,
+          "region": "Asia"
+        },
+        "MDT": {
+          "has_dst": false,
+          "offset_minutes": -360,
+          "region": "Americas"
+        },
+        "MST": {
+          "has_dst": true,
+          "offset_minutes": -420,
+          "region": "Americas"
+        },
+        "PDT": {
+          "has_dst": false,
+          "offset_minutes": -420,
+          "region": "Americas"
+        },
+        "PST": {
+          "has_dst": true,
+          "offset_minutes": -480,
+          "region": "Americas"
+        },
+        "SGT": {
+          "has_dst": false,
+          "offset_minutes": 480,
+          "region": "Asia"
+        },
+        "UTC": {
+          "has_dst": false,
+          "offset_minutes": 0,
+          "region": "UTC"
+        }
+      }
+    }
+  },
+  "session_variables": {
+    "inject_started_at": false,
+    "variables": []
+  },
+  "subscriptions": [],
+  "types": [
+    {
+      "description": "A user in the system.",
+      "fields": [
+        {
+          "field_type": "Int",
+          "name": "id",
+          "nullable": false,
+          "on_deny": "reject"
+        },
+        {
+          "field_type": "String",
+          "name": "name",
+          "nullable": false,
+          "on_deny": "reject"
+        },
+        {
+          "field_type": "String",
+          "name": "email",
+          "nullable": false,
+          "on_deny": "reject"
+        },
+        {
+          "field_type": "DateTime",
+          "name": "created_at",
+          "nullable": false,
+          "on_deny": "reject"
+        }
+      ],
+      "jsonb_column": "",
+      "name": "User",
+      "sql_source": ""
+    },
+    {
+      "description": "A blog post.",
+      "fields": [
+        {
+          "field_type": "Int",
+          "name": "id",
+          "nullable": false,
+          "on_deny": "reject"
+        },
+        {
+          "field_type": "String",
+          "name": "title",
+          "nullable": false,
+          "on_deny": "reject"
+        },
+        {
+          "field_type": "String",
+          "name": "content",
+          "nullable": false,
+          "on_deny": "reject"
+        },
+        {
+          "field_type": "Int",
+          "name": "author_id",
+          "nullable": false,
+          "on_deny": "reject"
+        },
+        {
+          "field_type": {
+            "Object": "User"
+          },
+          "name": "author",
+          "nullable": true,
+          "on_deny": "reject"
+        },
+        {
+          "field_type": "DateTime",
+          "name": "created_at",
+          "nullable": false,
+          "on_deny": "reject"
+        }
+      ],
+      "jsonb_column": "",
+      "name": "Post",
+      "sql_source": ""
+    }
+  ],
+  "unions": []
+}

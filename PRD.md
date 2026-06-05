@@ -468,7 +468,7 @@ Single deploy execution is sequential by design at the saga level. Multi-host fa
 ### 10.1 Functional acceptance (v1.0.0-beta.1)
 
 - [ ] Every row of §3.4 marked ✅ holds.
-- [ ] Single-host deploy of fraiseql v2 through the Rust binary works three consecutive times.
+- [x] Single-host deploy of fraiseql v2 through the Rust binary works three consecutive times. *(Met 2026-06-05 — real `fraiseql-server` v2.4.0 + `ecommerce_api` Confiture schema, 3× on a real Hetzner pid-1 host; see §10.3.)*
 - [ ] Multi-host deploy against a 3-host fixture cluster (rolling strategy) succeeds, including forced-failure rollback at each phase.
 - [ ] ~~At least one Python `fraises.yaml` from Python fraisier's test corpus deploys identically through the Rust binary~~ — withdrawn with the `fraises.yaml` compat layer (2026-06-02). The IPC-adapter coverage it implied is met by the reference adapters below.
 - [ ] specql-platform embeds `fraisier-saga` and deploys a fixture app via library call.
@@ -487,7 +487,7 @@ Single deploy execution is sequential by design at the saga level. Multi-host fa
 
 Gate for promoting `fraisier-core` → `fraisier v1.0.0-beta.1`:
 
-- [ ] Fraiseql v2 deploys successfully three consecutive times in production (single-host).
+- [x] Fraiseql v2 deploys successfully three consecutive times in production (single-host). **Met 2026-06-05:** fraisier's deploy saga deployed the real `fraiseql-server` v2.4.0 against the confiture-migrated `ecommerce_api` schema 3× consecutively, each committed + `/health` 200, on a real Hetzner debian-13 **pid-1 systemd** host over the network (and locally). See `.phases/part-b-fraiseql-canonical-migrations.md`.
 - [ ] Multi-host fixture cluster deploys successfully three consecutive times (experimental flag set).
 - [ ] specql-platform library embedding works.
 - [ ] ~~At least one Python `fraises.yaml` deploys identically via external IPC adapter~~ — withdrawn (2026-06-02); the IPC protocol is validated by the reference sqlx adapter instead.

@@ -74,6 +74,10 @@ pub struct DeployConfig {
     /// The `[lb]` section: the load balancer. Absent when there is none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lb: Option<LbSection>,
+    /// The `[ssh]` section: how fraisier reaches remote hosts in a multi-host
+    /// rollout. Absent for single-host deploys (which run locally).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshSection>,
     /// The `[specql]` preset. Present only in the *unexpanded* form; both
     /// [`from_toml_str`](DeployConfig::from_toml_str) and
     /// [`load`](DeployConfig::load) consume it and leave this `None`.
@@ -220,6 +224,27 @@ pub struct HealthSection {
     /// `http`: the expected status code (defaults to `200`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_status: Option<u16>,
+}
+
+/// The `[ssh]` section: the connection parameters fraisier uses to run per-host
+/// rollout commands on remote hosts (the per-host *address* comes from
+/// `[hosts].inventory`). Only used by multi-host deploys.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshSection {
+    /// The login user (the `user@` in `ssh user@host`). Defaults to the local
+    /// user when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// The identity (private key) file passed as `ssh -i`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_path: Option<PathBuf>,
+    /// The SSH port (`ssh -p`). Defaults to 22 when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Extra `ssh -o KEY=VALUE` options (e.g. `StrictHostKeyChecking=no`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
 }
 
 /// The `[lb]` section.

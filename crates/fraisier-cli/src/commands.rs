@@ -4,10 +4,12 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
 use fraisier_config::{DeployConfig, Severity, ValidationReport};
+use fraisier_core::multi_host::MultiHostDeploy;
 use fraisier_core::single_host::{DeployRecord, SingleHostDeploy};
 use fraisier_saga::saga::SagaOutcome;
 use fraisier_saga::state_store::{FilesystemStateStore, FraiseKey, StateStore};
@@ -239,6 +241,53 @@ fn render_summary(summary: &factory::PlanSummary) -> String {
     out
 }
 
+/// Render only a report's non-blocking issues (warnings/info), in the same shape
+/// as [`render_issues`]. Empty when there are none.
+fn render_warnings(report: &ValidationReport) -> String {
+    let mut out = report
+        .warnings()
+        .map(|issue| {
+            let tag = match issue.severity {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+                Severity::Info => "info",
+            };
+            format!("  [{tag}] {}: {}", issue.path, issue.message)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Render a multi-host `--dry-run` plan, with any validation warnings above it.
+fn render_multi_host_summary(
+    summary: &factory::MultiHostSummary,
+    report: &ValidationReport,
+) -> String {
+    let mut out = render_warnings(report);
+    let lines = vec![
+        format!(
+            "multi-host deploy plan for {}/{}:",
+            summary.fraise, summary.environment
+        ),
+        format!("  strategy:  {}", summary.strategy),
+        format!("  transport: {}", summary.transport),
+        format!("  hosts:     {}", summary.hosts.join(", ")),
+        format!("  artifact:  {}", summary.artifact),
+        format!("  migration: {}", summary.migration),
+        format!("  service:   {}", summary.service),
+        format!("  health:    {}", summary.health),
+        format!("  lb:        {}", summary.lb),
+        "(dry run — nothing was executed)".to_owned(),
+    ];
+    out.push_str(&lines.join("\n"));
+    out.push('\n');
+    out
+}
+
 /// `deploy`: validate, then either summarize the plan (`--dry-run`) or run the
 /// single-host deploy against the state store.
 pub(crate) async fn deploy(
@@ -260,7 +309,19 @@ pub(crate) async fn deploy(
         });
     }
 
+    // A config with [hosts] runs the multi-host rollout — unless an explicit
+    // --host override pins it to a single host (the existing single-host path).
+    let multi_host = config.hosts.is_some() && host.is_none();
+
     if dry_run {
+        if multi_host {
+            let summary = factory::summarize_multi_host(&config, app_version)?;
+            return Ok(CommandOutput {
+                exit_code: 0,
+                pretty: render_multi_host_summary(&summary, &report),
+                json: serde_json::to_value(&summary)?,
+            });
+        }
         let summary = factory::summarize(&config, host, app_version)?;
         return Ok(CommandOutput {
             exit_code: 0,
@@ -269,9 +330,14 @@ pub(crate) async fn deploy(
         });
     }
 
-    let resolved = factory::build(&config, host, app_version)?;
     let store = FilesystemStateStore::new(state_dir)
         .with_context(|| format!("opening state store at {}", state_dir.display()))?;
+
+    if multi_host {
+        return run_multi_host(&config, store, app_version, &report).await;
+    }
+
+    let resolved = factory::build(&config, host, app_version)?;
     let plan = SingleHostDeploy::builder(
         resolved.fraise.clone(),
         resolved.environment.clone(),
@@ -286,7 +352,59 @@ pub(crate) async fn deploy(
     .build()?;
 
     let outcome = plan.run(store).await?;
-    let (exit_code, label, detail) = match &outcome {
+    let (exit_code, label, detail) = outcome_result(&outcome);
+    Ok(CommandOutput {
+        exit_code,
+        pretty: format!(
+            "deploy of {}/{} {label}{detail}\n",
+            resolved.fraise, resolved.environment
+        ),
+        json: json!({ "outcome": label, "detail": detail.trim() }),
+    })
+}
+
+/// Build and run the multi-host rollout, mapping its outcome onto a
+/// [`CommandOutput`]. Any validation warnings (e.g. the artifact-locality caveat)
+/// are surfaced above the result so the operator sees them on a live deploy.
+async fn run_multi_host(
+    config: &DeployConfig,
+    store: FilesystemStateStore,
+    app_version: Option<&str>,
+    report: &ValidationReport,
+) -> Result<CommandOutput> {
+    let resolved = factory::build_multi_host(config, app_version)?;
+    let deploy = MultiHostDeploy::builder(
+        resolved.fraise.clone(),
+        resolved.environment.clone(),
+        resolved.plan,
+    )
+    .context(resolved.ctx)
+    .forward_compatible_lint(resolved.forward_compatible_lint)
+    .artifact(resolved.artifact)
+    .migration(resolved.migration)
+    .service(resolved.service)
+    .health(resolved.health)
+    .lb(resolved.lb)
+    .build()?;
+
+    let outcome = deploy.run(store).await?;
+    let (exit_code, label, detail) = outcome_result(&outcome);
+    let mut pretty = render_warnings(report);
+    let _ = writeln!(
+        pretty,
+        "multi-host deploy of {}/{} {label}{detail}",
+        resolved.fraise, resolved.environment
+    );
+    Ok(CommandOutput {
+        exit_code,
+        pretty,
+        json: json!({ "outcome": label, "detail": detail.trim(), "multi_host": true }),
+    })
+}
+
+/// Map a saga outcome onto `(exit code, label, detail)` for both deploy paths.
+fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
+    match outcome {
         SagaOutcome::Committed => (0, "committed", String::new()),
         SagaOutcome::RolledBack {
             failed_step,
@@ -298,15 +416,7 @@ pub(crate) async fn deploy(
         ),
         SagaOutcome::PartialRollback { reason } => (2, "partial_rollback", format!(" ({reason})")),
         _ => (1, "unknown", String::new()),
-    };
-    Ok(CommandOutput {
-        exit_code,
-        pretty: format!(
-            "deploy of {}/{} {label}{detail}\n",
-            resolved.fraise, resolved.environment
-        ),
-        json: json!({ "outcome": label, "detail": detail.trim() }),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -452,5 +562,88 @@ url = "http://127.0.0.1:8080/health"
         assert_eq!(out.exit_code, 0);
         assert_eq!(out.json["fraise"], serde_json::json!("checkout"));
         assert!(out.pretty.contains("Committed"), "pretty: {}", out.pretty);
+    }
+
+    const MULTI_HOST: &str = r#"
+[deploy]
+name = "checkout"
+environment = "production"
+
+[hosts]
+strategy = "rolling"
+rolling_batch_size = 1
+inventory = [
+  { name = "web-1", address = "web1.internal" },
+  { name = "web-2", address = "web2.internal" },
+]
+
+[ssh]
+user = "deploy"
+options = ["StrictHostKeyChecking=no"]
+
+[artifact]
+source = "release"
+release_url = "https://example.com/checkout-{version}.tar.gz"
+checksum_url = "https://example.com/checkout-{version}.tar.gz.sha256"
+
+[migration]
+adapter = "confiture"
+database_url_env = "CHECKOUT_DATABASE_URL"
+
+[service]
+adapter = "systemd"
+unit = "checkout.service"
+
+[health]
+adapter = "http"
+url = "http://127.0.0.1:8080/health"
+
+[lb]
+adapter = "nginx"
+config_path = "/etc/nginx/sites-available/checkout"
+upstream = "checkout_upstream"
+"#;
+
+    #[tokio::test]
+    async fn deploy_dry_run_renders_the_multi_host_plan_and_warnings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", MULTI_HOST);
+        let state = dir.path().join("state");
+        // No --host override: [hosts] selects the multi-host path.
+        let out = deploy(&config, &state, None, Some("1.2.3"), true)
+            .await
+            .expect("multi-host dry run");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert_eq!(out.json["strategy"], serde_json::json!("rolling(1)"));
+        assert_eq!(out.json["lb"], serde_json::json!("nginx"));
+        assert_eq!(out.json["hosts"].as_array().expect("hosts").len(), 2);
+        assert!(
+            out.json["transport"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ssh"),
+            "transport: {}",
+            out.json["transport"]
+        );
+        // The artifact-locality caveat is surfaced to the operator.
+        assert!(
+            out.pretty.contains("stages on the host running fraisier"),
+            "warning shown: {}",
+            out.pretty
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_with_host_override_takes_the_single_host_path() {
+        // --host pins even a [hosts] config to a single host (the summary has a
+        // `host` field; the multi-host summary does not).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", MULTI_HOST);
+        let state = dir.path().join("state");
+        let out = deploy(&config, &state, Some("web1.internal"), Some("1.2.3"), true)
+            .await
+            .expect("single-host dry run");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert_eq!(out.json["host"], serde_json::json!("web1.internal"));
     }
 }

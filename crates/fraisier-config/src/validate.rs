@@ -341,6 +341,35 @@ fn validate_hosts(cfg: &DeployConfig, report: &mut ValidationReport) {
             format!("unknown strategy '{other}' (expected: rolling, all-at-once)"),
         ),
     }
+
+    warn_local_only_axes(cfg, report);
+}
+
+/// In a multi-host deploy the service axis runs on each host over SSH, but the
+/// artifact and load-balancer axes still do local-filesystem work (the release
+/// adapter stages + symlinks locally; the nginx adapter edits a local config).
+/// Warn so the operator knows those axes act where fraisier runs — full remote
+/// artifact staging is an experimental follow-up, not yet wired.
+fn warn_local_only_axes(cfg: &DeployConfig, report: &mut ValidationReport) {
+    if let Some(source) = cfg.artifact.as_ref().and_then(|a| a.source.as_deref()) {
+        if matches!(source, "release" | "local") {
+            report.warn(
+                "artifact.source",
+                format!(
+                    "multi-host: the '{source}' artifact adapter stages on the host running \
+                     fraisier, not on each remote host — remote artifact staging is not yet \
+                     implemented (multi-host is experimental)"
+                ),
+            );
+        }
+    }
+    if cfg.lb.as_ref().and_then(|lb| lb.adapter.as_deref()) == Some("nginx") {
+        report.warn(
+            "lb.adapter",
+            "multi-host: the nginx adapter edits its config where fraisier runs, so the load \
+             balancer must run on that host (a remote-LB topology is not yet wired)",
+        );
+    }
 }
 
 fn validate_rolling(hosts: &crate::schema::HostsSection, report: &mut ValidationReport) {

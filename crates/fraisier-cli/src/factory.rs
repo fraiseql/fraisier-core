@@ -18,10 +18,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{bail, Context as _, Result};
+use fraisier_adapter_support::{SshTransport, Transport};
 use fraisier_config::DeployConfig;
 use fraisier_core::adapter_axes::{
-    AdapterCtx, ArtifactAdapter, HealthAdapter, HostId, MigrationAdapter, ServiceAdapter,
+    AdapterCtx, ArtifactAdapter, HealthAdapter, HostId, LbAdapter, MigrationAdapter, ServiceAdapter,
 };
+use fraisier_core::multi_host::{MultiHostPlan, RolloutStrategy};
 use serde_json::Value;
 
 /// The logical secret name every migration adapter resolves the DSN under.
@@ -74,19 +76,20 @@ pub struct ResolvedDeploy {
     pub health: Arc<dyn HealthAdapter>,
 }
 
-/// Resolve the single host the deploy targets.
+/// Resolve the single host the **single-host** builders target.
 ///
 /// # Errors
-/// Fails if the config is multi-host and no explicit `host` override was given —
-/// multi-host execution is Phase 4.
+/// Fails if the config declares `[hosts]` (multi-host) and no explicit `host`
+/// override was given — the caller should take the multi-host path
+/// ([`build_multi_host`]) instead, or pass `--host` to target one host directly.
 pub fn resolve_host(config: &DeployConfig, host_override: Option<&str>) -> Result<HostId> {
     if let Some(host) = host_override {
         return Ok(HostId::new(host));
     }
     if config.hosts.is_some() {
         bail!(
-            "this config declares [hosts] (multi-host); multi-host deploy is not implemented \
-             until Phase 4. Pass --host <address> to deploy a single host."
+            "this config declares [hosts] (multi-host); deploy it with the multi-host rollout \
+             (no --host), or pass --host <address> to target a single host of the inventory."
         );
     }
     Ok(HostId::new("localhost"))
@@ -146,7 +149,36 @@ fn settings_map(config: &DeployConfig, app_version: Option<&str>) -> BTreeMap<St
             Value::from(config.health_expected_status()),
         );
     }
+    if let Some(lb) = &config.lb {
+        put_path(&mut settings, "config_path", lb.config_path.as_deref());
+        put_str(&mut settings, "upstream", lb.upstream.as_deref());
+    }
     settings
+}
+
+/// Build the host-execution transport for a deploy: a remote `ssh` transport for
+/// a multi-host config (from the optional `[ssh]` section), or [`Transport::Local`]
+/// for a single-host one — so a single-host deploy is byte-identical to before.
+fn build_transport(config: &DeployConfig) -> Transport {
+    if config.hosts.is_none() {
+        return Transport::Local;
+    }
+    let mut ssh = SshTransport::new();
+    if let Some(cfg) = &config.ssh {
+        if let Some(user) = &cfg.user {
+            ssh = ssh.with_user(user.clone());
+        }
+        if let Some(port) = cfg.port {
+            ssh = ssh.with_port(port);
+        }
+        if let Some(identity) = &cfg.identity_path {
+            ssh = ssh.with_identity(identity.clone());
+        }
+        if !cfg.options.is_empty() {
+            ssh = ssh.with_options(cfg.options.clone());
+        }
+    }
+    Transport::ssh(ssh)
 }
 
 fn put_str(map: &mut BTreeMap<String, Value>, key: &str, value: Option<&str>) {
@@ -225,7 +257,7 @@ pub fn build(
     let settings = settings_map(config, app_version);
 
     let artifact = build_artifact(config)?;
-    let service = build_service(config)?;
+    let service = build_service(config, &build_transport(config))?;
     let health = build_health(config)?;
 
     let database_url_env = config
@@ -266,6 +298,184 @@ pub fn build(
     })
 }
 
+/// The fully-built inputs for a [`fraisier_core::multi_host::MultiHostDeploy`].
+pub struct ResolvedMultiHost {
+    /// The fraise (deployable) name.
+    pub fraise: String,
+    /// The target environment.
+    pub environment: String,
+    /// The inventory + rollout strategy resolved from `[hosts]`.
+    pub plan: MultiHostPlan,
+    /// The shared adapter context (host set per-host by the composition).
+    pub ctx: AdapterCtx,
+    /// Whether to run the forward-compatibility preflight lint.
+    pub forward_compatible_lint: bool,
+    /// The artifact adapter.
+    pub artifact: Arc<dyn ArtifactAdapter>,
+    /// The migration adapter (run once on the orchestrator).
+    pub migration: Arc<dyn MigrationAdapter>,
+    /// The service adapter (runs on each host over the transport).
+    pub service: Arc<dyn ServiceAdapter>,
+    /// The health adapter.
+    pub health: Arc<dyn HealthAdapter>,
+    /// The load-balancer adapter.
+    pub lb: Arc<dyn LbAdapter>,
+}
+
+/// Build the concrete adapters + plan for a **multi-host** deploy.
+///
+/// The service axis is bound to the SSH transport (from `[ssh]`) so it runs on
+/// each remote host; the migration runs once on the orchestrator (so the DSN
+/// secret stays local). The artifact and load-balancer axes are still local —
+/// the config validation warns about this.
+///
+/// # Errors
+/// Fails if `[hosts]`/`[deploy]` is missing or incomplete, an adapter name is
+/// unsupported, or (IPC migration) the configured DSN env var is unset.
+pub fn build_multi_host(
+    config: &DeployConfig,
+    app_version: Option<&str>,
+) -> Result<ResolvedMultiHost> {
+    let deploy = config.deploy.as_ref().context("missing [deploy] section")?;
+    let fraise = deploy.name.clone().context("[deploy].name is required")?;
+    let environment = deploy
+        .environment
+        .clone()
+        .context("[deploy].environment is required")?;
+    let inventory = config
+        .host_inventory()
+        .context("a multi-host deploy requires a [hosts] inventory")?;
+    let strategy = config
+        .rollout_strategy()
+        .unwrap_or(RolloutStrategy::Rolling(1));
+    let plan = MultiHostPlan::new(inventory, strategy);
+
+    let transport = build_transport(config);
+    let settings = settings_map(config, app_version);
+
+    let artifact = build_artifact(config)?;
+    let service = build_service(config, &transport)?;
+    let health = build_health(config)?;
+    let lb = build_lb(config)?;
+
+    let database_url_env = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.database_url_env.clone());
+    let mut env_secrets = BTreeMap::new();
+    let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
+
+    let forward_compatible_lint = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.forward_compatible_lint)
+        .unwrap_or(true);
+
+    // The host is set per-host by the multi-host composition; leave it None here.
+    let mut ctx = AdapterCtx::new(fraise.clone(), environment.clone());
+    ctx.workdir = PathBuf::from(".");
+    ctx.migrations_path = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.migrations_path.clone());
+    ctx.env_secrets = env_secrets;
+    ctx.settings = settings;
+
+    Ok(ResolvedMultiHost {
+        fraise,
+        environment,
+        plan,
+        ctx,
+        forward_compatible_lint,
+        artifact,
+        migration,
+        service,
+        health,
+        lb,
+    })
+}
+
+/// A read-only summary of a multi-host deploy — what `--dry-run` prints. Building
+/// it resolves no secrets and constructs no adapters.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MultiHostSummary {
+    /// The fraise (deployable) name.
+    pub fraise: String,
+    /// The target environment.
+    pub environment: String,
+    /// Each host rendered as `name (address)`, in rollout order.
+    pub hosts: Vec<String>,
+    /// The rollout strategy, rendered (e.g. `rolling(1)`).
+    pub strategy: String,
+    /// How the per-host commands reach each host (`ssh [user@]` or `local`).
+    pub transport: String,
+    /// The selected artifact adapter.
+    pub artifact: String,
+    /// The selected migration adapter.
+    pub migration: String,
+    /// The selected service adapter.
+    pub service: String,
+    /// The selected health adapter.
+    pub health: String,
+    /// The selected load-balancer adapter.
+    pub lb: String,
+}
+
+/// Build the read-only multi-host plan summary (no secrets, no adapters built).
+///
+/// # Errors
+/// Fails if `[deploy]`/`[hosts]` is missing or incomplete.
+pub fn summarize_multi_host(
+    config: &DeployConfig,
+    app_version: Option<&str>,
+) -> Result<MultiHostSummary> {
+    let deploy = config.deploy.as_ref();
+    let inventory = config
+        .host_inventory()
+        .context("a multi-host deploy requires a [hosts] inventory")?;
+    let hosts = inventory
+        .hosts()
+        .iter()
+        .map(|h| format!("{} ({})", h.host, h.address))
+        .collect();
+    let strategy = match config
+        .rollout_strategy()
+        .unwrap_or(RolloutStrategy::Rolling(1))
+    {
+        RolloutStrategy::AllAtOnce => "all-at-once".to_owned(),
+        RolloutStrategy::Rolling(n) => format!("rolling({n})"),
+        _ => "rolling(1)".to_owned(),
+    };
+    let transport = match build_transport(config) {
+        Transport::Local => "local".to_owned(),
+        Transport::Ssh(_) => config
+            .ssh
+            .as_ref()
+            .and_then(|s| s.user.clone())
+            .map_or_else(
+                || "ssh (<host>)".to_owned(),
+                |user| format!("ssh ({user}@<host>)"),
+            ),
+    };
+    let _ = app_version;
+    Ok(MultiHostSummary {
+        fraise: deploy
+            .and_then(|d| d.name.clone())
+            .unwrap_or_else(|| "<none>".to_owned()),
+        environment: deploy
+            .and_then(|d| d.environment.clone())
+            .unwrap_or_else(|| "<none>".to_owned()),
+        hosts,
+        strategy,
+        transport,
+        artifact: axis_name(config.artifact.as_ref().and_then(|a| a.source.as_deref())),
+        migration: render_migration(config),
+        service: axis_name(config.service.as_ref().and_then(|s| s.adapter.as_deref())),
+        health: axis_name(config.health.as_ref().and_then(|h| h.adapter.as_deref())),
+        lb: axis_name(config.lb.as_ref().and_then(|l| l.adapter.as_deref())),
+    })
+}
+
 fn build_artifact(config: &DeployConfig) -> Result<Arc<dyn ArtifactAdapter>> {
     match config.artifact.as_ref().and_then(|a| a.source.as_deref()) {
         Some("release") => Ok(Arc::new(fraisier_artifact_release::ReleaseArtifact::new())),
@@ -277,18 +487,35 @@ fn build_artifact(config: &DeployConfig) -> Result<Arc<dyn ArtifactAdapter>> {
     }
 }
 
-fn build_service(config: &DeployConfig) -> Result<Arc<dyn ServiceAdapter>> {
+fn build_service(config: &DeployConfig, transport: &Transport) -> Result<Arc<dyn ServiceAdapter>> {
     match config.service.as_ref().and_then(|s| s.adapter.as_deref()) {
-        Some("systemd") => Ok(Arc::new(fraisier_adapter_systemd::SystemdService::new())),
-        Some("rc") => Ok(Arc::new(fraisier_adapter_rc::RcService::new())),
+        Some("systemd") => Ok(Arc::new(
+            fraisier_adapter_systemd::SystemdService::new().with_transport(transport.clone()),
+        )),
+        Some("rc") => Ok(Arc::new(
+            fraisier_adapter_rc::RcService::new().with_transport(transport.clone()),
+        )),
         Some("docker-compose") => Ok(Arc::new(
-            fraisier_adapter_docker_compose::DockerComposeService::new(),
+            fraisier_adapter_docker_compose::DockerComposeService::new()
+                .with_transport(transport.clone()),
         )),
         Some(other) => bail!(
             "service adapter '{other}' is not available in this build \
              (built-in: 'systemd', 'rc', 'docker-compose')"
         ),
         None => bail!("[service].adapter is required"),
+    }
+}
+
+fn build_lb(config: &DeployConfig) -> Result<Arc<dyn LbAdapter>> {
+    match config.lb.as_ref().and_then(|l| l.adapter.as_deref()) {
+        Some("nginx") => Ok(Arc::new(fraisier_adapter_nginx::NginxLb::new())),
+        Some(other) => bail!(
+            "load-balancer adapter '{other}' is not available in this build (only 'nginx' ships)"
+        ),
+        None => {
+            bail!("a multi-host deploy requires an [lb] adapter (the rollout drains/reattaches)")
+        }
     }
 }
 

@@ -110,6 +110,7 @@ impl SpecqlPreset {
                 expected_status: Some(DEFAULT_EXPECTED_STATUS),
             }),
             lb: multi_host.then(|| Self::lb_defaults(name.as_deref())),
+            ssh: None,
             specql: None,
         }
     }
@@ -288,6 +289,8 @@ impl DeployConfig {
             service: base.service.overlay(self.service),
             health: base.health.overlay(self.health),
             lb: base.lb.overlay(self.lb),
+            // The SpecQL preset never emits [ssh]; an author-supplied one wins.
+            ssh: prefer(base.ssh, self.ssh),
             specql: None,
         }
     }

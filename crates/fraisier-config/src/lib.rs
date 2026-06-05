@@ -73,7 +73,7 @@ pub use error::ConfigError;
 pub use preset::SpecqlPreset;
 pub use schema::{
     ArtifactSection, DeployConfig, DeploySection, HealthSection, HostSpec, HostsSection, LbSection,
-    MigrationSection, ServiceSection,
+    MigrationSection, ServiceSection, SshSection,
 };
 pub use validate::{ValidationIssue, ValidationReport};
 

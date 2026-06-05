@@ -1,0 +1,33 @@
+[package]
+name = "fraisier-adapter-release"
+description = "First-party fraisier artifact IPC adapter: serves the JSON-RPC-over-stdio adapter protocol backed by the in-process release adapter (HTTP download + sha256 + symlink swap), run locally or on a host over ssh."
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "fraisier-adapter-release"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+fraisier-core = { path = "../fraisier-core", version = "1.0.0-alpha.1" }
+fraisier-artifact-release = { path = "../fraisier-artifact-release", version = "1.0.0-alpha.1" }
+fraisier-ipc = { path = "../fraisier-ipc", version = "1.0.0-alpha.1" }
+serde = "1.0.228"
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["macros", "rt"] }
+
+[dev-dependencies]
+sha2 = "0.10.9"
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }

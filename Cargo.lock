@@ -512,6 +512,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fraisier-adapter-release"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "fraisier-artifact-release",
+ "fraisier-core",
+ "fraisier-ipc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "fraisier-adapter-support"
 version = "1.0.0-alpha.1"
 dependencies = [

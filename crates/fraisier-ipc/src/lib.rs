@@ -28,6 +28,7 @@ mod client;
 mod framing;
 mod launcher;
 mod protocol;
+pub mod server;
 
 pub use adapter::IpcMigrationAdapter;
 pub use artifact::IpcArtifactAdapter;

@@ -1,11 +1,23 @@
-# Fraisier migration adapter IPC protocol
+# Fraisier adapter IPC protocol
 
 **Protocol version:** 1
 
 This is the contract a `fraisier-adapter-<name>` binary implements, in any
-language. Fraisier discovers the binary on `PATH` (selected by
-`migration.adapter = "<name>"`), spawns it as a child process, and exchanges one
-JSON-RPC 2.0 request/response per call over the child's stdin/stdout.
+language. Fraisier spawns it as a child process and exchanges one JSON-RPC 2.0
+request/response per call over the child's stdin/stdout.
+
+The protocol is **axis-generic**: each method name is a trait method of one of the
+adapter axes (migration, artifact, …), `params` carry its (serializable) arguments,
+and `result` is its (serializable) return value (the convergence rule). The
+**migration** axis is selected by `migration.adapter = "<name>"` and the binary is
+discovered on `PATH`. The **artifact** axis is selected by
+`artifact.source = "release-ipc"` (or a configured `adapter_bin`); a first-party
+example is [`fraisier-adapter-release`](../fraisier-adapter-release).
+
+The same binary runs either **on the orchestrator** (launched locally) or **on a
+target host** (launched as `ssh <host> -- <binary>`, the framed JSON-RPC flowing
+through ssh's stdio) — the adapter logic is identical; only the launch location
+changes.
 
 ## Framing
 
@@ -84,6 +96,24 @@ is the real secret. The adapter reads, e.g., `DATABASE_URL` from its environment
 | `post_migrate` | — | `null` | optional |
 
 `MigrationOutcome` = `{ from: string|null, to: string|null, applied: [string], log: string }`.
+
+### Artifact axis methods
+
+When the binary backs the **artifact** axis, it implements the `ArtifactAdapter`
+methods instead. Each per-host method carries `params.ctx` (the artifact config is
+in `ctx.settings`: `version`, `release_url`, `sha256`/`checksum_url`, `staging_dir`,
+`active_path`) and `params.host`:
+
+| Method | `params` (besides `ctx`) | `result` |
+|---|---|---|
+| `describe` | *(none)* | `{ name, version, protocol_version, capabilities: ["stage","activate","current"] }` |
+| `stage` | `host: string` | `StagedArtifact` |
+| `activate` | `host: string`, `staged: StagedArtifact` | `null` |
+| `current` | `host: string` | `ArtifactRef \| null` |
+
+`ArtifactRef` = `{ id: string, checksum: string|null }`;
+`StagedArtifact` = `{ artifact: ArtifactRef, path: string }`. No secret crosses the
+wire (the artifact axis needs none); a remote (ssh-launched) adapter carries no env.
 
 ### Optional methods and capabilities
 

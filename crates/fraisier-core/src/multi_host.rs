@@ -333,6 +333,7 @@ impl MultiHostDeploy {
         {
             saga = saga.with_step(shared.rollout_step(index + 1, batch));
         }
+        saga = saga.with_step(shared.step(StepKind::Verify));
 
         let outcome = shared.finalize(saga.run().await?);
 
@@ -548,6 +549,7 @@ enum StepKind {
         name: String,
         batch: Vec<HostEntry>,
     },
+    Verify,
 }
 
 impl StepKind {
@@ -558,6 +560,7 @@ impl StepKind {
             Self::Fetch => "fetch",
             Self::Migrate => "migrate",
             Self::Rollout { name, .. } => name,
+            Self::Verify => "verify",
         }
     }
 }
@@ -810,6 +813,64 @@ impl RolloutShared {
         }
     }
 
+    /// `VerifyGlobal` (PRD §5.3): once every host has advanced and passed its local
+    /// health check, confirm the deploy as a whole. Two gates, in order:
+    ///
+    /// 1. the migration adapter's post-apply `verify` (its SQL hooks), run **once**
+    ///    against the shared database; and
+    /// 2. a fleet smoke test — re-probe every host's health in parallel, now that
+    ///    the *entire* fleet is on the new release. This catches a regression that
+    ///    only shows once all hosts have advanced (which the per-host rollout checks
+    ///    cannot see). Point the health adapter's URL at the load balancer to make
+    ///    this an across-LB check.
+    ///
+    /// A failure in either gate fails the step, so the saga rolls the whole deploy
+    /// back exactly as a host health failure would.
+    async fn run_verify(&self) -> Result<(), SagaError> {
+        let report = self
+            .migration
+            .verify(&self.ctx)
+            .await
+            .map_err(|e| Self::failed("verify", &e))?;
+        if !report.ok {
+            let failed = report.checks.iter().filter(|check| !check.ok).count();
+            return Err(SagaError::StepFailed {
+                step: "verify".to_owned(),
+                message: format!("post-migration verify failed {failed} check(s)"),
+            });
+        }
+
+        let probes = self.inventory.iter().map(|entry| {
+            let ctx = self.host_ctx(entry);
+            async move {
+                match self.health.check(&ctx, &entry.host).await {
+                    Ok(status) if status.healthy => Ok(()),
+                    Ok(status) => {
+                        let detail = status.detail.map(|d| format!(" ({d})")).unwrap_or_default();
+                        Err(format!("{} unhealthy{detail}", entry.host))
+                    }
+                    Err(e) => Err(format!("{}: {e}", entry.host)),
+                }
+            }
+        });
+        let unhealthy: Vec<String> = futures::future::join_all(probes)
+            .await
+            .into_iter()
+            .filter_map(Result::err)
+            .collect();
+        if unhealthy.is_empty() {
+            return Ok(());
+        }
+        Err(SagaError::StepFailed {
+            step: "verify".to_owned(),
+            message: format!(
+                "global verify found {} unhealthy host(s): {}",
+                unhealthy.len(),
+                unhealthy.join("; ")
+            ),
+        })
+    }
+
     /// Advance one batch: every host through `drain → activate → restart → health
     /// → reattach`, concurrently. If any host fails, this batch's own hosts are
     /// restored before the failure is surfaced (the saga then rolls back the
@@ -1003,14 +1064,16 @@ impl Step for RolloutStep {
             StepKind::Fetch => self.shared.run_fetch().await,
             StepKind::Migrate => self.shared.run_migrate().await,
             StepKind::Rollout { batch, .. } => self.shared.run_rollout(batch).await,
+            StepKind::Verify => self.shared.run_verify().await,
         }
     }
 
     async fn compensate(&self, _ctx: &StepContext) -> Result<(), SagaError> {
         match &self.kind {
-            // Preflight and fetch are non-mutating (a reachability probe, an
-            // artifact staged but never activated), so they have nothing to undo.
-            StepKind::Preflight | StepKind::Fetch => Ok(()),
+            // Preflight, fetch, and verify are non-mutating (a reachability probe,
+            // an artifact staged but never activated, a read-only smoke test), so
+            // they have nothing to undo.
+            StepKind::Preflight | StepKind::Fetch | StepKind::Verify => Ok(()),
             StepKind::Migrate => self.shared.undo_migrate().await,
             StepKind::Rollout { batch, .. } => self.shared.restore_batch(batch).await,
         }
@@ -1027,7 +1090,7 @@ mod tests {
         AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, ArtifactAdapter,
         ArtifactRef, HealthAdapter, HealthStatus, HostId, LbAdapter, LbMembership, LbState,
         MigrationAdapter, MigrationOutcome, PreflightIssue, PreflightReport, Revision,
-        ServiceAdapter, ServiceStatus, Severity, StagedArtifact, VerifyReport,
+        ServiceAdapter, ServiceStatus, Severity, StagedArtifact, VerifyCheck, VerifyReport,
     };
     use async_trait::async_trait;
     use fraisier_saga::saga::SagaOutcome;
@@ -1078,6 +1141,8 @@ mod tests {
         /// the new release's restart but lets a rollback restart succeed; a larger
         /// value also fails the rollback restart (forcing `PartialRollback`).
         restart_fail: BTreeMap<String, usize>,
+        /// Whether the post-migration `verify` reports a failing check.
+        verify_fail: bool,
     }
 
     impl Faults {
@@ -1194,11 +1259,24 @@ mod tests {
             Ok(MigrationOutcome::default())
         }
 
-        async fn verify(&self, _ctx: &AdapterCtx) -> Result<VerifyReport, AdapterError> {
+        async fn verify(&self, ctx: &AdapterCtx) -> Result<VerifyReport, AdapterError> {
             log(&self.trail, "verify");
+            assert!(
+                ctx.host.is_none(),
+                "global verify runs against the shared DB"
+            );
+            let checks = if self.faults.verify_fail {
+                vec![VerifyCheck {
+                    name: "row count".to_owned(),
+                    ok: false,
+                    detail: Some("expected 3 rows, found 0".to_owned()),
+                }]
+            } else {
+                Vec::new()
+            };
             Ok(VerifyReport {
-                ok: true,
-                checks: Vec::new(),
+                ok: !self.faults.verify_fail,
+                checks,
             })
         }
 
@@ -1833,5 +1911,73 @@ mod tests {
             !trail.iter().any(|e| e == "drain:web-2"),
             "later hosts never started: {trail:?}"
         );
+    }
+
+    // ----- Cycle 4.4: VerifyGlobal -----------------------------------------------
+
+    #[tokio::test]
+    async fn global_verify_runs_once_after_the_rollout_and_reprobes_the_fleet() {
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let faults = Arc::new(Faults::default());
+        let plan = deploy(&trail, &faults, RolloutStrategy::Rolling(1));
+
+        let outcome = plan.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+
+        let trail = drain_trail(&trail);
+        // The post-migration verify runs exactly once, after the whole rollout.
+        assert_eq!(count(&trail, "verify"), 1, "{trail:?}");
+        assert!(
+            pos(&trail, "verify") > pos(&trail, "reattach:web-3"),
+            "verify runs after every host advanced: {trail:?}"
+        );
+        // The fleet smoke test re-probes every host once more (so each host is
+        // health-checked twice: once on reattach, once in the global verify).
+        for name in ["web-1", "web-2", "web-3"] {
+            assert_eq!(
+                count(&trail, &format!("check:{name}")),
+                2,
+                "host {name} probed in rollout and again in verify: {trail:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_failure_triggers_a_full_rollback() {
+        // Every host advances and passes its local health check, but the
+        // post-migration verify fails: the whole deploy rolls back — all hosts
+        // restored in reverse, then the migration once.
+        let (_dir, store) = store();
+        seed_prior(&store).await;
+        let trail = Trail::default();
+        let faults = Arc::new(Faults {
+            verify_fail: true,
+            ..Faults::default()
+        });
+        let plan = deploy(&trail, &faults, RolloutStrategy::Rolling(1));
+
+        let outcome = plan.run(store).await.expect("run completes with rollback");
+        assert!(
+            matches!(&outcome, SagaOutcome::RolledBack { failed_step, .. } if failed_step == "verify"),
+            "got {outcome:?}"
+        );
+        let trail = drain_trail(&trail);
+        assert_eq!(
+            count(&trail, "down_to:rev-prev"),
+            1,
+            "DB rolled back once: {trail:?}"
+        );
+        assert!(contains_all(
+            &trail,
+            &[
+                "activate:web-1:v-old",
+                "activate:web-2:v-old",
+                "activate:web-3:v-old"
+            ]
+        ));
+        // Reverse host order (the last-advanced host restores first), DB last.
+        assert!(pos(&trail, "activate:web-3:v-old") < pos(&trail, "activate:web-1:v-old"));
+        assert!(pos(&trail, "activate:web-1:v-old") < pos(&trail, "down_to:rev-prev"));
     }
 }

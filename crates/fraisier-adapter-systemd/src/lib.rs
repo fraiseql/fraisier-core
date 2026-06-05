@@ -17,15 +17,15 @@
 //!
 //! ## Locality
 //!
-//! Phase 1 runs `systemctl` on the **local** host; the `host` argument is
-//! reserved for the Phase 3+ SSH dispatch layer, which will run the same
-//! commands on a remote host. The adapter never assumes privilege — escalation
-//! (sudo, polkit) is the operator's concern.
+//! By default `systemctl` runs on the **local** host. Build the adapter with
+//! [`SystemdService::with_transport`] and a [`Transport::Ssh`] to run it on a
+//! remote host instead (the multi-host rollout does this per host). The adapter
+//! never assumes privilege — escalation (sudo, polkit) is the operator's concern.
 
 use std::ffi::OsString;
 
 use async_trait::async_trait;
-use fraisier_adapter_support::{error, run_command, Captured};
+use fraisier_adapter_support::{error, Captured, Transport};
 use fraisier_core::adapter_axes::{
     AdapterCtx, AdapterError, AdapterErrorKind, HostId, ServiceAdapter, ServiceStatus,
 };
@@ -52,6 +52,7 @@ const ACTIVE: &str = "active";
 /// ```
 pub struct SystemdService {
     program: OsString,
+    transport: Transport,
 }
 
 impl Default for SystemdService {
@@ -62,13 +63,16 @@ impl Default for SystemdService {
 
 impl SystemdService {
     /// Create an adapter that spawns `systemctl` (honouring the
-    /// `FRAISIER_SYSTEMCTL_BIN` override).
+    /// `FRAISIER_SYSTEMCTL_BIN` override) on the **local** host.
     #[must_use]
     pub fn new() -> Self {
         let program = std::env::var_os(PROGRAM_ENV)
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| OsString::from("systemctl"));
-        Self { program }
+        Self {
+            program,
+            transport: Transport::Local,
+        }
     }
 
     /// Create an adapter that spawns the binary at `program`.
@@ -76,7 +80,16 @@ impl SystemdService {
     pub fn with_program(program: impl Into<OsString>) -> Self {
         Self {
             program: program.into(),
+            transport: Transport::Local,
         }
+    }
+
+    /// Run `systemctl` over `transport` instead of locally — the multi-host path
+    /// passes an [`Transport::Ssh`] so the unit is managed on each remote host.
+    #[must_use]
+    pub fn with_transport(mut self, transport: Transport) -> Self {
+        self.transport = transport;
+        self
     }
 
     /// Build the argv for a `systemctl` `verb` against the configured unit:
@@ -117,7 +130,17 @@ impl SystemdService {
         operation: &str,
     ) -> Result<Captured, AdapterError> {
         let args = Self::args_for(ctx, verb, operation)?;
-        run_command(&self.program, &args, &[], None, ADAPTER_NAME, operation).await
+        self.transport
+            .run(
+                ctx,
+                &self.program,
+                &args,
+                &[],
+                None,
+                ADAPTER_NAME,
+                operation,
+            )
+            .await
     }
 }
 

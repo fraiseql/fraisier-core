@@ -31,14 +31,15 @@
 //!
 //! ## Locality
 //!
-//! Phase 1/2 run `docker` on the **local** host; the `host` argument is reserved
-//! for the Phase 3+ SSH dispatch layer.
+//! By default `docker` runs on the **local** host; build with
+//! [`DockerComposeService::with_transport`] and a [`Transport::Ssh`] to run it on
+//! a remote host (the multi-host rollout does this per host).
 
 use std::ffi::OsString;
 use std::path::Path;
 
 use async_trait::async_trait;
-use fraisier_adapter_support::{error, run_command, Captured};
+use fraisier_adapter_support::{error, Captured, Transport};
 use fraisier_core::adapter_axes::{
     AdapterCtx, AdapterError, AdapterErrorKind, HostId, ServiceAdapter, ServiceStatus,
 };
@@ -65,6 +66,7 @@ pub struct DockerComposeService {
     /// Whether to prepend the `compose` subcommand (v2). `false` for the v1
     /// `docker-compose` standalone binary.
     compose_subcommand: bool,
+    transport: Transport,
 }
 
 impl Default for DockerComposeService {
@@ -83,6 +85,7 @@ impl DockerComposeService {
             _ => Self {
                 program: OsString::from("docker"),
                 compose_subcommand: true,
+                transport: Transport::Local,
             },
         }
     }
@@ -100,7 +103,16 @@ impl DockerComposeService {
         Self {
             program,
             compose_subcommand: !is_v1,
+            transport: Transport::Local,
         }
+    }
+
+    /// Run `docker` over `transport` instead of locally (the multi-host path
+    /// passes a [`Transport::Ssh`] to manage the service on each remote host).
+    #[must_use]
+    pub fn with_transport(mut self, transport: Transport) -> Self {
+        self.transport = transport;
+        self
     }
 
     /// Build the argv for a Compose invocation:
@@ -141,7 +153,17 @@ impl DockerComposeService {
         operation: &str,
     ) -> Result<Captured, AdapterError> {
         let args = Self::compose_args(ctx, self.compose_subcommand, tail, operation)?;
-        run_command(&self.program, &args, &[], None, ADAPTER_NAME, operation).await
+        self.transport
+            .run(
+                ctx,
+                &self.program,
+                &args,
+                &[],
+                None,
+                ADAPTER_NAME,
+                operation,
+            )
+            .await
     }
 }
 

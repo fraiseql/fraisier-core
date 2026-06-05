@@ -24,14 +24,15 @@
 //!
 //! ## Locality
 //!
-//! Phase 1/2 run `service` on the **local** host; the `host` argument is reserved
-//! for the Phase 3+ SSH dispatch layer. The adapter never assumes privilege —
-//! escalation (sudo) is the operator's concern.
+//! By default `service` runs on the **local** host; build with
+//! [`RcService::with_transport`] and a [`Transport::Ssh`] to run it on a remote
+//! host (the multi-host rollout does this per host). The adapter never assumes
+//! privilege — escalation (sudo) is the operator's concern.
 
 use std::ffi::OsString;
 
 use async_trait::async_trait;
-use fraisier_adapter_support::{error, run_command, Captured};
+use fraisier_adapter_support::{error, Captured, Transport};
 use fraisier_core::adapter_axes::{
     AdapterCtx, AdapterError, AdapterErrorKind, HostId, ServiceAdapter, ServiceStatus,
 };
@@ -55,6 +56,7 @@ const PROGRAM_ENV: &str = "FRAISIER_SERVICE_BIN";
 /// ```
 pub struct RcService {
     program: OsString,
+    transport: Transport,
 }
 
 impl Default for RcService {
@@ -65,13 +67,16 @@ impl Default for RcService {
 
 impl RcService {
     /// Create an adapter that spawns `service` (honouring the
-    /// `FRAISIER_SERVICE_BIN` override).
+    /// `FRAISIER_SERVICE_BIN` override) on the **local** host.
     #[must_use]
     pub fn new() -> Self {
         let program = std::env::var_os(PROGRAM_ENV)
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| OsString::from("service"));
-        Self { program }
+        Self {
+            program,
+            transport: Transport::Local,
+        }
     }
 
     /// Create an adapter that spawns the binary at `program`.
@@ -79,7 +84,16 @@ impl RcService {
     pub fn with_program(program: impl Into<OsString>) -> Self {
         Self {
             program: program.into(),
+            transport: Transport::Local,
         }
+    }
+
+    /// Run `service` over `transport` instead of locally (the multi-host path
+    /// passes a [`Transport::Ssh`] to manage the service on each remote host).
+    #[must_use]
+    pub fn with_transport(mut self, transport: Transport) -> Self {
+        self.transport = transport;
+        self
     }
 
     /// Build the argv for a `service` `verb` against the configured service:
@@ -114,7 +128,17 @@ impl RcService {
         operation: &str,
     ) -> Result<Captured, AdapterError> {
         let args = Self::args_for(ctx, verb, operation)?;
-        run_command(&self.program, &args, &[], None, ADAPTER_NAME, operation).await
+        self.transport
+            .run(
+                ctx,
+                &self.program,
+                &args,
+                &[],
+                None,
+                ADAPTER_NAME,
+                operation,
+            )
+            .await
     }
 }
 

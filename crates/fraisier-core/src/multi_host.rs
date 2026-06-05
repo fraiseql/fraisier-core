@@ -38,6 +38,22 @@
 //! artifact. A failed first-ever deploy has no such record, so restoring a host it
 //! had already activated is impossible and surfaces as
 //! [`SagaOutcome::PartialRollback`].
+//!
+//! # Partial rollback — operator escalation
+//!
+//! A clean rollback returns [`SagaOutcome::RolledBack`]: every host is back on its
+//! prior artifact and the database is back on its prior revision. When a *rollback*
+//! step itself fails — a host that cannot be re-activated or restarted, or a
+//! first-ever deploy with no prior release to fall back to — the run returns
+//! [`SagaOutcome::PartialRollback`] with a human-readable reason naming the host
+//! and the operation that failed. fraisier never reports this as success. The
+//! fleet is then in a mixed state and needs an operator: read the reason, inspect
+//! the named host's active artifact and service status (`deployment-status
+//! --per-host`), and either finish restoring it by hand or re-run the deploy once
+//! the underlying fault (unreachable host, wedged unit) is cleared. The migration
+//! is rolled back only after every host is restored, so a `PartialRollback`
+//! surfaced during the host phase means the database may still be on the new
+//! revision — check it before retrying.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -589,6 +605,15 @@ impl RolloutShared {
         }
     }
 
+    /// A rollout-phase failure tagged with the host and the operation that failed,
+    /// so an aggregated batch error names exactly which host broke and where.
+    fn host_failed(host: &HostId, operation: &str, error: &AdapterError) -> SagaError {
+        SagaError::StepFailed {
+            step: "rollout".to_owned(),
+            message: format!("host {host} {operation}: {error}"),
+        }
+    }
+
     /// The per-host call context: the base context with `host` set and the host's
     /// `address` exposed as a setting, so address-keyed adapters (the LB, and the
     /// future SSH transport) can resolve which host this call targets.
@@ -826,7 +851,7 @@ impl RolloutShared {
             .lb
             .drain(&ctx, host)
             .await
-            .map_err(|e| Self::failed("rollout", &e))?;
+            .map_err(|e| Self::host_failed(host, "drain", &e))?;
         self.runtime()
             .progress
             .entry(host.clone())
@@ -845,7 +870,7 @@ impl RolloutShared {
         self.artifact
             .activate(&ctx, host, &staged)
             .await
-            .map_err(|e| Self::failed("rollout", &e))?;
+            .map_err(|e| Self::host_failed(host, "activate", &e))?;
         self.runtime()
             .progress
             .entry(host.clone())
@@ -855,13 +880,13 @@ impl RolloutShared {
         self.service
             .restart(&ctx, host)
             .await
-            .map_err(|e| Self::failed("rollout", &e))?;
+            .map_err(|e| Self::host_failed(host, "restart", &e))?;
 
         let status = self
             .health
             .check(&ctx, host)
             .await
-            .map_err(|e| Self::failed("rollout", &e))?;
+            .map_err(|e| Self::host_failed(host, "health", &e))?;
         if !status.healthy {
             let detail = status.detail.map(|d| format!(": {d}")).unwrap_or_default();
             return Err(SagaError::StepFailed {
@@ -873,7 +898,7 @@ impl RolloutShared {
         self.lb
             .reattach(&ctx, host, &membership)
             .await
-            .map_err(|e| Self::failed("rollout", &e))?;
+            .map_err(|e| Self::host_failed(host, "reattach", &e))?;
         self.runtime()
             .progress
             .entry(host.clone())
@@ -926,7 +951,7 @@ impl RolloutShared {
             self.lb
                 .drain(&ctx, host)
                 .await
-                .map_err(|e| Self::failed("rollout", &e))?;
+                .map_err(|e| Self::host_failed(host, "rollback drain", &e))?;
         }
 
         if progress.activated {
@@ -945,17 +970,17 @@ impl RolloutShared {
             self.artifact
                 .activate(&ctx, host, &prior_artifact)
                 .await
-                .map_err(|e| Self::failed("rollout", &e))?;
+                .map_err(|e| Self::host_failed(host, "rollback activate", &e))?;
             self.service
                 .restart(&ctx, host)
                 .await
-                .map_err(|e| Self::failed("rollout", &e))?;
+                .map_err(|e| Self::host_failed(host, "rollback restart", &e))?;
         }
 
         self.lb
             .reattach(&ctx, host, &prior_membership)
             .await
-            .map_err(|e| Self::failed("rollout", &e))
+            .map_err(|e| Self::host_failed(host, "rollback reattach", &e))
     }
 }
 
@@ -1626,5 +1651,187 @@ mod tests {
         let json = serde_json::to_string(&strategy).expect("serialize");
         let back: RolloutStrategy = serde_json::from_str(&json).expect("deserialize");
         assert!(matches!(back, RolloutStrategy::Rolling(2)));
+    }
+
+    // ----- Cycle 4.3: forced-failure rollback at each phase + PartialRollback ----
+
+    #[tokio::test]
+    async fn fetch_failure_rolls_back_without_touching_hosts_or_db() {
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let faults = Arc::new(Faults {
+            stage_fail: BTreeSet::from(["web-2".to_owned()]),
+            ..Faults::default()
+        });
+        let plan = deploy(&trail, &faults, RolloutStrategy::Rolling(1));
+
+        let outcome = plan.run(store).await.expect("run completes with rollback");
+        assert!(
+            matches!(&outcome, SagaOutcome::RolledBack { failed_step, .. } if failed_step == "fetch"),
+            "got {outcome:?}"
+        );
+        let trail = drain_trail(&trail);
+        // Fetch failed before the migration and any host op: nothing to undo.
+        assert_eq!(count(&trail, "up"), 0, "DB untouched: {trail:?}");
+        assert!(
+            !trail
+                .iter()
+                .any(|e| e.starts_with("drain:") || e.starts_with("down_to:")),
+            "no host or DB mutation: {trail:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_failure_compensates_nothing_destructive() {
+        // `up` fails, so migrate never completed: no host is touched, and the DB is
+        // never rolled back (there is nothing applied to undo).
+        let (_dir, store) = store();
+        seed_prior(&store).await;
+        let trail = Trail::default();
+        let faults = Arc::new(Faults {
+            migrate_fail: true,
+            ..Faults::default()
+        });
+        let plan = deploy(&trail, &faults, RolloutStrategy::AllAtOnce);
+
+        let outcome = plan.run(store).await.expect("run completes with rollback");
+        assert!(
+            matches!(&outcome, SagaOutcome::RolledBack { failed_step, .. } if failed_step == "migrate"),
+            "got {outcome:?}"
+        );
+        let trail = drain_trail(&trail);
+        assert_eq!(count(&trail, "up"), 1, "up was attempted: {trail:?}");
+        assert!(
+            !trail
+                .iter()
+                .any(|e| e.starts_with("drain:") || e.starts_with("down_to:")),
+            "no host advanced, no DB rollback: {trail:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_rollout_failure_restores_earlier_batches_in_reverse_then_db_once() {
+        // rolling(1), three hosts; the LAST host (web-3) is unhealthy. web-1 and
+        // web-2 fully advanced, so they are restored in REVERSE order (web-2 before
+        // web-1), then the single migration is rolled back once — last of all.
+        let (_dir, store) = store();
+        seed_prior(&store).await;
+        let trail = Trail::default();
+        let faults = Arc::new(Faults {
+            health_unhealthy: BTreeSet::from(["web-3".to_owned()]),
+            ..Faults::default()
+        });
+        let plan = deploy(&trail, &faults, RolloutStrategy::Rolling(1));
+
+        let outcome = plan.run(store).await.expect("run completes with rollback");
+        assert!(
+            matches!(&outcome, SagaOutcome::RolledBack { failed_step, .. } if failed_step == "rollout-3"),
+            "got {outcome:?}"
+        );
+        let trail = drain_trail(&trail);
+        assert_eq!(
+            count(&trail, "down_to:rev-prev"),
+            1,
+            "DB rolled back once: {trail:?}"
+        );
+        // Every host ends back on the prior artifact.
+        assert!(contains_all(
+            &trail,
+            &[
+                "activate:web-1:v-old",
+                "activate:web-2:v-old",
+                "activate:web-3:v-old"
+            ]
+        ));
+        // Reverse host order, then the DB last.
+        assert!(
+            pos(&trail, "activate:web-2:v-old") < pos(&trail, "activate:web-1:v-old"),
+            "later host restores first: {trail:?}"
+        );
+        assert!(
+            pos(&trail, "activate:web-1:v-old") < pos(&trail, "down_to:rev-prev"),
+            "all hosts restore before the DB: {trail:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_after_the_failing_batch_is_never_touched() {
+        // web-2 fails to activate the new artifact; web-3 (a later batch) must never
+        // be drained — a rollout stops advancing once a batch fails.
+        let (_dir, store) = store();
+        seed_prior(&store).await;
+        let trail = Trail::default();
+        let faults = Arc::new(Faults {
+            activate_fail: BTreeSet::from(["web-2".to_owned()]),
+            ..Faults::default()
+        });
+        let plan = deploy(&trail, &faults, RolloutStrategy::Rolling(1));
+
+        let outcome = plan.run(store).await.expect("run completes with rollback");
+        assert!(
+            matches!(&outcome, SagaOutcome::RolledBack { failed_step, .. } if failed_step == "rollout-2"),
+            "got {outcome:?}"
+        );
+        let trail = drain_trail(&trail);
+        assert!(
+            !trail.iter().any(|e| e == "drain:web-3"),
+            "the batch after the failure never started: {trail:?}"
+        );
+        // web-2 only drained (activate failed before it could mutate the release),
+        // so its restore is just a reattach — never a prior re-activation.
+        assert!(
+            !trail.iter().any(|e| e == "activate:web-2:v-old"),
+            "a host that never activated is not re-activated on restore: {trail:?}"
+        );
+        assert!(trail.iter().any(|e| e == "reattach:web-2"));
+    }
+
+    #[tokio::test]
+    async fn an_unrecoverable_host_restore_reports_partial_rollback() {
+        // web-2's restart fails forever, so both the forward restart AND the
+        // rollback restart fail: the host cannot be returned to its prior release.
+        // The run must surface PartialRollback (not a clean RolledBack) and name it.
+        let (_dir, store) = store();
+        seed_prior(&store).await;
+        let trail = Trail::default();
+        let faults = Arc::new(Faults {
+            restart_fail: BTreeMap::from([("web-2".to_owned(), 5)]),
+            ..Faults::default()
+        });
+        let plan = deploy(&trail, &faults, RolloutStrategy::Rolling(1));
+
+        let outcome = plan.run(store).await.expect("run completes");
+        let SagaOutcome::PartialRollback { reason } = &outcome else {
+            panic!("expected PartialRollback, got {outcome:?}");
+        };
+        assert!(
+            reason.contains("web-2"),
+            "the operator-facing reason names the stuck host: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_ever_deploy_failure_reports_partial_rollback() {
+        // No prior ledger: a host that activated the new release cannot be rolled
+        // back (there is no prior artifact to restore), so a first-deploy failure is
+        // a PartialRollback, exactly like the single-host first-deploy case.
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let faults = Arc::new(Faults {
+            health_unhealthy: BTreeSet::from(["web-1".to_owned()]),
+            ..Faults::default()
+        });
+        let plan = deploy(&trail, &faults, RolloutStrategy::Rolling(1));
+
+        let outcome = plan.run(store).await.expect("run completes");
+        assert!(
+            matches!(&outcome, SagaOutcome::PartialRollback { .. }),
+            "a first-deploy rollback with no prior release is a PartialRollback, got {outcome:?}"
+        );
+        let trail = drain_trail(&trail);
+        assert!(
+            !trail.iter().any(|e| e == "drain:web-2"),
+            "later hosts never started: {trail:?}"
+        );
     }
 }

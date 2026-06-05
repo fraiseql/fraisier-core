@@ -7,9 +7,13 @@ CLI — the native, intimate-integration migration path of the FraiseQL stack
 
 ## Requirements
 
-- **Confiture ≥ 0.20.0** on `PATH` (override with `FRAISIER_CONFITURE_BIN`).
-  0.20.0 provides `migrate current`, `migrate down-to`, and the `--no-config`
-  env-only DSN mode this adapter relies on.
+- **Confiture ≥ 0.20.0** on `PATH` (override with `FRAISIER_CONFITURE_BIN`) for
+  `current` / `up` / `down-to` / `verify`: 0.20.0 provides `migrate current`,
+  `migrate down-to`, and the `--no-config` env-only DSN mode this adapter relies on.
+- **Confiture ≥ 0.22.0** for `preflight` (and therefore for a default deploy, which
+  runs the forward-compat lint): earlier versions reject the `--output` flag the
+  adapter passes to every subcommand. 0.22 also froze its exit-code / JSON shapes as
+  a stability contract aligned to this adapter.
 
 ## DSN handoff (secrets via env, never argv)
 

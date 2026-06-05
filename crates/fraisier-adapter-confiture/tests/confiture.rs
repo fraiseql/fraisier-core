@@ -97,10 +97,13 @@ async fn env_dsn_beats_decoy_config() {
     );
 }
 
-/// Full round-trip against a real Postgres. Opt-in via `FRAISIER_TEST_DATABASE_URL`
-/// (must be an *empty* database — the test applies and rolls back migrations).
+/// Full round-trip against a real Postgres, exercising every adapter-consumed
+/// Confiture subcommand: `current` → `up` → `verify` → `preflight` → `down-to`
+/// (the surface in Confiture's `docs/reference/fraisier-adapter-contract.md`).
+/// Opt-in via `FRAISIER_TEST_DATABASE_URL` (must be an *empty* database — the test
+/// applies and rolls back migrations).
 #[tokio::test]
-async fn roundtrip_up_current_down_against_postgres() {
+async fn roundtrip_against_postgres_covers_full_surface() {
     let Ok(dsn) = std::env::var("FRAISIER_TEST_DATABASE_URL") else {
         eprintln!("skipping: set FRAISIER_TEST_DATABASE_URL to run the Postgres round-trip");
         return;
@@ -161,6 +164,27 @@ async fn roundtrip_up_current_down_against_postgres() {
             .await
             .expect("current after up"),
         Some(Revision::new("002"))
+    );
+
+    // verify: every applied migration checks out (the contract's `failed_count == 0`).
+    let verified = adapter.verify(&ctx).await.expect("verify");
+    assert!(
+        verified.ok,
+        "verify should pass on cleanly-applied migrations; checks = {:?}",
+        verified.checks
+    );
+
+    // preflight: the forward-compat lint must actually run against real Confiture.
+    // Before Confiture 0.22, `migrate preflight` rejected the `--output` flag the
+    // adapter passes to every subcommand, so this call could not produce a report at
+    // all (it errored). 0.22 fixed that (CHANGELOG: "migrate preflight accepts
+    // --output (fraisier adapter contract)"), so it now returns a report; our benign
+    // DDL carries no Error-severity issue, so the report is clean.
+    let preflight = adapter.preflight(&ctx).await.expect("preflight");
+    assert!(
+        preflight.ok,
+        "preflight should be clean for benign DDL; issues = {:?}",
+        preflight.issues
     );
 
     // Roll back to 001 → current is 001.

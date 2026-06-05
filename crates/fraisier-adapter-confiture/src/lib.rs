@@ -17,10 +17,19 @@
 //! honouring PRD review Decision 5 and the convergence rule that the in-process
 //! and IPC paths handle secrets identically.
 //!
-//! ## Connection requirements
+//! ## Version requirements
 //!
-//! Confiture ≥ 0.20.0 is required: it provides `migrate current`, `migrate
-//! down-to`, and the `--no-config` env-only DSN mode this adapter depends on.
+//! Confiture ≥ 0.20.0 is the floor for `current` / `up` / `down-to` / `verify`:
+//! it provides `migrate current`, `migrate down-to`, and the `--no-config`
+//! env-only DSN mode this adapter depends on. The **`preflight`** capability
+//! additionally requires **Confiture ≥ 0.22.0** — earlier versions reject the
+//! `--output` flag this adapter passes to every subcommand, so `migrate preflight`
+//! could not emit its JSON report. Since `preflight` is an advertised capability
+//! and the deploy layer enables the forward-compat lint by default,
+//! **≥ 0.22.0 is the effective minimum for a default deploy.** Confiture
+//! 0.22 also froze its exit-code / JSON shapes as a stability contract aligned to
+//! this adapter (`docs/reference/fraisier-adapter-contract.md` in the Confiture
+//! repo, mirrored by its `tests/contract/test_fraisier_adapter_surface.py`).
 //!
 //! ## Double locking (intentional)
 //!
@@ -282,9 +291,15 @@ const LOCK_EXIT_CODE: i32 = 6;
 
 /// Map a Confiture process exit code to an [`AdapterErrorKind`].
 ///
-/// Codes 2 (validation/config) and 5 (`CONFIG_010`, no usable DSN) are
-/// configuration problems; everything else (1 generic, 3 execution, 6 lock,
-/// 8 missing `.down.sql`, signals) is an execution failure.
+/// Follows Confiture's frozen exit-code contract (codes `0..8`; see the Confiture
+/// repo's `docs/reference/exit-codes.md` and `fraisier-adapter-contract.md`):
+/// exit `5` (configuration invalid / validation / lint / precondition — incl.
+/// `CONFIG_010`, no usable DSN) and exit `2` (`PRECON_1001`, tracking table
+/// absent — only reached here from a *non-*`current` command, since
+/// `current_revision` resolves it to "no revision" first) are classed as
+/// configuration problems. Everything else (`1` generic, `3` DB-connection,
+/// `4` schema/DDL, `6` lock, `7` git, `8` irreversible rollback, signals) is an
+/// execution failure.
 const fn kind_for_code(code: Option<i32>) -> AdapterErrorKind {
     match code {
         Some(2 | 5) => AdapterErrorKind::InvalidConfig,

@@ -572,6 +572,7 @@ dependencies = [
  "fraisier-adapter-rc",
  "fraisier-adapter-support",
  "fraisier-adapter-systemd",
+ "fraisier-artifact-pull",
  "fraisier-artifact-release",
  "fraisier-config",
  "fraisier-core",

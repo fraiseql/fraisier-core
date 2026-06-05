@@ -52,6 +52,7 @@ fraisier-adapter-docker-compose = { path = "../fraisier-adapter-docker-compose",
 fraisier-adapter-http = { path = "../fraisier-adapter-http", version = "1.0.0-alpha.1" }
 fraisier-adapter-nginx = { path = "../fraisier-adapter-nginx", version = "1.0.0-alpha.1" }
 fraisier-artifact-release = { path = "../fraisier-artifact-release", version = "1.0.0-alpha.1" }
+fraisier-artifact-pull = { path = "../fraisier-artifact-pull", version = "1.0.0-alpha.1" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

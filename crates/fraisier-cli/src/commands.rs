@@ -646,4 +646,24 @@ upstream = "checkout_upstream"
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
         assert_eq!(out.json["host"], serde_json::json!("web1.internal"));
     }
+
+    #[tokio::test]
+    async fn deploy_dry_run_host_pull_artifact_has_no_locality_warning() {
+        // source = "pull" stages on each host, so the artifact-locality warning
+        // must NOT fire (only release/local trigger it).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pull = MULTI_HOST.replace("source = \"release\"", "source = \"pull\"");
+        let config = write(dir.path(), "fraisier.toml", &pull);
+        let state = dir.path().join("state");
+        let out = deploy(&config, &state, None, Some("1.2.3"), true)
+            .await
+            .expect("multi-host pull dry run");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert_eq!(out.json["artifact"], serde_json::json!("pull"));
+        assert!(
+            !out.pretty.contains("stages on the host running fraisier"),
+            "host-pull must not warn about artifact locality: {}",
+            out.pretty
+        );
+    }
 }

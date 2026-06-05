@@ -256,8 +256,11 @@ pub fn build(
     let host = resolve_host(config, host_override)?;
     let settings = settings_map(config, app_version);
 
-    let artifact = build_artifact(config)?;
-    let service = build_service(config, &build_transport(config))?;
+    // Local for a single-host config; an `[ssh]`-configured remote transport only
+    // when `[hosts]` is present (host-pull artifact + service then run per host).
+    let transport = build_transport(config);
+    let artifact = build_artifact(config, &transport)?;
+    let service = build_service(config, &transport)?;
     let health = build_health(config)?;
 
     let database_url_env = config
@@ -353,7 +356,7 @@ pub fn build_multi_host(
     let transport = build_transport(config);
     let settings = settings_map(config, app_version);
 
-    let artifact = build_artifact(config)?;
+    let artifact = build_artifact(config, &transport)?;
     let service = build_service(config, &transport)?;
     let health = build_health(config)?;
     let lb = build_lb(config)?;
@@ -476,12 +479,20 @@ pub fn summarize_multi_host(
     })
 }
 
-fn build_artifact(config: &DeployConfig) -> Result<Arc<dyn ArtifactAdapter>> {
+fn build_artifact(
+    config: &DeployConfig,
+    transport: &Transport,
+) -> Result<Arc<dyn ArtifactAdapter>> {
     match config.artifact.as_ref().and_then(|a| a.source.as_deref()) {
         Some("release") => Ok(Arc::new(fraisier_artifact_release::ReleaseArtifact::new())),
+        // Host-pull: each host fetches + activates its own release over the
+        // transport (Local for single-host, Ssh per host for multi-host).
+        Some("pull") => Ok(Arc::new(
+            fraisier_artifact_pull::PullArtifact::new().with_transport(transport.clone()),
+        )),
         Some(other) => bail!(
-            "artifact source '{other}' is not available in this build (only 'release' ships \
-             in-process in Phase 1)"
+            "artifact source '{other}' is not available in this build \
+             (built-in: 'release', 'pull')"
         ),
         None => bail!("[artifact].source is required"),
     }

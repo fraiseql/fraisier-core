@@ -165,20 +165,24 @@ fn validate_artifact(cfg: &DeployConfig, report: &mut ValidationReport) {
     match artifact.source.as_deref() {
         None => report.error(
             "artifact.source",
-            "[artifact].source is required (one of: release, git, local)",
+            "[artifact].source is required (one of: release, pull, git, local)",
         ),
-        Some("release") => {
+        // `release` (orchestrator HTTP fetch) and `pull` (host fetches via curl)
+        // take the same URL + checksum fields.
+        Some(source @ ("release" | "pull")) => {
             if !is_set(artifact.release_url.as_ref()) {
                 report.error(
                     "artifact.release_url",
-                    "the release source requires release_url",
+                    format!("the {source} source requires release_url"),
                 );
             }
             if !is_set(artifact.checksum_url.as_ref()) && !is_set(artifact.checksum.as_ref()) {
                 report.error(
                     "artifact.checksum_url",
-                    "the release source requires checksum_url (or an inline checksum) \
-                     so the download can be sha256-verified before it is staged",
+                    format!(
+                        "the {source} source requires checksum_url (or an inline checksum) \
+                         so the download can be sha256-verified before it is staged"
+                    ),
                 );
             }
         }
@@ -345,11 +349,11 @@ fn validate_hosts(cfg: &DeployConfig, report: &mut ValidationReport) {
     warn_local_only_axes(cfg, report);
 }
 
-/// In a multi-host deploy the service axis runs on each host over SSH, but the
-/// artifact and load-balancer axes still do local-filesystem work (the release
-/// adapter stages + symlinks locally; the nginx adapter edits a local config).
-/// Warn so the operator knows those axes act where fraisier runs — full remote
-/// artifact staging is an experimental follow-up, not yet wired.
+/// In a multi-host deploy the service axis runs on each host over SSH. The
+/// `release`/`local` artifact adapters and the `nginx` LB adapter still do
+/// local-filesystem work, so warn the operator they act where fraisier runs (and
+/// point `release`/`local` at the host-pull `source = "pull"`, which *does* stage
+/// per host).
 fn warn_local_only_axes(cfg: &DeployConfig, report: &mut ValidationReport) {
     if let Some(source) = cfg.artifact.as_ref().and_then(|a| a.source.as_deref()) {
         if matches!(source, "release" | "local") {
@@ -357,8 +361,8 @@ fn warn_local_only_axes(cfg: &DeployConfig, report: &mut ValidationReport) {
                 "artifact.source",
                 format!(
                     "multi-host: the '{source}' artifact adapter stages on the host running \
-                     fraisier, not on each remote host — remote artifact staging is not yet \
-                     implemented (multi-host is experimental)"
+                     fraisier, not on each remote host — use source = \"pull\" to have each host \
+                     fetch + activate its own release over SSH"
                 ),
             );
         }

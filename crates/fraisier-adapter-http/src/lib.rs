@@ -10,7 +10,8 @@
 //! ```toml
 //! [health]
 //! adapter = "http"
-//! url = "http://127.0.0.1:8080/health"   # `{host}` is replaced with the host id
+//! url = "http://{host.address}:8080/health"   # `{host.address}` → the host's
+//!                                              # inventory address; `{host}` → its id
 //! expected_status = 200                   # default 200
 //! attempts = 3                            # default 3
 //! retry_delay_ms = 500                    # default 500
@@ -62,9 +63,18 @@ struct Probe {
 
 impl Probe {
     /// Resolve the probe configuration for `host` from `ctx.settings`.
-    // Reason: `{host}` is an intentional template token, not a format argument.
+    // Reason: `{host}` / `{host.address}` are intentional template tokens, not
+    // format arguments.
     #[allow(clippy::literal_string_with_formatting_args)]
     fn from_ctx(ctx: &AdapterCtx, host: &HostId) -> Result<Self, AdapterError> {
+        // The multi-host composition sets `address` per host; fall back to the host
+        // id so a `{host.address}` template still resolves single-host.
+        let address = ctx
+            .settings
+            .get("address")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| host.as_str());
         let url = ctx
             .settings
             .get("url")
@@ -79,6 +89,7 @@ impl Probe {
                     None,
                 )
             })?
+            .replace("{host.address}", address)
             .replace("{host}", host.as_str());
 
         let expected_status =
@@ -223,6 +234,28 @@ mod tests {
         assert_eq!(probe.url, "http://web-2.internal:8080/health");
         assert_eq!(probe.expected_status, 200);
         assert_eq!(probe.attempts, 3);
+    }
+
+    #[test]
+    fn probe_substitutes_the_per_host_address() {
+        // The multi-host composition sets `address` per host; `{host.address}`
+        // resolves to it so each host is probed at its own address.
+        let mut ctx = AdapterCtx::new("checkout", "production");
+        ctx.settings
+            .insert("url".to_owned(), json!("http://{host.address}:8080/health"));
+        ctx.settings
+            .insert("address".to_owned(), json!("127.0.0.2"));
+        let probe = Probe::from_ctx(&ctx, &HostId::new("web-1")).expect("probe");
+        assert_eq!(probe.url, "http://127.0.0.2:8080/health");
+    }
+
+    #[test]
+    fn host_address_falls_back_to_the_host_id_when_unset() {
+        let mut ctx = AdapterCtx::new("checkout", "production");
+        ctx.settings
+            .insert("url".to_owned(), json!("http://{host.address}/health"));
+        let probe = Probe::from_ctx(&ctx, &HostId::new("solo.internal")).expect("probe");
+        assert_eq!(probe.url, "http://solo.internal/health");
     }
 
     #[test]

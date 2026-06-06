@@ -46,6 +46,8 @@ pub struct ServerConfig {
 pub enum Served {
     /// The request verified and the handler succeeded.
     Ok,
+    /// A `GET /healthz` liveness probe was answered 200 (no HMAC, no handler).
+    Health,
     /// The request failed signature/replay verification (HTTP 401).
     Rejected(Rejection),
     /// The request was malformed, too large, timed out, or not a POST.
@@ -59,6 +61,7 @@ pub enum Served {
 /// Header names are lower-cased on parse for case-insensitive lookup.
 struct Request {
     method: String,
+    path: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
@@ -103,6 +106,16 @@ where
             return Served::BadRequest(message);
         }
     };
+
+    // Liveness probe: a `GET /healthz` is answered 200 the moment we are accepting
+    // connections, *before* the HMAC gate — it is the only unauthenticated route, by
+    // design (it proves the server is up, nothing more). The body is bare "ok": it
+    // must leak no version/build detail. apply (and blue-green's HealthGateGreen) read
+    // this signal out-of-process; the deploy handler is never invoked.
+    if request.method.eq_ignore_ascii_case("GET") && request.path == "/healthz" {
+        let _ = respond(&mut stream, 200, "OK", "ok").await;
+        return Served::Health;
+    }
 
     if !request.method.eq_ignore_ascii_case("POST") {
         let _ = respond(&mut stream, 405, "Method Not Allowed", "POST required").await;
@@ -248,8 +261,9 @@ async fn read_request<R: AsyncRead + Unpin>(
         .next()
         .ok_or_else(|| "missing request method".to_owned())?
         .to_owned();
-    // The path is parsed past but not used (the HMAC is the authorization).
-    let _ = parts.next();
+    // The path gates only the unauthenticated `GET /healthz` liveness route; for a
+    // signed POST the HMAC, not the path, is the authorization.
+    let path = parts.next().unwrap_or("/").to_owned();
 
     let mut headers = Vec::new();
     for line in lines {
@@ -285,6 +299,7 @@ async fn read_request<R: AsyncRead + Unpin>(
 
     Ok(Request {
         method,
+        path,
         headers,
         body,
     })
@@ -412,6 +427,22 @@ mod tests {
         assert!(matches!(outcome, Served::BadRequest(_)), "{outcome:?}");
         assert!(response.starts_with("HTTP/1.1 405"), "response: {response}");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_get_healthz_is_a_200_liveness_probe_with_no_secret() {
+        // Liveness: reaching serve_connection means the accept loop is up, so
+        // `GET /healthz` answers 200 *without* an HMAC (the only non-signed route).
+        // The handler (a deploy) must never run, and the body leaks nothing beyond
+        // "up" — no version/build detail (the route is unauthenticated by design).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let request = b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n";
+        let (outcome, response) = serve_once(request, calls.clone()).await;
+        assert_eq!(outcome, Served::Health, "{outcome:?}");
+        assert!(response.starts_with("HTTP/1.1 200"), "response: {response}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no deploy on a probe");
+        let body = response.rsplit("\r\n\r\n").next().unwrap_or_default();
+        assert_eq!(body, "ok\n", "body is bare liveness, no version/build");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,0 +1,66 @@
+name: release-plz
+
+# Automated, dependency-ordered releases for the workspace.
+#
+#   * release-pr  — on every push to main, open/update a "release" PR that bumps
+#     versions and updates changelogs from the conventional-commit history.
+#   * release     — on every push to main, publish to crates.io any crate whose
+#     Cargo.toml version is not yet on the registry (i.e. right after a release PR
+#     is merged), in dependency order, then tag + cut a GitHub release.
+#
+# The first publish of the 25 brand-new crate names is done MANUALLY (it claims
+# the names deliberately); release-plz takes over every release after that.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-pr:
+    name: release-plz PR
+    runs-on: ubuntu-latest
+    # Never run on forks.
+    if: github.repository == 'fraiseql/fraisier-core'
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: release-plz — maintain the release PR
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          # A PAT/GitHub-App token (not GITHUB_TOKEN) so the release PR + tags
+          # trigger CI. See the setup notes in the repo.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+  release:
+    name: release-plz release
+    runs-on: ubuntu-latest
+    if: github.repository == 'fraiseql/fraisier-core'
+    # The crates.io token lives in this protected Environment (restricted to the
+    # main branch; add required reviewers here for an extra manual gate).
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: release-plz — publish unreleased crates
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

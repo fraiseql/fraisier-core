@@ -2830,9 +2830,8 @@ current_revision = "true"
     #[test]
     fn scheduled_install_plans_then_installs_a_timer_and_service() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let cfg = format!(
-            "{VALID}\n[schedule]\non_calendar = \"*-*-* 03:00:00\"\ncommand = \"deploy\"\n"
-        );
+        let cfg =
+            format!("{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
 

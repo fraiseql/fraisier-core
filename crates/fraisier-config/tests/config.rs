@@ -533,3 +533,117 @@ fn service_user_on_a_non_systemd_adapter_warns() {
         .expect("a service.user warning");
     assert_eq!(issue.severity, Severity::Warning);
 }
+
+/// A minimal valid base config the `[schedule]` tests append a section to.
+const SCHEDULE_BASE: &str = r#"
+[deploy]
+name = "checkout"
+environment = "production"
+
+[artifact]
+source = "local"
+path = "/srv/checkout/build"
+active_path = "/srv/checkout/current"
+
+[migration]
+adapter = "command"
+
+[service]
+adapter = "systemd"
+unit = "checkout.service"
+
+[health]
+adapter = "http"
+url = "http://127.0.0.1:8080/health"
+"#;
+
+fn has_error(report: &fraisier_config::ValidationReport, path: &str) -> bool {
+    report
+        .issues
+        .iter()
+        .any(|i| i.path == path && i.severity == Severity::Error)
+}
+
+#[test]
+fn schedule_backup_with_native_calendar_validates_clean() {
+    let toml =
+        format!("{SCHEDULE_BASE}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(report.ok(), "backup + native calendar is valid: {report}");
+}
+
+#[test]
+fn schedule_requires_a_calendar_surface() {
+    let toml = format!("{SCHEDULE_BASE}\n[schedule]\ncommand = \"backup\"\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "schedule.calendar"), "{report}");
+}
+
+#[test]
+fn schedule_rejects_both_calendar_and_raw() {
+    let toml = format!(
+        "{SCHEDULE_BASE}\n[schedule]\ncalendar = \"hourly\"\non_calendar_raw = \"*-*-* 03:00:00\"\ncommand = \"backup\"\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "schedule.calendar"), "{report}");
+}
+
+#[test]
+fn schedule_rejects_a_malformed_native_calendar() {
+    let toml =
+        format!("{SCHEDULE_BASE}\n[schedule]\ncalendar = \"daily 25:00\"\ncommand = \"backup\"\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "schedule.calendar"), "{report}");
+}
+
+#[test]
+fn schedule_command_is_explicit_no_default() {
+    let toml = format!("{SCHEDULE_BASE}\n[schedule]\ncalendar = \"hourly\"\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "schedule.command"), "{report}");
+}
+
+#[test]
+fn unattended_deploy_requires_the_optin_and_a_notify_sink() {
+    // command = "deploy" without the opt-in or a sink: both are errors.
+    let toml =
+        format!("{SCHEDULE_BASE}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"deploy\"\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(
+        has_error(&report, "schedule.allow_unattended_deploy"),
+        "{report}"
+    );
+    assert!(has_error(&report, "schedule.notify"), "{report}");
+
+    // With both, it validates clean.
+    let ok = format!(
+        "{SCHEDULE_BASE}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"deploy\"\n\
+         allow_unattended_deploy = true\nnotify = \"systemd-cat -t fraisier\"\n"
+    );
+    let report = DeployConfig::from_toml_str(&ok).expect("parses").validate();
+    assert!(report.ok(), "opted-in unattended deploy is valid: {report}");
+}
+
+#[test]
+fn the_old_on_calendar_key_no_longer_parses() {
+    // The pre-GA breaking rename: `on_calendar` is gone (renamed on_calendar_raw).
+    let toml = format!(
+        "{SCHEDULE_BASE}\n[schedule]\non_calendar = \"*-*-* 03:00:00\"\ncommand = \"backup\"\n"
+    );
+    assert!(
+        DeployConfig::from_toml_str(&toml).is_err(),
+        "deny_unknown_fields must reject the removed `on_calendar` key"
+    );
+}

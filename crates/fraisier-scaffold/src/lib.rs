@@ -26,6 +26,16 @@ pub enum ScaffoldError {
         /// The missing field.
         field: &'static str,
     },
+    /// A config field is present but its value is invalid.
+    #[error("[{section}].{field}: {message}")]
+    InvalidField {
+        /// The config section the field belongs to.
+        section: &'static str,
+        /// The offending field.
+        field: &'static str,
+        /// Why the value is invalid.
+        message: String,
+    },
     /// Writing a generated/installed file failed.
     #[error("writing {path}: {source}")]
     Write {

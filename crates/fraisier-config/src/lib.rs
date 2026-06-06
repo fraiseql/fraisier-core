@@ -64,6 +64,7 @@
 //! assert_eq!(cfg.migration_env_secrets()["DATABASE_URL"], "FRAISEQL_DATABASE_URL");
 //! ```
 
+pub mod calendar;
 mod error;
 mod preset;
 mod schema;
@@ -73,7 +74,7 @@ pub use error::ConfigError;
 pub use preset::SpecqlPreset;
 pub use schema::{
     ArtifactSection, DeployConfig, DeploySection, HealthSection, HostSpec, HostsSection, LbSection,
-    MigrationSection, ServiceSection, SshSection,
+    MigrationSection, ScheduleSection, ServiceSection, SshSection,
 };
 pub use validate::{ValidationIssue, ValidationReport};
 

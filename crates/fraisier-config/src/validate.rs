@@ -451,19 +451,58 @@ fn validate_schedule(cfg: &DeployConfig, report: &mut ValidationReport) {
     let Some(schedule) = &cfg.schedule else {
         return; // optional
     };
-    if !is_set(schedule.on_calendar.as_ref()) {
-        report.error(
-            "schedule.on_calendar",
-            "the [schedule] timer requires on_calendar (a systemd OnCalendar= expression)",
-        );
-    }
-    if let Some(command) = schedule.command.as_deref() {
-        if !SCHEDULE_COMMANDS.contains(&command) {
-            report.error(
-                "schedule.command",
-                format!("unknown schedule command '{command}' (expected: deploy, backup)"),
-            );
+
+    // Exactly one calendar surface: the stable native vocab, or the raw escape
+    // hatch — never both, never neither.
+    let has_calendar = is_set(schedule.calendar.as_ref());
+    let has_raw = is_set(schedule.on_calendar_raw.as_ref());
+    match (has_calendar, has_raw) {
+        (false, false) => report.error(
+            "schedule.calendar",
+            "the [schedule] timer requires `calendar` (e.g. \"daily 03:00\") \
+             or the systemd-coupled escape hatch `on_calendar_raw`",
+        ),
+        (true, true) => report.error(
+            "schedule.calendar",
+            "set either `calendar` or `on_calendar_raw`, not both",
+        ),
+        _ => {
+            if let Some(spec) = schedule.calendar.as_deref() {
+                if let Err(message) = crate::calendar::to_on_calendar(spec) {
+                    report.error("schedule.calendar", message);
+                }
+            }
         }
+    }
+
+    // `command` is explicit (no silent default): an unattended deploy is never an
+    // accident.
+    match schedule.command.as_deref() {
+        None => report.error(
+            "schedule.command",
+            "set `command` explicitly (\"deploy\" or \"backup\") — there is no default",
+        ),
+        Some(command) if !SCHEDULE_COMMANDS.contains(&command) => report.error(
+            "schedule.command",
+            format!("unknown schedule command '{command}' (expected: deploy, backup)"),
+        ),
+        Some("deploy") => {
+            // The unattended-deploy gate: opt-in + a notify sink, both required.
+            if schedule.allow_unattended_deploy != Some(true) {
+                report.error(
+                    "schedule.allow_unattended_deploy",
+                    "an unattended scheduled deploy requires allow_unattended_deploy = true \
+                     (it removes the operator-is-watching protection by construction)",
+                );
+            }
+            if !is_set(schedule.notify.as_ref()) {
+                report.error(
+                    "schedule.notify",
+                    "an unattended scheduled deploy requires a `notify` failure sink",
+                );
+            }
+        }
+        Some(_) => {}
     }
 }
 

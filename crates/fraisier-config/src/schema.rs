@@ -307,17 +307,34 @@ pub struct SyncSection {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScheduleSection {
-    /// The systemd `OnCalendar=` expression (e.g. `*-*-* 03:00:00`).
+    /// The **stable** calendar surface: a fraisier-native minimal vocabulary —
+    /// `daily HH:MM`, `hourly`, `weekly DOW HH:MM`, `monthly DD HH:MM` — that is
+    /// translated to a systemd `OnCalendar=` so the portability door stays open.
+    /// Exactly one of `calendar` / `on_calendar_raw` must be set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_calendar: Option<String>,
+    pub calendar: Option<String>,
+    /// Escape hatch: a raw systemd `OnCalendar=` expression passed through
+    /// verbatim. **Unstable / systemd-coupled** — opting in knowingly locks you to
+    /// systemd. Prefer [`Self::calendar`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_calendar_raw: Option<String>,
     /// Which fraisier command the timer runs: `"deploy"` or `"backup"`.
-    /// Defaults to `"deploy"`.
+    /// **Explicit — no default**: an unattended deploy must never be an accident.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     /// The `--config` path the scheduled unit passes to fraisier on the host.
     /// Defaults to `/etc/fraisier/<name>.toml`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_path: Option<PathBuf>,
+    /// Required opt-in for `command = "deploy"`: confirms an operator-unwatched
+    /// (unattended) deploy is intended. Without it (plus [`Self::notify`]) a
+    /// scheduled deploy is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_unattended_deploy: Option<bool>,
+    /// A failure-notification exec hook (run via `sh -c`) fired when an unattended
+    /// deploy rolls back — the required sink for `command = "deploy"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<String>,
 }
 
 /// The `[lb]` section.

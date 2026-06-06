@@ -108,12 +108,15 @@ pub fn generate(config: &DeployConfig) -> Result<Vec<GeneratedFile>, ScaffoldErr
 ///
 /// Produces `fraisier-<name>-<environment>-scheduled.{service,timer}` (a oneshot
 /// service the timer triggers). The service's `ExecStart` runs `fraisier
-/// <command> --config <config_path>` on the host; `<command>` defaults to
-/// `deploy`, `<config_path>` to `/etc/fraisier/<name>.toml`.
+/// <command> --config <config_path>` on the host; `<command>` is explicit (no
+/// default), `<config_path>` defaults to `/etc/fraisier/<name>.toml`. The
+/// `OnCalendar=` comes from the native `[schedule].calendar` vocabulary
+/// (translated) or the `on_calendar_raw` escape hatch.
 ///
 /// # Errors
-/// [`ScaffoldError::MissingField`] if `[deploy].name`/`[deploy].environment` or
-/// `[schedule].on_calendar` is absent.
+/// [`ScaffoldError::MissingField`] if `[deploy].name`/`[deploy].environment`,
+/// `[schedule].command`, or a calendar surface is absent;
+/// [`ScaffoldError::InvalidField`] if the native `calendar` is malformed.
 pub fn generate_scheduled(config: &DeployConfig) -> Result<Vec<GeneratedFile>, ScaffoldError> {
     let deploy = config.deploy.as_ref();
     let name = required(deploy.and_then(|d| d.name.as_deref()), "deploy", "name")?;
@@ -123,16 +126,14 @@ pub fn generate_scheduled(config: &DeployConfig) -> Result<Vec<GeneratedFile>, S
         "environment",
     )?;
     let schedule = config.schedule.as_ref();
-    let on_calendar = required(
-        schedule.and_then(|s| s.on_calendar.as_deref()),
+    // `command` is explicit — there is no silent "deploy" default (an unattended
+    // deploy must never be an accident); see the unattended-deploy gate.
+    let command = required(
+        schedule.and_then(|s| s.command.as_deref()),
         "schedule",
-        "on_calendar",
+        "command",
     )?;
-    let command = schedule
-        .and_then(|s| s.command.as_deref())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("deploy")
-        .to_owned();
+    let on_calendar = resolve_on_calendar(schedule)?;
     let config_path = schedule.and_then(|s| s.config_path.as_deref()).map_or_else(
         || format!("/etc/fraisier/{name}.toml"),
         |p| p.display().to_string(),
@@ -183,6 +184,42 @@ fn required(
         .filter(|s| !s.trim().is_empty())
         .map(ToOwned::to_owned)
         .ok_or(ScaffoldError::MissingField { section, field })
+}
+
+/// Resolve the timer's `OnCalendar=` from the stable native `calendar` vocabulary
+/// (translated) or the `on_calendar_raw` escape hatch — exactly one of which the
+/// validator requires.
+fn resolve_on_calendar(
+    schedule: Option<&fraisier_config::ScheduleSection>,
+) -> Result<String, ScaffoldError> {
+    let schedule = schedule.ok_or(ScaffoldError::MissingField {
+        section: "schedule",
+        field: "calendar",
+    })?;
+    if let Some(spec) = schedule
+        .calendar
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return fraisier_config::calendar::to_on_calendar(spec).map_err(|message| {
+            ScaffoldError::InvalidField {
+                section: "schedule",
+                field: "calendar",
+                message,
+            }
+        });
+    }
+    if let Some(raw) = schedule
+        .on_calendar_raw
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Ok(raw.to_owned());
+    }
+    Err(ScaffoldError::MissingField {
+        section: "schedule",
+        field: "calendar",
+    })
 }
 
 /// The fields the templates are rendered from, resolved (with defaults) once.
@@ -511,18 +548,24 @@ upstream = "checkout_upstream"
 
     #[test]
     fn generate_scheduled_produces_a_timer_and_oneshot_service() {
-        let toml = format!(
-            "{MULTI}\n[schedule]\non_calendar = \"*-*-* 03:00:00\"\ncommand = \"deploy\"\n"
-        );
+        // Native `calendar` is translated to OnCalendar=; `command` is explicit.
+        let toml =
+            format!("{MULTI}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
         let cfg = DeployConfig::from_toml_str(&toml).expect("parse");
         let files = generate_scheduled(&cfg).expect("generate");
         assert_eq!(files.len(), 2, "timer + service: {files:?}");
+
+        let timer = find(&files, "scheduled.timer");
+        assert!(
+            timer.contents.contains("OnCalendar=*-*-* 03:00:00"),
+            "native calendar translated: {timer:?}"
+        );
 
         let service = find(&files, "scheduled.service");
         assert!(
             service
                 .contents
-                .contains("ExecStart=fraisier deploy --config"),
+                .contains("ExecStart=fraisier backup --config"),
             "{service:?}"
         );
         assert!(service.contents.contains(MARKER), "marker: {service:?}");
@@ -545,9 +588,23 @@ upstream = "checkout_upstream"
     }
 
     #[test]
-    fn generate_scheduled_requires_on_calendar() {
+    fn generate_scheduled_requires_a_calendar_and_command() {
         // MULTI has no [schedule] section.
         let cfg = DeployConfig::from_toml_str(MULTI).expect("parse");
         assert!(generate_scheduled(&cfg).is_err());
+    }
+
+    #[test]
+    fn generate_scheduled_accepts_the_raw_escape_hatch() {
+        let toml = format!(
+            "{MULTI}\n[schedule]\non_calendar_raw = \"Mon *-*-* 04:00:00\"\ncommand = \"backup\"\n"
+        );
+        let cfg = DeployConfig::from_toml_str(&toml).expect("parse");
+        let files = generate_scheduled(&cfg).expect("generate");
+        let timer = find(&files, "scheduled.timer");
+        assert!(
+            timer.contents.contains("OnCalendar=Mon *-*-* 04:00:00"),
+            "raw passthrough: {timer:?}"
+        );
     }
 }

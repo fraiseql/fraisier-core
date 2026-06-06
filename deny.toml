@@ -1,0 +1,41 @@
+# cargo-deny configuration — supply-chain, license, and advisory gate.
+#
+#   cargo deny check
+#
+# See https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# Check every dependency against the RustSec advisory database. No advisories are
+# ignored; a new one failing CI is a signal to upgrade, not to suppress.
+ignore = []
+
+[licenses]
+# Only permissive licenses compatible with redistributing under `MIT OR
+# Apache-2.0`. Anything outside this set fails the check and must be reviewed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate transitive versions are tolerated: sqlx / tokio / opentelemetry pull
+# overlapping sub-crate versions that are outside this workspace's control.
+multiple-versions = "allow"
+# A wildcard (`*`) version requirement is a release-hygiene hazard.
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

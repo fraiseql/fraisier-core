@@ -314,14 +314,24 @@ mod tests {
     }
 
     impl FakeUnit {
+        /// Mark each listed id fully down (boots-then-dies: not active, not healthy).
         fn new(layout: Layout, bad: &[&str]) -> Self {
-            let verdicts = bad
-                .iter()
-                .map(|id| ((*id).to_owned(), (false, false)))
-                .collect();
+            Self::with(
+                layout,
+                &bad.iter()
+                    .map(|id| (*id, (false, false)))
+                    .collect::<Vec<_>>(),
+            )
+        }
+
+        /// Set explicit `(is_active, healthy)` verdicts per id (others are healthy).
+        fn with(layout: Layout, verdicts: &[(&str, (bool, bool))]) -> Self {
             Self {
                 layout,
-                verdicts,
+                verdicts: verdicts
+                    .iter()
+                    .map(|(id, verdict)| ((*id).to_owned(), *verdict))
+                    .collect(),
                 restarts: AtomicUsize::new(0),
             }
         }
@@ -424,6 +434,79 @@ mod tests {
         );
         assert!(!layout.staged_path("0.9.0").exists(), "oldest pruned");
         assert!(layout.staged_path("1.0.0").exists(), "kept-old retained");
+    }
+
+    /// THE HARD EXIT GATE. A complete-but-broken binary (passes checksum, then
+    /// boots-then-dies) must auto-revert to the working binary and a healthy
+    /// server, with a non-zero outcome and a failure notification.
+    #[tokio::test]
+    async fn the_gate_a_boots_then_dies_binary_auto_reverts_to_a_healthy_server() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = Layout::new(dir.path().join("bin"));
+        layout.stage("1.0.0", b"the working binary").expect("stage");
+        layout.activate("1.0.0").expect("activate");
+
+        let new = write_binary(dir.path(), b"complete but boots-then-dies");
+        // 2.0.0 is fully down once live; 1.0.0 (unlisted) is healthy.
+        let fleet = FakeUnit::new(layout.clone(), &["2.0.0"]);
+        let recorder = Recorder::default();
+
+        let outcome = apply(
+            &plan(layout.clone(), new, "2.0.0"),
+            &fleet,
+            &fleet,
+            &recorder,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Reverted {
+                failed: "2.0.0".to_owned(),
+                restored: "1.0.0".to_owned(),
+                reason: "new binary '2.0.0' failed health-check; reverted to '1.0.0'".to_owned(),
+            }
+        );
+        // The symlink is back on the working binary and it is healthy again.
+        assert_eq!(layout.active().unwrap().as_deref(), Some("1.0.0"));
+        assert!(fleet.verdict().1, "/healthz is 200 after revert");
+        // Exactly two restarts: the failed new start + the revert. No loop.
+        assert_eq!(fleet.restarts.load(Ordering::SeqCst), 2);
+        let events = recorder.events.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "one failure notification");
+        assert_eq!(events[0].event, "self-upgrade-reverted");
+        assert_eq!(events[0].failed.as_deref(), Some("2.0.0"));
+        assert_eq!(events[0].restored.as_deref(), Some("1.0.0"));
+    }
+
+    /// Liveness is the floor: a unit that is `is-active` but wedged (no `/healthz`
+    /// 200) must still fail the gate — proving apply needs *both* signals, not
+    /// just `systemctl is-active`.
+    #[tokio::test]
+    async fn an_active_but_wedged_binary_still_fails_the_gate_and_reverts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = Layout::new(dir.path().join("bin"));
+        layout.stage("1.0.0", b"working").expect("stage");
+        layout.activate("1.0.0").expect("activate");
+
+        let new = write_binary(dir.path(), b"active but wedged");
+        // 2.0.0: active = true, healthy = false (up but not serving).
+        let fleet = FakeUnit::with(layout.clone(), &[("2.0.0", (true, false))]);
+        let recorder = Recorder::default();
+
+        let outcome = apply(
+            &plan(layout.clone(), new, "2.0.0"),
+            &fleet,
+            &fleet,
+            &recorder,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, ApplyOutcome::Reverted { .. }),
+            "active-but-wedged must not pass: {outcome:?}"
+        );
+        assert_eq!(layout.active().unwrap().as_deref(), Some("1.0.0"));
     }
 
     fn set_mtime(path: &std::path::Path, secs: u64) {

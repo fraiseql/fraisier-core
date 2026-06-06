@@ -130,6 +130,21 @@ impl DeployConfig {
         validate_lb(self, &mut report);
         report
     }
+
+    /// Validate only the sections a database operation needs.
+    ///
+    /// The `db migrate|backup|restore|reset` commands act on the database alone,
+    /// so they require `[deploy]` (for the state-ledger identity) and
+    /// `[migration]` (the adapter + DSN source), but **not** the
+    /// artifact/service/health/lb axes a full deploy needs. This is the same pure,
+    /// no-I/O check restricted to those two sections.
+    #[must_use]
+    pub fn validate_db_ops(&self) -> ValidationReport {
+        let mut report = ValidationReport::default();
+        validate_deploy(self, &mut report);
+        validate_migration(self, &mut report);
+        report
+    }
 }
 
 /// Whether an optional string field is present and non-blank.

@@ -690,6 +690,66 @@ fn build_health(config: &DeployConfig) -> Result<Arc<dyn HealthAdapter>> {
     }
 }
 
+/// The migration adapter + context for a standalone database operation
+/// (`db migrate`), built without the artifact/service/health axes a deploy needs.
+pub struct ResolvedMigration {
+    /// The fraise (deployable) name.
+    pub fraise: String,
+    /// The target environment.
+    pub environment: String,
+    /// The migration adapter (in-process or IPC).
+    pub migration: Arc<dyn MigrationAdapter>,
+    /// The context the adapter acts under (carries the DSN env mapping + settings).
+    pub ctx: AdapterCtx,
+    /// Whether to run the adapter's forward-compatibility `preflight` lint.
+    pub forward_compatible_lint: bool,
+}
+
+/// Build just the migration adapter + context from a config, for a database-only
+/// operation (no artifact/service/health axes resolved).
+///
+/// # Errors
+/// Fails if `[deploy]`/`[migration]` is missing or incomplete, the adapter name
+/// is unsupported in this build, or (IPC path) the configured DSN env var is unset.
+pub fn build_migration_only(config: &DeployConfig) -> Result<ResolvedMigration> {
+    let deploy = config.deploy.as_ref().context("missing [deploy] section")?;
+    let fraise = deploy.name.clone().context("[deploy].name is required")?;
+    let environment = deploy
+        .environment
+        .clone()
+        .context("[deploy].environment is required")?;
+
+    let database_url_env = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.database_url_env.clone());
+    let mut env_secrets = BTreeMap::new();
+    let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
+
+    let forward_compatible_lint = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.forward_compatible_lint)
+        .unwrap_or(true);
+
+    let mut ctx = AdapterCtx::new(fraise.clone(), environment.clone());
+    ctx.workdir = PathBuf::from(".");
+    ctx.migrations_path = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.migrations_path.clone());
+    ctx.env_secrets = env_secrets;
+    ctx.settings = settings_map(config, None);
+
+    Ok(ResolvedMigration {
+        fraise,
+        environment,
+        migration,
+        ctx,
+        forward_compatible_lint,
+    })
+}
+
 fn build_migration(
     config: &DeployConfig,
     database_url_env: Option<&str>,

@@ -60,6 +60,10 @@ enum Command {
     /// Show the recorded saga state and release ledger for a deploy.
     Status(StatusArgs),
 
+    /// Database lifecycle operations (migrate / backup / restore / reset).
+    #[command(subcommand)]
+    Db(DbCommand),
+
     /// Inspect the migration adapters available as external processes.
     #[command(subcommand)]
     Adapter(AdapterCommand),
@@ -300,6 +304,23 @@ struct RollbackArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum DbCommand {
+    /// Apply pending migrations through the configured migration adapter.
+    Migrate(DbMigrateArgs),
+}
+
+#[derive(Debug, Args)]
+struct DbMigrateArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Directory for the filesystem state store.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+}
+
+#[derive(Debug, Subcommand)]
 enum AdapterCommand {
     /// List `fraisier-adapter-*` binaries discoverable on `PATH`.
     List,
@@ -359,6 +380,9 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         }
         Command::Status(args) => {
             commands::status(&args.config, &args.state_dir, args.per_host).await
+        }
+        Command::Db(DbCommand::Migrate(args)) => {
+            commands::db_migrate(&args.config, &args.state_dir).await
         }
         Command::Adapter(AdapterCommand::List) => Ok(commands::adapter_list()),
         Command::Adapter(AdapterCommand::Describe { name }) => {

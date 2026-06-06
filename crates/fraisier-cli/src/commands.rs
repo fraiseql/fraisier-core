@@ -908,6 +908,127 @@ async fn run_multi_host(
     })
 }
 
+/// Refuse a database operation whose `[deploy]`/`[migration]` config is invalid,
+/// returning the rendered issues. `Ok(None)` means the config is acceptable.
+fn refuse_invalid_db_config(config: &DeployConfig, verb: &str) -> Option<CommandOutput> {
+    let report = config.validate_db_ops();
+    if report.ok() {
+        return None;
+    }
+    let mut pretty = render_issues(&report);
+    let _ = writeln!(pretty, "refusing to {verb} with an invalid config");
+    Some(CommandOutput {
+        exit_code: 1,
+        pretty,
+        json: json!({ "ok": false, "issues": serde_json::to_value(&report.issues).unwrap_or(Value::Null) }),
+    })
+}
+
+/// `db migrate`: apply pending migrations through the configured migration
+/// adapter — the deploy's migrate phase on its own (no artifact/service/health).
+///
+/// It runs the same forward-compatibility `preflight` gate the deploy uses
+/// (when the adapter advertises it and `forward_compatible_lint` is on), applies
+/// all pending migrations (`up(None)`), and records the resulting revision in the
+/// state ledger so `status`/`list` stay accurate.
+pub(crate) async fn db_migrate(config_path: &Path, state_dir: &Path) -> Result<CommandOutput> {
+    use fraisier_core::adapter_axes::Severity;
+
+    let config = load(config_path)?;
+    if let Some(refusal) = refuse_invalid_db_config(&config, "migrate") {
+        return Ok(refusal);
+    }
+
+    let resolved = factory::build_migration_only(&config)?;
+    let adapter = resolved.migration.as_ref();
+
+    // Forward-compat preflight, gated exactly as the deploy flow gates it: skip
+    // entirely on opt-out, describe to learn capabilities, only call preflight if
+    // advertised, and block on Error-severity findings.
+    if resolved.forward_compatible_lint {
+        let described = adapter
+            .describe()
+            .await
+            .context("describing the migration adapter")?;
+        if described.capabilities.iter().any(|c| c == "preflight") {
+            let report = adapter
+                .preflight(&resolved.ctx)
+                .await
+                .context("running the forward-compatibility preflight")?;
+            let blocking: Vec<_> = report
+                .issues
+                .iter()
+                .filter(|issue| issue.severity == Severity::Error)
+                .collect();
+            if !blocking.is_empty() {
+                let mut pretty = String::new();
+                for issue in &blocking {
+                    let _ = writeln!(pretty, "  [error] {}: {}", issue.code, issue.message);
+                }
+                let _ = writeln!(
+                    pretty,
+                    "refusing to migrate: {} blocking forward-compatibility issue(s)",
+                    blocking.len()
+                );
+                return Ok(CommandOutput {
+                    exit_code: 1,
+                    pretty,
+                    json: json!({ "ok": false, "preflight_blocking": blocking.len() }),
+                });
+            }
+        }
+    }
+
+    let outcome = adapter
+        .up(&resolved.ctx, None)
+        .await
+        .context("applying migrations")?;
+    let applied: Vec<String> = outcome.applied.iter().map(ToString::to_string).collect();
+    let to = outcome.to.as_ref().map(ToString::to_string);
+
+    // Record the new current revision in the ledger, preserving the active
+    // artifact a prior deploy recorded.
+    let current = adapter.current_revision(&resolved.ctx).await.ok().flatten();
+    let store = FilesystemStateStore::new(state_dir)
+        .with_context(|| format!("opening state store at {}", state_dir.display()))?;
+    let key = FraiseKey::new(&resolved.fraise, &resolved.environment);
+    let mut record = store
+        .current_snapshot(&key)
+        .await?
+        .and_then(|v| serde_json::from_value::<DeployRecord>(v).ok())
+        .unwrap_or(DeployRecord {
+            active: None,
+            revision: None,
+        });
+    record.revision = current.clone();
+    store
+        .record_snapshot(&key, &serde_json::to_value(&record)?)
+        .await?;
+
+    let mut pretty = format!(
+        "migrated {}/{}: {} migration(s) applied",
+        resolved.fraise,
+        resolved.environment,
+        applied.len()
+    );
+    if let Some(to) = &to {
+        let _ = write!(pretty, ", now at {to}");
+    }
+    pretty.push('\n');
+    Ok(CommandOutput {
+        exit_code: 0,
+        pretty,
+        json: json!({
+            "ok": true,
+            "fraise": resolved.fraise,
+            "environment": resolved.environment,
+            "applied": applied,
+            "count": applied.len(),
+            "to": to,
+        }),
+    })
+}
+
 /// Map a saga outcome onto `(exit code, label, detail)` for both deploy paths.
 fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
     match outcome {
@@ -928,8 +1049,9 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapter_list, deploy, discover_adapters, health, init, list, rollback, scaffold,
-        scaffold_install, ship, status, validate_config, version_bump, version_show, ShipArgs,
+        adapter_list, db_migrate, deploy, discover_adapters, health, init, list, rollback,
+        scaffold, scaffold_install, ship, status, validate_config, version_bump, version_show,
+        ShipArgs,
     };
     use fraisier_core::single_host::DeployRecord;
     use fraisier_saga::events::SagaState;
@@ -1410,5 +1532,56 @@ upstream = "checkout_upstream"
             "host-pull must not warn about artifact locality: {}",
             out.pretty
         );
+    }
+
+    /// A db-ops config: only [deploy] + [migration] (no artifact/service/health),
+    /// with a no-op `command` adapter so the migrate path runs hermetically.
+    const DB_OPS: &str = r#"
+[deploy]
+name = "demo"
+environment = "test"
+
+[migration]
+adapter = "command"
+
+[migration.settings.commands]
+up = "true"
+current_revision = "true"
+"#;
+
+    #[tokio::test]
+    async fn db_migrate_applies_through_the_adapter_and_records_the_ledger() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", DB_OPS);
+        let state_dir = dir.path().join("state");
+
+        let out = db_migrate(&config, &state_dir).await.expect("db migrate");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert_eq!(out.json["ok"], serde_json::json!(true));
+        assert_eq!(out.json["count"], serde_json::json!(0));
+
+        // The ledger now has an entry for this fraise/env (so status/list see it).
+        let store = FilesystemStateStore::new(&state_dir).expect("store");
+        let snap = store
+            .current_snapshot(&FraiseKey::new("demo", "test"))
+            .await
+            .expect("snapshot");
+        assert!(snap.is_some(), "db migrate records a ledger entry");
+    }
+
+    #[tokio::test]
+    async fn db_migrate_refuses_a_config_without_a_migration_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // db ops validate only [deploy] + [migration]; drop [migration].
+        let config = write(
+            dir.path(),
+            "fraisier.toml",
+            "[deploy]\nname = \"demo\"\nenvironment = \"test\"\n",
+        );
+        let out = db_migrate(&config, &dir.path().join("state"))
+            .await
+            .expect("run");
+        assert_eq!(out.exit_code, 1);
+        assert_eq!(out.json["ok"], serde_json::json!(false));
     }
 }

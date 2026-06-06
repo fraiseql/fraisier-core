@@ -104,6 +104,58 @@ fn is_fraisier_generated(path: &Path) -> bool {
     std::fs::read_to_string(path).is_ok_and(|contents| contents.contains(MARKER))
 }
 
+/// The systemd unit directory the installer targets (under the `root` prefix).
+const SYSTEMD_DIR: &str = "/etc/systemd/system";
+
+/// List the fraisier-installed (marker-bearing) unit files in the systemd dir.
+///
+/// Scans `/etc/systemd/system` under `root` — what `scheduled list` enumerates.
+/// Returns sorted paths; an absent directory yields an empty list.
+///
+/// # Errors
+/// [`ScaffoldError::Read`] if the systemd directory exists but cannot be scanned.
+pub fn list_installed(root: &Path) -> Result<Vec<PathBuf>, ScaffoldError> {
+    let dir = under_root(root, Path::new(SYSTEMD_DIR));
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(ScaffoldError::Read { path: dir, source }),
+    };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| is_fraisier_generated(path))
+        .collect();
+    found.sort();
+    Ok(found)
+}
+
+/// Remove exactly the files in `files` (their `install_dest` under `root`).
+///
+/// The inverse of [`install`]. A file is removed **only** if it carries the
+/// [`MARKER`]; a hand-written file at the same path is left untouched. Returns
+/// the removed paths.
+///
+/// # Errors
+/// [`ScaffoldError::Write`] if a marker-bearing file cannot be removed.
+pub fn uninstall(files: &[GeneratedFile], root: &Path) -> Result<Vec<PathBuf>, ScaffoldError> {
+    let mut removed = Vec::new();
+    for file in files {
+        let Some(dest) = &file.install_dest else {
+            continue;
+        };
+        let path = under_root(root, dest);
+        if path.exists() && is_fraisier_generated(&path) {
+            std::fs::remove_file(&path).map_err(|source| ScaffoldError::Write {
+                path: path.clone(),
+                source,
+            })?;
+            removed.push(path);
+        }
+    }
+    Ok(removed)
+}
+
 /// Remove the files in `stale` (the output of [`prune_plan`]).
 ///
 /// # Errors
@@ -233,5 +285,62 @@ upstream = "checkout_upstream"
             systemd.join("checkout.service").exists(),
             "current file kept"
         );
+    }
+
+    /// A scheduled `backup` config (the safe value; needs no unattended opt-in).
+    fn scheduled_files() -> Vec<crate::GeneratedFile> {
+        let toml = format!("{CFG}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+        crate::generate_scheduled(
+            &fraisier_config::DeployConfig::from_toml_str(&toml).expect("parse"),
+        )
+        .expect("generate scheduled")
+    }
+
+    #[test]
+    fn install_then_list_then_uninstall_round_trips_clean() {
+        use super::{list_installed, uninstall};
+        let root = tempfile::tempdir().unwrap();
+        let files = scheduled_files();
+
+        // Nothing installed yet.
+        assert!(list_installed(root.path()).expect("list").is_empty());
+
+        install(&files, root.path()).expect("install");
+        let listed = list_installed(root.path()).expect("list");
+        assert_eq!(listed.len(), 2, "timer + service listed: {listed:?}");
+        assert!(listed
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with("scheduled.timer")));
+
+        let removed = uninstall(&files, root.path()).expect("uninstall");
+        assert_eq!(removed.len(), 2, "both removed: {removed:?}");
+        assert!(
+            list_installed(root.path()).expect("list").is_empty(),
+            "systemd dir clean after uninstall"
+        );
+    }
+
+    #[test]
+    fn uninstall_never_removes_a_hand_written_file() {
+        use super::uninstall;
+        let root = tempfile::tempdir().unwrap();
+        let files = scheduled_files();
+        install(&files, root.path()).expect("install");
+
+        // A hand-written file sitting where a generated one would: same dir, no
+        // marker. Overwrite the installed timer with a non-marker body.
+        let timer = root
+            .path()
+            .join("etc/systemd/system/fraisier-checkout-production-scheduled.timer");
+        std::fs::write(&timer, "[Timer]\nOnCalendar=hourly\n").unwrap();
+
+        let removed = uninstall(&files, root.path()).expect("uninstall");
+        // Only the (still-marker-bearing) service is removed; the de-marked timer stays.
+        assert_eq!(
+            removed.len(),
+            1,
+            "only the marker file removed: {removed:?}"
+        );
+        assert!(timer.exists(), "the de-marked file is left untouched");
     }
 }

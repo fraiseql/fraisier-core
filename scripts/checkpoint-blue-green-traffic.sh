@@ -3,7 +3,7 @@
 # Blue-green TRAFFIC checkpoint — the phase-07 §7.5 traffic-tier gates, end-to-end
 # against a **real nginx** routing real HTTP between a blue and a green fleet.
 #
-# Drives the real `fraisier deploy --strategy blue-green` through the full flow and
+# Drives the real `fraisier deploy` with `[deploy].strategy = "blue-green"` through the full flow and
 # asserts what traffic nginx actually serves:
 #
 #   * Happy swap: green comes up healthy -> traffic SWAPS blue->green (nginx now

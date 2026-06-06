@@ -2,7 +2,7 @@
 #
 # Blue-green checkpoint — the phase-07 §7.5 GA gate, preflight half.
 #
-# Drives the REAL `fraisier deploy --strategy blue-green` end-to-end through its
+# Drives the REAL `fraisier deploy` with `[deploy].strategy = "blue-green"` end-to-end through its
 # preflight gates, against **real confiture 0.22** and a **real Postgres**:
 #
 #   * Gate (migration not window-safe): a DROP COLUMN migration is REFUSED at

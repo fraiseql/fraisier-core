@@ -281,8 +281,9 @@ This proves the Confiture-on-Postgres pipeline and de-risks Part B; it is **not*
 
 ### Blue-green — `scripts/checkpoint-blue-green.sh` (window-safety + budget gates)
 
-Drives the real `fraisier deploy --strategy blue-green` through its **preflight
-gates** against **real confiture** and a **real Postgres**. The gate consumes
+Drives the real `fraisier deploy` (with `[deploy].strategy = "blue-green"`)
+through its **preflight gates** against **real confiture** and a **real
+Postgres**. The gate consumes
 confiture's first-class **`window_safe`** verdict — one typed boolean, no code
 pattern-matching (confiture ≥ 0.23.0). The script probes for it:
 
@@ -307,8 +308,9 @@ the companion fixture below.
 
 ### Blue-green traffic — `scripts/checkpoint-blue-green-traffic.sh` (real nginx)
 
-The traffic-tier half of the blue-green gates: drives the real `fraisier deploy
---strategy blue-green` through the full flow against a **real nginx** routing real HTTP
+The traffic-tier half of the blue-green gates: drives the real `fraisier deploy`
+(with `[deploy].strategy = "blue-green"`) through the full flow against a **real
+nginx** routing real HTTP
 between a blue and a green fleet (two `python3` HTTP servers as user systemd
 units), with a throwaway Postgres + confiture for the migrate/window-safety step.
 It asserts what nginx actually serves:

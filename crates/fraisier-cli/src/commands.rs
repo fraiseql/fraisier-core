@@ -1804,6 +1804,124 @@ pub(crate) async fn self_upgrade_restart(unit: &str, user: bool) -> Result<Comma
     }
 }
 
+/// Arguments for [`self_upgrade_apply`].
+pub(crate) struct SelfUpgradeApplyArgs<'a> {
+    pub source: &'a str,
+    pub sha256: Option<&'a str>,
+    pub checksum_url: Option<&'a str>,
+    pub version: Option<&'a str>,
+    pub unit: &'a str,
+    pub user: bool,
+    pub bin_dir: &'a Path,
+    pub healthz_url: &'a str,
+    pub keep: usize,
+    pub health_timeout_secs: u64,
+    pub notify: Option<&'a str>,
+}
+
+/// Classify a `<source>` argument into a self-upgrade [`Source`]: an `http(s)://`
+/// URL downloads, anything else is a local path.
+///
+/// [`Source`]: fraisier_self_upgrade::Source
+fn classify_source(
+    source: &str,
+    sha256: Option<&str>,
+    checksum_url: Option<&str>,
+) -> fraisier_self_upgrade::Source {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        fraisier_self_upgrade::Source::Url {
+            url: source.to_owned(),
+            sha256: sha256.map(str::to_owned),
+            checksum_url: checksum_url.map(str::to_owned),
+        }
+    } else {
+        fraisier_self_upgrade::Source::Path {
+            path: PathBuf::from(source),
+            sha256: sha256.map(str::to_owned),
+        }
+    }
+}
+
+/// Map an apply outcome to `(exit code, machine label)`. `Committed` → 0;
+/// `Reverted`/`AbortedBeforeSwap` → 1; `ManualIntervention` → 2 (the terminal
+/// state, mirroring the saga's `PartialRollback`).
+const fn apply_exit(outcome: &fraisier_self_upgrade::ApplyOutcome) -> (i32, &'static str) {
+    use fraisier_self_upgrade::ApplyOutcome;
+    match outcome {
+        ApplyOutcome::Committed { .. } => (0, "committed"),
+        ApplyOutcome::Reverted { .. } => (1, "reverted"),
+        ApplyOutcome::ManualIntervention { .. } => (2, "manual_intervention"),
+        ApplyOutcome::AbortedBeforeSwap { .. } => (1, "aborted"),
+    }
+}
+
+/// `self-upgrade apply`: fetch + verify + swap fraisier's own binary, restart the
+/// unit, health-check it, and auto-revert to the kept-old binary on failure. The
+/// post-swap restart **is** the coordinated `self-upgrade restart` (graceful
+/// SIGTERM drain) — apply composes that coordination at the tail of its flow, and
+/// drives everything out-of-process (systemctl + HTTP), never exec-ing the binary
+/// it just swapped.
+pub(crate) async fn self_upgrade_apply(args: SelfUpgradeApplyArgs<'_>) -> Result<CommandOutput> {
+    use fraisier_self_upgrade::{
+        apply, ApplyOutcome, ExecHookNotifier, HttpHealth, Layout, Notifier, Plan,
+        SystemctlSupervisor, TracingNotifier,
+    };
+    use std::time::Duration;
+
+    let plan = Plan {
+        source: classify_source(args.source, args.sha256, args.checksum_url),
+        layout: Layout::new(args.bin_dir),
+        version: args.version.map(str::to_owned),
+        keep: args.keep,
+        systemd_available: fraisier_self_upgrade::systemd_available(args.user),
+        health_timeout: Duration::from_secs(args.health_timeout_secs),
+        poll_interval: Duration::from_millis(500),
+    };
+    let supervisor = SystemctlSupervisor::new(args.unit, args.user);
+    let health = HttpHealth::new(
+        args.healthz_url,
+        Duration::from_secs(args.health_timeout_secs),
+    );
+    let notifier: Box<dyn Notifier> = match args.notify {
+        Some(command) => {
+            Box::new(ExecHookNotifier::new(command).with_context("FRAISIER_NOTIFY_UNIT", args.unit))
+        }
+        None => Box::new(TracingNotifier),
+    };
+
+    let outcome = apply(&plan, &supervisor, &health, notifier.as_ref()).await;
+    let (exit_code, _label) = apply_exit(&outcome);
+    let (pretty, json) = match &outcome {
+        ApplyOutcome::Committed { id, pruned } => (
+            format!(
+                "self-upgrade committed: now running {id} ({pruned} stale binary(ies) pruned)\n"
+            ),
+            json!({ "result": "committed", "id": id, "pruned": pruned }),
+        ),
+        ApplyOutcome::Reverted {
+            failed,
+            restored,
+            reason,
+        } => (
+            format!("self-upgrade REVERTED to {restored}: {reason}\n"),
+            json!({ "result": "reverted", "failed": failed, "restored": restored, "reason": reason }),
+        ),
+        ApplyOutcome::ManualIntervention { reason } => (
+            format!("self-upgrade MANUAL INTERVENTION REQUIRED: {reason}\n"),
+            json!({ "result": "manual_intervention", "reason": reason }),
+        ),
+        ApplyOutcome::AbortedBeforeSwap { reason } => (
+            format!("self-upgrade aborted (no swap performed): {reason}\n"),
+            json!({ "result": "aborted", "reason": reason }),
+        ),
+    };
+    Ok(CommandOutput {
+        exit_code,
+        pretty,
+        json,
+    })
+}
+
 /// Map a saga outcome onto `(exit code, label, detail)` for both deploy paths.
 fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
     match outcome {
@@ -1824,10 +1942,10 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        bootstrap, db_backup, db_migrate, db_reset, db_restore, deploy, discover_adapters, health,
-        init, list, provider_test, providers, rollback, scaffold, scaffold_install,
-        scheduled_install, ship, status, sync, validate_config, version_bump, version_show,
-        webhook_server, ShipArgs,
+        apply_exit, bootstrap, classify_source, db_backup, db_migrate, db_reset, db_restore,
+        deploy, discover_adapters, health, init, list, provider_test, providers, rollback,
+        scaffold, scaffold_install, scheduled_install, ship, status, sync, validate_config,
+        version_bump, version_show, webhook_server, ShipArgs,
     };
     use fraisier_core::single_host::DeployRecord;
     use fraisier_saga::events::SagaState;
@@ -2604,6 +2722,55 @@ current_revision = "true"
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args, vec!["--user", "restart", "u.service"]);
+    }
+
+    #[test]
+    fn classify_source_splits_urls_from_local_paths() {
+        use fraisier_self_upgrade::Source;
+        assert!(matches!(
+            classify_source("https://x/fraisier", Some("abc"), None),
+            Source::Url { url, sha256: Some(s), .. } if url == "https://x/fraisier" && s == "abc"
+        ));
+        assert!(matches!(
+            classify_source("http://x/fraisier", None, Some("https://x/sum")),
+            Source::Url { checksum_url: Some(c), .. } if c == "https://x/sum"
+        ));
+        assert!(matches!(
+            classify_source("/opt/fraisier/new", Some("def"), None),
+            Source::Path { path, sha256: Some(s) } if path == std::path::Path::new("/opt/fraisier/new") && s == "def"
+        ));
+    }
+
+    #[test]
+    fn apply_exit_maps_each_outcome_to_a_code() {
+        use fraisier_self_upgrade::ApplyOutcome;
+        assert_eq!(
+            apply_exit(&ApplyOutcome::Committed {
+                id: "2".into(),
+                pruned: 0
+            }),
+            (0, "committed")
+        );
+        assert_eq!(
+            apply_exit(&ApplyOutcome::Reverted {
+                failed: "2".into(),
+                restored: "1".into(),
+                reason: String::new()
+            }),
+            (1, "reverted")
+        );
+        assert_eq!(
+            apply_exit(&ApplyOutcome::ManualIntervention {
+                reason: String::new()
+            }),
+            (2, "manual_intervention")
+        );
+        assert_eq!(
+            apply_exit(&ApplyOutcome::AbortedBeforeSwap {
+                reason: String::new()
+            }),
+            (1, "aborted")
+        );
     }
 
     #[tokio::test]

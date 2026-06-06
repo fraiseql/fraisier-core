@@ -473,6 +473,10 @@ struct ScheduledInstallArgs {
 enum SelfUpgradeCommand {
     /// Coordinated restart of fraisier's own long-running unit (webhook server).
     Restart(SelfUpgradeRestartArgs),
+
+    /// Fetch + verify + swap fraisier's own binary, with post-restart health-check
+    /// and auto-revert to the kept-old binary on failure.
+    Apply(SelfUpgradeApplyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -484,6 +488,57 @@ struct SelfUpgradeRestartArgs {
     /// Use the user systemd manager (`systemctl --user`).
     #[arg(long)]
     user: bool,
+}
+
+#[derive(Debug, Args)]
+struct SelfUpgradeApplyArgs {
+    /// The new binary: an `http(s)://` URL or a local filesystem path.
+    source: String,
+
+    /// Expected SHA-256 (hex) of the binary; a mismatch aborts before any swap.
+    #[arg(long)]
+    sha256: Option<String>,
+
+    /// A URL whose body's first token is the expected SHA-256 (alternative to
+    /// `--sha256`).
+    #[arg(long)]
+    checksum_url: Option<String>,
+
+    /// An explicit version id for the staged binary (else a digest tag is used).
+    #[arg(long)]
+    version: Option<String>,
+
+    /// The systemd unit to swap under (fraisier's own service).
+    #[arg(long, default_value = "fraisier-webhook.service")]
+    unit: String,
+
+    /// Use the user systemd manager (`systemctl --user`).
+    #[arg(long)]
+    user: bool,
+
+    /// The directory of staged binaries holding the `current` symlink the unit's
+    /// `ExecStart` points at.
+    #[arg(long, default_value = "/usr/local/lib/fraisier/bin")]
+    bin_dir: PathBuf,
+
+    /// The webhook's liveness URL, polled after the restart to confirm the new
+    /// binary is serving before the swap is committed.
+    #[arg(long, default_value = "http://127.0.0.1:8080/healthz")]
+    healthz_url: String,
+
+    /// How many binaries to retain after a healthy commit (incl. the active one).
+    #[arg(long, default_value_t = 2)]
+    keep: usize,
+
+    /// Seconds to wait for the restarted unit to report healthy before judging it
+    /// a failed start (and reverting).
+    #[arg(long, default_value_t = 30)]
+    health_timeout_secs: u64,
+
+    /// A command run (via `sh -c`) on failure, with the failure payload on stdin
+    /// and `FRAISIER_NOTIFY_*` env vars. Omit to log the OTel event only.
+    #[arg(long)]
+    notify: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -566,6 +621,7 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::SelfUpgrade(SelfUpgradeCommand::Restart(args)) => {
             commands::self_upgrade_restart(&args.unit, args.user).await
         }
+        Command::SelfUpgrade(SelfUpgradeCommand::Apply(args)) => self_upgrade_apply(args).await,
         Command::Scheduled(ScheduledCommand::Install(args)) => {
             commands::scheduled_install(&args.config, &args.root, args.yes, args.dry_run)
         }
@@ -601,6 +657,25 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
             commands::scaffold_install(&args.config, &args.root, args.prune, args.yes, args.dry_run)
         }
     }
+}
+
+/// Translate the clap `self-upgrade apply` args into the command's borrow-based
+/// arg struct and run it (kept out of `dispatch` to keep that match compact).
+async fn self_upgrade_apply(args: &SelfUpgradeApplyArgs) -> Result<CommandOutput> {
+    commands::self_upgrade_apply(commands::SelfUpgradeApplyArgs {
+        source: &args.source,
+        sha256: args.sha256.as_deref(),
+        checksum_url: args.checksum_url.as_deref(),
+        version: args.version.as_deref(),
+        unit: &args.unit,
+        user: args.user,
+        bin_dir: &args.bin_dir,
+        healthz_url: &args.healthz_url,
+        keep: args.keep,
+        health_timeout_secs: args.health_timeout_secs,
+        notify: args.notify.as_deref(),
+    })
+    .await
 }
 
 /// Install the OTLP span exporter when configured, returning a guard that flushes

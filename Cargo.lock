@@ -643,6 +643,7 @@ dependencies = [
  "fraisier-ipc",
  "fraisier-saga",
  "fraisier-scaffold",
+ "fraisier-self-upgrade",
  "fraisier-ship",
  "fraisier-sync",
  "fraisier-webhook",

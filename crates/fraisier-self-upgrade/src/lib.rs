@@ -29,7 +29,7 @@ mod source;
 mod swap;
 
 pub use apply::{apply, ApplyOutcome, Health, Plan, Supervisor};
-pub use notify::{FailurePayload, NoopNotifier, Notifier};
+pub use notify::{ExecHookNotifier, FailurePayload, NoopNotifier, Notifier};
 pub use source::{Source, Verified};
 pub use swap::Layout;
 

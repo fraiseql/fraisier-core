@@ -652,6 +652,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fraisier-db"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "percent-encoding",
+ "thiserror",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "fraisier-ipc"
 version = "1.0.0-alpha.1"
 dependencies = [

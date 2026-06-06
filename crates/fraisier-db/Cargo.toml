@@ -1,0 +1,25 @@
+[package]
+name = "fraisier-db"
+description = "Generic-Postgres database lifecycle ops for fraisier: backup (pg_dump), restore (pg_restore), and reset (drop schemas), with the DSN decomposed into PG* env so secrets never reach argv."
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+percent-encoding = "2.3.2"
+thiserror = "2.0.17"
+tokio = { version = "1.52.3", features = ["process"] }
+url = "2.5.8"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread"] }

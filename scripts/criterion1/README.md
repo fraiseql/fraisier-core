@@ -10,9 +10,9 @@ health → verify`) deployed the **real `fraiseql-server` v2.4.0** against the
 **confiture-migrated `ecommerce_api` schema**, 3× consecutively — each `outcome:
 committed` + `/health` 200.
 
-See `.phases/part-b-fraiseql-canonical-migrations.md` for the full investigation
-(why the subject is ecommerce_api, why the server schema is "rich DB + minimal boot",
-and the framework/app schema findings).
+The artifacts in this directory (the migration set, configs, schema.compiled.json,
+and harness scripts) reproduce that run end to end — the subject is `ecommerce_api`
+with a "rich DB + minimal boot" server schema.
 
 ## What's here
 

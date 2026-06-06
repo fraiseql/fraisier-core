@@ -12,3 +12,7 @@
 # Editor / OS
 .DS_Store
 *.swp
+
+# Local planning record — kept on disk, never published
+.phases/
+/20260601.md

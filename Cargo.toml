@@ -28,10 +28,9 @@ members = [
     "crates/fraisier-self-upgrade",
     "crates/xtask",
 ]
-# Exploratory spikes are standalone crates, not held to the production lint bar.
 # examples/training-field is test scaffolding (a deploy fixture), kept out of the
 # shipped workspace but linted on its own (see its Cargo.toml `[lints]`).
-exclude = ["spikes", "examples/training-field"]
+exclude = ["examples/training-field"]
 
 [workspace.package]
 version = "1.0.0-beta.1"

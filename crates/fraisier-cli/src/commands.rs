@@ -438,6 +438,51 @@ pub(crate) async fn adapter_describe(name: &str) -> Result<CommandOutput> {
     }
 }
 
+/// `list`: enumerate every deploy recorded in the state store, with its current
+/// state (and, unless `flat`, the active artifact + revision from the ledger).
+pub(crate) async fn list(state_dir: &Path, flat: bool) -> Result<CommandOutput> {
+    let store = FilesystemStateStore::new(state_dir)
+        .with_context(|| format!("opening state store at {}", state_dir.display()))?;
+    let mut keys = store.keys().await?;
+    keys.sort_by_key(ToString::to_string);
+
+    let mut entries = Vec::new();
+    let mut pretty = String::new();
+    for key in &keys {
+        let state = store.current_state(key).await?;
+        let ledger = store.current_snapshot(key).await?;
+        let state_label = state
+            .as_ref()
+            .map_or_else(|| "no-state".to_owned(), |s| format!("{:?}", s.state));
+        let revision = ledger
+            .as_ref()
+            .and_then(|l| serde_json::from_value::<DeployRecord>(l.clone()).ok())
+            .and_then(|r| r.revision.map(|rev| rev.to_string()));
+
+        if flat {
+            let _ = writeln!(pretty, "{key}");
+        } else {
+            let rev = revision.as_deref().unwrap_or("-");
+            let _ = writeln!(pretty, "{key}  {state_label}  (revision {rev})");
+        }
+        entries.push(json!({
+            "fraise": key.fraise(),
+            "environment": key.environment(),
+            "state": state_label,
+            "revision": revision,
+        }));
+    }
+    if entries.is_empty() {
+        pretty = format!("no recorded deploys in {}\n", state_dir.display());
+    }
+
+    Ok(CommandOutput {
+        exit_code: 0,
+        pretty,
+        json: json!({ "deploys": entries }),
+    })
+}
+
 /// `status`: the recorded saga state and release ledger for the config's deploy.
 pub(crate) async fn status(config_path: &Path, state_dir: &Path) -> Result<CommandOutput> {
     let config = load(config_path)?;
@@ -691,8 +736,8 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapter_list, deploy, discover_adapters, init, scaffold, scaffold_install, ship, status,
-        validate_config, version_bump, version_show, ShipArgs,
+        adapter_list, deploy, discover_adapters, init, list, scaffold, scaffold_install, ship,
+        status, validate_config, version_bump, version_show, ShipArgs,
     };
     use fraisier_core::single_host::DeployRecord;
     use fraisier_saga::events::SagaState;
@@ -924,6 +969,37 @@ url = "http://127.0.0.1:8080/health"
             .expect("run");
         assert_eq!(out.exit_code, 1);
         assert_eq!(out.json["ok"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn list_enumerates_recorded_deploys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        let store = FilesystemStateStore::new(&state_dir).expect("store");
+        for (fraise, env) in [("checkout", "staging"), ("billing", "production")] {
+            store
+                .record_state(
+                    &FraiseKey::new(fraise, env),
+                    &DeploymentState::new(SagaState::Committed, Some("r1".to_owned())),
+                )
+                .await
+                .expect("record");
+        }
+
+        let out = list(&state_dir, false).await.expect("list");
+        assert_eq!(out.exit_code, 0);
+        let deploys = out.json["deploys"].as_array().expect("deploys");
+        assert_eq!(deploys.len(), 2, "both recorded deploys: {}", out.pretty);
+        assert!(out.pretty.contains("billing/production"));
+        assert!(out.pretty.contains("checkout/staging"));
+    }
+
+    #[tokio::test]
+    async fn list_reports_an_empty_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = list(&dir.path().join("state"), false).await.expect("list");
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.json["deploys"].as_array().expect("deploys").len(), 0);
     }
 
     #[tokio::test]

@@ -281,6 +281,19 @@ pub trait StateStore: Send + Sync {
         &self,
         key: &FraiseKey,
     ) -> Result<Option<serde_json::Value>, StateStoreError>;
+
+    /// Enumerate every deploy key this store has recorded state or a snapshot for.
+    ///
+    /// Backs `fraisier list` and multi-deploy introspection. The default returns
+    /// an empty list for stores that do not track enumeration; the shipped
+    /// backends ([`FilesystemStateStore`], [`MemoryStateStore`], and the `sqlite`
+    /// backend) override it. Order is unspecified.
+    ///
+    /// # Errors
+    /// Returns a backend or deserialization error if the keys cannot be read.
+    async fn keys(&self) -> Result<Vec<FraiseKey>, StateStoreError> {
+        Ok(Vec::new())
+    }
 }
 
 /// A [`StateStore`] backed by a directory of JSON-lines files — one set of files
@@ -318,6 +331,20 @@ impl FilesystemStateStore {
 
     fn snapshot_path(&self, key: &FraiseKey) -> PathBuf {
         self.root.join(format!("{}.snapshot.json", key.slug()))
+    }
+
+    fn key_path(&self, key: &FraiseKey) -> PathBuf {
+        self.root.join(format!("{}.key.json", key.slug()))
+    }
+
+    /// Persist the original [`FraiseKey`] once (filenames use a one-way slug, so
+    /// enumeration needs the key recorded explicitly).
+    fn ensure_key_recorded(&self, key: &FraiseKey) -> Result<(), StateStoreError> {
+        let path = self.key_path(key);
+        if !path.exists() {
+            write_json_atomic(&path, key)?;
+        }
+        Ok(())
     }
 }
 
@@ -407,6 +434,7 @@ impl StateStore for FilesystemStateStore {
         key: &FraiseKey,
         state: &DeploymentState,
     ) -> Result<(), StateStoreError> {
+        self.ensure_key_recorded(key)?;
         append_jsonl(&self.state_path(key), state)
     }
 
@@ -435,6 +463,7 @@ impl StateStore for FilesystemStateStore {
         key: &FraiseKey,
         snapshot: &serde_json::Value,
     ) -> Result<(), StateStoreError> {
+        self.ensure_key_recorded(key)?;
         write_json_atomic(&self.snapshot_path(key), snapshot)
     }
 
@@ -447,6 +476,26 @@ impl StateStore for FilesystemStateStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    async fn keys(&self) -> Result<Vec<FraiseKey>, StateStoreError> {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut keys = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            let is_key_file = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".key.json"));
+            if is_key_file {
+                keys.push(serde_json::from_slice(&std::fs::read(&path)?)?);
+            }
+        }
+        Ok(keys)
     }
 }
 
@@ -483,6 +532,9 @@ struct MemoryInner {
     events: Mutex<HashMap<String, Vec<SagaEvent>>>,
     /// Single last-writer-wins opaque snapshot per pair.
     snapshots: Mutex<HashMap<String, serde_json::Value>>,
+    /// The original key for each slug, so [`keys`](StateStore::keys) can enumerate
+    /// (the maps above are slug-keyed, which is one-way).
+    keys: Mutex<HashMap<String, FraiseKey>>,
 }
 
 impl MemoryStateStore {
@@ -490,6 +542,16 @@ impl MemoryStateStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record the original key for its slug, so [`keys`](StateStore::keys) can
+    /// enumerate it (the data maps are slug-keyed, which is one-way).
+    fn remember_key(&self, key: &FraiseKey) {
+        self.inner
+            .keys
+            .lock()
+            .expect("memory state store keys poisoned")
+            .insert(key.slug(), key.clone());
     }
 }
 
@@ -527,6 +589,7 @@ impl StateStore for MemoryStateStore {
         key: &FraiseKey,
         state: &DeploymentState,
     ) -> Result<(), StateStoreError> {
+        self.remember_key(key);
         self.inner
             .states
             .lock()
@@ -583,6 +646,7 @@ impl StateStore for MemoryStateStore {
         key: &FraiseKey,
         snapshot: &serde_json::Value,
     ) -> Result<(), StateStoreError> {
+        self.remember_key(key);
         self.inner
             .snapshots
             .lock()
@@ -603,6 +667,17 @@ impl StateStore for MemoryStateStore {
             .get(&key.slug())
             .cloned();
         Ok(snapshot)
+    }
+
+    async fn keys(&self) -> Result<Vec<FraiseKey>, StateStoreError> {
+        Ok(self
+            .inner
+            .keys
+            .lock()
+            .expect("memory state store keys poisoned")
+            .values()
+            .cloned()
+            .collect())
     }
 }
 
@@ -634,6 +709,11 @@ CREATE TABLE IF NOT EXISTS snapshots (
     key     TEXT PRIMARY KEY,
     payload TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS fraise_keys (
+    key         TEXT PRIMARY KEY,
+    fraise      TEXT NOT NULL,
+    environment TEXT NOT NULL
+);
 ";
 
 /// A [`StateStore`] backed by SQLite via `sqlx` (runtime queries, no compile-time
@@ -664,6 +744,21 @@ impl SqliteStateStore {
         let pool = SqlitePoolOptions::new().connect_with(options).await?;
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
         Ok(Self { pool })
+    }
+
+    /// Record the original key once, so [`keys`](StateStore::keys) can enumerate
+    /// it (the data tables are slug-keyed, which is one-way).
+    async fn remember_key(&self, key: &FraiseKey) -> Result<(), StateStoreError> {
+        sqlx::query(
+            "INSERT INTO fraise_keys (key, fraise, environment) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(key) DO NOTHING",
+        )
+        .bind(key.slug())
+        .bind(key.fraise())
+        .bind(key.environment())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 
@@ -705,6 +800,7 @@ impl StateStore for SqliteStateStore {
         key: &FraiseKey,
         state: &DeploymentState,
     ) -> Result<(), StateStoreError> {
+        self.remember_key(key).await?;
         let payload = serde_json::to_string(state)?;
         sqlx::query("INSERT INTO deployment_state (key, payload, recorded_at) VALUES (?1, ?2, ?3)")
             .bind(key.slug())
@@ -759,6 +855,7 @@ impl StateStore for SqliteStateStore {
         key: &FraiseKey,
         snapshot: &serde_json::Value,
     ) -> Result<(), StateStoreError> {
+        self.remember_key(key).await?;
         let payload = serde_json::to_string(snapshot)?;
         sqlx::query(
             "INSERT INTO snapshots (key, payload) VALUES (?1, ?2) \
@@ -781,6 +878,17 @@ impl StateStore for SqliteStateStore {
             .await?;
         row.map(|(payload,)| serde_json::from_str(&payload).map_err(StateStoreError::from))
             .transpose()
+    }
+
+    async fn keys(&self) -> Result<Vec<FraiseKey>, StateStoreError> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT fraise, environment FROM fraise_keys")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(fraise, environment)| FraiseKey::new(fraise, environment))
+            .collect())
     }
 }
 
@@ -930,6 +1038,33 @@ mod tests {
             .is_none());
     }
 
+    pub(super) async fn enumerates_recorded_keys(store: &dyn StateStore) {
+        assert!(
+            store.keys().await.expect("empty keys").is_empty(),
+            "a fresh store enumerates no keys"
+        );
+
+        let a = FraiseKey::new("checkout", "production");
+        let b = FraiseKey::new("checkout", "staging");
+        store
+            .record_state(&a, &DeploymentState::new(SagaState::Committed, None))
+            .await
+            .expect("record a");
+        store
+            .record_snapshot(&b, &serde_json::json!({ "x": 1 }))
+            .await
+            .expect("snapshot b");
+        // Recording the same key twice must not duplicate it.
+        store
+            .record_state(&a, &DeploymentState::new(SagaState::Committed, None))
+            .await
+            .expect("record a again");
+
+        let mut keys = store.keys().await.expect("keys");
+        keys.sort_by_key(ToString::to_string);
+        assert_eq!(keys, vec![a, b], "both keys enumerated, no duplicates");
+    }
+
     // --- filesystem backend instantiation (Cycle 1.3) ---
 
     fn filesystem_store() -> (tempfile::TempDir, FilesystemStateStore) {
@@ -962,6 +1097,12 @@ mod tests {
         snapshot_is_last_writer_wins(&store).await;
     }
 
+    #[tokio::test]
+    async fn filesystem_enumerates_recorded_keys() {
+        let (_dir, store) = filesystem_store();
+        enumerates_recorded_keys(&store).await;
+    }
+
     // --- in-memory backend (default-on): same harness, different backend ---
 
     #[tokio::test]
@@ -982,6 +1123,11 @@ mod tests {
     #[tokio::test]
     async fn memory_snapshot_is_last_writer_wins() {
         snapshot_is_last_writer_wins(&super::MemoryStateStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_enumerates_recorded_keys() {
+        enumerates_recorded_keys(&super::MemoryStateStore::new()).await;
     }
 
     /// Clones of a [`MemoryStateStore`] share one backing store — the property
@@ -1044,5 +1190,12 @@ mod tests {
     async fn sqlite_snapshot_is_last_writer_wins() {
         let (_dir, store) = sqlite_store().await;
         snapshot_is_last_writer_wins(&store).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_enumerates_recorded_keys() {
+        let (_dir, store) = sqlite_store().await;
+        enumerates_recorded_keys(&store).await;
     }
 }

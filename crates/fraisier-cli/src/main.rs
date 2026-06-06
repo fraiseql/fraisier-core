@@ -48,6 +48,9 @@ enum Command {
     /// Run a single-host deploy (or, with `--dry-run`, just resolve the plan).
     Deploy(DeployArgs),
 
+    /// List every deploy recorded in the state store.
+    List(ListArgs),
+
     /// Show the recorded saga state and release ledger for a deploy.
     Status(StatusArgs),
 
@@ -237,6 +240,17 @@ struct StatusArgs {
     state_dir: PathBuf,
 }
 
+#[derive(Debug, Args)]
+struct ListArgs {
+    /// Directory for the filesystem state store.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+
+    /// Print only `fraise/environment` names, one per line.
+    #[arg(long)]
+    flat: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum AdapterCommand {
     /// List `fraisier-adapter-*` binaries discoverable on `PATH`.
@@ -282,6 +296,7 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
             )
             .await
         }
+        Command::List(args) => commands::list(&args.state_dir, args.flat).await,
         Command::Status(args) => commands::status(&args.config, &args.state_dir).await,
         Command::Adapter(AdapterCommand::List) => Ok(commands::adapter_list()),
         Command::Adapter(AdapterCommand::Describe { name }) => {

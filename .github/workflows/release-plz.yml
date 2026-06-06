@@ -10,6 +10,8 @@ name: release-plz
 #
 # The first publish of the 25 brand-new crate names is done MANUALLY (it claims
 # the names deliberately); release-plz takes over every release after that.
+#
+# Actions are pinned by commit SHA (matches the fraiseql repo's hardening).
 on:
   push:
     branches: [main]
@@ -28,14 +30,14 @@ jobs:
       group: release-plz-${{ github.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
       - name: Install the pinned Rust toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: release-plz — maintain the release PR
-        uses: release-plz/action@v0.5
+        uses: release-plz/action@064f4d1e36c843611ddf013be726beaa4ad804db # v0.5
         with:
           command: release-pr
         env:
@@ -49,18 +51,20 @@ jobs:
     if: github.repository == 'fraiseql/fraisier-core'
     # The crates.io token lives in this protected Environment (restricted to the
     # main branch; add required reviewers here for an extra manual gate).
-    environment: crates-io
+    environment: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
       - name: Install the pinned Rust toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: release-plz — publish unreleased crates
-        uses: release-plz/action@v0.5
+        uses: release-plz/action@064f4d1e36c843611ddf013be726beaa4ad804db # v0.5
         with:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          # The crates.io token; `CARGO_TOKEN` is the repo-wide secret name shared
+          # with the fraiseql repo, mapped to the env var cargo/release-plz expect.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}

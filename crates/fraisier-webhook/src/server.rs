@@ -6,10 +6,12 @@
 //! a hard cap on header and body size, so the parser stays small and auditable.
 //! Run it behind a reverse proxy or on a trusted network.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use listenfd::ListenFd;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 use crate::sign::{verify, Rejection, SIGNATURE_HEADER, TIMESTAMP_HEADER};
 
@@ -129,6 +131,74 @@ where
             Served::HandlerError(message)
         }
     }
+}
+
+/// Where the listening socket came from.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ListenSource {
+    /// Inherited from systemd via socket activation (`LISTEN_FDS`).
+    SocketActivated,
+    /// Bound directly to the given address (the standalone fallback).
+    Bound(String),
+}
+
+impl std::fmt::Display for ListenSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SocketActivated => write!(f, "socket activation (systemd)"),
+            Self::Bound(addr) => write!(f, "{addr}"),
+        }
+    }
+}
+
+/// Acquire the listening socket: systemd **socket activation** when a socket was
+/// passed in (`LISTEN_FDS`), otherwise **bind** `addr` directly.
+///
+/// The raw-fd handling for socket activation lives inside the `listenfd` crate,
+/// so this crate stays free of `unsafe`.
+///
+/// # Errors
+/// [`std::io::Error`] if the inherited socket cannot be adopted or `addr` cannot
+/// be bound.
+pub async fn acquire(addr: &str) -> std::io::Result<(TcpListener, ListenSource)> {
+    if let Some(std_listener) = ListenFd::from_env().take_tcp_listener(0).ok().flatten() {
+        std_listener.set_nonblocking(true)?;
+        return Ok((
+            TcpListener::from_std(std_listener)?,
+            ListenSource::SocketActivated,
+        ));
+    }
+    Ok((
+        TcpListener::bind(addr).await?,
+        ListenSource::Bound(addr.to_owned()),
+    ))
+}
+
+/// Accept connections forever, serving each with [`serve_connection`].
+///
+/// Connections are handled one at a time: webhook volume is low and deploys
+/// serialize on the state-store lock anyway, so sequential handling keeps the
+/// server simple and avoids unbounded concurrent deploys. Returns only if
+/// accepting a connection fails.
+///
+/// # Errors
+/// [`std::io::Error`] from [`TcpListener::accept`].
+pub async fn serve(
+    listener: TcpListener,
+    config: &ServerConfig,
+    handler: &dyn WebhookHandler,
+) -> std::io::Result<()> {
+    loop {
+        let (stream, _peer) = listener.accept().await?;
+        let _ = serve_connection(stream, config, handler, now_unix()).await;
+    }
+}
+
+/// The current time in Unix seconds (saturating to 0 before the epoch).
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Read one HTTP/1.1 request: the request line, headers (until `\r\n\r\n`), and a
@@ -329,6 +399,37 @@ mod tests {
         assert!(matches!(outcome, Served::BadRequest(_)), "{outcome:?}");
         assert!(response.starts_with("HTTP/1.1 405"), "response: {response}");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serves_a_signed_post_over_a_real_tcp_socket() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = calls.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let handler = Recorder {
+                calls: server_calls,
+            };
+            serve_connection(stream, &config(), &handler, NOW).await
+        });
+
+        let body = br#"{"version":"2.0.0"}"#;
+        let request = raw_post(body, &NOW.to_string(), &sign(SECRET, NOW, body));
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client.write_all(&request).await.expect("write");
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.expect("read");
+
+        let outcome = server.await.expect("server task");
+        assert_eq!(outcome, Served::Ok);
+        assert!(response.starts_with("HTTP/1.1 200"), "response: {response}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "handler ran once");
     }
 
     #[tokio::test]

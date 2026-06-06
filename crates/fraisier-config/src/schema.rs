@@ -78,6 +78,10 @@ pub struct DeployConfig {
     /// rollout. Absent for single-host deploys (which run locally).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshSection>,
+    /// The `[webhook]` section: the signed-POST deploy trigger server. Absent
+    /// when no webhook server is run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<WebhookSection>,
     /// The `[specql]` preset. Present only in the *unexpanded* form; both
     /// [`from_toml_str`](DeployConfig::from_toml_str) and
     /// [`load`](DeployConfig::load) consume it and leave this `None`.
@@ -249,6 +253,31 @@ pub struct SshSection {
     /// Extra `ssh -o KEY=VALUE` options (e.g. `StrictHostKeyChecking=no`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
+}
+
+/// The `[webhook]` section: the signed-POST deploy trigger server.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookSection {
+    /// The *source* env var holding the shared HMAC secret (Decision 5: the
+    /// secret value never enters config or argv).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_env: Option<String>,
+    /// The standalone bind address (`host:port`). Ignored under systemd socket
+    /// activation. Defaults to `127.0.0.1:9000`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
+    /// The replay tolerance in seconds (timestamp skew accepted in either
+    /// direction). Defaults to `300`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tolerance_secs: Option<u64>,
+    /// The maximum accepted request body size in bytes. Defaults to `1048576`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<usize>,
+    /// How long to wait for a complete request before giving up, in seconds.
+    /// Defaults to `30`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_timeout_secs: Option<u64>,
 }
 
 /// The `[lb]` section.

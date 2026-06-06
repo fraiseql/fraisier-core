@@ -16,5 +16,7 @@
 mod server;
 mod sign;
 
-pub use server::{serve_connection, Served, ServerConfig, WebhookHandler};
+pub use server::{
+    acquire, serve, serve_connection, ListenSource, Served, ServerConfig, WebhookHandler,
+};
 pub use sign::{sign, verify, Rejection, SIGNATURE_HEADER, TIMESTAMP_HEADER};

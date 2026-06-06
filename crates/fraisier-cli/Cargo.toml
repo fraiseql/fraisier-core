@@ -29,6 +29,7 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.100"
+async-trait = "0.1.89"
 clap = { version = "4.5.51", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -64,6 +65,8 @@ fraisier-ship = { path = "../fraisier-ship", version = "1.0.0-alpha.1" }
 fraisier-db = { path = "../fraisier-db", version = "1.0.0-alpha.1" }
 # SSH-based host bootstrap (prepare deploy directories over the transport).
 fraisier-bootstrap = { path = "../fraisier-bootstrap", version = "1.0.0-alpha.1" }
+# Signed-webhook server (HMAC + replay) that triggers a deploy.
+fraisier-webhook = { path = "../fraisier-webhook", version = "1.0.0-alpha.1" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

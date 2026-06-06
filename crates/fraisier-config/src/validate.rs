@@ -128,6 +128,7 @@ impl DeployConfig {
         validate_health(self, &mut report);
         validate_hosts(self, &mut report);
         validate_lb(self, &mut report);
+        validate_webhook(self, &mut report);
         report
     }
 
@@ -413,6 +414,19 @@ fn validate_rolling(hosts: &crate::schema::HostsSection, report: &mut Validation
             ),
         ),
         _ => {}
+    }
+}
+
+fn validate_webhook(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(webhook) = &cfg.webhook else {
+        return; // optional
+    };
+    if !is_set(webhook.secret_env.as_ref()) {
+        report.error(
+            "webhook.secret_env",
+            "the [webhook] server requires secret_env \
+             (the name of the env var holding the shared HMAC secret)",
+        );
     }
 }
 

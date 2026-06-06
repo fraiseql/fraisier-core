@@ -1378,6 +1378,110 @@ pub(crate) async fn bootstrap(
     })
 }
 
+/// A webhook handler that runs a deploy when a verified request arrives. An
+/// optional `{"version": "..."}` in the (signed) body becomes the deploy's app
+/// version.
+struct DeployHandler {
+    config: PathBuf,
+    state_dir: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl fraisier_webhook::WebhookHandler for DeployHandler {
+    async fn handle(&self, body: &[u8]) -> Result<String, String> {
+        let version = serde_json::from_slice::<Value>(body).ok().and_then(|v| {
+            v.get("version")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        });
+        let out = deploy(
+            &self.config,
+            &self.state_dir,
+            None,
+            version.as_deref(),
+            false,
+        )
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+        let outcome = out
+            .json
+            .get("outcome")
+            .and_then(Value::as_str)
+            .unwrap_or("done")
+            .to_owned();
+        if out.exit_code == 0 {
+            Ok(format!("deploy {outcome}"))
+        } else {
+            Err(format!("deploy {outcome}"))
+        }
+    }
+}
+
+/// `webhook-server`: run the signed-POST deploy trigger server. Blocks, serving
+/// requests over systemd socket activation (when present) or a standalone bind,
+/// until the listener fails. Refuses to start on an invalid config.
+pub(crate) async fn webhook_server(
+    config_path: &Path,
+    state_dir: &Path,
+    listen_override: Option<&str>,
+) -> Result<CommandOutput> {
+    let config = load(config_path)?;
+    let report = config.validate();
+    if !report.ok() {
+        let mut pretty = render_issues(&report);
+        pretty.push_str("refusing to start the webhook server with an invalid config\n");
+        return Ok(CommandOutput {
+            exit_code: 1,
+            pretty,
+            json: json!({ "ok": false, "issues": serde_json::to_value(&report.issues)? }),
+        });
+    }
+
+    let webhook = config
+        .webhook
+        .as_ref()
+        .context("missing [webhook] section")?;
+    let secret_env = webhook
+        .secret_env
+        .as_deref()
+        .context("[webhook].secret_env is required")?;
+    let secret = std::env::var(secret_env).with_context(|| {
+        format!("the configured [webhook].secret_env '{secret_env}' is not set in the environment")
+    })?;
+    let listen = listen_override
+        .map(ToOwned::to_owned)
+        .or_else(|| webhook.listen.clone())
+        .unwrap_or_else(|| "127.0.0.1:9000".to_owned());
+
+    let server_config = fraisier_webhook::ServerConfig {
+        secret: secret.into_bytes(),
+        tolerance_secs: webhook.tolerance_secs.unwrap_or(300),
+        max_body_bytes: webhook.max_body_bytes.unwrap_or(1024 * 1024),
+        read_timeout: std::time::Duration::from_secs(webhook.read_timeout_secs.unwrap_or(30)),
+    };
+    let (listener, source) = fraisier_webhook::acquire(&listen)
+        .await
+        .context("acquiring the webhook listener")?;
+    let handler = DeployHandler {
+        config: config_path.to_owned(),
+        state_dir: state_dir.to_owned(),
+    };
+    eprintln!(
+        "fraisier webhook-server listening on {source} (deploys {})",
+        config_path.display()
+    );
+    fraisier_webhook::serve(listener, &server_config, &handler)
+        .await
+        .context("serving webhook requests")?;
+
+    // `serve` only returns on a listener error (handled above by `?`).
+    Ok(CommandOutput {
+        exit_code: 0,
+        pretty: "webhook server stopped\n".to_owned(),
+        json: json!({ "ok": true }),
+    })
+}
+
 /// Map a saga outcome onto `(exit code, label, detail)` for both deploy paths.
 fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
     match outcome {
@@ -1400,7 +1504,7 @@ mod tests {
     use super::{
         adapter_list, bootstrap, db_backup, db_migrate, db_reset, db_restore, deploy,
         discover_adapters, health, init, list, rollback, scaffold, scaffold_install, ship, status,
-        validate_config, version_bump, version_show, ShipArgs,
+        validate_config, version_bump, version_show, webhook_server, ShipArgs,
     };
     use fraisier_core::single_host::DeployRecord;
     use fraisier_saga::events::SagaState;
@@ -2134,6 +2238,24 @@ current_revision = "true"
         assert!(
             out.pretty.contains("nothing to prepare"),
             "pretty: {}",
+            out.pretty
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_server_refuses_an_invalid_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Valid deploy axes, but [webhook] is missing secret_env → validation
+        // fails and the server refuses to start (no socket is bound).
+        let cfg = format!("{VALID}\n[webhook]\nlisten = \"127.0.0.1:0\"\n");
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let out = webhook_server(&config, &dir.path().join("state"), None)
+            .await
+            .expect("run");
+        assert_eq!(out.exit_code, 1);
+        assert!(
+            out.pretty.contains("secret_env"),
+            "names the missing field: {}",
             out.pretty
         );
     }

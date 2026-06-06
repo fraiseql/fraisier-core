@@ -63,6 +63,9 @@ enum Command {
     /// Prepare each target host's deploy directories over SSH (or locally).
     Bootstrap(BootstrapArgs),
 
+    /// Run the signed-webhook deploy trigger server (socket-activated or standalone).
+    WebhookServer(WebhookServerArgs),
+
     /// Back up the database to a custom-format archive (`pg_dump -Fc`).
     Backup(BackupArgs),
 
@@ -333,6 +336,22 @@ struct DbMigrateArgs {
 }
 
 #[derive(Debug, Args)]
+struct WebhookServerArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Directory for the filesystem state store (used by triggered deploys).
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+
+    /// Override the standalone bind address (`host:port`). Ignored under systemd
+    /// socket activation.
+    #[arg(long)]
+    listen: Option<String>,
+}
+
+#[derive(Debug, Args)]
 struct BootstrapArgs {
     /// Path to the `fraisier.toml`.
     #[arg(long, default_value = "fraisier.toml")]
@@ -455,6 +474,9 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         }
         Command::Bootstrap(args) => {
             commands::bootstrap(&args.config, args.host.as_deref(), args.dry_run).await
+        }
+        Command::WebhookServer(args) => {
+            commands::webhook_server(&args.config, &args.state_dir, args.listen.as_deref()).await
         }
         Command::Backup(args) => {
             commands::db_backup(&args.config, args.output.as_deref(), args.force).await

@@ -791,6 +791,97 @@ pub trait LbAdapter: Send + Sync {
     ) -> Result<(), AdapterError>;
 }
 
+/// Which fleet the load balancer's active upstream points at during a blue-green
+/// window. The name is opaque to fraisier — an operator-meaningful upstream/fleet
+/// id (e.g. `"blue"` / `"green"`).
+///
+/// # Example
+/// ```
+/// # use fraisier_core::adapter_axes::TrafficTarget;
+/// let t = TrafficTarget::new("green");
+/// assert_eq!(t.as_str(), "green");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrafficTarget(pub String);
+
+impl TrafficTarget {
+    /// A target named `name`.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    /// The target's name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TrafficTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The receipt of a completed traffic swap — confirms which target is now live.
+///
+/// The caller captures the *prior* [`TrafficTarget`] (via
+/// [`TrafficDirector::current_target`]) before swapping, so a rollback is just a
+/// swap back to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwapToken {
+    /// The target traffic now points at.
+    pub target: TrafficTarget,
+}
+
+/// **Traffic-direction capability** — an *additive* extension to the `lb` axis.
+///
+/// The frozen [`LbAdapter`] expresses per-host pool `drain`/`reattach` (rolling
+/// deploys); it **cannot** express "point the active upstream at the green fleet,"
+/// which is what a blue-green swap needs. Rather than reopen the Cycle-1.6 freeze,
+/// this is a separate, **capability-gated** trait: the deploy layer composes it
+/// only when the adapter advertises `traffic_swap` in
+/// [`AdapterDescription::capabilities`] (exactly as `preflight` gates the
+/// migration axis), and refuses blue-green otherwise. The frozen `LbAdapter` is
+/// untouched — this is surfaced, not silently changed.
+///
+/// # Example
+/// ```no_run
+/// # use fraisier_core::adapter_axes::{TrafficDirector, TrafficTarget, AdapterCtx, AdapterError};
+/// async fn swap(d: &dyn TrafficDirector, ctx: &AdapterCtx) -> Result<(), AdapterError> {
+///     let prior = d.current_target(ctx).await?;     // capture, for swap-back
+///     d.switch_to(ctx, &TrafficTarget::new("green")).await?;
+///     // ... on failure within the hold window: swap back ...
+///     d.switch_to(ctx, &prior).await?;
+///     Ok(())
+/// }
+/// ```
+#[async_trait]
+pub trait TrafficDirector: Send + Sync {
+    /// Report identity + capabilities (must include `traffic_swap`).
+    ///
+    /// # Errors
+    /// [`AdapterError`] if the adapter cannot describe itself.
+    async fn describe(&self) -> Result<AdapterDescription, AdapterError>;
+
+    /// Which fleet is currently live — captured *before* a swap so a rollback can
+    /// swap back to it.
+    ///
+    /// # Errors
+    /// [`AdapterError`] if the current target cannot be determined.
+    async fn current_target(&self, ctx: &AdapterCtx) -> Result<TrafficTarget, AdapterError>;
+
+    /// Atomically point the active upstream at `target` and make it live.
+    ///
+    /// # Errors
+    /// [`AdapterError`] if the swap or reload fails.
+    async fn switch_to(
+        &self,
+        ctx: &AdapterCtx,
+        target: &TrafficTarget,
+    ) -> Result<SwapToken, AdapterError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

@@ -69,14 +69,14 @@ impl Step for WriteFile {
         "write-file"
     }
 
-    async fn forward(&self, _ctx: &StepContext) -> Result<(), SagaError> {
+    async fn forward(&self, _ctx: &StepContext, _state: &mut ()) -> Result<(), SagaError> {
         std::fs::write(&self.path, b"live").map_err(|e| SagaError::StepFailed {
             step: "write-file".to_owned(),
             message: e.to_string(),
         })
     }
 
-    async fn compensate(&self, _ctx: &StepContext) -> Result<(), SagaError> {
+    async fn compensate(&self, _ctx: &StepContext, _state: &mut ()) -> Result<(), SagaError> {
         // Idempotent: "already gone" is success.
         let _ = std::fs::remove_file(&self.path);
         Ok(())
@@ -92,14 +92,14 @@ impl Step for AlwaysFails {
         "always-fails"
     }
 
-    async fn forward(&self, _ctx: &StepContext) -> Result<(), SagaError> {
+    async fn forward(&self, _ctx: &StepContext, _state: &mut ()) -> Result<(), SagaError> {
         Err(SagaError::StepFailed {
             step: "always-fails".to_owned(),
             message: "forced failure".to_owned(),
         })
     }
 
-    async fn compensate(&self, _ctx: &StepContext) -> Result<(), SagaError> {
+    async fn compensate(&self, _ctx: &StepContext, _state: &mut ()) -> Result<(), SagaError> {
         Ok(())
     }
 }

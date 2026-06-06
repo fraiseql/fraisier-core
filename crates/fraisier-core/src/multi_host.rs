@@ -1058,7 +1058,7 @@ impl Step for RolloutStep {
         self.kind.step_name()
     }
 
-    async fn forward(&self, _ctx: &StepContext) -> Result<(), SagaError> {
+    async fn forward(&self, _ctx: &StepContext, _state: &mut ()) -> Result<(), SagaError> {
         match &self.kind {
             StepKind::Preflight => self.shared.run_preflight().await,
             StepKind::Fetch => self.shared.run_fetch().await,
@@ -1068,7 +1068,7 @@ impl Step for RolloutStep {
         }
     }
 
-    async fn compensate(&self, _ctx: &StepContext) -> Result<(), SagaError> {
+    async fn compensate(&self, _ctx: &StepContext, _state: &mut ()) -> Result<(), SagaError> {
         match &self.kind {
             // Preflight, fetch, and verify are non-mutating (a reachability probe,
             // an artifact staged but never activated, a read-only smoke test), so

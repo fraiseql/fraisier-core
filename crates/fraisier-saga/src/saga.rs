@@ -55,25 +55,38 @@ impl StepContext {
 /// This is the engine's *generic* step abstraction — deliberately not an adapter
 /// axis. The deploy layer will wrap adapters (artifact/migration/…) into `Step`s;
 /// the engine never sees an adapter directly.
+///
+/// # Run-state (`R`)
+///
+/// Steps share mutable per-run state through the typed `&mut R` parameter the
+/// engine threads into every `forward`/`compensate` call — a value the *caller*
+/// owns and passes to [`Saga::run_with_state`]. Because a saga runs its steps
+/// strictly one at a time, each step gets **exclusive** (`&mut`) access in turn:
+/// a step *produces* a value (a staged artifact, a container handle) by writing
+/// it into the state, and a later step — or an earlier step's compensation —
+/// *consumes* it by reading it back. No `Arc<Mutex>`, no interior mutability, and
+/// no downcasting. `R` defaults to `()` for stateless sagas, whose steps simply
+/// ignore the `&mut ()` argument and run via [`Saga::run`].
 #[async_trait]
-pub trait Step: Send + Sync {
+pub trait Step<R: Send = ()>: Send + Sync {
     /// A short, stable name used in state, events, and spans (e.g. `"migrate"`).
     fn name(&self) -> &str;
 
-    /// Perform the step's forward action.
+    /// Perform the step's forward action, reading and writing the shared run
+    /// state `state` as needed.
     ///
     /// # Errors
     /// Returns a [`SagaError`] if the action fails; the saga then compensates
     /// every previously completed step in reverse.
-    async fn forward(&self, ctx: &StepContext) -> Result<(), SagaError>;
+    async fn forward(&self, ctx: &StepContext, state: &mut R) -> Result<(), SagaError>;
 
-    /// Undo the step's forward action. Only called for steps whose `forward`
-    /// completed successfully.
+    /// Undo the step's forward action, using `state` to recover what `forward`
+    /// produced. Only called for steps whose `forward` completed successfully.
     ///
     /// # Errors
     /// Returns a [`SagaError`] if compensation fails; the saga then reports
     /// [`SagaOutcome::PartialRollback`] rather than pretending it succeeded.
-    async fn compensate(&self, ctx: &StepContext) -> Result<(), SagaError>;
+    async fn compensate(&self, ctx: &StepContext, state: &mut R) -> Result<(), SagaError>;
 }
 
 /// How a saga run ended.
@@ -97,17 +110,19 @@ pub enum SagaOutcome {
     },
 }
 
-/// Drives a sequence of [`Step`]s atomically over a [`StateStore`].
+/// Drives a sequence of [`Step`]s atomically over a [`StateStore`], threading a
+/// caller-owned run state `R` (default `()`) through every step.
 ///
-/// Construct with [`Saga::new`], append steps with [`Saga::with_step`], and
-/// execute with [`Saga::run`].
-pub struct Saga<S: StateStore> {
+/// Construct with [`Saga::new`], append steps with [`Saga::with_step`] /
+/// [`Saga::with_steps`], and execute with [`Saga::run_with_state`] — or with the
+/// [`Saga::run`] shortcut when `R = ()` (a stateless saga).
+pub struct Saga<S: StateStore, R: Send = ()> {
     store: S,
     key: FraiseKey,
-    steps: Vec<Box<dyn Step>>,
+    steps: Vec<Box<dyn Step<R>>>,
 }
 
-impl<S: StateStore> Saga<S> {
+impl<S: StateStore, R: Send> Saga<S, R> {
     /// Create an empty saga for one `(fraise, environment)` pair.
     #[must_use]
     pub fn new(store: S, fraise: impl Into<String>, environment: impl Into<String>) -> Self {
@@ -120,7 +135,7 @@ impl<S: StateStore> Saga<S> {
 
     /// Append a step to the forward sequence (builder style).
     #[must_use]
-    pub fn with_step(mut self, step: Box<dyn Step>) -> Self {
+    pub fn with_step(mut self, step: Box<dyn Step<R>>) -> Self {
         self.steps.push(step);
         self
     }
@@ -129,35 +144,36 @@ impl<S: StateStore> Saga<S> {
     /// (builder style).
     ///
     /// A convenience for composing a *dynamically built* list of steps — e.g. a
-    /// `Vec<Box<dyn Step>>` assembled with conditional steps — without folding
+    /// `Vec<Box<dyn Step<R>>>` assembled with conditional steps — without folding
     /// over [`Saga::with_step`]. Equivalent to calling `with_step` once per item.
     #[must_use]
     pub fn with_steps<I>(mut self, steps: I) -> Self
     where
-        I: IntoIterator<Item = Box<dyn Step>>,
+        I: IntoIterator<Item = Box<dyn Step<R>>>,
     {
         self.steps.extend(steps);
         self
     }
 
-    /// Acquire the per-pair lock, run every step forward, and commit — or roll
-    /// back in reverse on the first failure. The lock is always released.
+    /// Acquire the per-pair lock, run every step forward threading `state`, and
+    /// commit — or roll back in reverse on the first failure. The lock is always
+    /// released; `state` reflects whatever the steps left in it.
     ///
     /// # Errors
     /// Returns a [`SagaError`] for infrastructure failures (locking or state
     /// persistence). A *business* failure that rolls back cleanly is reported as
     /// a successful `Ok(SagaOutcome::RolledBack)`, not an `Err`.
-    pub async fn run(&self) -> Result<SagaOutcome, SagaError> {
+    pub async fn run_with_state(&self, state: &mut R) -> Result<SagaOutcome, SagaError> {
         use tracing::Instrument as _;
         // One root span per run, held across the whole run, so every transition
         // span nests beneath it and the deploy exports as a single trace.
         let span = instrument_deploy_run(self.key.fraise(), self.key.environment());
-        self.run_inner().instrument(span).await
+        self.run_inner(state).instrument(span).await
     }
 
-    async fn run_inner(&self) -> Result<SagaOutcome, SagaError> {
+    async fn run_inner(&self, state: &mut R) -> Result<SagaOutcome, SagaError> {
         let guard = self.store.acquire_lock(&self.key).await?;
-        let outcome = self.execute().await;
+        let outcome = self.execute(state).await;
         match self.store.release_lock(guard).await {
             Ok(()) => outcome,
             // Prefer the run's own error; otherwise surface the release failure.
@@ -171,16 +187,18 @@ impl<S: StateStore> Saga<S> {
         }
     }
 
-    async fn execute(&self) -> Result<SagaOutcome, SagaError> {
+    async fn execute(&self, state: &mut R) -> Result<SagaOutcome, SagaError> {
         let ctx = StepContext::new(self.key.clone());
         let mut from = SagaState::Idle;
-        let mut completed: Vec<&dyn Step> = Vec::new();
+        let mut completed: Vec<&dyn Step<R>> = Vec::new();
 
         for step in &self.steps {
             let to = SagaState::Running(step.name().to_owned());
             self.transition(&from, &to).await?;
-            if let Err(error) = step.forward(&ctx).await {
-                return self.rollback(&ctx, &completed, step.name(), &error).await;
+            if let Err(error) = step.forward(&ctx, state).await {
+                return self
+                    .rollback(&ctx, &completed, step.name(), &error, state)
+                    .await;
             }
             completed.push(step.as_ref());
             from = to;
@@ -196,15 +214,16 @@ impl<S: StateStore> Saga<S> {
     async fn rollback(
         &self,
         ctx: &StepContext,
-        completed: &[&dyn Step],
+        completed: &[&dyn Step<R>],
         failed_step: &str,
         error: &SagaError,
+        state: &mut R,
     ) -> Result<SagaOutcome, SagaError> {
         let mut from = SagaState::Running(failed_step.to_owned());
         for step in completed.iter().rev() {
             let to = SagaState::Compensating(step.name().to_owned());
             self.transition(&from, &to).await?;
-            if let Err(comp_err) = step.compensate(ctx).await {
+            if let Err(comp_err) = step.compensate(ctx, state).await {
                 let reason = format!("compensation for '{}' failed: {comp_err}", step.name());
                 self.transition(&to, &SagaState::PartialRollback(reason.clone()))
                     .await?;
@@ -237,6 +256,20 @@ impl<S: StateStore> Saga<S> {
             .record_state(&self.key, &DeploymentState::new(to.clone(), None))
             .await?;
         Ok(())
+    }
+}
+
+impl<S: StateStore> Saga<S, ()> {
+    /// Run a **stateless** saga (run state `()`), the common case where steps
+    /// share nothing across the run. A convenience for
+    /// `run_with_state(&mut ())`; see [`Saga::run_with_state`] for the threaded
+    /// run-state form and its error contract.
+    ///
+    /// # Errors
+    /// Returns a [`SagaError`] for infrastructure failures; a clean business
+    /// rollback is `Ok(SagaOutcome::RolledBack)`.
+    pub async fn run(&self) -> Result<SagaOutcome, SagaError> {
+        self.run_with_state(&mut ()).await
     }
 }
 
@@ -299,7 +332,7 @@ mod tests {
         fn name(&self) -> &str {
             &self.name
         }
-        async fn forward(&self, _ctx: &StepContext) -> Result<(), SagaError> {
+        async fn forward(&self, _ctx: &StepContext, _state: &mut ()) -> Result<(), SagaError> {
             self.trail
                 .lock()
                 .expect("trail")
@@ -312,7 +345,7 @@ mod tests {
             }
             Ok(())
         }
-        async fn compensate(&self, _ctx: &StepContext) -> Result<(), SagaError> {
+        async fn compensate(&self, _ctx: &StepContext, _state: &mut ()) -> Result<(), SagaError> {
             self.trail
                 .lock()
                 .expect("trail")
@@ -468,6 +501,122 @@ mod tests {
             *trail.lock().expect("trail"),
             vec!["forward:a", "forward:b", "forward:c", "forward:d"],
             "with_step and with_steps preserve overall append order"
+        );
+    }
+
+    /// Writes a value into the typed run-state; a no-op compensation. Models a
+    /// step that *produces* cross-step data (e.g. a container handle).
+    struct Producer;
+
+    #[async_trait::async_trait]
+    impl Step<Option<u32>> for Producer {
+        fn name(&self) -> &'static str {
+            "produce"
+        }
+        async fn forward(
+            &self,
+            _ctx: &StepContext,
+            state: &mut Option<u32>,
+        ) -> Result<(), SagaError> {
+            *state = Some(42);
+            Ok(())
+        }
+        async fn compensate(
+            &self,
+            _ctx: &StepContext,
+            state: &mut Option<u32>,
+        ) -> Result<(), SagaError> {
+            *state = None; // undo the production so rollback leaves clean state
+            Ok(())
+        }
+    }
+
+    /// Reads the value the producer left in the run-state; optionally fails to
+    /// force a rollback. Models a step that *consumes* cross-step data.
+    struct Consumer {
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Step<Option<u32>> for Consumer {
+        fn name(&self) -> &'static str {
+            "consume"
+        }
+        async fn forward(
+            &self,
+            _ctx: &StepContext,
+            state: &mut Option<u32>,
+        ) -> Result<(), SagaError> {
+            if *state != Some(42) {
+                return Err(SagaError::StepFailed {
+                    step: "consume".to_owned(),
+                    message: format!("expected the producer's 42, got {state:?}"),
+                });
+            }
+            if self.fail {
+                return Err(SagaError::StepFailed {
+                    step: "consume".to_owned(),
+                    message: "forced failure after reading state".to_owned(),
+                });
+            }
+            Ok(())
+        }
+        async fn compensate(
+            &self,
+            _ctx: &StepContext,
+            _state: &mut Option<u32>,
+        ) -> Result<(), SagaError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_with_state_passes_typed_values_between_steps() {
+        init_global_subscriber();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FilesystemStateStore::new(dir.path()).expect("store");
+
+        // The caller owns the run-state; steps mutate it through `&mut R` with no
+        // Arc<Mutex> and no downcast. The consumer reads what the producer wrote.
+        let mut state: Option<u32> = None;
+        let outcome = Saga::new(store, "checkout", "production")
+            .with_step(Box::new(Producer))
+            .with_step(Box::new(Consumer { fail: false }))
+            .run_with_state(&mut state)
+            .await
+            .expect("run succeeds");
+
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+        assert_eq!(
+            state,
+            Some(42),
+            "the consumer saw the producer's value and the caller reads it back"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_with_state_threads_state_into_compensation_on_rollback() {
+        init_global_subscriber();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FilesystemStateStore::new(dir.path()).expect("store");
+
+        // The consumer fails after the producer wrote state; the producer's
+        // compensation runs with `&mut R` and clears it.
+        let mut state: Option<u32> = None;
+        let outcome = Saga::new(store, "checkout", "production")
+            .with_step(Box::new(Producer))
+            .with_step(Box::new(Consumer { fail: true }))
+            .run_with_state(&mut state)
+            .await
+            .expect("run completes (with rollback)");
+
+        assert!(
+            matches!(&outcome, SagaOutcome::RolledBack { failed_step, .. } if failed_step == "consume"),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            state, None,
+            "the producer's compensation saw the run-state and cleared it"
         );
     }
 

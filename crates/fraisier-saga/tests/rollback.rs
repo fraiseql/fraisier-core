@@ -42,7 +42,7 @@ impl Step for ScriptedStep {
         &self.name
     }
 
-    async fn forward(&self, _ctx: &StepContext) -> Result<(), SagaError> {
+    async fn forward(&self, _ctx: &StepContext, _state: &mut ()) -> Result<(), SagaError> {
         self.trail
             .lock()
             .expect("trail")
@@ -56,7 +56,7 @@ impl Step for ScriptedStep {
         Ok(())
     }
 
-    async fn compensate(&self, _ctx: &StepContext) -> Result<(), SagaError> {
+    async fn compensate(&self, _ctx: &StepContext, _state: &mut ()) -> Result<(), SagaError> {
         self.trail
             .lock()
             .expect("trail")

@@ -1020,6 +1020,11 @@ pub(crate) async fn deploy(
         });
     }
 
+    // `[deploy].strategy = "blue-green"` selects the HTTP-tier traffic-swap flow.
+    if config.deploy.as_ref().and_then(|d| d.strategy.as_deref()) == Some("blue-green") {
+        return run_blue_green(&config, app_version, state_dir, dry_run).await;
+    }
+
     // A config with [hosts] runs the multi-host rollout — unless an explicit
     // --host override pins it to a single host (the existing single-host path).
     let multi_host = config.hosts.is_some() && host.is_none();
@@ -1112,6 +1117,48 @@ async fn run_multi_host(
         exit_code,
         pretty,
         json: json!({ "outcome": label, "detail": detail.trim(), "multi_host": true }),
+    })
+}
+
+/// Run (or, with `dry_run`, summarize) an HTTP-tier blue-green deploy. On a
+/// non-committed outcome the `[schedule].notify` failure sink fires (unattended
+/// path), exactly as the rolling/single deploys do.
+async fn run_blue_green(
+    config: &DeployConfig,
+    app_version: Option<&str>,
+    state_dir: &Path,
+    dry_run: bool,
+) -> Result<CommandOutput> {
+    let resolved = factory::build_blue_green(config, app_version)?;
+    if dry_run {
+        let pretty = format!(
+            "blue-green deploy plan for {}/{} (dry run — nothing executed)\n",
+            resolved.fraise, resolved.environment
+        );
+        return Ok(CommandOutput {
+            exit_code: 0,
+            pretty,
+            json: json!({
+                "strategy": "blue-green",
+                "fraise": resolved.fraise,
+                "environment": resolved.environment,
+                "dry_run": true,
+            }),
+        });
+    }
+
+    let store = FilesystemStateStore::new(state_dir)
+        .with_context(|| format!("opening state store at {}", state_dir.display()))?;
+    let outcome = resolved.deploy.run(store).await?;
+    notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
+    let (exit_code, label, detail) = outcome_result(&outcome);
+    Ok(CommandOutput {
+        exit_code,
+        pretty: format!(
+            "blue-green deploy of {}/{} {label}{detail}\n",
+            resolved.fraise, resolved.environment
+        ),
+        json: json!({ "strategy": "blue-green", "outcome": label, "detail": detail.trim() }),
     })
 }
 
@@ -2350,6 +2397,31 @@ url = "http://127.0.0.1:8080/health"
             serde_json::json!("confiture (in-process)")
         );
         assert_eq!(out.json["host"], serde_json::json!("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn deploy_routes_a_blue_green_strategy_to_the_swap_flow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = format!(
+            "{}\n[lb]\nadapter = \"nginx\"\nupstream = \"checkout_upstream\"\n\
+             include_dir = \"{}\"\n\n[blue_green]\ngreen_unit = \"checkout-green.service\"\n\
+             green_health_url = \"http://127.0.0.1:8081/healthz\"\n\
+             green_servers = [\"127.0.0.1:8081\"]\nblue_servers = [\"127.0.0.1:8080\"]\n",
+            VALID.replace(
+                "environment = \"staging\"",
+                "environment = \"staging\"\nstrategy = \"blue-green\""
+            ),
+            dir.path().join("nginx").display(),
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let state = dir.path().join("state");
+        // Dry run: the strategy is recognized and routed; nothing is executed.
+        let out = deploy(&config, &state, None, Some("1.2.3"), true)
+            .await
+            .expect("dry run");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert_eq!(out.json["strategy"], serde_json::json!("blue-green"));
+        assert_eq!(out.json["dry_run"], serde_json::json!(true));
     }
 
     #[tokio::test]

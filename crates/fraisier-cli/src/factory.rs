@@ -156,6 +156,22 @@ fn settings_map(config: &DeployConfig, app_version: Option<&str>) -> BTreeMap<St
     if let Some(lb) = &config.lb {
         put_path(&mut settings, "config_path", lb.config_path.as_deref());
         put_str(&mut settings, "upstream", lb.upstream.as_deref());
+        put_path(&mut settings, "include_dir", lb.include_dir.as_deref());
+    }
+    if let Some(bg) = &config.blue_green {
+        // The nginx TrafficDirector reads `targets` = { <target>: [<server>, …] }.
+        let blue = bg.blue.as_deref().unwrap_or("blue");
+        let green = bg.green.as_deref().unwrap_or("green");
+        let mut targets = serde_json::Map::new();
+        if !bg.blue_servers.is_empty() {
+            targets.insert(blue.to_owned(), Value::from(bg.blue_servers.clone()));
+        }
+        if !bg.green_servers.is_empty() {
+            targets.insert(green.to_owned(), Value::from(bg.green_servers.clone()));
+        }
+        if !targets.is_empty() {
+            settings.insert("targets".to_owned(), Value::Object(targets));
+        }
     }
     settings
 }
@@ -863,6 +879,307 @@ fn build_migration(
             Ok(Arc::new(adapter))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Blue-green (phase-07) wiring
+// ---------------------------------------------------------------------------
+
+use std::time::Duration;
+
+use fraisier_core::adapter_axes::{TrafficDirector, TrafficTarget};
+use fraisier_core::blue_green::{BlueGreenDeploy, BlueGreenParams, FleetOps};
+use fraisier_core::connection_budget::{BudgetSnapshot, ConnectionBudget};
+
+/// How often green is polled within the hold window.
+const HOLD_POLL: Duration = Duration::from_secs(2);
+/// Default hold window when `[blue_green].hold_secs` is unset.
+const DEFAULT_HOLD_SECS: u64 = 30;
+/// Default connection-budget warn margin when unset.
+const DEFAULT_BUDGET_MARGIN: u32 = 10;
+
+/// The green fleet driven via the artifact/service/health adapters, with a green
+/// ctx overlay (its own unit/url/paths). Reaping shells out to `systemctl stop`
+/// — the frozen `ServiceAdapter` has no `stop`, so decommissioning stays at the
+/// deploy layer (consistent with the systemd substrate).
+struct AdapterFleet {
+    host: HostId,
+    base_ctx: AdapterCtx,
+    artifact: Arc<dyn ArtifactAdapter>,
+    service: Arc<dyn ServiceAdapter>,
+    health: Arc<dyn HealthAdapter>,
+    green_unit: String,
+    green_health_url: String,
+    green_active_path: Option<String>,
+    green_staging_dir: Option<String>,
+    blue_unit: String,
+    user: bool,
+}
+
+impl AdapterFleet {
+    /// The adapter context for green operations: the base ctx with green's unit,
+    /// health URL, and (optionally) artifact paths overlaid.
+    fn green_ctx(&self) -> AdapterCtx {
+        let mut ctx = self.base_ctx.clone();
+        ctx.settings
+            .insert("unit".to_owned(), Value::from(self.green_unit.clone()));
+        ctx.settings
+            .insert("url".to_owned(), Value::from(self.green_health_url.clone()));
+        if let Some(path) = &self.green_active_path {
+            ctx.settings
+                .insert("active_path".to_owned(), Value::from(path.clone()));
+        }
+        if let Some(dir) = &self.green_staging_dir {
+            ctx.settings
+                .insert("staging_dir".to_owned(), Value::from(dir.clone()));
+        }
+        ctx
+    }
+
+    async fn stop_unit(&self, unit: &str) -> Result<(), String> {
+        let mut command = tokio::process::Command::new("systemctl");
+        if self.user {
+            command.arg("--user");
+        }
+        command.arg("stop").arg(unit);
+        let output = command
+            .output()
+            .await
+            .map_err(|e| format!("spawning `systemctl stop {unit}`: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl FleetOps for AdapterFleet {
+    async fn provision_green(&self, _ctx: &AdapterCtx) -> Result<(), String> {
+        let ctx = self.green_ctx();
+        let staged = self
+            .artifact
+            .stage(&ctx, &self.host)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.artifact
+            .activate(&ctx, &self.host, &staged)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.service
+            .restart(&ctx, &self.host)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn green_healthy(&self, _ctx: &AdapterCtx) -> bool {
+        self.health
+            .check(&self.green_ctx(), &self.host)
+            .await
+            .is_ok_and(|status| status.healthy)
+    }
+
+    async fn watch_green(&self, ctx: &AdapterCtx, hold: Duration) -> Result<(), String> {
+        let mut elapsed = Duration::ZERO;
+        while elapsed < hold {
+            if !self.green_healthy(ctx).await {
+                return Err("green degraded during the hold window".to_owned());
+            }
+            tokio::time::sleep(HOLD_POLL).await;
+            elapsed += HOLD_POLL;
+        }
+        Ok(())
+    }
+
+    async fn reap_green(&self, _ctx: &AdapterCtx) -> Result<(), String> {
+        self.stop_unit(&self.green_unit).await
+    }
+
+    async fn reap_blue(&self, _ctx: &AdapterCtx) -> Result<(), String> {
+        self.stop_unit(&self.blue_unit).await
+    }
+}
+
+/// A connection-budget probe that queries the shared Postgres via `psql` (PG* env
+/// from the migration DSN — never argv).
+struct PgConnectionBudget {
+    dsn_env: String,
+}
+
+impl PgConnectionBudget {
+    async fn query_u32(conn: &fraisier_db::PgConn, sql: &str) -> Result<u32, String> {
+        let mut command = tokio::process::Command::from(fraisier_db::psql_command(conn, sql));
+        command.arg("-tA"); // tuples-only, unaligned → just the value
+        let output = command
+            .output()
+            .await
+            .map_err(|e| format!("spawning psql: {e}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .map_err(|e| format!("parsing `{sql}` result: {e}"))
+    }
+}
+
+#[async_trait::async_trait]
+impl ConnectionBudget for PgConnectionBudget {
+    async fn probe(&self, _ctx: &AdapterCtx) -> Result<BudgetSnapshot, String> {
+        let dsn =
+            std::env::var(&self.dsn_env).map_err(|_| format!("{} is not set", self.dsn_env))?;
+        let conn = fraisier_db::PgConn::parse(&dsn).map_err(|e| e.to_string())?;
+        let max_connections = Self::query_u32(&conn, "SHOW max_connections").await?;
+        let current = Self::query_u32(&conn, "SELECT count(*) FROM pg_stat_activity").await?;
+        Ok(BudgetSnapshot {
+            max_connections,
+            current,
+        })
+    }
+}
+
+/// The fully-built blue-green deploy + its identity, for the CLI dispatch.
+pub struct ResolvedBlueGreen {
+    /// The fraise (deployable) name.
+    pub fraise: String,
+    /// The target environment.
+    pub environment: String,
+    /// The composed blue-green deploy, ready to `run`.
+    pub deploy: BlueGreenDeploy,
+}
+
+/// Build a **blue-green** deploy from a `[deploy].strategy = "blue-green"` config:
+/// the green fleet over the artifact/service/health adapters, the built-in nginx
+/// [`TrafficDirector`], the window-safety gate's migration adapter, and (when a
+/// DSN is configured) the connection-budget probe.
+///
+/// # Errors
+/// Fails if a required section/field is missing or an adapter name is unsupported.
+pub fn build_blue_green(
+    config: &DeployConfig,
+    app_version: Option<&str>,
+) -> Result<ResolvedBlueGreen> {
+    let deploy = config.deploy.as_ref().context("missing [deploy] section")?;
+    let fraise = deploy.name.clone().context("[deploy].name is required")?;
+    let environment = deploy
+        .environment
+        .clone()
+        .context("[deploy].environment is required")?;
+    let bg = config
+        .blue_green
+        .as_ref()
+        .context("[deploy].strategy = \"blue-green\" requires a [blue_green] section")?;
+
+    let host = resolve_host(config, None)?;
+    let transport = build_transport(config);
+    let launcher = build_launcher(config);
+    let artifact = build_artifact(config, &transport, &launcher)?;
+    let service = build_service(config, &transport)?;
+    let health = build_health(config)?;
+
+    let database_url_env = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.database_url_env.clone());
+    let mut env_secrets = BTreeMap::new();
+    let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
+
+    let mut ctx = AdapterCtx::new(fraise.clone(), environment.clone());
+    ctx.host = Some(host.clone());
+    ctx.workdir = PathBuf::from(".");
+    ctx.migrations_path = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.migrations_path.clone());
+    ctx.env_secrets = env_secrets;
+    ctx.settings = settings_map(config, app_version);
+
+    let blue_unit = config
+        .service
+        .as_ref()
+        .and_then(|s| s.unit.clone())
+        .context("blue-green requires [service].unit (the blue fleet's unit)")?;
+    let user = config
+        .service
+        .as_ref()
+        .and_then(|s| s.user)
+        .unwrap_or(false);
+
+    let fleet: Arc<dyn FleetOps> = Arc::new(AdapterFleet {
+        host,
+        base_ctx: ctx.clone(),
+        artifact,
+        service,
+        health,
+        green_unit: bg
+            .green_unit
+            .clone()
+            .context("[blue_green].green_unit is required")?,
+        green_health_url: bg
+            .green_health_url
+            .clone()
+            .context("[blue_green].green_health_url is required")?,
+        green_active_path: bg
+            .green_active_path
+            .as_ref()
+            .map(|p| p.display().to_string()),
+        green_staging_dir: bg
+            .green_staging_dir
+            .as_ref()
+            .map(|p| p.display().to_string()),
+        blue_unit,
+        user,
+    });
+
+    let traffic: Arc<dyn TrafficDirector> = Arc::new(fraisier_adapter_nginx::NginxLb::new());
+
+    // The connection-budget probe is wired only when a DSN env + green_pool are
+    // configured; otherwise the check is skipped (None).
+    let budget: Option<Arc<dyn ConnectionBudget>> = match (&database_url_env, bg.green_pool) {
+        (Some(dsn_env), Some(_)) => Some(Arc::new(PgConnectionBudget {
+            dsn_env: dsn_env.clone(),
+        })),
+        _ => None,
+    };
+
+    let params = BlueGreenParams {
+        fraise: fraise.clone(),
+        environment: environment.clone(),
+        ctx,
+        migration_files: list_migration_files(config),
+        green: TrafficTarget::new(bg.green.as_deref().unwrap_or("green")),
+        hold: Duration::from_secs(bg.hold_secs.unwrap_or(DEFAULT_HOLD_SECS)),
+        green_pool: bg.green_pool.unwrap_or(0),
+        budget_margin: bg.connection_margin.unwrap_or(DEFAULT_BUDGET_MARGIN),
+    };
+
+    Ok(ResolvedBlueGreen {
+        fraise,
+        environment,
+        deploy: BlueGreenDeploy::new(params, migration, traffic, fleet, budget),
+    })
+}
+
+/// The pending migration basenames under `[migration].migrations_path`, for the
+/// window-safety can't-see (`.py`) check. An unreadable / unset dir yields an
+/// empty list (the SQL-only presence rule still applies to whatever is found).
+fn list_migration_files(config: &DeployConfig) -> Vec<String> {
+    let Some(dir) = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.migrations_path.as_ref())
+    else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(ToOwned::to_owned))
+        .collect()
 }
 
 #[cfg(test)]

@@ -30,11 +30,19 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use fraisier_adapter_support::{error, run_command};
+use fraisier_adapter_support::{error, run_command, staging};
 use fraisier_core::adapter_axes::{
-    AdapterCtx, AdapterError, AdapterErrorKind, HostId, LbAdapter, LbMembership, LbState,
+    AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, HostId, LbAdapter,
+    LbMembership, LbState, SwapToken, TrafficDirector, TrafficTarget,
 };
 use serde_json::Value;
+
+/// The header marking the upstream-include files this adapter drops on the host,
+/// so the full-CRUD list/uninstall rule can recognise them.
+const TRAFFIC_MARKER: &str = "# fraisier-generated traffic-swap include (do not edit by hand)";
+
+/// The basename of the symlink nginx `include`s; `switch_to` repoints it.
+const ACTIVE_LINK: &str = "active.upstream";
 
 /// The adapter's identity/discovery name.
 const ADAPTER_NAME: &str = "nginx";
@@ -195,6 +203,136 @@ impl LbAdapter for NginxLb {
     }
 }
 
+impl NginxLb {
+    /// The directory holding the per-target upstream includes + the active symlink.
+    fn include_dir(ctx: &AdapterCtx, operation: &str) -> Result<PathBuf, AdapterError> {
+        Ok(PathBuf::from(Self::setting(ctx, "include_dir", operation)?))
+    }
+
+    /// The per-target include file `<dir>/<target>.upstream.conf`.
+    fn target_file(dir: &Path, target: &str) -> PathBuf {
+        dir.join(format!("{target}.upstream.conf"))
+    }
+
+    /// The backend servers configured for `target` (the `[lb].targets` table),
+    /// if any — `{ "green": ["10.0.0.2:8080", …] }`.
+    fn target_servers(ctx: &AdapterCtx, target: &str) -> Option<Vec<String>> {
+        ctx.settings
+            .get("targets")
+            .and_then(Value::as_object)
+            .and_then(|targets| targets.get(target))
+            .and_then(Value::as_array)
+            .map(|servers| {
+                servers
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+    }
+
+    /// Render a MARKER-headed `upstream <name> { server …; }` include.
+    fn render_upstream(name: &str, servers: &[String]) -> String {
+        use std::fmt::Write as _;
+        let mut out = format!("{TRAFFIC_MARKER}\nupstream {name} {{\n");
+        for server in servers {
+            let _ = writeln!(out, "    server {server};");
+        }
+        out.push_str("}\n");
+        out
+    }
+}
+
+#[async_trait]
+impl TrafficDirector for NginxLb {
+    async fn describe(&self) -> Result<AdapterDescription, AdapterError> {
+        Ok(AdapterDescription {
+            name: ADAPTER_NAME.to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            protocol_version: 1,
+            capabilities: vec!["traffic_swap".to_owned()],
+        })
+    }
+
+    async fn current_target(&self, ctx: &AdapterCtx) -> Result<TrafficTarget, AdapterError> {
+        let dir = Self::include_dir(ctx, "current_target")?;
+        let active = dir.join(ACTIVE_LINK);
+        match staging::read_active_link(&active, ADAPTER_NAME, "current_target")? {
+            Some(artifact) => {
+                let name = artifact
+                    .id
+                    .strip_suffix(".upstream.conf")
+                    .unwrap_or(&artifact.id);
+                Ok(TrafficTarget::new(name))
+            }
+            None => Err(error(
+                AdapterErrorKind::InvalidConfig,
+                ADAPTER_NAME,
+                "current_target",
+                format!("no active upstream symlink at {}", active.display()),
+                None,
+            )),
+        }
+    }
+
+    async fn switch_to(
+        &self,
+        ctx: &AdapterCtx,
+        target: &TrafficTarget,
+    ) -> Result<SwapToken, AdapterError> {
+        let dir = Self::include_dir(ctx, "switch_to")?;
+        let upstream = Self::setting(ctx, "upstream", "switch_to")?.to_owned();
+        std::fs::create_dir_all(&dir).map_err(|cause| {
+            error(
+                AdapterErrorKind::Execution,
+                ADAPTER_NAME,
+                "switch_to",
+                format!("failed to create include dir {}: {cause}", dir.display()),
+                None,
+            )
+        })?;
+        let target_file = Self::target_file(&dir, target.as_str());
+
+        // Generate the target's include from its configured servers; if none are
+        // configured the include must already exist (pre-staged by the operator).
+        if let Some(servers) = Self::target_servers(ctx, target.as_str()) {
+            let content = Self::render_upstream(&upstream, &servers);
+            std::fs::write(&target_file, content).map_err(|cause| {
+                error(
+                    AdapterErrorKind::Execution,
+                    ADAPTER_NAME,
+                    "switch_to",
+                    format!("failed to write {}: {cause}", target_file.display()),
+                    None,
+                )
+            })?;
+        } else if !target_file.exists() {
+            return Err(error(
+                AdapterErrorKind::InvalidConfig,
+                ADAPTER_NAME,
+                "switch_to",
+                format!(
+                    "no servers configured for target '{target}' and no include at {}",
+                    target_file.display()
+                ),
+                None,
+            ));
+        }
+
+        // Atomically repoint the active symlink, then reload nginx.
+        staging::activate_symlink(
+            &dir.join(ACTIVE_LINK),
+            &target_file,
+            ADAPTER_NAME,
+            "switch_to",
+        )?;
+        self.reload("switch_to").await?;
+        Ok(SwapToken {
+            target: target.clone(),
+        })
+    }
+}
+
 /// Find the `server` directive for `token` inside `upstream { … }`, returning its
 /// line index and current membership.
 fn locate(lines: &[String], upstream: &str, token: &str) -> Option<(usize, LbMembership)> {
@@ -323,5 +461,115 @@ http {
         let line = "  server x:1 down;";
         assert_eq!(set_down(line, true), "  server x:1 down;");
         assert_eq!(set_down(line, false), "  server x:1;");
+    }
+
+    mod traffic {
+        use crate::{NginxLb, ACTIVE_LINK, TRAFFIC_MARKER};
+        use fraisier_core::adapter_axes::{AdapterCtx, TrafficDirector, TrafficTarget};
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::path::Path;
+
+        /// A fake `nginx` that records each `-s reload` to a log file and exits 0.
+        fn fake_nginx(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+            let log = dir.join("reload.log");
+            let script = dir.join("nginx");
+            std::fs::write(
+                &script,
+                format!("#!/bin/sh\necho reload >> {}\nexit 0\n", log.display()),
+            )
+            .expect("write fake nginx");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            (script, log)
+        }
+
+        fn ctx(include_dir: &Path) -> AdapterCtx {
+            let mut ctx = AdapterCtx::new("checkout", "production");
+            ctx.settings.insert(
+                "include_dir".to_owned(),
+                json!(include_dir.display().to_string()),
+            );
+            ctx.settings
+                .insert("upstream".to_owned(), json!("checkout_upstream"));
+            ctx.settings.insert(
+                "targets".to_owned(),
+                json!({ "blue": ["127.0.0.1:9001"], "green": ["127.0.0.1:9002"] }),
+            );
+            ctx
+        }
+
+        #[tokio::test]
+        async fn switch_generates_the_include_repoints_atomically_and_reloads() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let (nginx, log) = fake_nginx(tmp.path());
+            let inc = tmp.path().join("includes");
+            let lb = NginxLb::with_program(nginx);
+            let ctx = ctx(&inc);
+
+            // Swap to green.
+            let token = lb
+                .switch_to(&ctx, &TrafficTarget::new("green"))
+                .await
+                .expect("switch green");
+            assert_eq!(token.target.as_str(), "green");
+
+            // The green include was generated, MARKER-headed, with green's server.
+            let green = std::fs::read_to_string(inc.join("green.upstream.conf")).expect("green");
+            assert!(green.starts_with(TRAFFIC_MARKER), "marker header: {green}");
+            assert!(green.contains("upstream checkout_upstream"), "{green}");
+            assert!(green.contains("server 127.0.0.1:9002;"), "{green}");
+
+            // The active symlink points at the green include; current_target agrees.
+            let active = inc.join(ACTIVE_LINK);
+            assert_eq!(
+                std::fs::read_link(&active).unwrap().file_name().unwrap(),
+                "green.upstream.conf"
+            );
+            assert_eq!(
+                lb.current_target(&ctx).await.unwrap().as_str(),
+                "green",
+                "current_target round-trips the active symlink"
+            );
+
+            // Swap back to blue (the rollback primitive): symlink + target follow.
+            lb.switch_to(&ctx, &TrafficTarget::new("blue"))
+                .await
+                .expect("switch blue");
+            assert_eq!(lb.current_target(&ctx).await.unwrap().as_str(), "blue");
+            assert_eq!(
+                std::fs::read_link(&active).unwrap().file_name().unwrap(),
+                "blue.upstream.conf"
+            );
+
+            // Idempotent: swapping to the already-live target is a clean no-error.
+            lb.switch_to(&ctx, &TrafficTarget::new("blue"))
+                .await
+                .expect("idempotent");
+            assert_eq!(lb.current_target(&ctx).await.unwrap().as_str(), "blue");
+
+            // nginx was reloaded on each swap (3 swaps).
+            let reloads = std::fs::read_to_string(&log).unwrap_or_default();
+            assert_eq!(reloads.lines().count(), 3, "one reload per swap: {reloads}");
+        }
+
+        #[tokio::test]
+        async fn current_target_errors_before_any_swap() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let (nginx, _log) = fake_nginx(tmp.path());
+            let lb = NginxLb::with_program(nginx);
+            let ctx = ctx(&tmp.path().join("includes"));
+            assert!(
+                lb.current_target(&ctx).await.is_err(),
+                "no active upstream yet -> error, not a silent default"
+            );
+        }
+
+        #[tokio::test]
+        async fn describe_advertises_the_traffic_swap_capability() {
+            let lb = NginxLb::with_program("/bin/true");
+            let desc = lb.describe().await.expect("describe");
+            assert!(desc.capabilities.iter().any(|c| c == "traffic_swap"));
+        }
     }
 }

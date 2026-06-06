@@ -509,6 +509,77 @@ mod tests {
         assert_eq!(layout.active().unwrap().as_deref(), Some("1.0.0"));
     }
 
+    /// Gate (c): the deepest failure path — the new binary fails AND the kept-old
+    /// revert target is also unhealthy (environment drift, not just a bad binary).
+    /// Must be a loud, terminal manual-intervention state: non-zero, notified, no
+    /// restart loop, no false success.
+    #[tokio::test]
+    async fn the_gate_c_revert_target_also_fails_is_terminal_manual_intervention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = Layout::new(dir.path().join("bin"));
+        layout.stage("1.0.0", b"once worked").expect("stage");
+        layout.activate("1.0.0").expect("activate");
+
+        let new = write_binary(dir.path(), b"broken new");
+        // Both the new binary AND the revert target are down (e.g. the DB the old
+        // binary needs is gone too).
+        let fleet = FakeUnit::new(layout.clone(), &["1.0.0", "2.0.0"]);
+        let recorder = Recorder::default();
+
+        let outcome = apply(
+            &plan(layout.clone(), new, "2.0.0"),
+            &fleet,
+            &fleet,
+            &recorder,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, ApplyOutcome::ManualIntervention { .. }),
+            "expected terminal ManualIntervention, got {outcome:?}"
+        );
+        // Exactly two restarts (new + the single revert) — no loop, no retry.
+        assert_eq!(fleet.restarts.load(Ordering::SeqCst), 2, "no restart loop");
+        let events = recorder.events.lock().unwrap().clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "self-upgrade-manual-intervention");
+        assert_eq!(events[0].failed.as_deref(), Some("2.0.0"));
+        assert_eq!(events[0].restored.as_deref(), Some("1.0.0"));
+    }
+
+    /// With no kept-old binary (a first apply that fails), there is nothing to
+    /// revert to — terminal manual-intervention, one restart, no false success.
+    #[tokio::test]
+    async fn no_kept_old_binary_to_revert_to_is_manual_intervention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = Layout::new(dir.path().join("bin"));
+        let new = write_binary(dir.path(), b"broken first install");
+        let fleet = FakeUnit::new(layout.clone(), &["1.0.0"]);
+        let recorder = Recorder::default();
+
+        let outcome = apply(
+            &plan(layout.clone(), new, "1.0.0"),
+            &fleet,
+            &fleet,
+            &recorder,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, ApplyOutcome::ManualIntervention { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            fleet.restarts.load(Ordering::SeqCst),
+            1,
+            "only the new start"
+        );
+        let events = recorder.events.lock().unwrap().clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "self-upgrade-manual-intervention");
+        assert_eq!(events[0].restored, None, "nothing to restore to");
+    }
+
     fn set_mtime(path: &std::path::Path, secs: u64) {
         let when = filetime::FileTime::from_unix_time(i64::try_from(secs).unwrap(), 0);
         filetime::set_file_mtime(path, when).expect("set mtime");

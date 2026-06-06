@@ -473,7 +473,15 @@ fn parse_preflight_report(json: &Value) -> PreflightReport {
         .and_then(Value::as_array)
         .map(|items| items.iter().map(preflight_issue_from).collect())
         .unwrap_or_default();
-    PreflightReport { ok, issues }
+    // Confiture's first-class window-safety verdict, when this version emits it
+    // (top-level `window_safe` boolean). Absent on older confiture → `None`, so the
+    // consumer falls back to the `PFLIGHT_REPLICA_*` issue codes.
+    let window_safe = json.get("window_safe").and_then(Value::as_bool);
+    PreflightReport {
+        ok,
+        issues,
+        window_safe,
+    }
 }
 
 /// Convert one Confiture preflight `issues[]` entry to a [`PreflightIssue`].
@@ -852,6 +860,22 @@ mod tests {
         assert_eq!(report.issues[0].severity, Severity::Warning);
         assert_eq!(report.issues[0].code, "PFLIGHT_NON_TRANSACTIONAL");
         assert_eq!(report.issues[0].migration.as_deref(), Some("003"));
+        // No `window_safe` field on this (0.22-shaped) report → None, so the gate
+        // falls back to the PFLIGHT_REPLICA_* presence rule.
+        assert_eq!(report.window_safe, None);
+    }
+
+    #[test]
+    fn preflight_report_reads_the_first_class_window_safe_verdict() {
+        // A confiture that emits the typed verdict (the cross-repo Phase-3 contract).
+        let safe = parse_preflight_report(
+            &serde_json::json!({ "ok": true, "window_safe": true, "issues": [] }),
+        );
+        assert_eq!(safe.window_safe, Some(true));
+        let unsafe_ = parse_preflight_report(
+            &serde_json::json!({ "ok": true, "window_safe": false, "issues": [] }),
+        );
+        assert_eq!(unsafe_.window_safe, Some(false));
     }
 
     #[test]

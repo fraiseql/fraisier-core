@@ -5,8 +5,17 @@
 //! certified *forward-compatible for a two-version window*. fraisier consumes
 //! confiture's verdict; it never authors or validates expand/contract logic.
 //!
-//! The policy (a **hard block before any instance or traffic change**), grounded
-//! in reading confiture 0.22's replica lint, not in assumptions:
+//! ## Two paths to the verdict
+//!
+//! When the adapter supplies a **first-class** [`PreflightReport::window_safe`]
+//! boolean (confiture's `window_safe` field), it is **authoritative**:
+//! `Some(false)` blocks, `Some(true)` passes. When it is `None` (older confiture,
+//! no typed verdict) the gate falls back to the `PFLIGHT_REPLICA_*` **issue-code
+//! presence** rule below. Both fail safe; reversibility (`report.ok`) and the
+//! can't-see (`.py`) refusal apply on either path.
+//!
+//! The presence-rule policy (a **hard block before any instance or traffic
+//! change**), grounded in reading confiture 0.22's replica lint, not in assumptions:
 //!
 //! 1. **Can't-certify ⇒ refuse.** If the adapter does not advertise `preflight`,
 //!    nothing can certify the window — refuse (mirrors the
@@ -26,15 +35,19 @@
 //! There is **no force-equivalent** (a silent override would re-introduce the
 //! exact shared-DB-corruption footgun this gate exists to prevent).
 //!
-//! ## Cross-repo precondition (S2 — must hold before blue-green ships)
+//! ## Cross-repo precondition (S2 — tracked in confiture#154)
 //!
-//! This bridge keys on the `PFLIGHT_REPLICA_*` code **prefix**, which confiture
-//! 0.22 emits but whose *values* its contract test does **not** pin (only the
-//! issue fields + exit codes). A confiture rename would silently make this gate
-//! match nothing and let an uncertified migration through with confiture CI
-//! green. So the bridge is **not shippable** until either confiture pins the
-//! `PFLIGHT_REPLICA_*` namespace in its contract test, **or** a first-class
-//! `window_safe` verdict is adopted. Owner-gated, cross-repo — see phase-07 §2.
+//! The fallback path keys on the `PFLIGHT_REPLICA_*` code **prefix**, which
+//! confiture 0.22 emits but whose *values* its contract test originally did
+//! **not** pin — a rename would silently make this gate match nothing. Tracked in
+//! [fraiseql/confiture#154], resolved two ways (either suffices):
+//! 1. confiture **pins** the `PFLIGHT_REPLICA_*` namespace in its contract test
+//!    (Phase 1) — makes the prefix fallback above a guaranteed contract;
+//! 2. the **first-class `window_safe` verdict** (Phase 3): consumed here via
+//!    [`PreflightReport::window_safe`] — when present it is authoritative and the
+//!    prefix matching is bypassed entirely, decoupling fraisier from the codes.
+//!
+//! [fraiseql/confiture#154]: https://github.com/fraiseql/confiture/issues/154
 
 use crate::adapter_axes::{AdapterCtx, MigrationAdapter, PreflightReport};
 
@@ -105,7 +118,7 @@ pub fn evaluate(
             "no preflight report was produced; cannot certify the window".to_owned(),
         );
     };
-    // (4) reversibility/transactionality errors.
+    // (3) reversibility/transactionality errors (the down path), always checked.
     if !report.ok {
         return WindowSafety::Refused(
             "preflight reported blocking issues (report.ok == false): the down path / \
@@ -113,19 +126,28 @@ pub fn evaluate(
                 .to_owned(),
         );
     }
-    // (3) any forward-compat finding, warning OR error.
-    if let Some(issue) = report
-        .issues
-        .iter()
-        .find(|issue| issue.code.starts_with(REPLICA_CODE_PREFIX))
-    {
-        return WindowSafety::Refused(format!(
-            "migration is not forward-compatible for a two-version window: {} \
-             ({:?}) — {}",
-            issue.code, issue.severity, issue.message
-        ));
+    // (4) the forward-compat verdict. Prefer the adapter's **first-class**
+    // `window_safe` boolean when it provides one; otherwise fall back to the
+    // `PFLIGHT_REPLICA_*` issue-code presence rule (older confiture, no typed
+    // verdict). Both fail safe.
+    match report.window_safe {
+        Some(true) => WindowSafety::Safe,
+        Some(false) => WindowSafety::Refused(
+            "the migration adapter reports the migration is NOT forward-compatible for a \
+             two-version window (window_safe = false)"
+                .to_owned(),
+        ),
+        None => report
+            .issues
+            .iter()
+            .find(|issue| issue.code.starts_with(REPLICA_CODE_PREFIX))
+            .map_or(WindowSafety::Safe, |issue| {
+                WindowSafety::Refused(format!(
+                    "migration is not forward-compatible for a two-version window: {} ({:?}) — {}",
+                    issue.code, issue.severity, issue.message
+                ))
+            }),
     }
-    WindowSafety::Safe
 }
 
 /// Run the adapter's `preflight` (if advertised) and apply the [`evaluate`] policy.
@@ -263,6 +285,7 @@ mod tests {
                 message: "DROP COLUMN is not forward-compatible".to_owned(),
                 migration: Some("003".to_owned()),
             }],
+            window_safe: None,
         }
     }
 
@@ -294,6 +317,7 @@ mod tests {
         let clean = PreflightReport {
             ok: true,
             issues: Vec::new(),
+            window_safe: None,
         };
         let adapter = FakeMigration::with_preflight(clean);
         let mut files = sql_set();
@@ -308,6 +332,7 @@ mod tests {
         let clean = PreflightReport {
             ok: true,
             issues: Vec::new(),
+            window_safe: None,
         };
         let adapter = FakeMigration::with_preflight(clean);
         let verdict = check(&adapter, &ctx(), &sql_set()).await;
@@ -323,6 +348,7 @@ mod tests {
         // Reversibility/transactionality error → !ok → refused.
         let report = PreflightReport {
             ok: false,
+            window_safe: None,
             issues: vec![PreflightIssue {
                 severity: Severity::Error,
                 code: "missing_down".to_owned(),
@@ -332,5 +358,54 @@ mod tests {
         };
         let verdict = evaluate(true, &sql_set(), Some(&report));
         assert!(matches!(verdict, WindowSafety::Refused(_)), "{verdict:?}");
+    }
+
+    #[tokio::test]
+    async fn a_first_class_window_safe_false_refuses_with_no_issue_codes() {
+        // The typed verdict blocks on its own — no PFLIGHT_REPLICA_* needed.
+        let report = PreflightReport {
+            ok: true,
+            issues: Vec::new(),
+            window_safe: Some(false),
+        };
+        let adapter = FakeMigration::with_preflight(report);
+        let verdict = check(&adapter, &ctx(), &sql_set()).await;
+        assert!(matches!(verdict, WindowSafety::Refused(_)), "{verdict:?}");
+        assert!(verdict.reason().unwrap().contains("window_safe = false"));
+    }
+
+    #[tokio::test]
+    async fn a_first_class_window_safe_true_is_allowed() {
+        let report = PreflightReport {
+            ok: true,
+            issues: Vec::new(),
+            window_safe: Some(true),
+        };
+        let adapter = FakeMigration::with_preflight(report);
+        assert_eq!(
+            check(&adapter, &ctx(), &sql_set()).await,
+            WindowSafety::Safe
+        );
+    }
+
+    #[test]
+    fn the_typed_verdict_is_authoritative_over_the_prefix_rule() {
+        // `window_safe = Some(true)` is trusted even if a PFLIGHT_REPLICA_* code is
+        // present (confiture folded everything into the verdict); the prefix rule is
+        // only the `None` fallback.
+        let report = PreflightReport {
+            ok: true,
+            window_safe: Some(true),
+            issues: vec![PreflightIssue {
+                severity: Severity::Warning,
+                code: "PFLIGHT_REPLICA_ADD_COLUMN".to_owned(),
+                message: String::new(),
+                migration: None,
+            }],
+        };
+        assert_eq!(
+            evaluate(true, &sql_set(), Some(&report)),
+            WindowSafety::Safe
+        );
     }
 }

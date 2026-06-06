@@ -406,15 +406,24 @@ pub struct PreflightIssue {
 /// # Example
 /// ```
 /// # use fraisier_core::adapter_axes::PreflightReport;
-/// let report = PreflightReport { ok: true, issues: Vec::new() };
+/// let report = PreflightReport { ok: true, ..Default::default() };
 /// assert!(report.ok);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreflightReport {
     /// Whether the migrations are safe to deploy (no `Error`-severity issues).
     pub ok: bool,
     /// The findings.
     pub issues: Vec<PreflightIssue>,
+    /// The migration adapter's **first-class window-safety verdict**, when it
+    /// provides one: `Some(true)` iff every pending migration is forward-compatible
+    /// for a two-version window (both N-1 and N serving against the shared DB).
+    /// `Some(false)` is a hard block; `None` means the adapter offers no typed
+    /// verdict and the consumer must fall back to inspecting [`Self::issues`]
+    /// (e.g. confiture's `PFLIGHT_REPLICA_*` codes). Additive / Option-typed so an
+    /// adapter that doesn't emit it stays compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_safe: Option<bool>,
 }
 
 /// An adapter's self-description, returned by `describe` — the capability and

@@ -400,6 +400,7 @@ mod tests {
                 report: PreflightReport {
                     ok: true,
                     issues: Vec::new(),
+                    window_safe: None,
                 },
             })
         }
@@ -413,6 +414,7 @@ mod tests {
                         message: "DROP COLUMN".to_owned(),
                         migration: None,
                     }],
+                    window_safe: None,
                 },
             })
         }

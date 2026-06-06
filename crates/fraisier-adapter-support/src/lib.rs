@@ -20,6 +20,12 @@ use std::time::Duration;
 
 use fraisier_core::adapter_axes::{AdapterError, AdapterErrorKind};
 
+/// How many extra times to retry a spawn that fails with `ETXTBSY`.
+const ETXTBSY_RETRIES: u32 = 5;
+
+/// How long to wait between `ETXTBSY` spawn retries.
+const ETXTBSY_BACKOFF: Duration = Duration::from_millis(20);
+
 pub mod staging;
 pub mod transport;
 
@@ -104,22 +110,45 @@ pub async fn run_command(
         command.current_dir(dir);
     }
 
-    let output = command.output().await.map_err(|cause| {
-        let program = program.to_string_lossy();
-        error(
-            AdapterErrorKind::Execution,
-            adapter,
-            operation,
-            format!("failed to spawn '{program}': {cause}"),
-            None,
-        )
-    })?;
+    let output = spawn_with_etxtbsy_retry(&mut command)
+        .await
+        .map_err(|cause| {
+            let program = program.to_string_lossy();
+            error(
+                AdapterErrorKind::Execution,
+                adapter,
+                operation,
+                format!("failed to spawn '{program}': {cause}"),
+                None,
+            )
+        })?;
 
     Ok(Captured {
         code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+/// Run `command`, retrying a few times on `ETXTBSY` ("text file busy").
+///
+/// Spawning a just-written executable can transiently fail with `ETXTBSY` when
+/// another thread in this process forked (e.g. spawned its own child) while a
+/// writer file descriptor to the target was still open — a known multithreaded
+/// fork/exec race. It is always transient, so a short bounded retry resolves it
+/// without masking a genuine spawn failure (missing binary, no permission).
+async fn spawn_with_etxtbsy_retry(
+    command: &mut tokio::process::Command,
+) -> std::io::Result<std::process::Output> {
+    for _ in 0..ETXTBSY_RETRIES {
+        match command.output().await {
+            Err(cause) if cause.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                tokio::time::sleep(ETXTBSY_BACKOFF).await;
+            }
+            other => return other,
+        }
+    }
+    command.output().await
 }
 
 /// Build an [`AdapterError`] of `kind`, tagged with `adapter` and `operation`.

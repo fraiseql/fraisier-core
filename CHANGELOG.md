@@ -6,6 +6,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Developer task runner** (`crates/xtask`, zero dependencies): `cargo xtask ci`
+  runs the full gate (fmt, clippy `-D warnings`, test, release build, `cargo
+  deny`, shellcheck) — the same command CI invokes, so local and CI cannot drift.
+  `cargo xtask dist` cross-builds the static musl binary via `cargo-zigbuild`.
+- **GitHub Actions CI** that runs `cargo xtask ci`.
+
 ## [1.0.0-alpha.1]
 
 The first Rust release line: a deploy-orchestration engine with atomic,

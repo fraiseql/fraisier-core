@@ -210,7 +210,18 @@ including which step failed and which compensations ran.
 - `unsafe` code is forbidden workspace-wide; dependencies are gated by
   `cargo deny`.
 
-## Building
+## Building & the CI gate
+
+The full gate is defined once, in Rust, as a task runner (`crates/xtask`). The
+command you run locally is the command CI runs — there is no second list to drift:
+
+```sh
+cargo xtask ci      # fmt + clippy -D warnings + test + release build + deny + shellcheck
+```
+
+Individual checks are available too (`cargo xtask fmt | lint | test | deny |
+shellcheck`), and `cargo xtask dist` cross-builds the static musl binary via
+`cargo-zigbuild`. The underlying commands, if you prefer to run them directly:
 
 ```sh
 cargo build --release

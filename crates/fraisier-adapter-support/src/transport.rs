@@ -156,7 +156,8 @@ impl SshTransport {
         self
     }
 
-    /// Append extra `ssh -o` options (e.g. `StrictHostKeyChecking=no`).
+    /// Append extra `ssh -o` options (e.g. `ConnectTimeout=10`). Host-key
+    /// checking is left to ssh's own configuration; fraisier never disables it.
     #[must_use]
     pub fn with_options(mut self, options: Vec<String>) -> Self {
         self.options = options;

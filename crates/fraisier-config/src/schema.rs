@@ -267,7 +267,8 @@ pub struct SshSection {
     /// The SSH port (`ssh -p`). Defaults to 22 when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
-    /// Extra `ssh -o KEY=VALUE` options (e.g. `StrictHostKeyChecking=no`).
+    /// Extra `ssh -o KEY=VALUE` options (e.g. `ConnectTimeout=10`). Host-key
+    /// checking is left to ssh's own configuration; fraisier never disables it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
 }

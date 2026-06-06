@@ -7,8 +7,10 @@
 
 use std::path::{Path, PathBuf};
 
+mod ship;
 mod version;
 
+pub use ship::{ship, ShipOptions, ShipReport};
 pub use version::{bump, locate, next_version, show, Bump, ProjectKind, VersionInfo};
 
 /// An error from reading or bumping a project's version.
@@ -56,6 +58,20 @@ pub enum ShipError {
         path: PathBuf,
         /// The underlying I/O error.
         source: std::io::Error,
+    },
+    /// `ship` refuses to run with uncommitted changes in the working tree.
+    #[error("the working tree at {dir} has uncommitted changes; commit or stash them before ship")]
+    DirtyWorkingTree {
+        /// The repository directory.
+        dir: PathBuf,
+    },
+    /// A `git` invocation failed (non-zero exit or could not be spawned).
+    #[error("git {op} failed: {detail}")]
+    Git {
+        /// The git operation that failed (e.g. `commit`).
+        op: String,
+        /// The captured stderr or spawn error.
+        detail: String,
     },
 }
 

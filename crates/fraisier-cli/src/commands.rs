@@ -108,6 +108,105 @@ pub(crate) fn version_bump(dir: &Path, level: fraisier_ship::Bump) -> Result<Com
     })
 }
 
+/// Everything `ship` needs: the version bump plus the follow-on deploy inputs.
+pub(crate) struct ShipArgs<'a> {
+    /// The project directory holding the version file.
+    pub dir: &'a Path,
+    /// Which component to bump.
+    pub level: fraisier_ship::Bump,
+    /// Compute the plan without writing/committing/pushing.
+    pub dry_run: bool,
+    /// Skip the follow-on deploy.
+    pub no_deploy: bool,
+    /// Push the release commit.
+    pub push: bool,
+    /// The git remote to push to.
+    pub remote: String,
+    /// The deploy config (only used when a deploy follows).
+    pub config: &'a Path,
+    /// The state store directory (only used when a deploy follows).
+    pub state_dir: &'a Path,
+    /// The single-host override (only used when a deploy follows).
+    pub host: Option<&'a str>,
+}
+
+/// `ship <level>`: bump → commit → push, then (unless `--no-deploy`) deploy the
+/// freshly-bumped version.
+pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
+    let opts = fraisier_ship::ShipOptions {
+        dry_run: args.dry_run,
+        no_deploy: args.no_deploy,
+        push: args.push,
+        remote: args.remote,
+        message_template: None,
+    };
+    let report = fraisier_ship::ship(args.dir, args.level, &opts)?;
+
+    let mut pretty = String::new();
+    if report.dry_run {
+        let _ = writeln!(
+            pretty,
+            "ship plan: {} → {} (commit {:?}{})",
+            report.old_version,
+            report.new_version,
+            report.message,
+            if report.deploy_requested {
+                ", then deploy"
+            } else {
+                ""
+            },
+        );
+        let _ = writeln!(pretty, "(dry run — nothing was written)");
+    } else {
+        let _ = writeln!(
+            pretty,
+            "shipped {} → {} (committed{})",
+            report.old_version,
+            report.new_version,
+            if report.pushed { ", pushed" } else { "" },
+        );
+    }
+
+    // No deploy requested (or a dry run): report the ship result alone.
+    if !report.deploy_requested || report.dry_run {
+        return Ok(CommandOutput {
+            exit_code: 0,
+            pretty,
+            json: json!({
+                "old_version": report.old_version,
+                "new_version": report.new_version,
+                "committed": report.committed,
+                "pushed": report.pushed,
+                "deployed": false,
+                "dry_run": report.dry_run,
+            }),
+        });
+    }
+
+    // Deploy the version just shipped; its exit code becomes the command's.
+    let deploy_out = deploy(
+        args.config,
+        args.state_dir,
+        args.host,
+        Some(&report.new_version),
+        false,
+    )
+    .await?;
+    pretty.push_str(&deploy_out.pretty);
+    Ok(CommandOutput {
+        exit_code: deploy_out.exit_code,
+        pretty,
+        json: json!({
+            "old_version": report.old_version,
+            "new_version": report.new_version,
+            "committed": report.committed,
+            "pushed": report.pushed,
+            "deployed": true,
+            "deploy": deploy_out.json,
+        }),
+    })
+}
+
 /// `validate-config`: parse, expand, and validate, reporting every located issue.
 pub(crate) fn validate_config(config_path: &Path) -> Result<CommandOutput> {
     let toml = std::fs::read_to_string(config_path)
@@ -476,8 +575,8 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapter_list, deploy, discover_adapters, init, status, validate_config, version_bump,
-        version_show,
+        adapter_list, deploy, discover_adapters, init, ship, status, validate_config, version_bump,
+        version_show, ShipArgs,
     };
     use fraisier_core::single_host::DeployRecord;
     use fraisier_saga::events::SagaState;
@@ -590,6 +689,36 @@ url = "http://127.0.0.1:8080/health"
         // The bump persisted.
         let out = version_show(dir.path()).expect("show after bump");
         assert_eq!(out.json["version"], serde_json::json!("0.1.6"));
+    }
+
+    #[tokio::test]
+    async fn ship_dry_run_reports_the_plan_without_deploying() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.5\"\n",
+        )
+        .expect("write");
+        let out = ship(ShipArgs {
+            dir: dir.path(),
+            level: fraisier_ship::Bump::Patch,
+            dry_run: true,
+            no_deploy: true,
+            push: false,
+            remote: "origin".to_owned(),
+            config: Path::new("fraisier.toml"),
+            state_dir: Path::new(".fraisier/state"),
+            host: None,
+        })
+        .await
+        .expect("ship dry run");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert_eq!(out.json["new_version"], serde_json::json!("0.1.6"));
+        assert_eq!(out.json["deployed"], serde_json::json!(false));
+        // Untouched on disk.
+        assert!(std::fs::read_to_string(dir.path().join("Cargo.toml"))
+            .unwrap()
+            .contains("0.1.5"));
     }
 
     #[test]

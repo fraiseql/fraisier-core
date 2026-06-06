@@ -58,6 +58,48 @@ enum Command {
     /// Show or bump the project version (`Cargo.toml` / `pyproject.toml`).
     #[command(subcommand)]
     Version(VersionCommand),
+
+    /// Bump the version, commit, push, and (unless `--no-deploy`) deploy it.
+    Ship(ShipCliArgs),
+}
+
+#[derive(Debug, Args)]
+struct ShipCliArgs {
+    /// Which component to bump.
+    #[arg(value_enum)]
+    level: BumpLevel,
+
+    /// The project directory holding `Cargo.toml` / `pyproject.toml`.
+    #[arg(long, default_value = ".")]
+    path: PathBuf,
+
+    /// Show the plan without writing, committing, pushing, or deploying.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Skip the follow-on deploy.
+    #[arg(long)]
+    no_deploy: bool,
+
+    /// Do not push the release commit.
+    #[arg(long)]
+    no_push: bool,
+
+    /// The git remote to push to.
+    #[arg(long, default_value = "origin")]
+    remote: String,
+
+    /// The deploy config (used only when a deploy follows).
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// The state store directory (used only when a deploy follows).
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+
+    /// The single-host override (used only when a deploy follows).
+    #[arg(long)]
+    host: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -203,6 +245,20 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::Version(VersionCommand::Show(args)) => commands::version_show(&args.path),
         Command::Version(VersionCommand::Bump { level, project }) => {
             commands::version_bump(&project.path, (*level).into())
+        }
+        Command::Ship(args) => {
+            commands::ship(commands::ShipArgs {
+                dir: &args.path,
+                level: args.level.into(),
+                dry_run: args.dry_run,
+                no_deploy: args.no_deploy,
+                push: !args.no_push,
+                remote: args.remote.clone(),
+                config: &args.config,
+                state_dir: &args.state_dir,
+                host: args.host.as_deref(),
+            })
+            .await
         }
     }
 }

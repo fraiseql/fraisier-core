@@ -80,6 +80,34 @@ pub(crate) fn init(config_path: &Path, force: bool) -> Result<CommandOutput> {
     })
 }
 
+/// `version show`: report the project version and the file it came from.
+pub(crate) fn version_show(dir: &Path) -> Result<CommandOutput> {
+    let info = fraisier_ship::show(dir)?;
+    Ok(CommandOutput {
+        exit_code: 0,
+        pretty: format!("{} ({})\n", info.version, info.path.display()),
+        json: json!({
+            "version": info.version,
+            "path": info.path.display().to_string(),
+        }),
+    })
+}
+
+/// `version bump <level>`: increment the version in place and report old → new.
+pub(crate) fn version_bump(dir: &Path, level: fraisier_ship::Bump) -> Result<CommandOutput> {
+    let info = fraisier_ship::locate(dir)?;
+    let (old, new) = fraisier_ship::bump(dir, level)?;
+    Ok(CommandOutput {
+        exit_code: 0,
+        pretty: format!("bumped {old} → {new} in {}\n", info.path.display()),
+        json: json!({
+            "old": old,
+            "new": new,
+            "path": info.path.display().to_string(),
+        }),
+    })
+}
+
 /// `validate-config`: parse, expand, and validate, reporting every located issue.
 pub(crate) fn validate_config(config_path: &Path) -> Result<CommandOutput> {
     let toml = std::fs::read_to_string(config_path)
@@ -447,7 +475,10 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{adapter_list, deploy, discover_adapters, init, status, validate_config};
+    use super::{
+        adapter_list, deploy, discover_adapters, init, status, validate_config, version_bump,
+        version_show,
+    };
     use fraisier_core::single_host::DeployRecord;
     use fraisier_saga::events::SagaState;
     use fraisier_saga::state_store::{
@@ -536,6 +567,29 @@ url = "http://127.0.0.1:8080/health"
         assert!(std::fs::read_to_string(&path)
             .expect("read back")
             .contains("[deploy]"));
+    }
+
+    #[test]
+    fn version_show_and_bump_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.5\"\n",
+        )
+        .expect("write");
+
+        let out = version_show(dir.path()).expect("show");
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.json["version"], serde_json::json!("0.1.5"));
+
+        let out = version_bump(dir.path(), fraisier_ship::Bump::Patch).expect("bump");
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.json["old"], serde_json::json!("0.1.5"));
+        assert_eq!(out.json["new"], serde_json::json!("0.1.6"));
+
+        // The bump persisted.
+        let out = version_show(dir.path()).expect("show after bump");
+        assert_eq!(out.json["version"], serde_json::json!("0.1.6"));
     }
 
     #[test]

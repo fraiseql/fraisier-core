@@ -54,6 +54,48 @@ enum Command {
     /// Inspect the migration adapters available as external processes.
     #[command(subcommand)]
     Adapter(AdapterCommand),
+
+    /// Show or bump the project version (`Cargo.toml` / `pyproject.toml`).
+    #[command(subcommand)]
+    Version(VersionCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum VersionCommand {
+    /// Print the current project version.
+    Show(ProjectArgs),
+    /// Increment the version in place, preserving formatting.
+    Bump {
+        /// Which component to increment.
+        #[arg(value_enum)]
+        level: BumpLevel,
+        #[command(flatten)]
+        project: ProjectArgs,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum BumpLevel {
+    Major,
+    Minor,
+    Patch,
+}
+
+impl From<BumpLevel> for fraisier_ship::Bump {
+    fn from(level: BumpLevel) -> Self {
+        match level {
+            BumpLevel::Major => Self::Major,
+            BumpLevel::Minor => Self::Minor,
+            BumpLevel::Patch => Self::Patch,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct ProjectArgs {
+    /// The project directory holding `Cargo.toml` / `pyproject.toml`.
+    #[arg(long, default_value = ".")]
+    path: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -157,6 +199,10 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::Adapter(AdapterCommand::List) => Ok(commands::adapter_list()),
         Command::Adapter(AdapterCommand::Describe { name }) => {
             commands::adapter_describe(name).await
+        }
+        Command::Version(VersionCommand::Show(args)) => commands::version_show(&args.path),
+        Command::Version(VersionCommand::Bump { level, project }) => {
+            commands::version_bump(&project.path, (*level).into())
         }
     }
 }

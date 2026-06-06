@@ -593,6 +593,7 @@ dependencies = [
  "fraisier-ipc",
  "fraisier-saga",
  "fraisier-scaffold",
+ "fraisier-ship",
  "serde",
  "serde_json",
  "tempfile",
@@ -662,6 +663,16 @@ name = "fraisier-scaffold"
 version = "1.0.0-alpha.1"
 dependencies = [
  "fraisier-config",
+]
+
+[[package]]
+name = "fraisier-ship"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "semver",
+ "tempfile",
+ "thiserror",
+ "toml_edit",
 ]
 
 [[package]]

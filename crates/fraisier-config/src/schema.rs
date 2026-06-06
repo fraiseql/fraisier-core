@@ -86,6 +86,10 @@ pub struct DeployConfig {
     /// calendar schedule. Absent when nothing is scheduled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ScheduleSection>,
+    /// The `[sync]` section: the git remote the deploy ledger is shared through
+    /// (experimental). Absent when state is not shared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncSection>,
     /// The `[specql]` preset. Present only in the *unexpanded* form; both
     /// [`from_toml_str`](DeployConfig::from_toml_str) and
     /// [`load`](DeployConfig::load) consume it and leave this `None`.
@@ -282,6 +286,21 @@ pub struct WebhookSection {
     /// Defaults to `30`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_timeout_secs: Option<u64>,
+}
+
+/// The `[sync]` section: how the deploy ledger is shared across operators
+/// (experimental — see `fraisier-sync`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncSection {
+    /// The git remote the `refs/fraisier/sync/*` ledger is pushed to / pulled
+    /// from (a URL or path git understands).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    /// The local bare repo that holds the sync base (last-synced commits).
+    /// Defaults to `.fraisier/sync.git`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_dir: Option<PathBuf>,
 }
 
 /// The `[schedule]` section: a systemd timer that runs fraisier on a schedule.

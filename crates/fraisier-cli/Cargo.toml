@@ -67,6 +67,8 @@ fraisier-db = { path = "../fraisier-db", version = "1.0.0-alpha.1" }
 fraisier-bootstrap = { path = "../fraisier-bootstrap", version = "1.0.0-alpha.1" }
 # Signed-webhook server (HMAC + replay) that triggers a deploy.
 fraisier-webhook = { path = "../fraisier-webhook", version = "1.0.0-alpha.1" }
+# Git-ref deploy-ledger sync across operators (experimental).
+fraisier-sync = { path = "../fraisier-sync", version = "1.0.0-alpha.1" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

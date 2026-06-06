@@ -130,6 +130,7 @@ impl DeployConfig {
         validate_lb(self, &mut report);
         validate_webhook(self, &mut report);
         validate_schedule(self, &mut report);
+        validate_sync(self, &mut report);
         report
     }
 
@@ -433,6 +434,18 @@ fn validate_webhook(cfg: &DeployConfig, report: &mut ValidationReport) {
 
 /// Recognised `[schedule].command` values (what the timer runs).
 const SCHEDULE_COMMANDS: [&str; 2] = ["deploy", "backup"];
+
+fn validate_sync(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(sync) = &cfg.sync else {
+        return; // optional
+    };
+    if !is_set(sync.remote.as_ref()) {
+        report.error(
+            "sync.remote",
+            "the [sync] ledger requires remote (the git remote it is shared through)",
+        );
+    }
+}
 
 fn validate_schedule(cfg: &DeployConfig, report: &mut ValidationReport) {
     let Some(schedule) = &cfg.schedule else {

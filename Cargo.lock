@@ -634,6 +634,7 @@ dependencies = [
  "fraisier-saga",
  "fraisier-scaffold",
  "fraisier-ship",
+ "fraisier-sync",
  "fraisier-webhook",
  "serde",
  "serde_json",
@@ -726,6 +727,14 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml_edit",
+]
+
+[[package]]
+name = "fraisier-sync"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

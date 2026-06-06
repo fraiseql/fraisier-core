@@ -1593,6 +1593,179 @@ pub(crate) async fn webhook_server(
     })
 }
 
+/// `sync` (experimental): share the deploy ledger across operators over git
+/// refs. By default it **pushes** each local fraise/env's state to the remote
+/// (a non-fast-forward — another operator's concurrent change — is reported as a
+/// conflict, never force-pushed). `--pull` fetches remote state into the local
+/// store (accepting the remote); `--reclaim-orphans` deletes remote refs with no
+/// local counterpart.
+pub(crate) async fn sync(
+    config_path: &Path,
+    state_dir: &Path,
+    pull: bool,
+    reclaim_orphans: bool,
+) -> Result<CommandOutput> {
+    eprintln!(
+        "warning: `fraisier sync` is experimental; the on-ref state format may change before GA"
+    );
+    let config = load(config_path)?;
+    let section = config.sync.as_ref().context("missing [sync] section")?;
+    let remote = section
+        .remote
+        .as_deref()
+        .context("[sync].remote is required")?;
+    let sync_dir = section
+        .sync_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(".fraisier/sync.git"));
+
+    let store = FilesystemStateStore::new(state_dir)
+        .with_context(|| format!("opening state store at {}", state_dir.display()))?;
+
+    if pull {
+        return sync_pull(&store, &sync_dir, remote).await;
+    }
+    if reclaim_orphans {
+        return sync_reclaim(&store, remote).await;
+    }
+    sync_push(&store, &sync_dir, remote).await
+}
+
+/// The ref key for a fraise/env: `<fraise>/<env>` (a valid two-component ref).
+fn sync_key(key: &FraiseKey) -> String {
+    format!("{}/{}", key.fraise(), key.environment())
+}
+
+/// Push every local deploy's state to the remote ledger.
+async fn sync_push(
+    store: &FilesystemStateStore,
+    sync_dir: &Path,
+    remote: &str,
+) -> Result<CommandOutput> {
+    use fraisier_sync::PushOutcome;
+
+    let keys = store.keys().await?;
+    let mut results = Vec::new();
+    let mut conflicts = 0;
+    for key in &keys {
+        let payload = serde_json::to_string(&json!({
+            "state": store.current_state(key).await?,
+            "ledger": store.current_snapshot(key).await?,
+        }))?;
+        let key_str = sync_key(key);
+        let outcome = fraisier_sync::push_state(sync_dir, remote, &key_str, &payload)
+            .with_context(|| format!("pushing {key_str}"))?;
+        let label = match outcome {
+            PushOutcome::Pushed => "pushed",
+            PushOutcome::UpToDate => "up-to-date",
+            PushOutcome::Conflict { .. } => {
+                conflicts += 1;
+                "CONFLICT"
+            }
+        };
+        results.push(json!({ "key": key_str, "outcome": label }));
+    }
+
+    let mut pretty = String::new();
+    for result in &results {
+        let _ = writeln!(
+            pretty,
+            "  [{}] {}",
+            result["outcome"].as_str().unwrap_or("?"),
+            result["key"].as_str().unwrap_or("?")
+        );
+    }
+    if keys.is_empty() {
+        pretty.push_str("no local deploys to sync\n");
+    }
+    if conflicts > 0 {
+        let _ = writeln!(
+            pretty,
+            "{conflicts} conflict(s): the remote moved — `fraisier sync --pull` then retry"
+        );
+    }
+    Ok(CommandOutput {
+        exit_code: i32::from(conflicts > 0),
+        pretty,
+        json: json!({ "ok": conflicts == 0, "pushed": results }),
+    })
+}
+
+/// Pull remote ledger state into the local store (accepting the remote).
+async fn sync_pull(
+    store: &FilesystemStateStore,
+    sync_dir: &Path,
+    remote: &str,
+) -> Result<CommandOutput> {
+    use fraisier_saga::state_store::DeploymentState;
+
+    let keys = fraisier_sync::remote_keys(remote).context("listing remote sync refs")?;
+    let mut pulled = Vec::new();
+    for key_str in &keys {
+        let Some((fraise, environment)) = key_str.split_once('/') else {
+            continue; // malformed ref key
+        };
+        let Some(payload) = fraisier_sync::pull_state(sync_dir, remote, key_str)
+            .with_context(|| format!("pulling {key_str}"))?
+        else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+        let key = FraiseKey::new(fraise, environment);
+        if let Some(state) = value.get("state") {
+            if let Ok(state) = serde_json::from_value::<DeploymentState>(state.clone()) {
+                store.record_state(&key, &state).await?;
+            }
+        }
+        if let Some(ledger) = value.get("ledger") {
+            if !ledger.is_null() {
+                store.record_snapshot(&key, ledger).await?;
+            }
+        }
+        pulled.push(key_str.clone());
+    }
+
+    let mut pretty = String::new();
+    for key in &pulled {
+        let _ = writeln!(pretty, "  [pulled] {key}");
+    }
+    if pulled.is_empty() {
+        pretty.push_str("no remote state to pull\n");
+    }
+    Ok(CommandOutput {
+        exit_code: 0,
+        pretty,
+        json: json!({ "ok": true, "pulled": pulled }),
+    })
+}
+
+/// Delete remote sync refs that have no local deploy (orphan reclaim).
+async fn sync_reclaim(store: &FilesystemStateStore, remote: &str) -> Result<CommandOutput> {
+    let local: BTreeSet<String> = store.keys().await?.iter().map(sync_key).collect();
+    let remote_keys = fraisier_sync::remote_keys(remote).context("listing remote sync refs")?;
+    let mut reclaimed = Vec::new();
+    for key in &remote_keys {
+        if !local.contains(key) {
+            fraisier_sync::delete_remote(remote, key)
+                .with_context(|| format!("deleting orphan {key}"))?;
+            reclaimed.push(key.clone());
+        }
+    }
+
+    let mut pretty = String::new();
+    for key in &reclaimed {
+        let _ = writeln!(pretty, "  [reclaimed] {key}");
+    }
+    if reclaimed.is_empty() {
+        pretty.push_str("no orphan refs to reclaim\n");
+    }
+    Ok(CommandOutput {
+        exit_code: 0,
+        pretty,
+        json: json!({ "ok": true, "reclaimed": reclaimed }),
+    })
+}
+
 /// Build the `systemctl [--user] restart <unit>` command (kept separate so its
 /// construction is unit-testable without a systemd manager present).
 fn systemctl_restart_command(unit: &str, user: bool) -> std::process::Command {
@@ -1653,7 +1826,7 @@ mod tests {
     use super::{
         bootstrap, db_backup, db_migrate, db_reset, db_restore, deploy, discover_adapters, health,
         init, list, provider_test, providers, rollback, scaffold, scaffold_install,
-        scheduled_install, ship, status, validate_config, version_bump, version_show,
+        scheduled_install, ship, status, sync, validate_config, version_bump, version_show,
         webhook_server, ShipArgs,
     };
     use fraisier_core::single_host::DeployRecord;
@@ -2431,6 +2604,60 @@ current_revision = "true"
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args, vec!["--user", "restart", "u.service"]);
+    }
+
+    #[tokio::test]
+    async fn sync_pushes_local_state_and_pull_round_trips_via_a_remote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A bare repo standing in for the shared remote.
+        let remote = dir.path().join("remote.git");
+        let ok = std::process::Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(&remote)
+            .status()
+            .expect("git init")
+            .success();
+        assert!(ok, "bare remote created");
+
+        let cfg = format!(
+            "{VALID}\n[sync]\nremote = \"{}\"\nsync_dir = \"{}\"\n",
+            remote.display(),
+            dir.path().join("sync.git").display(),
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+
+        // Seed a deploy state, then push it to the remote ledger.
+        let state_dir = dir.path().join("state");
+        let store = FilesystemStateStore::new(&state_dir).expect("store");
+        store
+            .record_state(
+                &FraiseKey::new("checkout", "staging"),
+                &DeploymentState::new(SagaState::Committed, Some("rev-7".to_owned())),
+            )
+            .await
+            .expect("seed");
+        let out = sync(&config, &state_dir, false, false).await.expect("push");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert!(
+            out.pretty.contains("checkout/staging"),
+            "pushed the key: {}",
+            out.pretty
+        );
+
+        // Pull into a fresh store: the state comes back through the remote.
+        let fresh = dir.path().join("state-fresh");
+        let out = sync(&config, &fresh, true, false).await.expect("pull");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        let restored = FilesystemStateStore::new(&fresh)
+            .expect("fresh store")
+            .current_state(&FraiseKey::new("checkout", "staging"))
+            .await
+            .expect("read");
+        assert!(
+            restored.is_some(),
+            "pull restored the state: {}",
+            out.pretty
+        );
     }
 
     #[test]

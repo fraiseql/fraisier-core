@@ -74,6 +74,9 @@ enum Command {
     #[command(subcommand)]
     Scheduled(ScheduledCommand),
 
+    /// Share the deploy ledger across operators over git refs (experimental).
+    Sync(SyncArgs),
+
     /// Back up the database to a custom-format archive (`pg_dump -Fc`).
     Backup(BackupArgs),
 
@@ -421,6 +424,25 @@ struct DbResetArgs {
     yes: bool,
 }
 
+#[derive(Debug, Args)]
+struct SyncArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Directory for the filesystem state store.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+
+    /// Fetch remote ledger state into the local store (instead of pushing).
+    #[arg(long)]
+    pull: bool,
+
+    /// Delete remote sync refs that have no local deploy (orphan reclaim).
+    #[arg(long)]
+    reclaim_orphans: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum ScheduledCommand {
     /// Generate + install the systemd timer + service for scheduled runs.
@@ -546,6 +568,15 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         }
         Command::Scheduled(ScheduledCommand::Install(args)) => {
             commands::scheduled_install(&args.config, &args.root, args.yes, args.dry_run)
+        }
+        Command::Sync(args) => {
+            commands::sync(
+                &args.config,
+                &args.state_dir,
+                args.pull,
+                args.reclaim_orphans,
+            )
+            .await
         }
         Command::Version(VersionCommand::Show(args)) => commands::version_show(&args.path),
         Command::Version(VersionCommand::Bump { level, project }) => {

@@ -1,0 +1,22 @@
+[package]
+name = "fraisier-sync"
+description = "Git-ref state sync for fraisier (experimental): share the deploy ledger across operators via refs/fraisier/sync/* with optimistic-concurrency (non-fast-forward) conflict detection — never a force-push."
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = "2.0.17"
+
+[dev-dependencies]
+tempfile = "3.27.0"

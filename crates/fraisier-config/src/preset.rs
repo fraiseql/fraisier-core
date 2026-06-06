@@ -113,6 +113,7 @@ impl SpecqlPreset {
             ssh: None,
             webhook: None,
             schedule: None,
+            sync: None,
             specql: None,
         }
     }
@@ -298,6 +299,8 @@ impl DeployConfig {
             webhook: prefer(base.webhook, self.webhook),
             // The preset never emits [schedule]; an author-supplied one wins.
             schedule: prefer(base.schedule, self.schedule),
+            // The preset never emits [sync]; an author-supplied one wins.
+            sync: prefer(base.sync, self.sync),
             specql: None,
         }
     }

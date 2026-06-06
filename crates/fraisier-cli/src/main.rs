@@ -54,6 +54,9 @@ enum Command {
     /// Probe the configured health endpoint on every host.
     Health(HealthArgs),
 
+    /// Roll the deploy back to a prior revision (migrates the database down).
+    Rollback(RollbackArgs),
+
     /// Show the recorded saga state and release ledger for a deploy.
     Status(StatusArgs),
 
@@ -269,6 +272,33 @@ struct HealthArgs {
     host: Option<String>,
 }
 
+#[derive(Debug, Args)]
+struct RollbackArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Directory for the filesystem state store.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+
+    /// The revision to roll the database down to.
+    #[arg(long)]
+    to: String,
+
+    /// The application version of the rolled-back-to artifact to stage.
+    #[arg(long)]
+    app_version: Option<String>,
+
+    /// Pin a single host (required for a multi-host config).
+    #[arg(long)]
+    host: Option<String>,
+
+    /// Execute the rollback (without this, only the plan is shown).
+    #[arg(long)]
+    yes: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum AdapterCommand {
     /// List `fraisier-adapter-*` binaries discoverable on `PATH`.
@@ -316,6 +346,17 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         }
         Command::List(args) => commands::list(&args.state_dir, args.flat).await,
         Command::Health(args) => commands::health(&args.config, args.host.as_deref()).await,
+        Command::Rollback(args) => {
+            commands::rollback(
+                &args.config,
+                &args.state_dir,
+                args.host.as_deref(),
+                &args.to,
+                args.app_version.as_deref(),
+                args.yes,
+            )
+            .await
+        }
         Command::Status(args) => {
             commands::status(&args.config, &args.state_dir, args.per_host).await
         }

@@ -483,6 +483,90 @@ pub(crate) async fn list(state_dir: &Path, flat: bool) -> Result<CommandOutput> 
     })
 }
 
+/// `rollback`: revert the deploy to a prior `to` revision. Shows the plan
+/// (`source → target`) unless `execute` is set, then runs a deploy of the
+/// rolled-back-to artifact with the migration taken `down_to(target)`.
+pub(crate) async fn rollback(
+    config_path: &Path,
+    state_dir: &Path,
+    host: Option<&str>,
+    to: &str,
+    app_version: Option<&str>,
+    execute: bool,
+) -> Result<CommandOutput> {
+    use fraisier_core::adapter_axes::Revision;
+
+    let config = load(config_path)?;
+    let report = config.validate();
+    if !report.ok() {
+        let mut pretty = render_issues(&report);
+        pretty.push_str("refusing to roll back with an invalid config\n");
+        return Ok(CommandOutput {
+            exit_code: 1,
+            pretty,
+            json: json!({ "ok": false, "issues": serde_json::to_value(&report.issues)? }),
+        });
+    }
+
+    let deploy = config.deploy.as_ref().context("missing [deploy] section")?;
+    let fraise = deploy.name.clone().context("[deploy].name is required")?;
+    let environment = deploy
+        .environment
+        .clone()
+        .context("[deploy].environment is required")?;
+
+    let store = FilesystemStateStore::new(state_dir)
+        .with_context(|| format!("opening state store at {}", state_dir.display()))?;
+    let key = FraiseKey::new(&fraise, &environment);
+    let source = store
+        .current_snapshot(&key)
+        .await?
+        .and_then(|v| serde_json::from_value::<DeployRecord>(v).ok())
+        .and_then(|r| r.revision)
+        .map_or_else(|| "<unknown>".to_owned(), |r| r.to_string());
+
+    if !execute {
+        return Ok(CommandOutput {
+            exit_code: 0,
+            pretty: format!(
+                "rollback plan for {fraise}/{environment}: {source} → {to}\n\
+                 pass --yes to execute (migrates the database down to {to})\n"
+            ),
+            json: json!({
+                "fraise": fraise, "environment": environment,
+                "source": source, "target": to, "executed": false,
+            }),
+        });
+    }
+
+    let resolved = factory::build(&config, host, app_version)?;
+    let plan = SingleHostDeploy::builder(
+        resolved.fraise.clone(),
+        resolved.environment.clone(),
+        resolved.host.clone(),
+    )
+    .context(resolved.ctx)
+    .forward_compatible_lint(resolved.forward_compatible_lint)
+    .artifact(resolved.artifact)
+    .migration(resolved.migration)
+    .service(resolved.service)
+    .health(resolved.health)
+    .rollback_to(Revision::new(to))
+    .build()?;
+
+    let outcome = plan.run(store).await?;
+    let (exit_code, label, detail) = outcome_result(&outcome);
+    Ok(CommandOutput {
+        exit_code,
+        pretty: format!("rollback of {fraise}/{environment} to {to} {label}{detail}\n"),
+        json: json!({
+            "fraise": fraise, "environment": environment,
+            "source": source, "target": to, "executed": true,
+            "outcome": label, "detail": detail.trim(),
+        }),
+    })
+}
+
 /// `health`: probe the configured health endpoint on every host (or just
 /// `host_filter`), reporting each result. Exit 0 iff every probed host is healthy.
 pub(crate) async fn health(config_path: &Path, host_filter: Option<&str>) -> Result<CommandOutput> {
@@ -844,8 +928,8 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapter_list, deploy, discover_adapters, health, init, list, scaffold, scaffold_install,
-        ship, status, validate_config, version_bump, version_show, ShipArgs,
+        adapter_list, deploy, discover_adapters, health, init, list, rollback, scaffold,
+        scaffold_install, ship, status, validate_config, version_bump, version_show, ShipArgs,
     };
     use fraisier_core::single_host::DeployRecord;
     use fraisier_saga::events::SagaState;
@@ -1077,6 +1161,40 @@ url = "http://127.0.0.1:8080/health"
             .expect("run");
         assert_eq!(out.exit_code, 1);
         assert_eq!(out.json["ok"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn rollback_plan_shows_source_and_target_without_executing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", VALID);
+        let state_dir = dir.path().join("state");
+        // Seed a current revision so the plan can show the source.
+        let store = FilesystemStateStore::new(&state_dir).expect("store");
+        let ledger = DeployRecord {
+            active: None,
+            revision: Some(fraisier_core::adapter_axes::Revision::new("rev-9")),
+        };
+        store
+            .record_snapshot(
+                &FraiseKey::new("checkout", "staging"),
+                &serde_json::to_value(&ledger).expect("encode"),
+            )
+            .await
+            .expect("seed");
+
+        // No --yes: plan only, nothing executed (so no adapters/DSN are needed).
+        let out = rollback(&config, &state_dir, None, "rev-3", None, false)
+            .await
+            .expect("rollback plan");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert_eq!(out.json["executed"], serde_json::json!(false));
+        assert_eq!(out.json["source"], serde_json::json!("rev-9"));
+        assert_eq!(out.json["target"], serde_json::json!("rev-3"));
+        assert!(
+            out.pretty.contains("rev-9 → rev-3"),
+            "pretty: {}",
+            out.pretty
+        );
     }
 
     #[tokio::test]

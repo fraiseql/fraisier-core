@@ -94,6 +94,9 @@ pub struct SingleHostDeploy {
     host: HostId,
     ctx: AdapterCtx,
     target: Option<Revision>,
+    /// When set, this run is a deliberate rollback: the migrate step runs
+    /// `down_to(this)` instead of `up`, and its compensation goes back `up`.
+    rollback_to: Option<Revision>,
     forward_compatible_lint: bool,
     artifact: Arc<dyn ArtifactAdapter>,
     migration: Arc<dyn MigrationAdapter>,
@@ -175,6 +178,7 @@ pub struct SingleHostDeployBuilder {
     host: HostId,
     ctx: Option<AdapterCtx>,
     target: Option<Revision>,
+    rollback_to: Option<Revision>,
     forward_compatible_lint: bool,
     artifact: Option<Arc<dyn ArtifactAdapter>>,
     migration: Option<Arc<dyn MigrationAdapter>>,
@@ -190,6 +194,7 @@ impl SingleHostDeployBuilder {
             host,
             ctx: None,
             target: None,
+            rollback_to: None,
             // Default on: forward-compat preflight runs whenever the adapter
             // advertises it, unless the operator opts out (PRD G11 / Decision 4).
             forward_compatible_lint: true,
@@ -212,6 +217,16 @@ impl SingleHostDeployBuilder {
     #[must_use]
     pub fn target(mut self, target: Revision) -> Self {
         self.target = Some(target);
+        self
+    }
+
+    /// Make this run a deliberate rollback to `revision`: the migrate step runs
+    /// `down_to(revision)` instead of `up`, its compensation goes back `up` to the
+    /// pre-rollback revision, and (as always) the artifact for the rolled-back-to
+    /// version is staged + activated. Mutually exclusive with [`target`] in intent.
+    #[must_use]
+    pub fn rollback_to(mut self, revision: Revision) -> Self {
+        self.rollback_to = Some(revision);
         self
     }
 
@@ -279,6 +294,7 @@ impl SingleHostDeployBuilder {
             host: self.host,
             ctx,
             target: self.target,
+            rollback_to: self.rollback_to,
             forward_compatible_lint: self.forward_compatible_lint,
         })
     }
@@ -301,6 +317,7 @@ struct DeployShared {
     ctx: AdapterCtx,
     host: HostId,
     target: Option<Revision>,
+    rollback_to: Option<Revision>,
     forward_compatible_lint: bool,
     artifact: Arc<dyn ArtifactAdapter>,
     migration: Arc<dyn MigrationAdapter>,
@@ -374,6 +391,7 @@ impl DeployShared {
             ctx,
             host: deploy.host.clone(),
             target: deploy.target.clone(),
+            rollback_to: deploy.rollback_to.clone(),
             forward_compatible_lint: deploy.forward_compatible_lint,
             artifact: Arc::clone(&deploy.artifact),
             migration: Arc::clone(&deploy.migration),
@@ -455,32 +473,49 @@ impl DeployShared {
             .map_err(|e| Self::failed("migrate", &e))?;
         runtime.previous_revision = previous;
 
-        let outcome = self
-            .migration
-            .up(&self.ctx, self.target.clone())
-            .await
-            .map_err(|e| Self::failed("migrate", &e))?;
-
-        runtime.new_revision = outcome.to.or_else(|| runtime.previous_revision.clone());
+        if let Some(target) = &self.rollback_to {
+            // Deliberate rollback: take the database *down* to the target revision.
+            self.migration
+                .down_to(&self.ctx, target.clone())
+                .await
+                .map_err(|e| Self::failed("migrate", &e))?;
+            runtime.new_revision = Some(target.clone());
+        } else {
+            let outcome = self
+                .migration
+                .up(&self.ctx, self.target.clone())
+                .await
+                .map_err(|e| Self::failed("migrate", &e))?;
+            runtime.new_revision = outcome.to.or_else(|| runtime.previous_revision.clone());
+        }
         Ok(())
     }
 
     async fn undo_migrate(&self, runtime: &DeployRuntime) -> Result<(), SagaError> {
-        match runtime.previous_revision.clone() {
-            Some(target) => self
-                .migration
-                .down_to(&self.ctx, target)
-                .await
-                .map(|_| ())
-                .map_err(|e| Self::failed("migrate", &e)),
-            None => Err(SagaError::StepFailed {
+        let Some(previous) = runtime.previous_revision.clone() else {
+            return Err(SagaError::StepFailed {
                 step: "migrate".to_owned(),
                 message: "cannot roll back the initial migration: there is no prior revision to \
                           return the database to (a failed first-ever deploy has no committed \
                           state to restore)"
                     .to_owned(),
-            }),
-        }
+            });
+        };
+        // Compensation undoes whatever `run_migrate` did: a forward deploy went
+        // `up`, so it comes back `down_to(previous)`; a rollback went `down_to`, so
+        // it goes back `up` to the pre-rollback revision.
+        let result = if self.rollback_to.is_some() {
+            self.migration
+                .up(&self.ctx, Some(previous))
+                .await
+                .map(|_| ())
+        } else {
+            self.migration
+                .down_to(&self.ctx, previous)
+                .await
+                .map(|_| ())
+        };
+        result.map_err(|e| Self::failed("migrate", &e))
     }
 
     async fn run_activate(&self, runtime: &DeployRuntime) -> Result<(), SagaError> {
@@ -945,6 +980,94 @@ mod tests {
         let record: DeployRecord = serde_json::from_value(snapshot).expect("decode");
         assert_eq!(record.active.expect("active").artifact.id, "v-new");
         assert_eq!(record.revision, Some(Revision::new("rev-new")));
+    }
+
+    #[tokio::test]
+    async fn rollback_migrates_down_to_the_target_and_commits() {
+        let (_dir, store) = store();
+        seed_prior(&store).await;
+        let trail = Trail::default();
+        let plan = SingleHostDeploy::builder("checkout", "production", HostId::new("localhost"))
+            .artifact(Arc::new(FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            }))
+            .migration(Arc::new(FakeMigration::healthy(&trail)))
+            .service(Arc::new(FakeService {
+                trail: trail.clone(),
+                fail_restarts: Arc::new(Mutex::new(0)),
+            }))
+            .health(Arc::new(FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            }))
+            .rollback_to(Revision::new("rev-old"))
+            .build()
+            .expect("build");
+
+        let outcome = plan.run(store.clone()).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+
+        let trail = drain(&trail);
+        assert!(
+            trail.contains(&"down_to:rev-old".to_owned()),
+            "a rollback migrates down to the target: {trail:?}"
+        );
+        assert!(
+            !trail.contains(&"up".to_owned()),
+            "a rollback must not migrate up on the forward path: {trail:?}"
+        );
+        // The ledger now reflects the rolled-back-to revision.
+        let record: DeployRecord = serde_json::from_value(
+            store
+                .current_snapshot(&key())
+                .await
+                .expect("query")
+                .expect("ledger"),
+        )
+        .expect("decode");
+        assert_eq!(record.revision, Some(Revision::new("rev-old")));
+    }
+
+    #[tokio::test]
+    async fn rollback_compensation_migrates_back_up() {
+        // A rollback whose health check fails must compensate by going back *up* to
+        // the pre-rollback revision — the inverse of the rollback's `down_to`.
+        let (_dir, store) = store();
+        seed_prior(&store).await;
+        let trail = Trail::default();
+        let plan = SingleHostDeploy::builder("checkout", "production", HostId::new("localhost"))
+            .artifact(Arc::new(FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            }))
+            .migration(Arc::new(FakeMigration::healthy(&trail)))
+            .service(Arc::new(FakeService {
+                trail: trail.clone(),
+                fail_restarts: Arc::new(Mutex::new(0)),
+            }))
+            .health(Arc::new(FakeHealth {
+                trail: trail.clone(),
+                healthy: false,
+            }))
+            .rollback_to(Revision::new("rev-old"))
+            .build()
+            .expect("build");
+
+        let outcome = plan.run(store).await.expect("run completes with rollback");
+        assert!(
+            matches!(outcome, SagaOutcome::RolledBack { .. }),
+            "got {outcome:?}"
+        );
+        let trail = drain(&trail);
+        assert!(
+            trail.contains(&"down_to:rev-old".to_owned()),
+            "forward rollback went down: {trail:?}"
+        );
+        assert!(
+            trail.contains(&"up".to_owned()),
+            "compensation goes back up to the pre-rollback revision: {trail:?}"
+        );
     }
 
     #[tokio::test]

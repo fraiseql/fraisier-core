@@ -720,6 +720,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fraisier-self-upgrade"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "async-trait",
+ "fraisier-adapter-support",
+ "fraisier-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fraisier-ship"
 version = "1.0.0-alpha.1"
 dependencies = [

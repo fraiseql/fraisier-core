@@ -1,0 +1,31 @@
+[package]
+name = "fraisier-self-upgrade"
+description = "Self-upgrade engine for fraisier: fetch + sha256-verify + keep-old + atomic swap + post-restart health-check + auto-revert of fraisier's own binary."
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+fraisier-core = { path = "../fraisier-core", version = "1.0.0-alpha.1" }
+fraisier-adapter-support = { path = "../fraisier-adapter-support", version = "1.0.0-alpha.1" }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.10.9"
+tokio = { version = "1.52.3", features = ["process", "time", "fs"] }
+tracing = "0.1.41"
+
+[dev-dependencies]
+tempfile = "3.14.0"
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "process", "time", "fs"] }

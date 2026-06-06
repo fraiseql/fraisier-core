@@ -39,6 +39,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Write a starter `fraisier.toml` into the current project.
+    Init(InitArgs),
+
     /// Parse, expand the SpecQL preset, and validate a `fraisier.toml`.
     ValidateConfig(ConfigArgs),
 
@@ -58,6 +61,17 @@ struct ConfigArgs {
     /// Path to the `fraisier.toml`.
     #[arg(long, default_value = "fraisier.toml")]
     config: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct InitArgs {
+    /// Where to write the starter config.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Overwrite the file if it already exists.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -127,6 +141,7 @@ async fn main() -> ExitCode {
 
 async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
     match &cli.command {
+        Command::Init(args) => commands::init(&args.config, args.force),
         Command::ValidateConfig(args) => commands::validate_config(&args.config),
         Command::Deploy(args) => {
             commands::deploy(

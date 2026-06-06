@@ -54,6 +54,32 @@ fn render_issues(report: &ValidationReport) -> String {
     out
 }
 
+/// `init`: write the starter [`fraisier.toml`](fraisier_scaffold::starter_config)
+/// into the project. Refuses to clobber an existing file unless `force` is set —
+/// the safe default for a command a user might run a second time by reflex.
+pub(crate) fn init(config_path: &Path, force: bool) -> Result<CommandOutput> {
+    if config_path.exists() && !force {
+        return Ok(CommandOutput {
+            exit_code: 1,
+            pretty: format!(
+                "{} already exists; pass --force to overwrite it\n",
+                config_path.display()
+            ),
+            json: json!({ "ok": false, "path": config_path.display().to_string(), "wrote": false }),
+        });
+    }
+    std::fs::write(config_path, fraisier_scaffold::starter_config())
+        .with_context(|| format!("writing {}", config_path.display()))?;
+    Ok(CommandOutput {
+        exit_code: 0,
+        pretty: format!(
+            "wrote starter config to {}\nnext: edit it, then run `fraisier validate-config`\n",
+            config_path.display()
+        ),
+        json: json!({ "ok": true, "path": config_path.display().to_string(), "wrote": true }),
+    })
+}
+
 /// `validate-config`: parse, expand, and validate, reporting every located issue.
 pub(crate) fn validate_config(config_path: &Path) -> Result<CommandOutput> {
     let toml = std::fs::read_to_string(config_path)
@@ -421,7 +447,7 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{adapter_list, deploy, discover_adapters, status, validate_config};
+    use super::{adapter_list, deploy, discover_adapters, init, status, validate_config};
     use fraisier_core::single_host::DeployRecord;
     use fraisier_saga::events::SagaState;
     use fraisier_saga::state_store::{
@@ -479,6 +505,37 @@ url = "http://127.0.0.1:8080/health"
         assert!(issues
             .iter()
             .any(|i| i["path"] == "migration.database_url_env"));
+    }
+
+    #[test]
+    fn init_writes_starter_then_guards_against_overwrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fraisier.toml");
+
+        // Absent → writes the starter and reports success.
+        let out = init(&path, false).expect("init writes");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert!(path.exists(), "the file was created");
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(written.contains("[deploy]"), "starter content written");
+
+        // Present, no force → refuses, leaves the file untouched.
+        std::fs::write(&path, "EDITED").expect("simulate user edit");
+        let out = init(&path, false).expect("init guards");
+        assert_eq!(out.exit_code, 1);
+        assert_eq!(out.json["wrote"], serde_json::json!(false));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "EDITED",
+            "the guard must not clobber the existing file"
+        );
+
+        // Present, force → overwrites.
+        let out = init(&path, true).expect("init --force");
+        assert_eq!(out.exit_code, 0);
+        assert!(std::fs::read_to_string(&path)
+            .expect("read back")
+            .contains("[deploy]"));
     }
 
     #[test]

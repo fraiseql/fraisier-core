@@ -1,0 +1,22 @@
+[package]
+name = "fraisier-scaffold"
+description = "Generators for fraisier's on-disk files: the `init` starter `fraisier.toml` and the `scaffold` systemd/socket/nginx/CI templates."
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+# Used only by tests, to prove the generated starter config validates clean.
+fraisier-config = { path = "../fraisier-config", version = "1.0.0-alpha.1" }

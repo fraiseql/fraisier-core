@@ -592,6 +592,7 @@ dependencies = [
  "fraisier-core",
  "fraisier-ipc",
  "fraisier-saga",
+ "fraisier-scaffold",
  "serde",
  "serde_json",
  "tempfile",
@@ -654,6 +655,13 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "fraisier-scaffold"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "fraisier-config",
 ]
 
 [[package]]

@@ -730,6 +730,7 @@ dependencies = [
 name = "fraisier-webhook"
 version = "1.0.0-alpha.1"
 dependencies = [
+ "async-trait",
  "hex",
  "hmac",
  "sha2",

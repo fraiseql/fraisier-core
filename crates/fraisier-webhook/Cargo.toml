@@ -16,9 +16,11 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = "0.1.89"
 hex = "0.4.3"
 hmac = "0.12.1"
 sha2 = "0.10.9"
+tokio = { version = "1.52.3", features = ["io-util", "net", "rt", "time"] }
 
 [dev-dependencies]
-tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1.52.3", features = ["io-util", "macros", "rt", "rt-multi-thread"] }

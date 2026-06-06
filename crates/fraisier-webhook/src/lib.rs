@@ -10,7 +10,11 @@
 //!
 //! - [`sign`] / [`verify`] — the signed-request scheme (HMAC-SHA256 over
 //!   `"<timestamp>.<body>"` with a replay window), the security core.
+//! - [`serve_connection`] / [`WebhookHandler`] — the minimal HTTP/1.1 receiver
+//!   that verifies a request and dispatches the verified body.
 
+mod server;
 mod sign;
 
+pub use server::{serve_connection, Served, ServerConfig, WebhookHandler};
 pub use sign::{sign, verify, Rejection, SIGNATURE_HEADER, TIMESTAMP_HEADER};

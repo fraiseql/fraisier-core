@@ -356,13 +356,13 @@ fn validate_hosts(cfg: &DeployConfig, report: &mut ValidationReport) {
 }
 
 /// In a multi-host deploy the service axis runs on each host over SSH. The
-/// `release`/`local` artifact adapters and the `nginx` LB adapter still do
+/// `release`/`local`/`git` artifact adapters and the `nginx` LB adapter still do
 /// local-filesystem work, so warn the operator they act where fraisier runs. The
 /// genuinely-remote artifact sources (`pull` via curl, `release-ipc` via the
 /// adapter over ssh) stage on each host and are not warned.
 fn warn_local_only_axes(cfg: &DeployConfig, report: &mut ValidationReport) {
     if let Some(source) = cfg.artifact.as_ref().and_then(|a| a.source.as_deref()) {
-        if matches!(source, "release" | "local") {
+        if matches!(source, "release" | "local" | "git") {
             report.warn(
                 "artifact.source",
                 format!(

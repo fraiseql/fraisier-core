@@ -1742,6 +1742,7 @@ async fn sync_push(
 
     let keys = store.keys().await?;
     let mut results = Vec::new();
+    let mut pretty = String::new();
     let mut conflicts = 0;
     for key in &keys {
         let payload = serde_json::to_string(&json!({
@@ -1751,33 +1752,42 @@ async fn sync_push(
         let key_str = sync_key(key);
         let outcome = fraisier_sync::push_state(sync_dir, remote, &key_str, &payload)
             .with_context(|| format!("pushing {key_str}"))?;
-        let label = match outcome {
-            PushOutcome::Pushed => "pushed",
-            PushOutcome::UpToDate => "up-to-date",
-            PushOutcome::Conflict { .. } => {
-                conflicts += 1;
-                "CONFLICT"
+        match outcome {
+            PushOutcome::Pushed => {
+                let _ = writeln!(pretty, "  [pushed] {key_str}");
+                results.push(json!({ "key": key_str, "outcome": "pushed" }));
             }
-        };
-        results.push(json!({ "key": key_str, "outcome": label }));
+            PushOutcome::UpToDate => {
+                let _ = writeln!(pretty, "  [up-to-date] {key_str}");
+                results.push(json!({ "key": key_str, "outcome": "up-to-date" }));
+            }
+            PushOutcome::Conflict {
+                local_head,
+                remote_head,
+            } => {
+                conflicts += 1;
+                // Show the divergence loudly: local (rejected) vs the remote tip.
+                let _ = writeln!(pretty, "  [CONFLICT] {key_str} — the remote diverged");
+                let _ = writeln!(pretty, "      local  {local_head}");
+                let _ = writeln!(pretty, "      remote {remote_head}");
+                results.push(json!({
+                    "key": key_str,
+                    "outcome": "conflict",
+                    "local_head": local_head,
+                    "remote_head": remote_head,
+                }));
+            }
+        }
     }
 
-    let mut pretty = String::new();
-    for result in &results {
-        let _ = writeln!(
-            pretty,
-            "  [{}] {}",
-            result["outcome"].as_str().unwrap_or("?"),
-            result["key"].as_str().unwrap_or("?")
-        );
-    }
     if keys.is_empty() {
         pretty.push_str("no local deploys to sync\n");
     }
     if conflicts > 0 {
         let _ = writeln!(
             pretty,
-            "{conflicts} conflict(s): the remote moved — `fraisier sync --pull` then retry"
+            "{conflicts} conflict(s): run `fraisier sync --pull` to fetch the remote, review the \
+             divergence, then retry"
         );
     }
     Ok(CommandOutput {
@@ -2954,6 +2964,95 @@ current_revision = "true"
         assert!(
             restored.is_some(),
             "pull restored the state: {}",
+            out.pretty
+        );
+    }
+
+    #[tokio::test]
+    async fn a_divergent_sync_push_shows_the_divergence_then_pull_retry_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(&remote)
+            .status()
+            .expect("git init")
+            .success());
+        let key = FraiseKey::new("checkout", "staging");
+
+        let config_for = |name: &str| {
+            let cfg = format!(
+                "{VALID}\n[sync]\nremote = \"{}\"\nsync_dir = \"{}\"\n",
+                remote.display(),
+                dir.path().join(format!("{name}/sync.git")).display(),
+            );
+            write(dir.path(), &format!("{name}.toml"), &cfg)
+        };
+
+        // Operator A establishes the remote ref.
+        let (config_a, state_a) = (config_for("a"), dir.path().join("a/state"));
+        FilesystemStateStore::new(&state_a)
+            .expect("store a")
+            .record_state(
+                &key,
+                &DeploymentState::new(SagaState::Committed, Some("A".to_owned())),
+            )
+            .await
+            .expect("seed a");
+        let out = sync(&config_a, &state_a, false, false)
+            .await
+            .expect("a push");
+        assert_eq!(out.exit_code, 0, "A pushed: {}", out.pretty);
+
+        // Operator B, with an independent sync base + divergent state, loses the race.
+        let (config_b, state_b) = (config_for("b"), dir.path().join("b/state"));
+        FilesystemStateStore::new(&state_b)
+            .expect("store b")
+            .record_state(
+                &key,
+                &DeploymentState::new(SagaState::Committed, Some("B".to_owned())),
+            )
+            .await
+            .expect("seed b");
+        let out = sync(&config_b, &state_b, false, false)
+            .await
+            .expect("b push");
+        assert_eq!(
+            out.exit_code, 1,
+            "the loser gets a non-zero exit: {}",
+            out.pretty
+        );
+        assert!(
+            out.pretty.contains("CONFLICT"),
+            "loud conflict: {}",
+            out.pretty
+        );
+        assert!(
+            out.pretty.contains("local "),
+            "shows local head: {}",
+            out.pretty
+        );
+        assert!(
+            out.pretty.contains("remote "),
+            "shows remote head: {}",
+            out.pretty
+        );
+
+        // A's state was not clobbered.
+        let on_remote = fraisier_sync::remote_keys(&remote.display().to_string()).expect("keys");
+        assert_eq!(on_remote, vec!["checkout/staging".to_owned()]);
+
+        // B reconciles: pull accepts the remote, then the retry succeeds (exit 0).
+        let out = sync(&config_b, &state_b, true, false)
+            .await
+            .expect("b pull");
+        assert_eq!(out.exit_code, 0, "pull: {}", out.pretty);
+        let out = sync(&config_b, &state_b, false, false)
+            .await
+            .expect("b retry");
+        assert_eq!(
+            out.exit_code, 0,
+            "retry succeeds after pull: {}",
             out.pretty
         );
     }

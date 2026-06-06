@@ -1,10 +1,48 @@
 //! On-disk file generators for the `fraisier` CLI.
 //!
 //! This crate owns the *content* fraisier writes to a user's project and hosts:
-//! the [`starter_config`] that `fraisier init` produces, and (later) the
-//! `scaffold` systemd / socket / nginx / CI templates. It deliberately performs
-//! no I/O of its own — it returns strings; the CLI decides where they land and
-//! handles overwrite confirmation.
+//! the [`starter_config`] that `fraisier init` produces, and the
+//! [`generate`](generate::generate) systemd / socket / nginx / CI templates.
+//! Generation performs no I/O — it returns [`GeneratedFile`]s; each carries the
+//! [`MARKER`] header so install/prune can recognise fraisier's own files and a
+//! prune never touches a file fraisier did not generate.
+
+use std::path::PathBuf;
+
+mod generate;
+mod install;
+
+pub use generate::{generate, GeneratedFile, MARKER};
+pub use install::{install, install_targets, prune, prune_plan, write_tree};
+
+/// An error from generating, installing, or pruning scaffold files.
+#[derive(Debug, thiserror::Error)]
+pub enum ScaffoldError {
+    /// A config field required to render the templates is missing.
+    #[error("[{section}].{field} is required to scaffold")]
+    MissingField {
+        /// The config section the field belongs to.
+        section: &'static str,
+        /// The missing field.
+        field: &'static str,
+    },
+    /// Writing a generated/installed file failed.
+    #[error("writing {path}: {source}")]
+    Write {
+        /// The destination path.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+    /// Reading a directory during prune failed.
+    #[error("reading {path}: {source}")]
+    Read {
+        /// The directory being scanned.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+}
 
 /// The starter `fraisier.toml` that `fraisier init` writes into a fresh project.
 ///

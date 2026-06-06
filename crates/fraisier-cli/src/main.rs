@@ -61,6 +61,51 @@ enum Command {
 
     /// Bump the version, commit, push, and (unless `--no-deploy`) deploy it.
     Ship(ShipCliArgs),
+
+    /// Generate the systemd/socket/nginx/CI deploy files into a local tree.
+    Scaffold(ScaffoldArgs),
+
+    /// Install the generated system files (and optionally prune stale ones).
+    ScaffoldInstall(ScaffoldInstallArgs),
+}
+
+#[derive(Debug, Args)]
+struct ScaffoldArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Directory to write the generated tree into.
+    #[arg(long, default_value = "deploy")]
+    out: PathBuf,
+
+    /// List the files that would be written without writing them.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+struct ScaffoldInstallArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Filesystem prefix the system paths are installed under (override for
+    /// sandboxed installs; defaults to the real root).
+    #[arg(long, default_value = "/")]
+    root: PathBuf,
+
+    /// Also remove stale fraisier-generated files from the install directories.
+    #[arg(long)]
+    prune: bool,
+
+    /// Apply the changes (without this, only the plan is shown).
+    #[arg(long)]
+    yes: bool,
+
+    /// Show the install + prune plans without applying them.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -259,6 +304,10 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
                 host: args.host.as_deref(),
             })
             .await
+        }
+        Command::Scaffold(args) => commands::scaffold(&args.config, &args.out, args.dry_run),
+        Command::ScaffoldInstall(args) => {
+            commands::scaffold_install(&args.config, &args.root, args.prune, args.yes, args.dry_run)
         }
     }
 }

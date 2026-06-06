@@ -207,6 +207,122 @@ pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
     })
 }
 
+/// `scaffold`: render the deploy infrastructure files and write the tree into
+/// `out_dir` (or, with `dry_run`, just list what would be written).
+pub(crate) fn scaffold(config_path: &Path, out_dir: &Path, dry_run: bool) -> Result<CommandOutput> {
+    let config = load(config_path)?;
+    let files = fraisier_scaffold::generate(&config)?;
+
+    if dry_run {
+        let mut pretty = format!("scaffold plan (into {}):\n", out_dir.display());
+        for file in &files {
+            let _ = writeln!(pretty, "  {}", out_dir.join(&file.rel_path).display());
+        }
+        pretty.push_str("(dry run — nothing was written)\n");
+        return Ok(CommandOutput {
+            exit_code: 0,
+            pretty,
+            json: json!({
+                "dry_run": true,
+                "files": files.iter().map(|f| f.rel_path.display().to_string()).collect::<Vec<_>>(),
+            }),
+        });
+    }
+
+    let written = fraisier_scaffold::write_tree(&files, out_dir)?;
+    let mut pretty = format!(
+        "wrote {} files into {}:\n",
+        written.len(),
+        out_dir.display()
+    );
+    for path in &written {
+        let _ = writeln!(pretty, "  {}", path.display());
+    }
+    Ok(CommandOutput {
+        exit_code: 0,
+        pretty,
+        json: json!({
+            "wrote": written.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        }),
+    })
+}
+
+/// `scaffold-install`: install the system files (under `root`) and optionally
+/// prune stale fraisier-generated files. Writes only when `apply` is set;
+/// otherwise (and under `dry_run`) it prints the install + prune plans.
+pub(crate) fn scaffold_install(
+    config_path: &Path,
+    root: &Path,
+    prune: bool,
+    apply: bool,
+    dry_run: bool,
+) -> Result<CommandOutput> {
+    let config = load(config_path)?;
+    let files = fraisier_scaffold::generate(&config)?;
+    let targets = fraisier_scaffold::install_targets(&files, root);
+    let stale = if prune {
+        fraisier_scaffold::prune_plan(&files, root)?
+    } else {
+        Vec::new()
+    };
+
+    let render_plan = |verb: &str| {
+        let mut pretty = format!("install plan ({verb}, root {}):\n", root.display());
+        for path in &targets {
+            let _ = writeln!(pretty, "  + {}", path.display());
+        }
+        if prune {
+            pretty.push_str("prune plan:\n");
+            if stale.is_empty() {
+                pretty.push_str("  (nothing stale)\n");
+            }
+            for path in &stale {
+                let _ = writeln!(pretty, "  - {}", path.display());
+            }
+        }
+        pretty
+    };
+
+    // Apply only on an explicit, non-dry-run go-ahead; otherwise show the plan.
+    if dry_run || !apply {
+        let mut pretty = render_plan("dry run");
+        if !dry_run {
+            pretty.push_str("pass --yes to apply\n");
+        }
+        return Ok(CommandOutput {
+            exit_code: 0,
+            pretty,
+            json: json!({
+                "applied": false,
+                "install": targets.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "prune": stale.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            }),
+        });
+    }
+
+    let installed = fraisier_scaffold::install(&files, root)?;
+    if prune {
+        fraisier_scaffold::prune(&stale)?;
+    }
+    let mut pretty = format!(
+        "installed {} files (root {})\n",
+        installed.len(),
+        root.display()
+    );
+    if prune {
+        let _ = writeln!(pretty, "pruned {} stale files", stale.len());
+    }
+    Ok(CommandOutput {
+        exit_code: 0,
+        pretty,
+        json: json!({
+            "applied": true,
+            "installed": installed.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "pruned": stale.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        }),
+    })
+}
+
 /// `validate-config`: parse, expand, and validate, reporting every located issue.
 pub(crate) fn validate_config(config_path: &Path) -> Result<CommandOutput> {
     let toml = std::fs::read_to_string(config_path)
@@ -575,8 +691,8 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapter_list, deploy, discover_adapters, init, ship, status, validate_config, version_bump,
-        version_show, ShipArgs,
+        adapter_list, deploy, discover_adapters, init, scaffold, scaffold_install, ship, status,
+        validate_config, version_bump, version_show, ShipArgs,
     };
     use fraisier_core::single_host::DeployRecord;
     use fraisier_saga::events::SagaState;
@@ -719,6 +835,41 @@ url = "http://127.0.0.1:8080/health"
         assert!(std::fs::read_to_string(dir.path().join("Cargo.toml"))
             .unwrap()
             .contains("0.1.5"));
+    }
+
+    #[test]
+    fn scaffold_writes_a_tree_and_dry_run_lists_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", VALID);
+        let out = dir.path().join("deploy");
+
+        // Dry run lists files, writes nothing.
+        let plan = scaffold(&config, &out, true).expect("dry run");
+        assert_eq!(plan.exit_code, 0);
+        assert_eq!(plan.json["files"].as_array().expect("files").len(), 5);
+        assert!(!out.exists(), "dry run wrote nothing");
+
+        // Real run writes the tree.
+        let done = scaffold(&config, &out, false).expect("scaffold");
+        assert_eq!(done.exit_code, 0);
+        assert!(out.join("systemd/checkout.service").exists());
+    }
+
+    #[test]
+    fn scaffold_install_plans_then_applies_under_a_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", VALID);
+        let root = dir.path().join("root");
+
+        // Without --yes it only plans (apply = false).
+        let plan = scaffold_install(&config, &root, false, false, false).expect("plan");
+        assert_eq!(plan.json["applied"], serde_json::json!(false));
+        assert!(!root.exists(), "planning wrote nothing");
+
+        // With apply it installs under the root.
+        let done = scaffold_install(&config, &root, false, true, false).expect("install");
+        assert_eq!(done.json["applied"], serde_json::json!(true));
+        assert!(root.join("etc/systemd/system/checkout.service").exists());
     }
 
     #[test]

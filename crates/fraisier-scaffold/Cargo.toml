@@ -16,7 +16,9 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+# The `scaffold` templates are parameterized by the parsed deploy config.
+fraisier-config = { path = "../fraisier-config", version = "1.0.0-alpha.1" }
+thiserror = "2.0.17"
 
 [dev-dependencies]
-# Used only by tests, to prove the generated starter config validates clean.
-fraisier-config = { path = "../fraisier-config", version = "1.0.0-alpha.1" }
+tempfile = "3.27.0"

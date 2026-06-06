@@ -241,6 +241,10 @@ struct StatusArgs {
     /// Directory for the filesystem state store.
     #[arg(long, default_value = ".fraisier/state")]
     state_dir: PathBuf,
+
+    /// Also query each host's live active artifact.
+    #[arg(long)]
+    per_host: bool,
 }
 
 #[derive(Debug, Args)]
@@ -312,7 +316,9 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         }
         Command::List(args) => commands::list(&args.state_dir, args.flat).await,
         Command::Health(args) => commands::health(&args.config, args.host.as_deref()).await,
-        Command::Status(args) => commands::status(&args.config, &args.state_dir).await,
+        Command::Status(args) => {
+            commands::status(&args.config, &args.state_dir, args.per_host).await
+        }
         Command::Adapter(AdapterCommand::List) => Ok(commands::adapter_list()),
         Command::Adapter(AdapterCommand::Describe { name }) => {
             commands::adapter_describe(name).await

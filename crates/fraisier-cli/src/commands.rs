@@ -548,7 +548,12 @@ pub(crate) async fn health(config_path: &Path, host_filter: Option<&str>) -> Res
 }
 
 /// `status`: the recorded saga state and release ledger for the config's deploy.
-pub(crate) async fn status(config_path: &Path, state_dir: &Path) -> Result<CommandOutput> {
+/// With `per_host`, also query each host's *live* active artifact.
+pub(crate) async fn status(
+    config_path: &Path,
+    state_dir: &Path,
+    per_host: bool,
+) -> Result<CommandOutput> {
     let config = load(config_path)?;
     let deploy = config.deploy.as_ref().context("missing [deploy] section")?;
     let fraise = deploy.name.clone().context("[deploy].name is required")?;
@@ -586,6 +591,19 @@ pub(crate) async fn status(config_path: &Path, state_dir: &Path) -> Result<Comma
         }
     }
 
+    let per_host_json = if per_host {
+        let hosts = per_host_active(&config).await?;
+        pretty.push_str("  per-host active artifact:\n");
+        for entry in &hosts {
+            let host = entry["host"].as_str().unwrap_or("?");
+            let active = entry["active"].as_str().unwrap_or("<none>");
+            let _ = writeln!(pretty, "    {host}: {active}");
+        }
+        Value::Array(hosts)
+    } else {
+        Value::Null
+    };
+
     Ok(CommandOutput {
         exit_code: 0,
         pretty,
@@ -594,8 +612,34 @@ pub(crate) async fn status(config_path: &Path, state_dir: &Path) -> Result<Comma
             "environment": environment,
             "state": serde_json::to_value(&state)?,
             "ledger": ledger.unwrap_or(Value::Null),
+            "per_host": per_host_json,
         }),
     })
+}
+
+/// Query each host's live active artifact via the artifact adapter's `current`.
+async fn per_host_active(config: &DeployConfig) -> Result<Vec<Value>> {
+    let plan = factory::build_artifact_probe(config)?;
+    let mut entries = Vec::new();
+    for (host, address) in &plan.hosts {
+        let mut ctx = plan.ctx.clone();
+        ctx.host = Some(host.clone());
+        if let Some(addr) = address {
+            ctx.settings
+                .insert("address".to_owned(), Value::String(addr.clone()));
+        }
+        let (active, error) = match plan.artifact.current(&ctx, host).await {
+            Ok(current) => (current.map(|c| c.id), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        entries.push(json!({
+            "host": host.as_str(),
+            "address": address,
+            "active": active,
+            "error": error,
+        }));
+    }
+    Ok(entries)
 }
 
 fn render_summary(summary: &factory::PlanSummary) -> String {
@@ -1112,10 +1156,39 @@ url = "http://127.0.0.1:8080/health"
             .await
             .expect("record ledger");
 
-        let out = status(&config, &state_dir).await.expect("status");
+        let out = status(&config, &state_dir, false).await.expect("status");
         assert_eq!(out.exit_code, 0);
         assert_eq!(out.json["fraise"], serde_json::json!("checkout"));
         assert!(out.pretty.contains("Committed"), "pretty: {}", out.pretty);
+    }
+
+    #[tokio::test]
+    async fn status_per_host_reports_the_live_active_artifact() {
+        // A local artifact with an `active` symlink the current() probe reads back.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let active = dir.path().join("current");
+        let release = dir.path().join("releases/7.7.7");
+        std::fs::create_dir_all(&release).expect("release");
+        std::os::unix::fs::symlink(&release, &active).expect("symlink");
+
+        let cfg = format!(
+            "[deploy]\nname = \"app\"\nenvironment = \"prod\"\n\n\
+             [artifact]\nsource = \"local\"\npath = \"{}\"\nactive_path = \"{}\"\n\n\
+             [migration]\nadapter = \"command\"\n\n\
+             [service]\nadapter = \"systemd\"\nunit = \"app.service\"\n\n\
+             [health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n",
+            release.display(),
+            active.display(),
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let state_dir = dir.path().join("state");
+
+        let out = status(&config, &state_dir, true).await.expect("status");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        let per_host = out.json["per_host"].as_array().expect("per_host");
+        assert_eq!(per_host.len(), 1);
+        assert_eq!(per_host[0]["active"], serde_json::json!("7.7.7"));
+        assert!(out.pretty.contains("7.7.7"), "pretty: {}", out.pretty);
     }
 
     const MULTI_HOST: &str = r#"

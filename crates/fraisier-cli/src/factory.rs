@@ -634,6 +634,52 @@ pub fn build_health_probe(config: &DeployConfig) -> Result<HealthProbePlan> {
     Ok(HealthProbePlan { health, ctx, hosts })
 }
 
+/// A ready-to-run artifact probe: the adapter, a base context, and the hosts to
+/// query for their live active artifact (`deployment-status --per-host`).
+pub struct ArtifactProbePlan {
+    /// The artifact adapter (bound to the transport/launcher for remote hosts).
+    pub artifact: Arc<dyn ArtifactAdapter>,
+    /// The base context (artifact settings); the caller sets `host`/`address`.
+    pub ctx: AdapterCtx,
+    /// The hosts to query: each inventory host, or a lone `localhost`.
+    pub hosts: Vec<(HostId, Option<String>)>,
+}
+
+/// Build the artifact-probe plan, *without* touching the migration axis.
+///
+/// # Errors
+/// Fails if `[artifact].source` is missing or unsupported in this build.
+pub fn build_artifact_probe(config: &DeployConfig) -> Result<ArtifactProbePlan> {
+    let transport = build_transport(config);
+    let launcher = build_launcher(config);
+    let artifact = build_artifact(config, &transport, &launcher)?;
+    let deploy = config.deploy.as_ref();
+    let fraise = deploy
+        .and_then(|d| d.name.clone())
+        .unwrap_or_else(|| "<none>".to_owned());
+    let environment = deploy
+        .and_then(|d| d.environment.clone())
+        .unwrap_or_else(|| "<none>".to_owned());
+    let mut ctx = AdapterCtx::new(fraise, environment);
+    ctx.workdir = PathBuf::from(".");
+    ctx.settings = settings_map(config, None);
+    let hosts = config.host_inventory().map_or_else(
+        || vec![(HostId::new("localhost"), None)],
+        |inventory| {
+            inventory
+                .hosts()
+                .iter()
+                .map(|host| (host.host.clone(), Some(host.address.clone())))
+                .collect()
+        },
+    );
+    Ok(ArtifactProbePlan {
+        artifact,
+        ctx,
+        hosts,
+    })
+}
+
 fn build_health(config: &DeployConfig) -> Result<Arc<dyn HealthAdapter>> {
     match config.health.as_ref().and_then(|h| h.adapter.as_deref()) {
         Some("http") => Ok(Arc::new(fraisier_adapter_http::HttpHealth::new())),

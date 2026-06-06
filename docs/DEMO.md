@@ -276,11 +276,34 @@ scripts/checkpoint-blue-green.sh                 # throwaway Postgres (cached *-
 scripts/checkpoint-blue-green.sh --db-dsn <url>  # query an existing Postgres for the budget gate
 ```
 
-These are three of the four phase-07 §4 gates. The two traffic-tier gates
-(pre-swap health gate, post-swap degradation swap-back) are proven hermetically in
-`fraisier-core::blue_green`; the real-nginx end-to-end traffic swap is a follow-up
-(it needs nginx + a dual app-instance fixture). **Note:** the bridge keys on
+These are three of the four phase-07 §4 gates (window-safety refuse/allow +
+connection budget). The two **traffic-tier** gates run against a **real nginx** in
+the companion fixture below. **Note:** the bridge keys on
 confiture's `PFLIGHT_REPLICA_*` code prefix; per phase-07 §2 it is not *shippable*
 until confiture pins that namespace in its contract test (or a first-class
 `window_safe` verdict is adopted) — this checkpoint proves it *works today*, not
 that the contract is pinned.
+
+### Blue-green traffic — `scripts/checkpoint-blue-green-traffic.sh` (real nginx)
+
+The traffic-tier half of §7.5: drives the real `fraisier deploy --strategy
+blue-green` through the full flow against a **real nginx** routing real HTTP
+between a blue and a green fleet (two `python3` HTTP servers as user systemd
+units), with a throwaway Postgres + confiture for the migrate/window-safety step.
+It asserts what nginx actually serves:
+
+- **healthy green → traffic swaps blue→green** (nginx serves "green"), the deploy
+  commits, blue is reaped;
+- **sick green → the pre-swap health gate holds**: traffic never moves (nginx
+  still serves "blue"), green is decommissioned;
+- **green degrades during the hold window → traffic swaps back** to still-hot blue
+  (nginx serves "blue" again).
+
+```sh
+scripts/checkpoint-blue-green-traffic.sh          # rootless podman + user systemd, zero spend
+```
+
+The include dir is bind-mounted into the nginx container at its *same absolute
+path*, so fraisier's absolute swap symlink resolves identically inside. Together
+with `checkpoint-blue-green.sh`, all four phase-07 §4 gates are proven end-to-end
+against real infra.

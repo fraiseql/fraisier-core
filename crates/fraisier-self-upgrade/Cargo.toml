@@ -27,5 +27,6 @@ tokio = { version = "1.52.3", features = ["process", "time", "fs"] }
 tracing = "0.1.41"
 
 [dev-dependencies]
+filetime = "0.2.25"
 tempfile = "3.14.0"
 tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "process", "time", "fs"] }

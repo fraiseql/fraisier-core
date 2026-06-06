@@ -24,8 +24,10 @@
 //! process that would revert.
 
 mod source;
+mod swap;
 
 pub use source::{Source, Verified};
+pub use swap::Layout;
 
 /// A fetch/verify/IO failure that aborts an upgrade **before** any swap.
 #[derive(Debug, Clone, PartialEq, Eq)]

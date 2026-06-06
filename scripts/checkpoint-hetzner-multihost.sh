@@ -95,6 +95,7 @@ fi
 
 CREATED=0
 teardown() {
+  trap - INT TERM EXIT   # idempotent: never tear down twice
   set +e
   $PODMAN rm -f "$LB_CTR" >/dev/null 2>&1 || true
   if [ "$CREATED" = 1 ]; then
@@ -109,7 +110,8 @@ teardown() {
   fi
   [ "$KEEP" = 1 ] || rm -rf "$WORK"
 }
-trap teardown EXIT
+# Tear down on a timeout/Ctrl-C too, not just a clean exit — these are paid VMs.
+trap teardown INT TERM EXIT
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
   -o ConnectTimeout=10 -o BatchMode=yes)

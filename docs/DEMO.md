@@ -195,6 +195,26 @@ fix under a *real* rate-limited systemd. The remote matrix store is the referenc
 sqlx adapter (SQLite); criterion 1 against real Postgres is Part B below (`--keep`,
 then drive your real config).
 
+### Multi-host IPC — `scripts/checkpoint-hetzner-multihost.sh` (§6.4 GA gate)
+
+Runs the proven 2a/2b/2c multi-host rollout across **real Hetzner VMs over the
+real network** with the **IPC-over-SSH artifact** — the environmental delta the
+podman fixture (`checkpoint-multihost.sh`) cannot cover. Lean 2-VM topology: a
+**local** orchestrator + N (default 2) **rocky-9** app hosts (Rocky 9's glibc
+matches the ubi9 builder, so the locally-built IPC adapter runs unchanged) + a
+real nginx LB in a local podman container routing real HTTP to the hosts' public
+IPs. Migrates once on the orchestrator; each host runs the
+`fraisier-adapter-release` IPC adapter over SSH. Hosts are always deleted on exit.
+
+```sh
+scripts/checkpoint-hetzner-multihost.sh --ssh-key <key> --ssh-identity <file>
+```
+
+It asserts: (2a) three consecutive deploys commit (migrate once, all hosts on the
+version, LB routes to the fleet); (2b) a sick build rolls the **whole fleet** back
++ reverts the migration; (2c) a crash build rolls the fleet back. This is one of
+the **two GA-blocking gates** (the other is the blue-green checkpoint above).
+
 ### Final production sign-off — `scripts/checkpoint-matrix.sh` (operator judgement)
 
 The production matrix is scripted and self-asserting. It runs against a real

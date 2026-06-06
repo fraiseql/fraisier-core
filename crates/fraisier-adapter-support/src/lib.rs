@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use fraisier_core::adapter_axes::{AdapterError, AdapterErrorKind};
 
+pub mod staging;
 pub mod transport;
 
 pub use transport::{SshTransport, Transport};

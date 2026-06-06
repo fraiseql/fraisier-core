@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use fraisier_adapter_support::{error, retry_on_err};
+use fraisier_adapter_support::{error, retry_on_err, staging};
 use fraisier_core::adapter_axes::{
     AdapterCtx, AdapterError, AdapterErrorKind, ArtifactAdapter, ArtifactRef, HostId,
     StagedArtifact,
@@ -278,24 +278,7 @@ impl ArtifactAdapter for ReleaseArtifact {
     ) -> Result<(), AdapterError> {
         let cfg = Config::from_ctx(ctx, "activate")?;
         let active = cfg.require_active_path("activate")?;
-
-        // Atomic swap: create a temp symlink next to active_path, then rename it
-        // over the target so `current` never observes a half-updated link.
-        let tmp = active.with_file_name(format!(
-            "{}.fraisier-tmp-{}",
-            active
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("current"),
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&tmp);
-        std::os::unix::fs::symlink(&staged.path, &tmp)
-            .map_err(|e| execution("activate", format!("failed to create symlink: {e}")))?;
-        std::fs::rename(&tmp, active).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            execution("activate", format!("failed to swap active symlink: {e}"))
-        })
+        staging::activate_symlink(active, &staged.path, ADAPTER_NAME, "activate")
     }
 
     async fn current(
@@ -305,22 +288,7 @@ impl ArtifactAdapter for ReleaseArtifact {
     ) -> Result<Option<ArtifactRef>, AdapterError> {
         let cfg = Config::from_ctx(ctx, "current")?;
         let active = cfg.require_active_path("current")?;
-        match std::fs::read_link(active) {
-            Ok(target) => {
-                Ok(target
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(|id| ArtifactRef {
-                        id: id.to_owned(),
-                        checksum: None,
-                    }))
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(execution(
-                "current",
-                format!("failed to read active link: {err}"),
-            )),
-        }
+        staging::read_active_link(active, ADAPTER_NAME, "current")
     }
 }
 

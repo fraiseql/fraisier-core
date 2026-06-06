@@ -51,6 +51,9 @@ enum Command {
     /// List every deploy recorded in the state store.
     List(ListArgs),
 
+    /// Probe the configured health endpoint on every host.
+    Health(HealthArgs),
+
     /// Show the recorded saga state and release ledger for a deploy.
     Status(StatusArgs),
 
@@ -251,6 +254,17 @@ struct ListArgs {
     flat: bool,
 }
 
+#[derive(Debug, Args)]
+struct HealthArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Probe only this host (inventory name or address).
+    #[arg(long)]
+    host: Option<String>,
+}
+
 #[derive(Debug, Subcommand)]
 enum AdapterCommand {
     /// List `fraisier-adapter-*` binaries discoverable on `PATH`.
@@ -297,6 +311,7 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
             .await
         }
         Command::List(args) => commands::list(&args.state_dir, args.flat).await,
+        Command::Health(args) => commands::health(&args.config, args.host.as_deref()).await,
         Command::Status(args) => commands::status(&args.config, &args.state_dir).await,
         Command::Adapter(AdapterCommand::List) => Ok(commands::adapter_list()),
         Command::Adapter(AdapterCommand::Describe { name }) => {

@@ -483,6 +483,70 @@ pub(crate) async fn list(state_dir: &Path, flat: bool) -> Result<CommandOutput> 
     })
 }
 
+/// `health`: probe the configured health endpoint on every host (or just
+/// `host_filter`), reporting each result. Exit 0 iff every probed host is healthy.
+pub(crate) async fn health(config_path: &Path, host_filter: Option<&str>) -> Result<CommandOutput> {
+    let config = load(config_path)?;
+    let plan = factory::build_health_probe(&config)?;
+
+    let mut results = Vec::new();
+    let mut all_healthy = true;
+    let mut probed = 0usize;
+    for (host, address) in &plan.hosts {
+        if let Some(filter) = host_filter {
+            if host.as_str() != filter && address.as_deref() != Some(filter) {
+                continue;
+            }
+        }
+        probed += 1;
+        let mut ctx = plan.ctx.clone();
+        ctx.host = Some(host.clone());
+        if let Some(addr) = address {
+            ctx.settings
+                .insert("address".to_owned(), Value::String(addr.clone()));
+        }
+        let (healthy, detail) = match plan.health.check(&ctx, host).await {
+            Ok(status) => (status.healthy, status.detail),
+            // A probe that can't be performed (unreachable, DNS, …) is reported as
+            // unhealthy with the error as detail, not a hard command failure.
+            Err(error) => (false, Some(error.to_string())),
+        };
+        all_healthy &= healthy;
+        results.push(json!({
+            "host": host.as_str(),
+            "address": address,
+            "healthy": healthy,
+            "detail": detail,
+        }));
+    }
+
+    let mut pretty = String::new();
+    for result in &results {
+        let mark = if result["healthy"] == json!(true) {
+            "ok"
+        } else {
+            "UNHEALTHY"
+        };
+        let host = result["host"].as_str().unwrap_or("?");
+        let detail = result["detail"]
+            .as_str()
+            .map_or(String::new(), |d| format!(" — {d}"));
+        let _ = writeln!(pretty, "  [{mark}] {host}{detail}");
+    }
+    if probed == 0 {
+        pretty = host_filter.map_or_else(
+            || "no hosts to probe\n".to_owned(),
+            |f| format!("no host matching '{f}'\n"),
+        );
+    }
+
+    Ok(CommandOutput {
+        exit_code: i32::from(!(all_healthy && probed > 0)),
+        pretty,
+        json: json!({ "healthy": all_healthy && probed > 0, "hosts": results }),
+    })
+}
+
 /// `status`: the recorded saga state and release ledger for the config's deploy.
 pub(crate) async fn status(config_path: &Path, state_dir: &Path) -> Result<CommandOutput> {
     let config = load(config_path)?;
@@ -736,8 +800,8 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapter_list, deploy, discover_adapters, init, list, scaffold, scaffold_install, ship,
-        status, validate_config, version_bump, version_show, ShipArgs,
+        adapter_list, deploy, discover_adapters, health, init, list, scaffold, scaffold_install,
+        ship, status, validate_config, version_bump, version_show, ShipArgs,
     };
     use fraisier_core::single_host::DeployRecord;
     use fraisier_saga::events::SagaState;
@@ -992,6 +1056,29 @@ url = "http://127.0.0.1:8080/health"
         assert_eq!(deploys.len(), 2, "both recorded deploys: {}", out.pretty);
         assert!(out.pretty.contains("billing/production"));
         assert!(out.pretty.contains("checkout/staging"));
+    }
+
+    #[tokio::test]
+    async fn health_reports_an_unreachable_host_as_unhealthy() {
+        // Port 1 refuses immediately, so the probe fails fast (no hung DNS).
+        let cfg = VALID.replace(
+            "url = \"http://127.0.0.1:8080/health\"",
+            "url = \"http://127.0.0.1:1/health\"",
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let out = health(&config, None).await.expect("health");
+        assert_eq!(out.exit_code, 1, "unreachable → non-zero: {}", out.pretty);
+        assert_eq!(out.json["healthy"], serde_json::json!(false));
+        assert_eq!(out.json["hosts"].as_array().expect("hosts").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn health_host_filter_selecting_nothing_is_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", VALID);
+        let out = health(&config, Some("no-such-host")).await.expect("health");
+        assert!(out.pretty.contains("no host matching"), "{}", out.pretty);
     }
 
     #[tokio::test]

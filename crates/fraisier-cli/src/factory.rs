@@ -592,6 +592,48 @@ fn build_lb(config: &DeployConfig) -> Result<Arc<dyn LbAdapter>> {
     }
 }
 
+/// A ready-to-run health probe: the adapter, a base context carrying the probe
+/// settings, and the hosts to probe (each `(id, optional address)`).
+pub struct HealthProbePlan {
+    /// The health adapter.
+    pub health: Arc<dyn HealthAdapter>,
+    /// The base context (probe URL + expected status in `settings`); the caller
+    /// sets `host`/`settings["address"]` per host.
+    pub ctx: AdapterCtx,
+    /// The hosts to probe: each inventory host for a multi-host config, or a lone
+    /// `localhost` for a single-host one.
+    pub hosts: Vec<(HostId, Option<String>)>,
+}
+
+/// Build the health-probe plan from a config, *without* touching the migration
+/// axis — a health check needs no database secret.
+///
+/// # Errors
+/// Fails if `[health].adapter` is missing or unsupported in this build.
+pub fn build_health_probe(config: &DeployConfig) -> Result<HealthProbePlan> {
+    let health = build_health(config)?;
+    let deploy = config.deploy.as_ref();
+    let fraise = deploy
+        .and_then(|d| d.name.clone())
+        .unwrap_or_else(|| "<none>".to_owned());
+    let environment = deploy
+        .and_then(|d| d.environment.clone())
+        .unwrap_or_else(|| "<none>".to_owned());
+    let mut ctx = AdapterCtx::new(fraise, environment);
+    ctx.settings = settings_map(config, None);
+    let hosts = config.host_inventory().map_or_else(
+        || vec![(HostId::new("localhost"), None)],
+        |inventory| {
+            inventory
+                .hosts()
+                .iter()
+                .map(|host| (host.host.clone(), Some(host.address.clone())))
+                .collect()
+        },
+    );
+    Ok(HealthProbePlan { health, ctx, hosts })
+}
+
 fn build_health(config: &DeployConfig) -> Result<Arc<dyn HealthAdapter>> {
     match config.health.as_ref().and_then(|h| h.adapter.as_deref()) {
         Some("http") => Ok(Arc::new(fraisier_adapter_http::HttpHealth::new())),

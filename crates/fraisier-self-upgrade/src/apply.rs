@@ -580,6 +580,74 @@ mod tests {
         assert_eq!(events[0].restored, None, "nothing to restore to");
     }
 
+    /// Gate (a): a checksum mismatch aborts **before** any swap — the live binary
+    /// and its symlink are untouched, nothing is restarted, nothing is notified.
+    #[tokio::test]
+    async fn a_checksum_mismatch_aborts_before_any_swap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = Layout::new(dir.path().join("bin"));
+        layout.stage("1.0.0", b"the live binary").expect("stage");
+        layout.activate("1.0.0").expect("activate");
+
+        let new = write_binary(dir.path(), b"would-be 2.0.0");
+        let mut plan = plan(layout.clone(), new, "2.0.0");
+        plan.source = Source::Path {
+            path: match &plan.source {
+                Source::Path { path, .. } => path.clone(),
+                Source::Url { .. } => unreachable!(),
+            },
+            // 64 hex chars, but not the digest of the bytes.
+            sha256: Some("0".repeat(64)),
+        };
+        let fleet = FakeUnit::new(layout.clone(), &[]);
+        let recorder = Recorder::default();
+
+        let outcome = apply(&plan, &fleet, &fleet, &recorder).await;
+
+        assert!(
+            matches!(outcome, ApplyOutcome::AbortedBeforeSwap { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            layout.active().unwrap().as_deref(),
+            Some("1.0.0"),
+            "untouched"
+        );
+        assert!(!layout.staged_path("2.0.0").exists(), "nothing staged");
+        assert_eq!(fleet.restarts.load(Ordering::SeqCst), 0, "no restart");
+        assert!(recorder.events.lock().unwrap().is_empty(), "clean refusal");
+    }
+
+    /// Gate (b): a non-systemd target is refused before any swap — the auto-revert
+    /// is systemd-managed, so a best-effort unprotectable swap is never attempted.
+    #[tokio::test]
+    async fn a_non_systemd_target_is_refused_with_no_swap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout = Layout::new(dir.path().join("bin"));
+        layout.stage("1.0.0", b"the live binary").expect("stage");
+        layout.activate("1.0.0").expect("activate");
+
+        let new = write_binary(dir.path(), b"would-be 2.0.0");
+        let mut plan = plan(layout.clone(), new, "2.0.0");
+        plan.systemd_available = false;
+        let fleet = FakeUnit::new(layout.clone(), &[]);
+        let recorder = Recorder::default();
+
+        let outcome = apply(&plan, &fleet, &fleet, &recorder).await;
+
+        assert!(
+            matches!(outcome, ApplyOutcome::AbortedBeforeSwap { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            layout.active().unwrap().as_deref(),
+            Some("1.0.0"),
+            "untouched"
+        );
+        assert!(!layout.staged_path("2.0.0").exists(), "nothing staged");
+        assert_eq!(fleet.restarts.load(Ordering::SeqCst), 0, "no restart");
+    }
+
     fn set_mtime(path: &std::path::Path, secs: u64) {
         let when = filetime::FileTime::from_unix_time(i64::try_from(secs).unwrap(), 0);
         filetime::set_file_mtime(path, when).expect("set mtime");

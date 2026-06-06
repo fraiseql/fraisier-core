@@ -112,6 +112,9 @@ fn settings_map(config: &DeployConfig, app_version: Option<&str>) -> BTreeMap<St
             artifact.checksum_url.as_deref(),
         );
         put_str(&mut settings, "sha256", artifact.checksum.as_deref());
+        put_path(&mut settings, "path", artifact.path.as_deref());
+        put_str(&mut settings, "repo", artifact.repo.as_deref());
+        put_str(&mut settings, "ref", artifact.reference.as_deref());
         put_path(
             &mut settings,
             "active_path",
@@ -528,6 +531,9 @@ fn build_artifact(
         Some("pull") => Ok(Arc::new(
             fraisier_artifact_pull::PullArtifact::new().with_transport(transport.clone()),
         )),
+        // Local: stage a versioned copy of an already-built local path, activate
+        // via the shared atomic symlink swap (single-host / orchestrator-local).
+        Some("local") => Ok(Arc::new(fraisier_artifact_local::LocalArtifact::new())),
         // IPC-over-SSH: run the rich in-process release adapter ON each host as a
         // JSON-RPC subprocess launched over ssh (Local subprocess single-host).
         Some("release-ipc") => {
@@ -546,7 +552,7 @@ fn build_artifact(
         }
         Some(other) => bail!(
             "artifact source '{other}' is not available in this build \
-             (built-in: 'release', 'pull', 'release-ipc')"
+             (built-in: 'release', 'pull', 'release-ipc', 'local')"
         ),
         None => bail!("[artifact].source is required"),
     }

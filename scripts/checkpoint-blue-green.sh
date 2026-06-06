@@ -60,7 +60,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/fraisier-bg.XXXXXX")"
 cleanup() {
   [ "$KEEP" = 1 ] && { say "keeping $WORK + container $PG_NAME (--keep)"; return; }
   rm -rf "$WORK"
-  [ -n "$CONTAINER" ] && $CONTAINER rm -f "$PG_NAME" >/dev/null 2>&1 || true
+  if [ -n "$CONTAINER" ]; then "$CONTAINER" rm -f "$PG_NAME" >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
 

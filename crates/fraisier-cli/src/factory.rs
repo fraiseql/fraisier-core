@@ -534,6 +534,8 @@ fn build_artifact(
         // Local: stage a versioned copy of an already-built local path, activate
         // via the shared atomic symlink swap (single-host / orchestrator-local).
         Some("local") => Ok(Arc::new(fraisier_artifact_local::LocalArtifact::new())),
+        // Git: clone/checkout a ref into a versioned staging dir, then activate.
+        Some("git") => Ok(Arc::new(fraisier_artifact_git::GitArtifact::new())),
         // IPC-over-SSH: run the rich in-process release adapter ON each host as a
         // JSON-RPC subprocess launched over ssh (Local subprocess single-host).
         Some("release-ipc") => {
@@ -552,7 +554,7 @@ fn build_artifact(
         }
         Some(other) => bail!(
             "artifact source '{other}' is not available in this build \
-             (built-in: 'release', 'pull', 'release-ipc', 'local')"
+             (built-in: 'release', 'pull', 'release-ipc', 'local', 'git')"
         ),
         None => bail!("[artifact].source is required"),
     }
@@ -657,8 +659,35 @@ fn build_migration(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_multi_host, summarize, summarize_multi_host};
+    use super::{build, build_multi_host, summarize, summarize_multi_host};
     use fraisier_config::DeployConfig;
+
+    /// A single-host config with the given artifact source block.
+    fn single_host_with_artifact(artifact: &str) -> String {
+        format!(
+            "[deploy]\nname = \"app\"\nenvironment = \"prod\"\n\n{artifact}\n\n\
+             [migration]\nadapter = \"command\"\n\n\
+             [service]\nadapter = \"systemd\"\nunit = \"app.service\"\n\n\
+             [health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n"
+        )
+    }
+
+    #[test]
+    fn local_and_git_artifact_sources_build() {
+        // local: an already-built path on disk.
+        let local = single_host_with_artifact(
+            "[artifact]\nsource = \"local\"\npath = \"/builds/app\"\nactive_path = \"/srv/app/current\"",
+        );
+        let config = DeployConfig::from_toml_str(&local).expect("parses");
+        assert!(build(&config, Some("localhost"), Some("1.0.0")).is_ok());
+
+        // git: a repo + ref.
+        let git = single_host_with_artifact(
+            "[artifact]\nsource = \"git\"\nrepo = \"https://x/app.git\"\nref = \"v1\"\nactive_path = \"/srv/app/current\"",
+        );
+        let config = DeployConfig::from_toml_str(&git).expect("parses");
+        assert!(build(&config, Some("localhost"), Some("1.0.0")).is_ok());
+    }
 
     /// A complete multi-host config selecting the IPC-over-SSH artifact source.
     const MULTI_HOST_IPC: &str = r#"

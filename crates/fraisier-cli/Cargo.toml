@@ -54,6 +54,7 @@ fraisier-adapter-nginx = { path = "../fraisier-adapter-nginx", version = "1.0.0-
 fraisier-artifact-release = { path = "../fraisier-artifact-release", version = "1.0.0-alpha.1" }
 fraisier-artifact-pull = { path = "../fraisier-artifact-pull", version = "1.0.0-alpha.1" }
 fraisier-artifact-local = { path = "../fraisier-artifact-local", version = "1.0.0-alpha.1" }
+fraisier-artifact-git = { path = "../fraisier-artifact-git", version = "1.0.0-alpha.1" }
 
 # On-disk file generators (the `init` starter config; `scaffold` templates).
 fraisier-scaffold = { path = "../fraisier-scaffold", version = "1.0.0-alpha.1" }

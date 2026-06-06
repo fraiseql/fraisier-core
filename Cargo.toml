@@ -17,6 +17,7 @@ members = [
     "crates/fraisier-artifact-release",
     "crates/fraisier-artifact-pull",
     "crates/fraisier-artifact-local",
+    "crates/fraisier-artifact-git",
     "crates/fraisier-adapter-release",
     "crates/fraisier-scaffold",
     "crates/fraisier-ship",

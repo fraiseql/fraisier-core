@@ -38,3 +38,4 @@
 pub mod adapter_axes;
 pub mod multi_host;
 pub mod single_host;
+pub mod window_safety;

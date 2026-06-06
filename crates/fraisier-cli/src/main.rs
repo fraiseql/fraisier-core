@@ -447,6 +447,34 @@ struct SyncArgs {
 enum ScheduledCommand {
     /// Generate + install the systemd timer + service for scheduled runs.
     Install(ScheduledInstallArgs),
+
+    /// List the fraisier-installed systemd units (marker-bearing) under a root.
+    List(ScheduledListArgs),
+
+    /// Remove the scheduled timer + service this config installed.
+    Uninstall(ScheduledUninstallArgs),
+}
+
+#[derive(Debug, Args)]
+struct ScheduledListArgs {
+    /// Filesystem prefix the units were installed under (defaults to the real root).
+    #[arg(long, default_value = "/")]
+    root: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct ScheduledUninstallArgs {
+    /// Path to the `fraisier.toml` (names the units to remove).
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Filesystem prefix the units were installed under (defaults to the real root).
+    #[arg(long, default_value = "/")]
+    root: PathBuf,
+
+    /// Apply the removal (without this, only the plan is shown).
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -624,6 +652,10 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::SelfUpgrade(SelfUpgradeCommand::Apply(args)) => self_upgrade_apply(args).await,
         Command::Scheduled(ScheduledCommand::Install(args)) => {
             commands::scheduled_install(&args.config, &args.root, args.yes, args.dry_run)
+        }
+        Command::Scheduled(ScheduledCommand::List(args)) => commands::scheduled_list(&args.root),
+        Command::Scheduled(ScheduledCommand::Uninstall(args)) => {
+            commands::scheduled_uninstall(&args.config, &args.root, args.yes)
         }
         Command::Sync(args) => {
             commands::sync(

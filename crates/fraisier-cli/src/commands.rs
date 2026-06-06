@@ -335,6 +335,36 @@ pub(crate) fn scheduled_install(
     dry_run: bool,
 ) -> Result<CommandOutput> {
     let config = load(config_path)?;
+
+    // The unattended-deploy gate: refuse to install a schedule whose [schedule]
+    // section is invalid — in particular `command = "deploy"` without
+    // `allow_unattended_deploy = true` + a notify sink. The validator carries the
+    // policy; here we refuse (with the located reasons) rather than install.
+    let report = config.validate();
+    let schedule_errors: Vec<&fraisier_config::ValidationIssue> = report
+        .issues
+        .iter()
+        .filter(|issue| issue.severity == Severity::Error && issue.path.starts_with("schedule"))
+        .collect();
+    if !schedule_errors.is_empty() {
+        let mut pretty = String::from("refusing to install: invalid [schedule] config\n");
+        for issue in &schedule_errors {
+            let _ = writeln!(pretty, "  [error] {}: {}", issue.path, issue.message);
+        }
+        return Ok(CommandOutput {
+            exit_code: 1,
+            pretty,
+            json: json!({
+                "applied": false,
+                "refused": true,
+                "errors": schedule_errors
+                    .iter()
+                    .map(|i| json!({ "path": i.path, "message": i.message }))
+                    .collect::<Vec<_>>(),
+            }),
+        });
+    }
+
     let files = fraisier_scaffold::generate_scheduled(&config)?;
     let targets = fraisier_scaffold::install_targets(&files, root);
 
@@ -370,6 +400,70 @@ pub(crate) fn scheduled_install(
         json: json!({
             "applied": true,
             "installed": installed.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        }),
+    })
+}
+
+/// `scheduled list`: enumerate the fraisier-installed (marker-bearing) systemd
+/// units under `root` — no silent accretion of host state.
+pub(crate) fn scheduled_list(root: &Path) -> Result<CommandOutput> {
+    let units = fraisier_scaffold::list_installed(root)?;
+    let mut pretty = format!("fraisier-installed units (root {}):\n", root.display());
+    if units.is_empty() {
+        pretty.push_str("  (none)\n");
+    }
+    for unit in &units {
+        let _ = writeln!(pretty, "  {}", unit.display());
+    }
+    Ok(CommandOutput {
+        exit_code: 0,
+        pretty,
+        json: json!({
+            "units": units.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        }),
+    })
+}
+
+/// `scheduled uninstall`: remove exactly the timer + service this config
+/// installed (marker-checked), leaving the systemd directory clean. Writes only
+/// on `apply`; otherwise shows the plan.
+pub(crate) fn scheduled_uninstall(
+    config_path: &Path,
+    root: &Path,
+    apply: bool,
+) -> Result<CommandOutput> {
+    let config = load(config_path)?;
+    let files = fraisier_scaffold::generate_scheduled(&config)?;
+    let targets = fraisier_scaffold::install_targets(&files, root);
+
+    if !apply {
+        let mut pretty = format!("scheduled uninstall plan (root {}):\n", root.display());
+        for path in &targets {
+            let _ = writeln!(pretty, "  - {}", path.display());
+        }
+        pretty.push_str("pass --yes to remove\n");
+        return Ok(CommandOutput {
+            exit_code: 0,
+            pretty,
+            json: json!({
+                "removed": false,
+                "plan": targets.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            }),
+        });
+    }
+
+    let removed = fraisier_scaffold::uninstall(&files, root)?;
+    let pretty = format!(
+        "removed {} scheduled unit(s) (root {})\nthen: systemctl daemon-reload\n",
+        removed.len(),
+        root.display()
+    );
+    Ok(CommandOutput {
+        exit_code: 0,
+        pretty,
+        json: json!({
+            "removed": true,
+            "files": removed.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         }),
     })
 }
@@ -1944,8 +2038,8 @@ mod tests {
     use super::{
         apply_exit, bootstrap, classify_source, db_backup, db_migrate, db_reset, db_restore,
         deploy, discover_adapters, health, init, list, provider_test, providers, rollback,
-        scaffold, scaffold_install, scheduled_install, ship, status, sync, validate_config,
-        version_bump, version_show, webhook_server, ShipArgs,
+        scaffold, scaffold_install, scheduled_install, scheduled_list, scheduled_uninstall, ship,
+        status, sync, validate_config, version_bump, version_show, webhook_server, ShipArgs,
     };
     use fraisier_core::single_host::DeployRecord;
     use fraisier_saga::events::SagaState;
@@ -2849,6 +2943,66 @@ current_revision = "true"
         assert!(root
             .join("etc/systemd/system/fraisier-checkout-staging-scheduled.service")
             .exists());
+    }
+
+    #[test]
+    fn scheduled_install_refuses_an_unattended_deploy_without_the_optin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // command = "deploy" without allow_unattended_deploy + notify: refused.
+        let cfg =
+            format!("{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"deploy\"\n");
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+
+        let out = scheduled_install(&config, &root, true, false).expect("runs");
+        assert_eq!(out.exit_code, 1, "refused: {}", out.pretty);
+        assert_eq!(out.json["refused"], serde_json::json!(true));
+        assert!(!root.exists(), "nothing installed on refusal");
+    }
+
+    #[test]
+    fn scheduled_install_with_optin_deploy_installs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = format!(
+            "{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"deploy\"\n\
+             allow_unattended_deploy = true\nnotify = \"systemd-cat -t fraisier\"\n"
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        let out = scheduled_install(&config, &root, true, false).expect("install");
+        assert_eq!(
+            out.json["applied"],
+            serde_json::json!(true),
+            "{}",
+            out.pretty
+        );
+    }
+
+    #[test]
+    fn scheduled_install_list_uninstall_round_trips_clean() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg =
+            format!("{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+
+        scheduled_install(&config, &root, true, false).expect("install");
+        let listed = scheduled_list(&root).expect("list");
+        let units = listed.json["units"].as_array().expect("units array");
+        assert_eq!(units.len(), 2, "timer + service listed: {}", listed.pretty);
+
+        // Plan only: nothing removed yet.
+        let plan = scheduled_uninstall(&config, &root, false).expect("plan");
+        assert_eq!(plan.json["removed"], serde_json::json!(false));
+
+        let done = scheduled_uninstall(&config, &root, true).expect("uninstall");
+        assert_eq!(done.json["removed"], serde_json::json!(true));
+        let after = scheduled_list(&root).expect("list");
+        assert!(
+            after.json["units"].as_array().expect("array").is_empty(),
+            "systemd dir clean after uninstall: {}",
+            after.pretty
+        );
     }
 
     #[tokio::test]

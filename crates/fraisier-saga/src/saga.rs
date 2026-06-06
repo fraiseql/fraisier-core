@@ -125,6 +125,21 @@ impl<S: StateStore> Saga<S> {
         self
     }
 
+    /// Append every step yielded by `steps` to the forward sequence, in order
+    /// (builder style).
+    ///
+    /// A convenience for composing a *dynamically built* list of steps — e.g. a
+    /// `Vec<Box<dyn Step>>` assembled with conditional steps — without folding
+    /// over [`Saga::with_step`]. Equivalent to calling `with_step` once per item.
+    #[must_use]
+    pub fn with_steps<I>(mut self, steps: I) -> Self
+    where
+        I: IntoIterator<Item = Box<dyn Step>>,
+    {
+        self.steps.extend(steps);
+        self
+    }
+
     /// Acquire the per-pair lock, run every step forward, and commit — or roll
     /// back in reverse on the first failure. The lock is always released.
     ///
@@ -402,6 +417,57 @@ mod tests {
         assert!(
             transitions().all(|(_, parent)| parent.as_deref() == Some("saga.deploy")),
             "every transition nests under the one saga.deploy root: {edges:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn with_steps_appends_an_iterator_of_steps() {
+        init_global_subscriber();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FilesystemStateStore::new(dir.path()).expect("store");
+        let trail: Trail = Trail::default();
+
+        // A dynamically built list of steps composed in a single call, rather
+        // than a fixed `.with_step(...).with_step(...)` chain.
+        let steps: Vec<Box<dyn Step>> = vec![
+            RecordingStep::ok("preflight", &trail),
+            RecordingStep::ok("migrate", &trail),
+            RecordingStep::ok("activate", &trail),
+        ];
+        let saga = Saga::new(store, "checkout", "production").with_steps(steps);
+
+        let outcome = saga.run().await.expect("run succeeds");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+        assert_eq!(
+            *trail.lock().expect("trail"),
+            vec!["forward:preflight", "forward:migrate", "forward:activate"],
+            "every step from the iterator ran forward, in iterator order"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_step_and_with_steps_compose_in_append_order() {
+        init_global_subscriber();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FilesystemStateStore::new(dir.path()).expect("store");
+        let trail: Trail = Trail::default();
+
+        // Mixing the singular and plural builders preserves overall order: a
+        // leading step, then a batch, then a trailing step.
+        let batch: Vec<Box<dyn Step>> = vec![
+            RecordingStep::ok("b", &trail),
+            RecordingStep::ok("c", &trail),
+        ];
+        let saga = Saga::new(store, "checkout", "production")
+            .with_step(RecordingStep::ok("a", &trail))
+            .with_steps(batch)
+            .with_step(RecordingStep::ok("d", &trail));
+
+        saga.run().await.expect("run succeeds");
+        assert_eq!(
+            *trail.lock().expect("trail"),
+            vec!["forward:a", "forward:b", "forward:c", "forward:d"],
+            "with_step and with_steps preserve overall append order"
         );
     }
 

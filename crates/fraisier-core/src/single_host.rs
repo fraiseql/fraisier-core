@@ -37,7 +37,7 @@
 //! committed state to return to. This is deliberate, not a gap — every deploy
 //! tool treats first-deploy rollback as a special, operator-visible case.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use fraisier_saga::saga::{Saga, SagaError, SagaOutcome, Step, StepContext};
@@ -153,10 +153,11 @@ impl SingleHostDeploy {
             .with_step(shared.step(Phase::Health))
             .with_step(shared.step(Phase::Verify));
 
-        let outcome = saga.run().await?;
+        let mut runtime = DeployRuntime::default();
+        let outcome = saga.run_with_state(&mut runtime).await?;
 
         if matches!(outcome, SagaOutcome::Committed) {
-            let record = shared.committed_record();
+            let record = runtime.committed_record();
             store
                 .record_snapshot(&key, &serde_json::to_value(&record)?)
                 .await?;
@@ -292,8 +293,10 @@ pub enum DeployBuildError {
     MissingAdapter(&'static str),
 }
 
-/// The deploy state shared by every step: the adapters, the call context, the
-/// durable rollback target (`prior`), and the in-run captures (`runtime`).
+/// The deploy state shared by every step: the adapters, the call context, and
+/// the durable rollback target (`prior`). All fields are immutable for the run —
+/// the mutable in-run captures live in [`DeployRuntime`], which the saga engine
+/// threads to each step as `&mut`.
 struct DeployShared {
     ctx: AdapterCtx,
     host: HostId,
@@ -306,11 +309,10 @@ struct DeployShared {
     /// The previously-committed release — the rollback target. Immutable for the
     /// run.
     prior: DeployRecord,
-    /// State captured during this run, read back during compensation and commit.
-    runtime: Mutex<DeployRuntime>,
 }
 
-/// State captured while a deploy runs forward.
+/// The mutable run state captured while a deploy runs forward, threaded to every
+/// step by the saga engine as `&mut DeployRuntime` (no lock, no `Arc`).
 #[derive(Default)]
 struct DeployRuntime {
     /// The artifact staged by `fetch`, activated by `release`, and recorded into
@@ -321,6 +323,16 @@ struct DeployRuntime {
     previous_revision: Option<Revision>,
     /// The revision live after `up` — recorded into the new ledger on commit.
     new_revision: Option<Revision>,
+}
+
+impl DeployRuntime {
+    /// The ledger entry to persist on a successful commit.
+    fn committed_record(&self) -> DeployRecord {
+        DeployRecord {
+            active: self.staged.clone(),
+            revision: self.new_revision.clone(),
+        }
+    }
 }
 
 /// Which deploy step a [`DeployStep`] represents.
@@ -368,24 +380,14 @@ impl DeployShared {
             service: Arc::clone(&deploy.service),
             health: Arc::clone(&deploy.health),
             prior,
-            runtime: Mutex::new(DeployRuntime::default()),
         }
     }
 
-    fn step(self: &Arc<Self>, phase: Phase) -> Box<dyn Step> {
+    fn step(self: &Arc<Self>, phase: Phase) -> Box<dyn Step<DeployRuntime>> {
         Box::new(DeployStep {
             shared: Arc::clone(self),
             phase,
         })
-    }
-
-    /// The ledger entry to persist on a successful commit.
-    fn committed_record(&self) -> DeployRecord {
-        let runtime = self.runtime.lock().expect("deploy runtime mutex poisoned");
-        DeployRecord {
-            active: runtime.staged.clone(),
-            revision: runtime.new_revision.clone(),
-        }
     }
 
     /// Map an adapter error into a saga step failure, preserving its rendered detail.
@@ -433,17 +435,17 @@ impl DeployShared {
         Ok(())
     }
 
-    async fn run_fetch(&self) -> Result<(), SagaError> {
+    async fn run_fetch(&self, runtime: &mut DeployRuntime) -> Result<(), SagaError> {
         let staged = self
             .artifact
             .stage(&self.ctx, &self.host)
             .await
             .map_err(|e| Self::failed("fetch", &e))?;
-        self.runtime.lock().expect("runtime").staged = Some(staged);
+        runtime.staged = Some(staged);
         Ok(())
     }
 
-    async fn run_migrate(&self) -> Result<(), SagaError> {
+    async fn run_migrate(&self, runtime: &mut DeployRuntime) -> Result<(), SagaError> {
         // Capture the live pre-migration revision first, so compensation has an
         // exact target even if the durable ledger has drifted.
         let previous = self
@@ -451,7 +453,7 @@ impl DeployShared {
             .current_revision(&self.ctx)
             .await
             .map_err(|e| Self::failed("migrate", &e))?;
-        self.runtime.lock().expect("runtime").previous_revision = previous;
+        runtime.previous_revision = previous;
 
         let outcome = self
             .migration
@@ -459,23 +461,12 @@ impl DeployShared {
             .await
             .map_err(|e| Self::failed("migrate", &e))?;
 
-        // Scope the guard so it drops before returning (no lock held across the
-        // function tail).
-        {
-            let mut runtime = self.runtime.lock().expect("runtime");
-            runtime.new_revision = outcome.to.or_else(|| runtime.previous_revision.clone());
-        }
+        runtime.new_revision = outcome.to.or_else(|| runtime.previous_revision.clone());
         Ok(())
     }
 
-    async fn undo_migrate(&self) -> Result<(), SagaError> {
-        let previous = self
-            .runtime
-            .lock()
-            .expect("runtime")
-            .previous_revision
-            .clone();
-        match previous {
+    async fn undo_migrate(&self, runtime: &DeployRuntime) -> Result<(), SagaError> {
+        match runtime.previous_revision.clone() {
             Some(target) => self
                 .migration
                 .down_to(&self.ctx, target)
@@ -492,11 +483,8 @@ impl DeployShared {
         }
     }
 
-    async fn run_activate(&self) -> Result<(), SagaError> {
-        let staged = self
-            .runtime
-            .lock()
-            .expect("runtime")
+    async fn run_activate(&self, runtime: &DeployRuntime) -> Result<(), SagaError> {
+        let staged = runtime
             .staged
             .clone()
             .ok_or_else(|| SagaError::StepFailed {
@@ -584,26 +572,34 @@ struct DeployStep {
 }
 
 #[async_trait]
-impl Step for DeployStep {
+impl Step<DeployRuntime> for DeployStep {
     fn name(&self) -> &str {
         self.phase.step_name()
     }
 
-    async fn forward(&self, _ctx: &StepContext, _state: &mut ()) -> Result<(), SagaError> {
+    async fn forward(
+        &self,
+        _ctx: &StepContext,
+        runtime: &mut DeployRuntime,
+    ) -> Result<(), SagaError> {
         match self.phase {
             Phase::Preflight => self.shared.run_preflight().await,
-            Phase::Fetch => self.shared.run_fetch().await,
-            Phase::Migrate => self.shared.run_migrate().await,
-            Phase::Activate => self.shared.run_activate().await,
+            Phase::Fetch => self.shared.run_fetch(runtime).await,
+            Phase::Migrate => self.shared.run_migrate(runtime).await,
+            Phase::Activate => self.shared.run_activate(runtime).await,
             Phase::Restart => self.shared.run_restart().await,
             Phase::Health => self.shared.run_health().await,
             Phase::Verify => self.shared.run_verify().await,
         }
     }
 
-    async fn compensate(&self, _ctx: &StepContext, _state: &mut ()) -> Result<(), SagaError> {
+    async fn compensate(
+        &self,
+        _ctx: &StepContext,
+        runtime: &mut DeployRuntime,
+    ) -> Result<(), SagaError> {
         match self.phase {
-            Phase::Migrate => self.shared.undo_migrate().await,
+            Phase::Migrate => self.shared.undo_migrate(runtime).await,
             // Undoing the activation re-points + restarts the prior release; the
             // restart step itself has nothing to undo (its compensation is the
             // Activate step's, run next in reverse order).

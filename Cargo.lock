@@ -616,6 +616,7 @@ dependencies = [
  "fraisier-artifact-release",
  "fraisier-config",
  "fraisier-core",
+ "fraisier-db",
  "fraisier-ipc",
  "fraisier-saga",
  "fraisier-scaffold",

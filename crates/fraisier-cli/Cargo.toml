@@ -60,6 +60,8 @@ fraisier-artifact-git = { path = "../fraisier-artifact-git", version = "1.0.0-al
 fraisier-scaffold = { path = "../fraisier-scaffold", version = "1.0.0-alpha.1" }
 # Version reading/bumping and the `ship` release workflow.
 fraisier-ship = { path = "../fraisier-ship", version = "1.0.0-alpha.1" }
+# Generic-Postgres database lifecycle ops (backup/restore/reset).
+fraisier-db = { path = "../fraisier-db", version = "1.0.0-alpha.1" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

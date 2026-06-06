@@ -60,7 +60,10 @@ enum Command {
     /// Show the recorded saga state and release ledger for a deploy.
     Status(StatusArgs),
 
-    /// Database lifecycle operations (migrate / backup / restore / reset).
+    /// Back up the database to a custom-format archive (`pg_dump -Fc`).
+    Backup(BackupArgs),
+
+    /// Database lifecycle operations (migrate / restore / reset).
     #[command(subcommand)]
     Db(DbCommand),
 
@@ -307,6 +310,12 @@ struct RollbackArgs {
 enum DbCommand {
     /// Apply pending migrations through the configured migration adapter.
     Migrate(DbMigrateArgs),
+
+    /// Restore a `pg_dump` archive into the database (drops existing objects).
+    Restore(DbRestoreArgs),
+
+    /// Drop every user schema and re-apply migrations from scratch.
+    Reset(DbResetArgs),
 }
 
 #[derive(Debug, Args)]
@@ -318,6 +327,51 @@ struct DbMigrateArgs {
     /// Directory for the filesystem state store.
     #[arg(long, default_value = ".fraisier/state")]
     state_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct BackupArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Where to write the archive (defaults to `<fraise>-<environment>.pgdump`).
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    /// Overwrite the output file if it already exists.
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
+struct DbRestoreArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// The `pg_dump -Fc` archive to restore.
+    #[arg(long)]
+    input: PathBuf,
+
+    /// Execute the restore (without this, only the plan is shown). Destructive.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct DbResetArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Directory for the filesystem state store.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+
+    /// Execute the reset (without this, only the plan is shown). Destructive.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -381,8 +435,17 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::Status(args) => {
             commands::status(&args.config, &args.state_dir, args.per_host).await
         }
+        Command::Backup(args) => {
+            commands::db_backup(&args.config, args.output.as_deref(), args.force).await
+        }
         Command::Db(DbCommand::Migrate(args)) => {
             commands::db_migrate(&args.config, &args.state_dir).await
+        }
+        Command::Db(DbCommand::Restore(args)) => {
+            commands::db_restore(&args.config, &args.input, args.yes).await
+        }
+        Command::Db(DbCommand::Reset(args)) => {
+            commands::db_reset(&args.config, &args.state_dir, args.yes).await
         }
         Command::Adapter(AdapterCommand::List) => Ok(commands::adapter_list()),
         Command::Adapter(AdapterCommand::Describe { name }) => {

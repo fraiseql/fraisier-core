@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use fraisier_config::{DeployConfig, Severity, ValidationReport};
@@ -989,21 +989,7 @@ pub(crate) async fn db_migrate(config_path: &Path, state_dir: &Path) -> Result<C
     // Record the new current revision in the ledger, preserving the active
     // artifact a prior deploy recorded.
     let current = adapter.current_revision(&resolved.ctx).await.ok().flatten();
-    let store = FilesystemStateStore::new(state_dir)
-        .with_context(|| format!("opening state store at {}", state_dir.display()))?;
-    let key = FraiseKey::new(&resolved.fraise, &resolved.environment);
-    let mut record = store
-        .current_snapshot(&key)
-        .await?
-        .and_then(|v| serde_json::from_value::<DeployRecord>(v).ok())
-        .unwrap_or(DeployRecord {
-            active: None,
-            revision: None,
-        });
-    record.revision = current.clone();
-    store
-        .record_snapshot(&key, &serde_json::to_value(&record)?)
-        .await?;
+    record_ledger_revision(state_dir, &resolved.fraise, &resolved.environment, current).await?;
 
     let mut pretty = format!(
         "migrated {}/{}: {} migration(s) applied",
@@ -1029,6 +1015,265 @@ pub(crate) async fn db_migrate(config_path: &Path, state_dir: &Path) -> Result<C
     })
 }
 
+/// Record `revision` as the current revision in the state ledger for
+/// `fraise`/`environment`, preserving the active artifact a prior deploy recorded.
+/// Used by the migration-state changing db ops (`db migrate`, `db reset`).
+async fn record_ledger_revision(
+    state_dir: &Path,
+    fraise: &str,
+    environment: &str,
+    revision: Option<fraisier_core::adapter_axes::Revision>,
+) -> Result<()> {
+    let store = FilesystemStateStore::new(state_dir)
+        .with_context(|| format!("opening state store at {}", state_dir.display()))?;
+    let key = FraiseKey::new(fraise, environment);
+    let mut record = store
+        .current_snapshot(&key)
+        .await?
+        .and_then(|v| serde_json::from_value::<DeployRecord>(v).ok())
+        .unwrap_or(DeployRecord {
+            active: None,
+            revision: None,
+        });
+    record.revision = revision;
+    store
+        .record_snapshot(&key, &serde_json::to_value(&record)?)
+        .await?;
+    Ok(())
+}
+
+/// Resolve the Postgres connection for a generic database op from the configured
+/// DSN env var (`[migration].database_url_env`). The DSN value is read here and
+/// decomposed into `PG*` env on the child by the command builders — it never
+/// reaches argv.
+///
+/// # Errors
+/// If `database_url_env` is unset in the config, the named env var is not set in
+/// the environment, or the DSN is not a parseable `postgres://` URL.
+fn resolve_pg_conn(config: &DeployConfig) -> Result<fraisier_db::PgConn> {
+    let source = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.database_url_env.clone())
+        .context(
+            "db backup/restore/reset need [migration].database_url_env \
+             (the name of the env var holding the database DSN)",
+        )?;
+    let dsn = std::env::var(&source)
+        .with_context(|| format!("the configured database_url_env '{source}' is not set"))?;
+    fraisier_db::PgConn::parse(&dsn).context("parsing the database DSN")
+}
+
+/// A clean exit-1 [`CommandOutput`] for an expected db-op configuration error
+/// (missing/unset DSN, non-postgres DSN), so `--json` still renders.
+fn db_config_error(error: &anyhow::Error) -> CommandOutput {
+    let message = format!("{error:#}");
+    CommandOutput {
+        exit_code: 1,
+        pretty: format!("{message}\n"),
+        json: json!({ "ok": false, "error": message }),
+    }
+}
+
+/// `backup`: dump the database to a custom-format archive with `pg_dump -Fc`.
+///
+/// Non-destructive, but refuses to clobber an existing archive unless `force` is
+/// set. The output path defaults to `<fraise>-<environment>.pgdump`.
+pub(crate) async fn db_backup(
+    config_path: &Path,
+    output: Option<&Path>,
+    force: bool,
+) -> Result<CommandOutput> {
+    let config = load(config_path)?;
+    if let Some(refusal) = refuse_invalid_db_config(&config, "back up") {
+        return Ok(refusal);
+    }
+    let conn = match resolve_pg_conn(&config) {
+        Ok(conn) => conn,
+        Err(error) => return Ok(db_config_error(&error)),
+    };
+
+    let deploy = config.deploy.as_ref().context("[deploy] section")?;
+    let fraise = deploy.name.clone().unwrap_or_default();
+    let environment = deploy.environment.clone().unwrap_or_default();
+    let default_path = PathBuf::from(format!("{fraise}-{environment}.pgdump"));
+    let out_path: &Path = output.unwrap_or(&default_path);
+
+    if out_path.exists() && !force {
+        return Ok(CommandOutput {
+            exit_code: 1,
+            pretty: format!(
+                "{} already exists; pass --force to overwrite it\n",
+                out_path.display()
+            ),
+            json: json!({ "ok": false, "wrote": false, "output": out_path.display().to_string() }),
+        });
+    }
+
+    let outcome = fraisier_db::run(fraisier_db::backup_command(&conn, out_path))
+        .await
+        .context("running pg_dump")?;
+    if outcome.succeeded() {
+        Ok(CommandOutput {
+            exit_code: 0,
+            pretty: format!("backed up {} → {}\n", conn.redacted(), out_path.display()),
+            json: json!({ "ok": true, "output": out_path.display().to_string() }),
+        })
+    } else {
+        Ok(CommandOutput {
+            exit_code: 1,
+            pretty: format!("pg_dump failed:\n{}\n", outcome.stderr.trim()),
+            json: json!({ "ok": false, "stderr": outcome.stderr.trim() }),
+        })
+    }
+}
+
+/// `db restore`: restore a `pg_dump -Fc` archive into the database with
+/// `pg_restore`, dropping existing objects first (`--clean --if-exists`).
+///
+/// Destructive: it overwrites the target database, so it only runs with
+/// `execute` (the `--yes` flag); otherwise it prints the plan.
+pub(crate) async fn db_restore(
+    config_path: &Path,
+    input: &Path,
+    execute: bool,
+) -> Result<CommandOutput> {
+    let config = load(config_path)?;
+    if let Some(refusal) = refuse_invalid_db_config(&config, "restore") {
+        return Ok(refusal);
+    }
+    let conn = match resolve_pg_conn(&config) {
+        Ok(conn) => conn,
+        Err(error) => return Ok(db_config_error(&error)),
+    };
+
+    if !execute {
+        return Ok(CommandOutput {
+            exit_code: 0,
+            pretty: format!(
+                "restore plan: {} → {} (drops existing objects, then restores)\n\
+                 pass --yes to execute — this OVERWRITES the database\n",
+                input.display(),
+                conn.redacted(),
+            ),
+            json: json!({
+                "executed": false,
+                "input": input.display().to_string(),
+                "target": conn.redacted(),
+            }),
+        });
+    }
+
+    if !input.exists() {
+        return Ok(CommandOutput {
+            exit_code: 1,
+            pretty: format!("backup file {} not found\n", input.display()),
+            json: json!({ "ok": false, "input": input.display().to_string() }),
+        });
+    }
+
+    let outcome = fraisier_db::run(fraisier_db::restore_command(&conn, input, true))
+        .await
+        .context("running pg_restore")?;
+    let (exit_code, ok) = (i32::from(!outcome.succeeded()), outcome.succeeded());
+    let mut pretty = if ok {
+        format!("restored {} → {}\n", input.display(), conn.redacted())
+    } else {
+        format!("pg_restore failed:\n{}\n", outcome.stderr.trim())
+    };
+    if ok && !outcome.stderr.trim().is_empty() {
+        // pg_restore can emit non-fatal warnings on stderr while still exiting 0.
+        let _ = writeln!(pretty, "(warnings)\n{}", outcome.stderr.trim());
+    }
+    Ok(CommandOutput {
+        exit_code,
+        pretty,
+        json: json!({ "ok": ok, "executed": true, "input": input.display().to_string() }),
+    })
+}
+
+/// `db reset`: drop every user schema and re-apply migrations from scratch.
+///
+/// Destructive: it wipes the database, so it only runs with `execute` (the
+/// `--yes` flag); otherwise it prints the plan. The wipe is generic Postgres
+/// (`psql` running [`fraisier_db::RESET_SQL`]); the re-apply goes through the
+/// configured migration adapter.
+pub(crate) async fn db_reset(
+    config_path: &Path,
+    state_dir: &Path,
+    execute: bool,
+) -> Result<CommandOutput> {
+    let config = load(config_path)?;
+    if let Some(refusal) = refuse_invalid_db_config(&config, "reset") {
+        return Ok(refusal);
+    }
+    let conn = match resolve_pg_conn(&config) {
+        Ok(conn) => conn,
+        Err(error) => return Ok(db_config_error(&error)),
+    };
+
+    let deploy = config.deploy.as_ref().context("[deploy] section")?;
+    let fraise = deploy.name.clone().unwrap_or_default();
+    let environment = deploy.environment.clone().unwrap_or_default();
+
+    if !execute {
+        return Ok(CommandOutput {
+            exit_code: 0,
+            pretty: format!(
+                "reset plan for {fraise}/{environment}: DROP ALL user schemas in {}, \
+                 then re-apply migrations\n\
+                 pass --yes to execute — this DESTROYS all data in the database\n",
+                conn.redacted(),
+            ),
+            json: json!({
+                "executed": false,
+                "fraise": fraise,
+                "environment": environment,
+                "target": conn.redacted(),
+            }),
+        });
+    }
+
+    // 1. Drop every user schema (generic Postgres).
+    let dropped = fraisier_db::run(fraisier_db::psql_command(&conn, fraisier_db::RESET_SQL))
+        .await
+        .context("running psql to drop schemas")?;
+    if !dropped.succeeded() {
+        return Ok(CommandOutput {
+            exit_code: 1,
+            pretty: format!("schema drop failed:\n{}\n", dropped.stderr.trim()),
+            json: json!({ "ok": false, "stage": "drop", "stderr": dropped.stderr.trim() }),
+        });
+    }
+
+    // 2. Re-apply migrations through the configured adapter.
+    let resolved = factory::build_migration_only(&config)?;
+    let adapter = resolved.migration.as_ref();
+    let outcome = adapter
+        .up(&resolved.ctx, None)
+        .await
+        .context("re-applying migrations after reset")?;
+    let applied = outcome.applied.len();
+
+    // 3. Record the resulting revision in the ledger.
+    let current = adapter.current_revision(&resolved.ctx).await.ok().flatten();
+    record_ledger_revision(state_dir, &fraise, &environment, current).await?;
+
+    Ok(CommandOutput {
+        exit_code: 0,
+        pretty: format!(
+            "reset {fraise}/{environment}: dropped all schemas, re-applied {applied} migration(s)\n"
+        ),
+        json: json!({
+            "ok": true,
+            "executed": true,
+            "fraise": fraise,
+            "environment": environment,
+            "applied": applied,
+        }),
+    })
+}
+
 /// Map a saga outcome onto `(exit code, label, detail)` for both deploy paths.
 fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
     match outcome {
@@ -1049,9 +1294,9 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapter_list, db_migrate, deploy, discover_adapters, health, init, list, rollback,
-        scaffold, scaffold_install, ship, status, validate_config, version_bump, version_show,
-        ShipArgs,
+        adapter_list, db_backup, db_migrate, db_reset, db_restore, deploy, discover_adapters,
+        health, init, list, rollback, scaffold, scaffold_install, ship, status, validate_config,
+        version_bump, version_show, ShipArgs,
     };
     use fraisier_core::single_host::DeployRecord;
     use fraisier_saga::events::SagaState;
@@ -1059,6 +1304,29 @@ mod tests {
         DeploymentState, FilesystemStateStore, FraiseKey, StateStore,
     };
     use std::path::Path;
+
+    /// Serializes the env-mutating db-op tests so `set_var`/`var` don't race the
+    /// process environment across threads.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Drive an async command to completion on a fresh current-thread runtime.
+    /// Kept synchronous so the [`ENV_LOCK`] guard is never held across an `.await`.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(future)
+    }
+
+    /// A db-ops config naming `dsn_env` as the DSN source (no-op command adapter).
+    fn db_ops_config(dsn_env: &str) -> String {
+        format!(
+            "[deploy]\nname = \"demo\"\nenvironment = \"test\"\n\n\
+             [migration]\nadapter = \"command\"\ndatabase_url_env = \"{dsn_env}\"\n\n\
+             [migration.settings.commands]\nup = \"true\"\ncurrent_revision = \"true\"\n"
+        )
+    }
 
     const VALID: &str = r#"
 [deploy]
@@ -1583,5 +1851,130 @@ current_revision = "true"
             .expect("run");
         assert_eq!(out.exit_code, 1);
         assert_eq!(out.json["ok"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn db_restore_plan_shows_the_target_without_executing() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let var = "FRAISIER_DBOPS_RESTORE_PLAN";
+        std::env::set_var(var, "postgresql://u:s3cret@dbhost:5432/shop");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", &db_ops_config(var));
+        let out = block_on(db_restore(
+            &config,
+            Path::new("/backups/shop.pgdump"),
+            false,
+        ))
+        .expect("plan");
+        std::env::remove_var(var);
+
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert_eq!(out.json["executed"], serde_json::json!(false));
+        assert!(
+            out.pretty.contains("dbhost:5432/shop"),
+            "redacted target shown: {}",
+            out.pretty
+        );
+        assert!(
+            !out.pretty.contains("s3cret"),
+            "the password must not appear in the plan: {}",
+            out.pretty
+        );
+    }
+
+    #[test]
+    fn db_reset_plan_is_destructive_and_does_not_execute() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let var = "FRAISIER_DBOPS_RESET_PLAN";
+        std::env::set_var(var, "postgres://app@dbhost/shop");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", &db_ops_config(var));
+        let out = block_on(db_reset(&config, &dir.path().join("state"), false)).expect("plan");
+        std::env::remove_var(var);
+
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert_eq!(out.json["executed"], serde_json::json!(false));
+        assert!(
+            out.pretty.contains("DESTROYS"),
+            "the plan must spell out the destruction: {}",
+            out.pretty
+        );
+    }
+
+    #[test]
+    fn db_backup_refuses_to_clobber_without_force() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let var = "FRAISIER_DBOPS_BACKUP_GUARD";
+        std::env::set_var(var, "postgres://app@dbhost/shop");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", &db_ops_config(var));
+        let existing = dir.path().join("out.pgdump");
+        std::fs::write(&existing, b"old archive").expect("seed");
+        // The clobber guard fires before pg_dump is ever invoked.
+        let out = block_on(db_backup(&config, Some(&existing), false)).expect("guard");
+        std::env::remove_var(var);
+
+        assert_eq!(out.exit_code, 1);
+        assert_eq!(out.json["wrote"], serde_json::json!(false));
+        assert_eq!(std::fs::read(&existing).expect("read"), b"old archive");
+    }
+
+    #[test]
+    fn db_ops_error_when_the_dsn_env_is_unset() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let var = "FRAISIER_DBOPS_DELIBERATELY_UNSET";
+        std::env::remove_var(var);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", &db_ops_config(var));
+        // Even the plan path resolves the connection first, so an unset var fails.
+        let out = block_on(db_restore(&config, Path::new("/x.pgdump"), false)).expect("run");
+
+        assert_eq!(out.exit_code, 1);
+        assert_eq!(out.json["ok"], serde_json::json!(false));
+        assert!(
+            out.pretty.contains(var),
+            "names the missing var: {}",
+            out.pretty
+        );
+    }
+
+    #[test]
+    fn db_ops_reject_a_non_postgres_dsn() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let var = "FRAISIER_DBOPS_SQLITE";
+        std::env::set_var(var, "sqlite:///tmp/x.db");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", &db_ops_config(var));
+        let out = block_on(db_backup(
+            &config,
+            Some(&dir.path().join("o.pgdump")),
+            false,
+        ))
+        .expect("run");
+        std::env::remove_var(var);
+
+        assert_eq!(out.exit_code, 1);
+        assert!(
+            out.pretty.contains("postgres://"),
+            "explains the postgres-only requirement: {}",
+            out.pretty
+        );
+    }
+
+    #[tokio::test]
+    async fn db_ops_require_database_url_env() {
+        // DB_OPS (the db_migrate fixture) has no database_url_env, so the generic
+        // Postgres ops cannot find a DSN and refuse with a clear message.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", DB_OPS);
+        let out = db_backup(&config, Some(&dir.path().join("o.pgdump")), false)
+            .await
+            .expect("run");
+        assert_eq!(out.exit_code, 1);
+        assert!(
+            out.pretty.contains("database_url_env"),
+            "points at the missing config: {}",
+            out.pretty
+        );
     }
 }

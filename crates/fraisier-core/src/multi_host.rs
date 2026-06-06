@@ -56,7 +56,7 @@
 //! revision — check it before retrying.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use fraisier_saga::saga::{Saga, SagaError, SagaOutcome, Step, StepContext};
@@ -323,22 +323,29 @@ impl MultiHostDeploy {
         };
 
         let shared = Arc::new(RolloutShared::new(self, prior));
-        let mut saga = Saga::new(store.clone(), self.fraise.clone(), self.environment.clone())
-            .with_step(shared.step(StepKind::Preflight))
-            .with_step(shared.step(StepKind::Fetch))
-            .with_step(shared.step(StepKind::Migrate));
+        // Compose the fixed phases plus one rollout step per batch as a single
+        // dynamically built list (Saga::with_steps).
+        let mut steps: Vec<Box<dyn Step<RolloutRuntime>>> = vec![
+            shared.step(StepKind::Preflight),
+            shared.step(StepKind::Fetch),
+            shared.step(StepKind::Migrate),
+        ];
         for (index, batch) in plan_batches(self.plan.strategy(), self.plan.inventory().hosts())
             .into_iter()
             .enumerate()
         {
-            saga = saga.with_step(shared.rollout_step(index + 1, batch));
+            steps.push(shared.rollout_step(index + 1, batch));
         }
-        saga = saga.with_step(shared.step(StepKind::Verify));
+        steps.push(shared.step(StepKind::Verify));
+        let saga = Saga::new(store.clone(), self.fraise.clone(), self.environment.clone())
+            .with_steps(steps);
 
-        let outcome = shared.finalize(saga.run().await?);
+        let mut runtime = RolloutRuntime::default();
+        let saga_outcome = saga.run_with_state(&mut runtime).await?;
+        let outcome = runtime.finalize(saga_outcome);
 
         if matches!(outcome, SagaOutcome::Committed) {
-            let record = shared.committed_record();
+            let record = runtime.committed_record();
             store
                 .record_snapshot(&key, &serde_json::to_value(&record)?)
                 .await?;
@@ -491,7 +498,9 @@ impl MultiHostDeployBuilder {
 }
 
 /// The rollout state shared by every step: the adapters, the base call context,
-/// the inventory, the durable rollback target (`prior`), and the in-run captures.
+/// the inventory, and the durable rollback target (`prior`). All fields are
+/// immutable for the run — the mutable in-run captures live in [`RolloutRuntime`],
+/// which the saga engine threads to each step as `&mut`.
 struct RolloutShared {
     ctx: AdapterCtx,
     inventory: Vec<HostEntry>,
@@ -505,12 +514,13 @@ struct RolloutShared {
     /// The previously-committed release — the per-host rollback target. Immutable
     /// for the run.
     prior: MultiHostRecord,
-    /// State captured while the deploy runs forward, read back during compensation
-    /// and commit.
-    runtime: Mutex<RolloutRuntime>,
 }
 
-/// State captured while a multi-host deploy runs forward.
+/// The mutable run state captured while a multi-host deploy runs forward, threaded
+/// to every step by the saga engine as `&mut RolloutRuntime`. Within the rollout
+/// step, hosts advance concurrently into **disjoint** `progress` slots (no lock):
+/// each task fills its own host's [`HostProgress`], merged into this map after the
+/// batch completes.
 #[derive(Default)]
 struct RolloutRuntime {
     /// The artifact staged on each host by `fetch` and activated by the rollout.
@@ -526,6 +536,37 @@ struct RolloutRuntime {
     /// Set when a *rollback* step could not fully restore a host: the run then
     /// reports [`SagaOutcome::PartialRollback`] rather than a clean rollback.
     unrecoverable: Option<String>,
+}
+
+impl RolloutRuntime {
+    /// Map the saga outcome onto the run's own findings: a clean rollback that left
+    /// at least one host unrecoverable is reported as a [`SagaOutcome::PartialRollback`].
+    fn finalize(&mut self, outcome: SagaOutcome) -> SagaOutcome {
+        match (outcome, self.unrecoverable.take()) {
+            (
+                SagaOutcome::RolledBack {
+                    failed_step,
+                    reason,
+                },
+                Some(detail),
+            ) => SagaOutcome::PartialRollback {
+                reason: format!(
+                    "rollback after '{failed_step}' failed left a host unrecoverable: {detail} \
+                         (original failure: {reason})"
+                ),
+            },
+            (other, _) => other,
+        }
+    }
+
+    /// The ledger entry to persist on a successful commit: the artifact now active
+    /// on each host (the staged one), plus the new migration revision.
+    fn committed_record(&self) -> MultiHostRecord {
+        MultiHostRecord {
+            active: self.staged.clone(),
+            revision: self.new_revision.clone(),
+        }
+    }
 }
 
 /// How far one host got through `drain → activate → restart → health → reattach`.
@@ -578,26 +619,25 @@ impl RolloutShared {
             health: Arc::clone(&deploy.health),
             lb: Arc::clone(&deploy.lb),
             prior,
-            runtime: Mutex::new(RolloutRuntime::default()),
         }
     }
 
-    fn step(self: &Arc<Self>, kind: StepKind) -> Box<dyn Step> {
+    fn step(self: &Arc<Self>, kind: StepKind) -> Box<dyn Step<RolloutRuntime>> {
         Box::new(RolloutStep {
             shared: Arc::clone(self),
             kind,
         })
     }
 
-    fn rollout_step(self: &Arc<Self>, index: usize, batch: Vec<HostEntry>) -> Box<dyn Step> {
+    fn rollout_step(
+        self: &Arc<Self>,
+        index: usize,
+        batch: Vec<HostEntry>,
+    ) -> Box<dyn Step<RolloutRuntime>> {
         self.step(StepKind::Rollout {
             name: format!("rollout-{index}"),
             batch,
         })
-    }
-
-    fn runtime(&self) -> MutexGuard<'_, RolloutRuntime> {
-        self.runtime.lock().expect("rollout runtime mutex poisoned")
     }
 
     /// Map an adapter error into a saga step failure, preserving its detail.
@@ -626,37 +666,6 @@ impl RolloutShared {
         ctx.settings
             .insert("address".to_owned(), Value::String(entry.address.clone()));
         ctx
-    }
-
-    /// Map the saga outcome onto the run's own findings: a clean rollback that left
-    /// at least one host unrecoverable is reported as a [`SagaOutcome::PartialRollback`].
-    fn finalize(&self, outcome: SagaOutcome) -> SagaOutcome {
-        let unrecoverable = self.runtime().unrecoverable.take();
-        match (outcome, unrecoverable) {
-            (
-                SagaOutcome::RolledBack {
-                    failed_step,
-                    reason,
-                },
-                Some(detail),
-            ) => SagaOutcome::PartialRollback {
-                reason: format!(
-                    "rollback after '{failed_step}' failed left a host unrecoverable: {detail} \
-                         (original failure: {reason})"
-                ),
-            },
-            (other, _) => other,
-        }
-    }
-
-    /// The ledger entry to persist on a successful commit: the artifact now active
-    /// on each host (the staged one), plus the new migration revision.
-    fn committed_record(&self) -> MultiHostRecord {
-        let runtime = self.runtime();
-        MultiHostRecord {
-            active: runtime.staged.clone(),
-            revision: runtime.new_revision.clone(),
-        }
     }
 
     /// The migration forward-compatibility lint, gated exactly like the single-host
@@ -731,7 +740,7 @@ impl RolloutShared {
 
     /// Fetch: stage the artifact on every host in parallel, recording each staged
     /// artifact for the rollout phase. Reports all hosts that failed to stage.
-    async fn run_fetch(&self) -> Result<(), SagaError> {
+    async fn run_fetch(&self, runtime: &mut RolloutRuntime) -> Result<(), SagaError> {
         let pending = self.inventory.iter().map(|entry| {
             let ctx = self.host_ctx(entry);
             async move {
@@ -764,19 +773,19 @@ impl RolloutShared {
                 ),
             });
         }
-        self.runtime().staged = staged;
+        runtime.staged = staged;
         Ok(())
     }
 
     /// Migrate **once** against the shared database. Captures the live revision
     /// before `up` so a rollback has an exact `down_to` target.
-    async fn run_migrate(&self) -> Result<(), SagaError> {
+    async fn run_migrate(&self, runtime: &mut RolloutRuntime) -> Result<(), SagaError> {
         let previous = self
             .migration
             .current_revision(&self.ctx)
             .await
             .map_err(|e| Self::failed("migrate", &e))?;
-        self.runtime().previous_revision = previous;
+        runtime.previous_revision = previous;
 
         let outcome = self
             .migration
@@ -784,19 +793,13 @@ impl RolloutShared {
             .await
             .map_err(|e| Self::failed("migrate", &e))?;
 
-        // Scope the guard so it drops before the function tail (no lock held across
-        // the return).
-        {
-            let mut runtime = self.runtime();
-            runtime.new_revision = outcome.to.or_else(|| runtime.previous_revision.clone());
-        }
+        runtime.new_revision = outcome.to.or_else(|| runtime.previous_revision.clone());
         Ok(())
     }
 
     /// Roll the single shared-database migration back to the pre-deploy revision.
-    async fn undo_migrate(&self) -> Result<(), SagaError> {
-        let previous = self.runtime().previous_revision.clone();
-        match previous {
+    async fn undo_migrate(&self, runtime: &RolloutRuntime) -> Result<(), SagaError> {
+        match runtime.previous_revision.clone() {
             Some(target) => self
                 .migration
                 .down_to(&self.ctx, target)
@@ -876,19 +879,41 @@ impl RolloutShared {
     /// restored before the failure is surfaced (the saga then rolls back the
     /// earlier batches and the migration); a restore that itself fails is recorded
     /// as unrecoverable.
-    async fn run_rollout(&self, batch: &[HostEntry]) -> Result<(), SagaError> {
-        let advances = batch.iter().map(|entry| self.advance_host(entry));
+    async fn run_rollout(
+        &self,
+        batch: &[HostEntry],
+        runtime: &mut RolloutRuntime,
+    ) -> Result<(), SagaError> {
+        // Each host advances concurrently, but into its **own** progress slot
+        // (disjoint `&mut`, so no lock); the shared `staged` map is read-only here.
+        let mut progresses: Vec<(HostId, HostProgress)> = batch
+            .iter()
+            .map(|entry| (entry.host.clone(), HostProgress::default()))
+            .collect();
+        let advances = batch
+            .iter()
+            .zip(progresses.iter_mut())
+            .map(|(entry, (_, progress))| self.advance_host(entry, &runtime.staged, progress));
         let errors: Vec<String> = futures::future::join_all(advances)
             .await
             .into_iter()
             .filter_map(Result::err)
             .map(|e| e.to_string())
             .collect();
+
+        // Merge how far each host got into the run state, so a restore touches
+        // exactly the steps that actually happened (this runs after the concurrent
+        // advances, so the `&mut runtime` borrow no longer overlaps them).
+        for (host, progress) in progresses {
+            runtime.progress.insert(host, progress);
+        }
+
         if errors.is_empty() {
             return Ok(());
         }
-        if let Err(restore_err) = self.restore_batch(batch).await {
-            self.runtime()
+        let restore = self.restore_batch(batch, runtime).await;
+        if let Err(restore_err) = restore {
+            runtime
                 .unrecoverable
                 .get_or_insert_with(|| restore_err.to_string());
         }
@@ -903,8 +928,13 @@ impl RolloutShared {
     }
 
     /// Advance a single host through the rollout sequence, recording how far it got
-    /// so a later restore can undo exactly those steps.
-    async fn advance_host(&self, entry: &HostEntry) -> Result<(), SagaError> {
+    /// into its own `progress` slot so a later restore can undo exactly those steps.
+    async fn advance_host(
+        &self,
+        entry: &HostEntry,
+        staged: &BTreeMap<HostId, StagedArtifact>,
+        progress: &mut HostProgress,
+    ) -> Result<(), SagaError> {
         let ctx = self.host_ctx(entry);
         let host = &entry.host;
 
@@ -913,30 +943,20 @@ impl RolloutShared {
             .drain(&ctx, host)
             .await
             .map_err(|e| Self::host_failed(host, "drain", &e))?;
-        self.runtime()
-            .progress
-            .entry(host.clone())
-            .or_default()
-            .drained = Some(membership.clone());
+        progress.drained = Some(membership.clone());
 
-        let staged =
-            self.runtime()
-                .staged
-                .get(host)
-                .cloned()
-                .ok_or_else(|| SagaError::StepFailed {
-                    step: "rollout".to_owned(),
-                    message: format!("no staged artifact recorded for host {host}"),
-                })?;
+        let staged_artifact = staged
+            .get(host)
+            .cloned()
+            .ok_or_else(|| SagaError::StepFailed {
+                step: "rollout".to_owned(),
+                message: format!("no staged artifact recorded for host {host}"),
+            })?;
         self.artifact
-            .activate(&ctx, host, &staged)
+            .activate(&ctx, host, &staged_artifact)
             .await
             .map_err(|e| Self::host_failed(host, "activate", &e))?;
-        self.runtime()
-            .progress
-            .entry(host.clone())
-            .or_default()
-            .activated = true;
+        progress.activated = true;
 
         self.service
             .restart(&ctx, host)
@@ -960,18 +980,18 @@ impl RolloutShared {
             .reattach(&ctx, host, &membership)
             .await
             .map_err(|e| Self::host_failed(host, "reattach", &e))?;
-        self.runtime()
-            .progress
-            .entry(host.clone())
-            .or_default()
-            .reattached = true;
+        progress.reattached = true;
         Ok(())
     }
 
     /// Restore every host in a batch concurrently, reporting all that could not be
     /// fully restored.
-    async fn restore_batch(&self, batch: &[HostEntry]) -> Result<(), SagaError> {
-        let restores = batch.iter().map(|entry| self.restore_host(entry));
+    async fn restore_batch(
+        &self,
+        batch: &[HostEntry],
+        runtime: &RolloutRuntime,
+    ) -> Result<(), SagaError> {
+        let restores = batch.iter().map(|entry| self.restore_host(entry, runtime));
         let errors: Vec<String> = futures::future::join_all(restores)
             .await
             .into_iter()
@@ -995,15 +1015,14 @@ impl RolloutShared {
     /// had been reattached, re-activate the prior artifact + restart if the new one
     /// had been activated, then restore the LB membership captured at drain. A host
     /// that was never drained was never touched, so nothing is undone.
-    async fn restore_host(&self, entry: &HostEntry) -> Result<(), SagaError> {
+    async fn restore_host(
+        &self,
+        entry: &HostEntry,
+        runtime: &RolloutRuntime,
+    ) -> Result<(), SagaError> {
         let ctx = self.host_ctx(entry);
         let host = &entry.host;
-        let progress = self
-            .runtime()
-            .progress
-            .get(host)
-            .cloned()
-            .unwrap_or_default();
+        let progress = runtime.progress.get(host).cloned().unwrap_or_default();
         let Some(prior_membership) = progress.drained else {
             return Ok(());
         };
@@ -1053,29 +1072,37 @@ struct RolloutStep {
 }
 
 #[async_trait]
-impl Step for RolloutStep {
+impl Step<RolloutRuntime> for RolloutStep {
     fn name(&self) -> &str {
         self.kind.step_name()
     }
 
-    async fn forward(&self, _ctx: &StepContext, _state: &mut ()) -> Result<(), SagaError> {
+    async fn forward(
+        &self,
+        _ctx: &StepContext,
+        runtime: &mut RolloutRuntime,
+    ) -> Result<(), SagaError> {
         match &self.kind {
             StepKind::Preflight => self.shared.run_preflight().await,
-            StepKind::Fetch => self.shared.run_fetch().await,
-            StepKind::Migrate => self.shared.run_migrate().await,
-            StepKind::Rollout { batch, .. } => self.shared.run_rollout(batch).await,
+            StepKind::Fetch => self.shared.run_fetch(runtime).await,
+            StepKind::Migrate => self.shared.run_migrate(runtime).await,
+            StepKind::Rollout { batch, .. } => self.shared.run_rollout(batch, runtime).await,
             StepKind::Verify => self.shared.run_verify().await,
         }
     }
 
-    async fn compensate(&self, _ctx: &StepContext, _state: &mut ()) -> Result<(), SagaError> {
+    async fn compensate(
+        &self,
+        _ctx: &StepContext,
+        runtime: &mut RolloutRuntime,
+    ) -> Result<(), SagaError> {
         match &self.kind {
             // Preflight, fetch, and verify are non-mutating (a reachability probe,
             // an artifact staged but never activated, a read-only smoke test), so
             // they have nothing to undo.
             StepKind::Preflight | StepKind::Fetch | StepKind::Verify => Ok(()),
-            StepKind::Migrate => self.shared.undo_migrate().await,
-            StepKind::Rollout { batch, .. } => self.shared.restore_batch(batch).await,
+            StepKind::Migrate => self.shared.undo_migrate(runtime).await,
+            StepKind::Rollout { batch, .. } => self.shared.restore_batch(batch, runtime).await,
         }
     }
 }

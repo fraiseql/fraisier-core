@@ -73,9 +73,11 @@ enum Command {
     #[command(subcommand)]
     Db(DbCommand),
 
-    /// Inspect the migration adapters available as external processes.
-    #[command(subcommand)]
-    Adapter(AdapterCommand),
+    /// List the adapters available to this binary, per axis (built-in + IPC).
+    Providers,
+
+    /// Probe one provider (IPC handshake, or presence for a built-in).
+    ProviderTest(ProviderTestArgs),
 
     /// Show or bump the project version (`Cargo.toml` / `pyproject.toml`).
     #[command(subcommand)]
@@ -411,15 +413,11 @@ struct DbResetArgs {
     yes: bool,
 }
 
-#[derive(Debug, Subcommand)]
-enum AdapterCommand {
-    /// List `fraisier-adapter-*` binaries discoverable on `PATH`.
-    List,
-    /// Run the `describe` handshake against `fraisier-adapter-<name>`.
-    Describe {
-        /// The adapter name (without the `fraisier-adapter-` prefix).
-        name: String,
-    },
+#[derive(Debug, Args)]
+struct ProviderTestArgs {
+    /// The provider name: a built-in adapter, or an IPC adapter discovered on
+    /// `PATH` (without the `fraisier-adapter-` prefix).
+    name: String,
 }
 
 #[tokio::main]
@@ -490,10 +488,8 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::Db(DbCommand::Reset(args)) => {
             commands::db_reset(&args.config, &args.state_dir, args.yes).await
         }
-        Command::Adapter(AdapterCommand::List) => Ok(commands::adapter_list()),
-        Command::Adapter(AdapterCommand::Describe { name }) => {
-            commands::adapter_describe(name).await
-        }
+        Command::Providers => Ok(commands::providers()),
+        Command::ProviderTest(args) => commands::provider_test(&args.name).await,
         Command::Version(VersionCommand::Show(args)) => commands::version_show(&args.path),
         Command::Version(VersionCommand::Bump { level, project }) => {
             commands::version_bump(&project.path, (*level).into())

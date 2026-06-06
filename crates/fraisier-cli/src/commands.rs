@@ -395,47 +395,107 @@ fn is_executable(entry: &std::fs::DirEntry) -> bool {
     }
 }
 
-/// `adapter list`: the migration adapters discoverable on `PATH`.
-pub(crate) fn adapter_list() -> CommandOutput {
-    let names = discover_adapters(std::env::var_os("PATH").as_deref());
-    let pretty = if names.is_empty() {
-        "no fraisier-adapter-* binaries found on PATH\n".to_owned()
-    } else {
-        let mut listing = names.join("\n");
-        listing.push('\n');
-        listing
-    };
+/// The in-process adapters compiled into this binary, per axis. Kept in step
+/// with the factory's `build_*` match arms (the source of truth for what a
+/// config can actually select).
+const BUILTIN_PROVIDERS: &[(&str, &[&str])] = &[
+    (
+        "artifact",
+        &["release", "pull", "release-ipc", "local", "git"],
+    ),
+    ("migration", &["confiture", "command"]),
+    ("service", &["systemd", "rc", "docker-compose"]),
+    ("health", &["http"]),
+    ("lb", &["nginx"]),
+];
+
+/// Whether `name` is a built-in (compiled-in) provider on any axis.
+fn builtin_axis(name: &str) -> Option<&'static str> {
+    BUILTIN_PROVIDERS
+        .iter()
+        .find(|(_, names)| names.contains(&name))
+        .map(|(axis, _)| *axis)
+}
+
+/// `providers`: list every adapter available to this binary, per axis — the
+/// compiled-in ones and the `fraisier-adapter-*` IPC adapters discovered on
+/// `PATH` (migration axis). A diagnostic for "which adapter will my config find?".
+pub(crate) fn providers() -> CommandOutput {
+    let discovered = discover_adapters(std::env::var_os("PATH").as_deref());
+    let mut pretty = String::new();
+    let mut axes = Vec::new();
+    for (axis, names) in BUILTIN_PROVIDERS {
+        let _ = writeln!(pretty, "{axis}:");
+        let mut entries = Vec::new();
+        for name in *names {
+            let _ = writeln!(pretty, "  {name} (built-in)");
+            entries.push(json!({ "name": name, "source": "built-in" }));
+        }
+        // The migration axis is the only one the IPC protocol extends.
+        if *axis == "migration" {
+            for name in &discovered {
+                let _ = writeln!(pretty, "  {name} (IPC: fraisier-adapter-{name})");
+                entries.push(json!({ "name": name, "source": "ipc" }));
+            }
+        }
+        axes.push(json!({ "axis": axis, "providers": entries }));
+    }
     CommandOutput {
         exit_code: 0,
         pretty,
-        json: json!({ "adapters": names }),
+        json: json!({ "axes": axes }),
     }
 }
 
-/// `adapter describe <name>`: spawn the adapter and run the `describe` handshake.
-pub(crate) async fn adapter_describe(name: &str) -> Result<CommandOutput> {
+/// `provider-test <name>`: probe one provider. For a PATH-discovered IPC adapter
+/// this runs the real `describe` handshake (the genuine pre-deploy check — a bad
+/// protocol version or a crash-on-handshake is caught here). For a compiled-in
+/// adapter it just confirms presence: there is nothing to handshake, the code is
+/// in this binary.
+pub(crate) async fn provider_test(name: &str) -> Result<CommandOutput> {
     use fraisier_core::adapter_axes::MigrationAdapter as _;
 
-    let program = format!("fraisier-adapter-{name}");
-    let adapter = fraisier_ipc::IpcMigrationAdapter::new(&program, name);
-    match adapter.describe().await {
-        Ok(description) => Ok(CommandOutput {
+    let discovered = discover_adapters(std::env::var_os("PATH").as_deref());
+    if discovered.iter().any(|d| d == name) {
+        let program = format!("fraisier-adapter-{name}");
+        let adapter = fraisier_ipc::IpcMigrationAdapter::new(&program, name);
+        return Ok(match adapter.describe().await {
+            Ok(description) => CommandOutput {
+                exit_code: 0,
+                pretty: format!(
+                    "{} v{} (IPC, protocol v{})\n  capabilities: {}\n",
+                    description.name,
+                    description.version,
+                    description.protocol_version,
+                    description.capabilities.join(", "),
+                ),
+                json: json!({ "ok": true, "source": "ipc", "describe": serde_json::to_value(&description)? }),
+            },
+            Err(error) => CommandOutput {
+                exit_code: 1,
+                pretty: format!("IPC adapter '{name}' ({program}) failed its handshake: {error}\n"),
+                json: json!({ "ok": false, "source": "ipc", "error": error.to_string() }),
+            },
+        });
+    }
+
+    if let Some(axis) = builtin_axis(name) {
+        return Ok(CommandOutput {
             exit_code: 0,
             pretty: format!(
-                "{} v{} (protocol v{})\n  capabilities: {}\n",
-                description.name,
-                description.version,
-                description.protocol_version,
-                description.capabilities.join(", "),
+                "{name}: built-in {axis} adapter (compiled in; nothing to handshake)\n"
             ),
-            json: serde_json::to_value(&description)?,
-        }),
-        Err(error) => Ok(CommandOutput {
-            exit_code: 1,
-            pretty: format!("could not describe adapter '{name}' ({program}): {error}\n"),
-            json: json!({ "adapter": name, "error": error.to_string() }),
-        }),
+            json: json!({ "ok": true, "source": "built-in", "axis": axis }),
+        });
     }
+
+    Ok(CommandOutput {
+        exit_code: 1,
+        pretty: format!(
+            "unknown provider '{name}' (not a built-in adapter, and no fraisier-adapter-{name} on PATH)\n"
+        ),
+        json: json!({ "ok": false, "error": "unknown provider" }),
+    })
 }
 
 /// `list`: enumerate every deploy recorded in the state store, with its current
@@ -1502,8 +1562,8 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapter_list, bootstrap, db_backup, db_migrate, db_reset, db_restore, deploy,
-        discover_adapters, health, init, list, rollback, scaffold, scaffold_install, ship, status,
+        bootstrap, db_backup, db_migrate, db_reset, db_restore, deploy, discover_adapters, health,
+        init, list, provider_test, providers, rollback, scaffold, scaffold_install, ship, status,
         validate_config, version_bump, version_show, webhook_server, ShipArgs,
     };
     use fraisier_core::single_host::DeployRecord;
@@ -1725,11 +1785,33 @@ url = "http://127.0.0.1:8080/health"
     }
 
     #[test]
-    fn adapter_list_runs_without_error() {
-        // Whatever is on PATH, the command must produce valid output.
-        let out = adapter_list();
+    fn providers_lists_built_in_adapters_per_axis() {
+        // Whatever is on PATH, every axis with its built-ins must be listed.
+        let out = providers();
         assert_eq!(out.exit_code, 0);
-        assert!(out.json.get("adapters").is_some());
+        let axes = out.json["axes"].as_array().expect("axes");
+        assert_eq!(axes.len(), 5, "all five axes listed");
+        assert!(
+            out.pretty.contains("confiture (built-in)"),
+            "{}",
+            out.pretty
+        );
+        assert!(out.pretty.contains("nginx (built-in)"), "{}", out.pretty);
+    }
+
+    #[tokio::test]
+    async fn provider_test_confirms_a_built_in_and_rejects_an_unknown() {
+        // A compiled-in adapter is reported present (no handshake).
+        let ok = provider_test("confiture").await.expect("built-in");
+        assert_eq!(ok.exit_code, 0, "pretty: {}", ok.pretty);
+        assert_eq!(ok.json["source"], serde_json::json!("built-in"));
+
+        // An unknown name (no built-in, no fraisier-adapter-* on PATH) fails.
+        let unknown = provider_test("definitely-not-a-real-provider-xyz")
+            .await
+            .expect("unknown");
+        assert_eq!(unknown.exit_code, 1);
+        assert_eq!(unknown.json["ok"], serde_json::json!(false));
     }
 
     #[tokio::test]

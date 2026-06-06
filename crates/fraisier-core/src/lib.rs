@@ -36,6 +36,7 @@
 //! embedder layer (see the crate README).
 
 pub mod adapter_axes;
+pub mod blue_green;
 pub mod multi_host;
 pub mod single_host;
 pub mod window_safety;

@@ -12,9 +12,12 @@
 //! The migration adapter returns a first-class
 //! [`PreflightReport::window_safe`](crate::adapter_axes::PreflightReport::window_safe):
 //! `Some(true)` iff **every** pending migration is forward-compatible for a
-//! two-version window — confiture folds *everything* into it (replica-unsafe ops,
-//! migrations it cannot classify, and reversibility/transactionality). The gate
-//! is therefore a single boolean read:
+//! two-version window — confiture folds the relevant concerns into it
+//! (replica-unsafe ops + migrations it cannot classify). It is purely about
+//! forward-compatibility: transactionality / reversibility are **not** consulted,
+//! because blue-green does no DB rollback (rollback is a traffic swap-back to
+//! still-hot blue), so a non-transactional-but-forward-compatible op like
+//! `CREATE INDEX CONCURRENTLY` is window-safe. The gate is a single boolean read:
 //!
 //! - `Some(true)` ⇒ **Safe**;
 //! - `Some(false)` ⇒ **Refused** (hard block before any instance or traffic change);
@@ -87,14 +90,13 @@ pub fn evaluate(has_preflight: bool, report: Option<&PreflightReport>) -> Window
             "no preflight report was produced; cannot certify the window".to_owned(),
         );
     };
-    // Reversibility/transactionality (the down path), independent of forward-compat.
-    if !report.ok {
-        return WindowSafety::Refused(
-            "preflight reported blocking issues (report.ok == false): the migration is not \
-             safe to deploy"
-                .to_owned(),
-        );
-    }
+    // `window_safe` is the SOLE window-safety verdict — purely forward-compatibility
+    // for the two-version window. Transactionality / reversibility are deliberately
+    // NOT consulted: blue-green does no DB rollback (rollback is a traffic swap-back
+    // to still-hot blue on the expanded schema), so a non-transactional but
+    // forward-compatible op like `CREATE INDEX CONCURRENTLY` is window-safe. A
+    // genuinely broken migration still fails at the `migrate` step (before any
+    // traffic moves), not here.
     match report.window_safe {
         Some(true) => WindowSafety::Safe,
         Some(false) => WindowSafety::Refused(
@@ -257,9 +259,19 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_refuses_a_non_ok_report() {
-        // A hard preflight error (e.g. non-reversible) blocks regardless of the verdict.
-        let verdict = evaluate(true, Some(&report(Some(true), false)));
-        assert!(matches!(verdict, WindowSafety::Refused(_)), "{verdict:?}");
+    fn window_safe_is_authoritative_over_report_ok() {
+        // A non-transactional but forward-compatible migration (e.g. CREATE INDEX
+        // CONCURRENTLY) may carry `ok == false` yet `window_safe == true`. The gate
+        // trusts the verdict: transactionality is not a window-safety concern
+        // (blue-green does no DB rollback), so it is allowed. The converse —
+        // `window_safe == false` — is refused regardless of `ok`.
+        assert_eq!(
+            evaluate(true, Some(&report(Some(true), false))),
+            WindowSafety::Safe
+        );
+        assert!(matches!(
+            evaluate(true, Some(&report(Some(false), true))),
+            WindowSafety::Refused(_)
+        ));
     }
 }

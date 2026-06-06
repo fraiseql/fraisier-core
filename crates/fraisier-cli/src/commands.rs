@@ -1063,6 +1063,7 @@ pub(crate) async fn deploy(
     .build()?;
 
     let outcome = plan.run(store).await?;
+    notify_deploy_failure(&config, &resolved.fraise, &resolved.environment, &outcome).await;
     let (exit_code, label, detail) = outcome_result(&outcome);
     Ok(CommandOutput {
         exit_code,
@@ -1099,6 +1100,7 @@ async fn run_multi_host(
     .build()?;
 
     let outcome = deploy.run(store).await?;
+    notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
     let (exit_code, label, detail) = outcome_result(&outcome);
     let mut pretty = render_warnings(report);
     let _ = writeln!(
@@ -2033,16 +2035,51 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
     }
 }
 
+/// Fire the configured `[schedule].notify` failure sink when a deploy did not
+/// commit. This is the unattended-failure path: a scheduled (operator-unwatched)
+/// deploy of a sick build rolls back **and** emits a notification, reusing the
+/// self-upgrade notify primitive. A committed deploy, or a config with no notify
+/// sink, fires nothing.
+async fn notify_deploy_failure(
+    config: &DeployConfig,
+    fraise: &str,
+    environment: &str,
+    outcome: &SagaOutcome,
+) {
+    use fraisier_self_upgrade::Notifier as _;
+    if matches!(outcome, SagaOutcome::Committed) {
+        return;
+    }
+    let Some(command) = config.schedule.as_ref().and_then(|s| s.notify.as_deref()) else {
+        return;
+    };
+    let (_, label, detail) = outcome_result(outcome);
+    let payload = fraisier_self_upgrade::FailurePayload {
+        event: "scheduled-deploy-failed".to_owned(),
+        failed: Some(format!("{fraise}/{environment}")),
+        restored: None,
+        reason: format!("{label}{detail}").trim().to_owned(),
+    };
+    fraisier_self_upgrade::ExecHookNotifier::new(command)
+        .with_context("FRAISIER_NOTIFY_FRAISE", fraise)
+        .with_context("FRAISIER_NOTIFY_ENVIRONMENT", environment)
+        .notify(&payload)
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         apply_exit, bootstrap, classify_source, db_backup, db_migrate, db_reset, db_restore,
-        deploy, discover_adapters, health, init, list, provider_test, providers, rollback,
-        scaffold, scaffold_install, scheduled_install, scheduled_list, scheduled_uninstall, ship,
-        status, sync, validate_config, version_bump, version_show, webhook_server, ShipArgs,
+        deploy, discover_adapters, health, init, list, notify_deploy_failure, provider_test,
+        providers, rollback, scaffold, scaffold_install, scheduled_install, scheduled_list,
+        scheduled_uninstall, ship, status, sync, validate_config, version_bump, version_show,
+        webhook_server, ShipArgs,
     };
+    use fraisier_config::DeployConfig;
     use fraisier_core::single_host::DeployRecord;
     use fraisier_saga::events::SagaState;
+    use fraisier_saga::saga::SagaOutcome;
     use fraisier_saga::state_store::{
         DeploymentState, FilesystemStateStore, FraiseKey, StateStore,
     };
@@ -3003,6 +3040,56 @@ current_revision = "true"
             "systemd dir clean after uninstall: {}",
             after.pretty
         );
+    }
+
+    #[tokio::test]
+    async fn notify_fires_on_a_rolled_back_deploy_and_is_silent_on_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("captured");
+        // A notify hook (no single quotes, so it embeds in a TOML literal string).
+        let command = format!(
+            "echo \"$FRAISIER_NOTIFY_EVENT $FRAISIER_NOTIFY_FRAISE\" > {}",
+            out.display()
+        );
+        let toml = format!("[schedule]\nnotify = '{command}'\n");
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+
+        // A rolled-back (sick) deploy fires the hook with a failure payload.
+        notify_deploy_failure(
+            &config,
+            "checkout",
+            "production",
+            &SagaOutcome::RolledBack {
+                failed_step: "health".to_owned(),
+                reason: "500".to_owned(),
+            },
+        )
+        .await;
+        let captured = std::fs::read_to_string(&out).expect("hook ran");
+        assert!(
+            captured.contains("scheduled-deploy-failed checkout"),
+            "payload via env: {captured}"
+        );
+
+        // A committed deploy notifies nothing (remove the file, re-run, stays gone).
+        std::fs::remove_file(&out).expect("rm");
+        notify_deploy_failure(&config, "checkout", "production", &SagaOutcome::Committed).await;
+        assert!(!out.exists(), "no notify on a committed deploy");
+    }
+
+    #[tokio::test]
+    async fn notify_is_a_noop_without_a_configured_sink() {
+        // No [schedule].notify: a rolled-back deploy must not panic or error.
+        let config = DeployConfig::from_toml_str("[deploy]\nname = \"x\"\n").expect("parses");
+        notify_deploy_failure(
+            &config,
+            "x",
+            "prod",
+            &SagaOutcome::PartialRollback {
+                reason: "boom".to_owned(),
+            },
+        )
+        .await;
     }
 
     #[tokio::test]

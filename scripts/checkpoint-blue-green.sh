@@ -70,6 +70,29 @@ FRAISIER="$REPO_ROOT/target/debug/fraisier"
 [ -x "$FRAISIER" ] || die "fraisier binary missing after build"
 ok "confiture: $(confiture --version 2>&1 | head -1)"
 
+# Does the installed confiture emit the first-class `window_safe` verdict
+# (confiture#154 Phase 3)? fraisier's blue-green gate requires it; an older
+# confiture returns no verdict and is refused (fail-safe). The full DROP/ADD/budget
+# gates need it; without it we assert only the fail-safe.
+WINDOW_SAFE=0
+probe_window_safe() {
+  local d="$1"
+  mkdir -p "$d"
+  printf 'CREATE TABLE _bg_probe (id int);\n' > "$d/001_p.up.sql"
+  printf 'DROP TABLE _bg_probe;\n' > "$d/001_p.down.sql"
+  CONFITURE_DATABASE_URL='postgresql://u@127.0.0.1:1/n?sslmode=disable' \
+    confiture migrate preflight --no-config --format json --output "$d/r.json" \
+    --migrations-dir "$d" >/dev/null 2>&1 || true
+  grep -q '"window_safe"' "$d/r.json" 2>/dev/null
+}
+if probe_window_safe "$WORK/probe"; then
+  WINDOW_SAFE=1
+  ok "confiture emits window_safe (Phase 3) — running the full window-safety gates"
+else
+  say "confiture has no window_safe verdict yet — asserting the FAIL-SAFE only"
+  say "      (the full DROP/ADD/budget gates validate once confiture#154 Phase 3 ships)"
+fi
+
 # A dummy local artifact (provision-green's stage step reads it; the deploy never
 # reaches a swap, so its contents are irrelevant).
 mkdir -p "$WORK/build" "$WORK/staging" "$WORK/state" "$WORK/migrations"
@@ -168,19 +191,32 @@ deploy() {
 # ==========================================================================
 say "BLUE-GREEN — preflight GA gates (real confiture + real Postgres)"
 
-# --- Gate 1: a DROP COLUMN migration is refused at the window-safety gate ----
-say "gate: migration not window-safe (DROP COLUMN) -> refused at preflight"
+# --- Gate 1: a non-window-safe migration is refused at the window-safety gate -
+# With Phase 3 confiture: DROP COLUMN -> window_safe = false. Without it: ANY
+# migration -> no verdict -> refused (fail-safe). Both cite `window_safe`.
+say "gate: migration not window-safe -> refused at preflight"
 reset_migrations; write_drop
 write_config ""   # no connection-budget probe
 deploy 'postgresql://unused@127.0.0.1:1/none?sslmode=disable'
 echo "$DEPLOY_OUT"
-[ "$DEPLOY_RC" -ne 0 ] || die "DROP COLUMN deploy must exit non-zero"
+[ "$DEPLOY_RC" -ne 0 ] || die "the deploy must exit non-zero"
 echo "$DEPLOY_OUT" | grep -q "step 'preflight'" \
-  || die "DROP COLUMN must be refused at the preflight step:\n$DEPLOY_OUT"
-echo "$DEPLOY_OUT" | grep -q "PFLIGHT_REPLICA_DROP_COLUMN" \
-  || die "the refusal must cite confiture's PFLIGHT_REPLICA_DROP_COLUMN finding:\n$DEPLOY_OUT"
+  || die "must be refused at the preflight step:\n$DEPLOY_OUT"
+echo "$DEPLOY_OUT" | grep -qi "window_safe" \
+  || die "the refusal must cite the window-safety verdict:\n$DEPLOY_OUT"
 [ ! -e "$WORK/current" ] || die "no artifact must be staged on a preflight refusal"
-ok "DROP COLUMN refused before any instance/traffic change (window-safety gate)"
+if [ "$WINDOW_SAFE" = 1 ]; then
+  ok "DROP COLUMN: confiture window_safe=false -> refused before any change"
+else
+  ok "no window_safe verdict -> refused (fail-safe; an un-upgraded confiture can't certify)"
+fi
+
+if [ "$WINDOW_SAFE" != 1 ]; then
+  say "SKIP the expand-allowed + connection-budget gates (need confiture Phase 3)"
+  say "      — these are proven hermetically in fraisier-core::{window_safety,connection_budget}"
+  say "BLUE-GREEN preflight gates: PASS (fail-safe verified; full gates pending Phase 3)"
+  exit 0
+fi
 
 # --- Gate 2: an ADD COLUMN expand migration passes the window-safety gate ----
 say "gate: ADD COLUMN expand -> passes window-safety (preflight cleared)"

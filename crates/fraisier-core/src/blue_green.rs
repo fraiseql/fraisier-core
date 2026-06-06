@@ -77,7 +77,6 @@ pub trait FleetOps: Send + Sync {
 /// The immutable per-run state shared by every step.
 struct BgShared {
     ctx: AdapterCtx,
-    migration_files: Vec<String>,
     green: TrafficTarget,
     hold: Duration,
     /// The green fleet's connection-pool size + the warn margin, for the pre-swap
@@ -147,7 +146,7 @@ impl BgShared {
     /// a probe is configured, if doubling connections would exhaust the shared DB.
     async fn run_preflight(&self) -> Result<(), SagaError> {
         if let WindowSafety::Refused(reason) =
-            window_safety::check(&*self.migration, &self.ctx, &self.migration_files).await
+            window_safety::check(&*self.migration, &self.ctx).await
         {
             return Err(Self::failed(
                 "preflight",
@@ -316,8 +315,6 @@ pub struct BlueGreenParams {
     pub environment: String,
     /// The adapter call context (carries `[migration]`/secrets/settings).
     pub ctx: AdapterCtx,
-    /// The pending migration basenames (for the window-safety can't-see check).
-    pub migration_files: Vec<String>,
     /// The green fleet's traffic target id.
     pub green: TrafficTarget,
     /// How long blue is kept hot while green is watched.
@@ -343,7 +340,6 @@ impl BlueGreenDeploy {
             environment: params.environment,
             shared: Arc::new(BgShared {
                 ctx: params.ctx,
-                migration_files: params.migration_files,
                 green: params.green,
                 hold: params.hold,
                 green_pool: params.green_pool,
@@ -381,8 +377,7 @@ mod tests {
     use super::{BlueGreenDeploy, BlueGreenParams, FleetOps};
     use crate::adapter_axes::{
         AdapterCtx, AdapterDescription, AdapterError, MigrationAdapter, MigrationOutcome,
-        PreflightIssue, PreflightReport, Revision, Severity, SwapToken, TrafficDirector,
-        TrafficTarget, VerifyReport,
+        PreflightReport, Revision, SwapToken, TrafficDirector, TrafficTarget, VerifyReport,
     };
     use async_trait::async_trait;
     use fraisier_saga::saga::SagaOutcome;
@@ -400,21 +395,17 @@ mod tests {
                 report: PreflightReport {
                     ok: true,
                     issues: Vec::new(),
-                    window_safe: None,
+                    window_safe: Some(true),
                 },
             })
         }
         fn unsafe_drop_column() -> Arc<Self> {
+            // confiture's typed verdict: NOT forward-compatible for a two-version window.
             Arc::new(Self {
                 report: PreflightReport {
-                    ok: true, // warn-by-default — the trap `ok` can't catch
-                    issues: vec![PreflightIssue {
-                        severity: Severity::Warning,
-                        code: "PFLIGHT_REPLICA_DROP_COLUMN".to_owned(),
-                        message: "DROP COLUMN".to_owned(),
-                        migration: None,
-                    }],
-                    window_safe: None,
+                    ok: true,
+                    issues: Vec::new(),
+                    window_safe: Some(false),
                 },
             })
         }
@@ -558,7 +549,6 @@ mod tests {
             fraise: "checkout".to_owned(),
             environment: "production".to_owned(),
             ctx: AdapterCtx::new("checkout", "production"),
-            migration_files: vec!["001_add_col.up.sql".to_owned()],
             green: TrafficTarget::new("green"),
             hold: Duration::from_millis(20),
             green_pool: 20,

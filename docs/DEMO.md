@@ -282,14 +282,18 @@ This proves the Confiture-on-Postgres pipeline and de-risks Part B; it is **not*
 ### Blue-green — `scripts/checkpoint-blue-green.sh` (window-safety + budget gates)
 
 Drives the real `fraisier deploy --strategy blue-green` through its **preflight
-gates** against **real confiture 0.22** and a **real Postgres**, end-to-end:
+gates** against **real confiture** and a **real Postgres**. The gate consumes
+confiture's first-class **`window_safe`** verdict (confiture#154 Phase 3) — one
+typed boolean, no code pattern-matching. The script probes for it:
 
-- a `DROP COLUMN` migration is **refused** at the window-safety gate (confiture
-  emits `PFLIGHT_REPLICA_DROP_COLUMN`, a *warning* with `ok==true` — the trap the
-  gate exists to catch), before any instance or traffic change;
-- an `ADD COLUMN` (nullable) **expand** migration clears the window-safety gate;
-- with green's pool larger than the shared DB's headroom, the pre-swap
-  **connection-budget** probe (a real `psql` query) refuses before the swap.
+- **with `window_safe` (Phase 3):** a `DROP COLUMN` migration → `window_safe =
+  false` → **refused** before any instance/traffic change; an `ADD COLUMN`
+  (nullable) **expand** → `window_safe = true` → clears the gate; and with green's
+  pool larger than the shared DB's headroom the pre-swap **connection-budget**
+  probe (a real `psql` query) refuses before the swap;
+- **without it (older confiture):** any migration → *no verdict* → **refused**
+  (the fail-safe — an un-upgraded confiture can't certify the window). The script
+  asserts this and notes the full gates need Phase 3.
 
 ```sh
 scripts/checkpoint-blue-green.sh                 # throwaway Postgres (cached *-alpine), zero spend
@@ -298,11 +302,7 @@ scripts/checkpoint-blue-green.sh --db-dsn <url>  # query an existing Postgres fo
 
 These are three of the four phase-07 §4 gates (window-safety refuse/allow +
 connection budget). The two **traffic-tier** gates run against a **real nginx** in
-the companion fixture below. **Note:** the bridge keys on
-confiture's `PFLIGHT_REPLICA_*` code prefix; per phase-07 §2 it is not *shippable*
-until confiture pins that namespace in its contract test (or a first-class
-`window_safe` verdict is adopted) — this checkpoint proves it *works today*, not
-that the contract is pinned.
+the companion fixture below.
 
 ### Blue-green traffic — `scripts/checkpoint-blue-green-traffic.sh` (real nginx)
 
@@ -326,4 +326,7 @@ scripts/checkpoint-blue-green-traffic.sh          # rootless podman + user syste
 The include dir is bind-mounted into the nginx container at its *same absolute
 path*, so fraisier's absolute swap symlink resolves identically inside. Together
 with `checkpoint-blue-green.sh`, all four phase-07 §4 gates are proven end-to-end
-against real infra.
+against real infra. (This fixture needs a confiture that emits `window_safe`
+(confiture#154 Phase 3) — the swap requires the window-safety gate to *pass*; it
+dies early with a clear message otherwise. The traffic-tier gates are also proven
+hermetically in `fraisier-core::blue_green`.)

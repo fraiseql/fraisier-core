@@ -73,6 +73,19 @@ say "building fraisier"
 FRAISIER="$REPO_ROOT/target/debug/fraisier"
 [ -x "$FRAISIER" ] || die "fraisier binary missing"
 
+# Blue-green requires confiture's first-class window_safe verdict (confiture#154
+# Phase 3) — the happy swap needs window-safety to PASS, which needs window_safe.
+# An older confiture returns no verdict and is refused, so the swap can't run.
+probe="$WORK/probe"; mkdir -p "$probe"
+printf 'CREATE TABLE _bg_probe (id int);\n' > "$probe/001_p.up.sql"
+printf 'DROP TABLE _bg_probe;\n' > "$probe/001_p.down.sql"
+CONFITURE_DATABASE_URL='postgresql://u@127.0.0.1:1/n?sslmode=disable' \
+  confiture migrate preflight --no-config --format json --output "$probe/r.json" \
+  --migrations-dir "$probe" >/dev/null 2>&1 || true
+grep -q '"window_safe"' "$probe/r.json" 2>/dev/null \
+  || die "this confiture does not emit window_safe — blue-green needs confiture#154 Phase 3 ($(confiture --version 2>&1 | head -1)). The traffic-tier gates are also proven hermetically in fraisier-core::blue_green."
+ok "confiture emits window_safe (Phase 3)"
+
 # --- the trivial blue/green app -------------------------------------------
 cat > "$WORK/app.py" <<'PY'
 import http.server, os, sys, time

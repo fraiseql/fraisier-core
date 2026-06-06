@@ -1148,7 +1148,6 @@ pub fn build_blue_green(
         fraise: fraise.clone(),
         environment: environment.clone(),
         ctx,
-        migration_files: list_migration_files(config),
         green: TrafficTarget::new(bg.green.as_deref().unwrap_or("green")),
         hold: Duration::from_secs(bg.hold_secs.unwrap_or(DEFAULT_HOLD_SECS)),
         green_pool: bg.green_pool.unwrap_or(0),
@@ -1160,26 +1159,6 @@ pub fn build_blue_green(
         environment,
         deploy: BlueGreenDeploy::new(params, migration, traffic, fleet, budget),
     })
-}
-
-/// The pending migration basenames under `[migration].migrations_path`, for the
-/// window-safety can't-see (`.py`) check. An unreadable / unset dir yields an
-/// empty list (the SQL-only presence rule still applies to whatever is found).
-fn list_migration_files(config: &DeployConfig) -> Vec<String> {
-    let Some(dir) = config
-        .migration
-        .as_ref()
-        .and_then(|m| m.migrations_path.as_ref())
-    else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str().map(ToOwned::to_owned))
-        .collect()
 }
 
 #[cfg(test)]

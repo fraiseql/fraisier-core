@@ -32,6 +32,7 @@ use fraisier_saga::saga::{Saga, SagaError, SagaOutcome, Step, StepContext};
 use fraisier_saga::state_store::StateStore;
 
 use crate::adapter_axes::{AdapterCtx, MigrationAdapter, TrafficDirector, TrafficTarget};
+use crate::connection_budget::{self, BudgetVerdict, ConnectionBudget};
 use crate::window_safety::{self, WindowSafety};
 
 /// Operations on the blue/green fleets the flow drives.
@@ -79,9 +80,15 @@ struct BgShared {
     migration_files: Vec<String>,
     green: TrafficTarget,
     hold: Duration,
+    /// The green fleet's connection-pool size + the warn margin, for the pre-swap
+    /// connection-budget check.
+    green_pool: u32,
+    budget_margin: u32,
     migration: Arc<dyn MigrationAdapter>,
     traffic: Arc<dyn TrafficDirector>,
     fleet: Arc<dyn FleetOps>,
+    /// Optional pre-swap connection-budget probe (None skips the check).
+    budget: Option<Arc<dyn ConnectionBudget>>,
 }
 
 /// The mutable run state threaded to every step by the saga engine.
@@ -136,15 +143,32 @@ impl BgShared {
     }
 
     /// The headline gate: refuse the whole deploy if confiture cannot certify the
-    /// migration window-safe — **before** any instance or traffic change.
+    /// migration window-safe — **before** any instance or traffic change — and, if
+    /// a probe is configured, if doubling connections would exhaust the shared DB.
     async fn run_preflight(&self) -> Result<(), SagaError> {
-        match window_safety::check(&*self.migration, &self.ctx, &self.migration_files).await {
-            WindowSafety::Safe => Ok(()),
-            WindowSafety::Refused(reason) => Err(Self::failed(
+        if let WindowSafety::Refused(reason) =
+            window_safety::check(&*self.migration, &self.ctx, &self.migration_files).await
+        {
+            return Err(Self::failed(
                 "preflight",
                 format!("blue-green refused: migration not window-safe: {reason}"),
-            )),
+            ));
         }
+        // The connection-budget edge: both fleets are live during the window.
+        if let Some(budget) = &self.budget {
+            let snapshot = budget
+                .probe(&self.ctx)
+                .await
+                .map_err(|e| Self::failed("preflight", format!("connection-budget probe: {e}")))?;
+            match connection_budget::evaluate(snapshot, self.green_pool, self.budget_margin) {
+                BudgetVerdict::Ok => {}
+                BudgetVerdict::Warn(message) => tracing::warn!("connection-budget: {message}"),
+                BudgetVerdict::Refuse(reason) => {
+                    return Err(Self::failed("preflight", reason));
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn run_provision_green(&self, runtime: &mut BgRuntime) -> Result<(), SagaError> {
@@ -298,6 +322,10 @@ pub struct BlueGreenParams {
     pub green: TrafficTarget,
     /// How long blue is kept hot while green is watched.
     pub hold: Duration,
+    /// The green fleet's connection-pool size (for the pre-swap budget check).
+    pub green_pool: u32,
+    /// The connection-budget warn margin below `max_connections`.
+    pub budget_margin: u32,
 }
 
 impl BlueGreenDeploy {
@@ -308,6 +336,7 @@ impl BlueGreenDeploy {
         migration: Arc<dyn MigrationAdapter>,
         traffic: Arc<dyn TrafficDirector>,
         fleet: Arc<dyn FleetOps>,
+        budget: Option<Arc<dyn ConnectionBudget>>,
     ) -> Self {
         Self {
             fraise: params.fraise,
@@ -317,9 +346,12 @@ impl BlueGreenDeploy {
                 migration_files: params.migration_files,
                 green: params.green,
                 hold: params.hold,
+                green_pool: params.green_pool,
+                budget_margin: params.budget_margin,
                 migration,
                 traffic,
                 fleet,
+                budget,
             }),
         }
     }
@@ -527,6 +559,8 @@ mod tests {
             migration_files: vec!["001_add_col.up.sql".to_owned()],
             green: TrafficTarget::new("green"),
             hold: Duration::from_millis(20),
+            green_pool: 20,
+            budget_margin: 10,
         }
     }
 
@@ -539,6 +573,7 @@ mod tests {
             FakeMigration::window_safe(),
             Arc::clone(&traffic) as Arc<dyn TrafficDirector>,
             Arc::clone(&fleet) as Arc<dyn FleetOps>,
+            None,
         );
         let outcome = bg.run(MemoryStateStore::new()).await.expect("run");
         assert!(matches!(outcome, SagaOutcome::Committed), "{outcome:?}");
@@ -561,6 +596,7 @@ mod tests {
             FakeMigration::window_safe(),
             Arc::clone(&traffic) as Arc<dyn TrafficDirector>,
             Arc::clone(&fleet) as Arc<dyn FleetOps>,
+            None,
         );
         let outcome = bg.run(MemoryStateStore::new()).await.expect("run");
         assert!(
@@ -593,6 +629,7 @@ mod tests {
             FakeMigration::window_safe(),
             Arc::clone(&traffic) as Arc<dyn TrafficDirector>,
             Arc::clone(&fleet) as Arc<dyn FleetOps>,
+            None,
         );
         let outcome = bg.run(MemoryStateStore::new()).await.expect("run");
         assert!(
@@ -617,6 +654,7 @@ mod tests {
             FakeMigration::unsafe_drop_column(),
             Arc::clone(&traffic) as Arc<dyn TrafficDirector>,
             Arc::clone(&fleet) as Arc<dyn FleetOps>,
+            None,
         );
         let outcome = bg.run(MemoryStateStore::new()).await.expect("run");
         assert!(
@@ -628,5 +666,46 @@ mod tests {
             fleet.log().is_empty(),
             "no instance change (green never provisioned)"
         );
+    }
+
+    /// A connection-budget probe reporting a fixed snapshot.
+    struct FakeBudget {
+        snapshot: crate::connection_budget::BudgetSnapshot,
+    }
+    #[async_trait]
+    impl crate::connection_budget::ConnectionBudget for FakeBudget {
+        async fn probe(
+            &self,
+            _ctx: &AdapterCtx,
+        ) -> Result<crate::connection_budget::BudgetSnapshot, String> {
+            Ok(self.snapshot)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_connection_budget_refuses_before_the_swap() {
+        // 90 in use + a 20-connection green pool = 110 > max_connections 100.
+        let traffic = FakeTraffic::blue();
+        let fleet = FakeFleet::new(true, true);
+        let budget = Arc::new(FakeBudget {
+            snapshot: crate::connection_budget::BudgetSnapshot {
+                max_connections: 100,
+                current: 90,
+            },
+        });
+        let bg = BlueGreenDeploy::new(
+            params(), // green_pool = 20, budget_margin = 10
+            FakeMigration::window_safe(),
+            Arc::clone(&traffic) as Arc<dyn TrafficDirector>,
+            Arc::clone(&fleet) as Arc<dyn FleetOps>,
+            Some(budget as Arc<dyn crate::connection_budget::ConnectionBudget>),
+        );
+        let outcome = bg.run(MemoryStateStore::new()).await.expect("run");
+        assert!(
+            matches!(outcome, SagaOutcome::RolledBack { ref failed_step, .. } if failed_step == "preflight"),
+            "{outcome:?}"
+        );
+        assert!(traffic.swaps().is_empty(), "refused before any swap");
+        assert!(fleet.log().is_empty(), "refused before any instance change");
     }
 }

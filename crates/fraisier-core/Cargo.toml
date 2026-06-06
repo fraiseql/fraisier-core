@@ -24,6 +24,8 @@ futures = { version = "0.3.31", default-features = false, features = ["std", "as
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.17"
+# A logging facade only (no runtime); used for advisory connection-budget warnings.
+tracing = "0.1.41"
 
 [dev-dependencies]
 tempfile = "3.27.0"

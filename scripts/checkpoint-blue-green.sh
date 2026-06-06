@@ -115,6 +115,14 @@ SQL
 ALTER TABLE notes DROP COLUMN label;
 SQL
 }
+write_concurrent_index() { # CREATE INDEX CONCURRENTLY — replica-safe, non-transactional
+  cat > "$WORK/migrations/002_idx.up.sql"  <<'SQL'
+CREATE INDEX CONCURRENTLY idx_notes_body ON notes (body);
+SQL
+  cat > "$WORK/migrations/002_idx.down.sql" <<'SQL'
+DROP INDEX CONCURRENTLY IF EXISTS idx_notes_body;
+SQL
+}
 write_drop() { # a DROP COLUMN — NOT forward-compatible for a two-version window
   cat > "$WORK/migrations/002_drop_body.up.sql"  <<'SQL'
 ALTER TABLE notes DROP COLUMN body;
@@ -231,6 +239,22 @@ fi
 echo "$DEPLOY_OUT" | grep -q "step 'provision-green'" \
   || die "expand should clear preflight and fail at provision-green (no green unit):\n$DEPLOY_OUT"
 ok "ADD COLUMN expand cleared the window-safety gate (failed later, at provision-green)"
+
+# --- Gate 2b: CREATE INDEX CONCURRENTLY (replica-safe, non-transactional) ----
+# The regression guard for confiture#154's Option 2: an online-safe but
+# non-transactional op must clear the window-safety gate (window_safe=true), not
+# be refused for being non-transactional.
+say "gate: CREATE INDEX CONCURRENTLY -> passes window-safety (Option 2)"
+reset_migrations; write_concurrent_index
+write_config ""
+deploy 'postgresql://unused@127.0.0.1:1/none?sslmode=disable'
+echo "$DEPLOY_OUT"
+if echo "$DEPLOY_OUT" | grep -q "step 'preflight'"; then
+  die "CREATE INDEX CONCURRENTLY must NOT be refused at preflight (it is window-safe):\n$DEPLOY_OUT"
+fi
+echo "$DEPLOY_OUT" | grep -q "step 'provision-green'" \
+  || die "CONCURRENTLY should clear preflight and fail at provision-green:\n$DEPLOY_OUT"
+ok "CREATE INDEX CONCURRENTLY cleared the window-safety gate (non-transactional ≠ unsafe)"
 
 # --- Gate 3: the connection-budget probe refuses before the swap -------------
 say "gate: connection budget (green pool > headroom) -> refused at preflight"

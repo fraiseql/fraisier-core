@@ -31,6 +31,14 @@
 //! this adapter (`docs/reference/fraisier-adapter-contract.md` in the Confiture
 //! repo, mirrored by its `tests/contract/test_fraisier_adapter_surface.py`).
 //!
+//! The **`window_safe`** capability (the first-class blue-green forward-compat
+//! verdict, parsed from the `preflight` report's top-level `window_safe` boolean)
+//! requires **Confiture ≥ 0.23.0** (fraiseql/confiture#154). The verdict is
+//! purely forward-compatibility for a two-version window — `false` for any
+//! replica-unsafe op or any migration the classifier cannot read (`.py`), `true`
+//! for online-safe ops including `CREATE INDEX CONCURRENTLY`. An older confiture
+//! omits the field; fraisier's blue-green gate then refuses (fail-safe).
+//!
 //! ## Double locking (intentional)
 //!
 //! Confiture takes its own DB-level migration lock; the saga takes a deploy-level
@@ -73,7 +81,14 @@ const PROGRAM_ENV: &str = "FRAISIER_CONFITURE_BIN";
 /// advertise a capability it cannot meaningfully fulfil (PRD review Decision 3).
 ///
 /// [`describe`]: MigrationAdapter::describe
-const CAPABILITIES: &[&str] = &["current_revision", "up", "down_to", "verify", "preflight"];
+const CAPABILITIES: &[&str] = &[
+    "current_revision",
+    "up",
+    "down_to",
+    "verify",
+    "preflight",
+    "window_safe",
+];
 
 /// Confiture's error code for a reachable-but-uninitialised database (tracking
 /// table absent). `migrate current` reports it with exit code 2; the adapter

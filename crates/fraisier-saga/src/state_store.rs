@@ -25,8 +25,10 @@
 //! - `record_state` is append-only; `current_state` returns the most recently
 //!   recorded state for the pair (ordering is by append order, not wall clock).
 
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
@@ -181,9 +183,9 @@ impl LockGuard {
         }
     }
 
-    /// A guard for a backend whose lock is a database row rather than an `flock`;
-    /// `release_lock` deletes the row.
-    #[cfg(feature = "sqlite")]
+    /// A guard for a backend whose lock is a logical lease — an in-memory set
+    /// entry or a database row — rather than an OS `flock`. `release_lock` drops
+    /// that lease (removes the entry / deletes the row).
     const fn lease(key: FraiseKey) -> Self {
         Self {
             key,
@@ -445,6 +447,162 @@ impl StateStore for FilesystemStateStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+/// A [`StateStore`] kept entirely in process memory — no filesystem, no
+/// database, and no extra dependencies (just `std` collections).
+///
+/// Always available (no Cargo feature). It is the zero-setup backend for
+/// **embedder unit tests** and single-process callers that need no durability:
+/// state lives in `std` maps behind a `Mutex`, and the per-pair lock is an entry
+/// in an in-memory set — the same non-blocking try-lock contract as the other
+/// backends, so a contended pair returns [`StateStoreError::Locked`].
+///
+/// Cloning shares one backing store (it is `Arc`-backed), so a clone handed to a
+/// [`Saga`](crate::saga::Saga) and the original observe the same state. Unlike
+/// [`FilesystemStateStore`], state does **not** survive the process or a fresh
+/// [`MemoryStateStore::new`] — two independently-constructed stores share
+/// nothing. A request/response server that must read deploy state across
+/// separate calls wants the filesystem (or `sqlite`) backend instead.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryStateStore {
+    inner: Arc<MemoryInner>,
+}
+
+/// The shared, mutex-guarded backing maps for a [`MemoryStateStore`]. Keyed by
+/// [`FraiseKey`]'s slug so distinct pairs never collide, mirroring the on-disk
+/// backend's per-pair file naming.
+#[derive(Debug, Default)]
+struct MemoryInner {
+    /// Slugs of the pairs whose lock is currently held.
+    locks: Mutex<HashSet<String>>,
+    /// Append-only lifecycle snapshots per pair (latest is last).
+    states: Mutex<HashMap<String, Vec<DeploymentState>>>,
+    /// Append-only event log per pair, in insertion order.
+    events: Mutex<HashMap<String, Vec<SagaEvent>>>,
+    /// Single last-writer-wins opaque snapshot per pair.
+    snapshots: Mutex<HashMap<String, serde_json::Value>>,
+}
+
+impl MemoryStateStore {
+    /// Create an empty in-memory state store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl StateStore for MemoryStateStore {
+    async fn acquire_lock(&self, key: &FraiseKey) -> Result<LockGuard, StateStoreError> {
+        // Bind the boolean so the guard is a statement-scoped temporary, dropped
+        // before the branches — the lock is never held across the return.
+        let acquired = self
+            .inner
+            .locks
+            .lock()
+            .expect("memory state store locks poisoned")
+            .insert(key.slug());
+        if acquired {
+            Ok(LockGuard::lease(key.clone()))
+        } else {
+            Err(StateStoreError::Locked {
+                key: key.to_string(),
+            })
+        }
+    }
+
+    async fn release_lock(&self, guard: LockGuard) -> Result<(), StateStoreError> {
+        self.inner
+            .locks
+            .lock()
+            .expect("memory state store locks poisoned")
+            .remove(&guard.key().slug());
+        Ok(())
+    }
+
+    async fn record_state(
+        &self,
+        key: &FraiseKey,
+        state: &DeploymentState,
+    ) -> Result<(), StateStoreError> {
+        self.inner
+            .states
+            .lock()
+            .expect("memory state store states poisoned")
+            .entry(key.slug())
+            .or_default()
+            .push(state.clone());
+        Ok(())
+    }
+
+    async fn current_state(
+        &self,
+        key: &FraiseKey,
+    ) -> Result<Option<DeploymentState>, StateStoreError> {
+        let latest = self
+            .inner
+            .states
+            .lock()
+            .expect("memory state store states poisoned")
+            .get(&key.slug())
+            .and_then(|states| states.last().cloned());
+        Ok(latest)
+    }
+
+    async fn record_event(
+        &self,
+        key: &FraiseKey,
+        event: &SagaEvent,
+    ) -> Result<(), StateStoreError> {
+        self.inner
+            .events
+            .lock()
+            .expect("memory state store events poisoned")
+            .entry(key.slug())
+            .or_default()
+            .push(event.clone());
+        Ok(())
+    }
+
+    async fn events(&self, key: &FraiseKey) -> Result<Vec<SagaEvent>, StateStoreError> {
+        let events = self
+            .inner
+            .events
+            .lock()
+            .expect("memory state store events poisoned")
+            .get(&key.slug())
+            .cloned()
+            .unwrap_or_default();
+        Ok(events)
+    }
+
+    async fn record_snapshot(
+        &self,
+        key: &FraiseKey,
+        snapshot: &serde_json::Value,
+    ) -> Result<(), StateStoreError> {
+        self.inner
+            .snapshots
+            .lock()
+            .expect("memory state store snapshots poisoned")
+            .insert(key.slug(), snapshot.clone());
+        Ok(())
+    }
+
+    async fn current_snapshot(
+        &self,
+        key: &FraiseKey,
+    ) -> Result<Option<serde_json::Value>, StateStoreError> {
+        let snapshot = self
+            .inner
+            .snapshots
+            .lock()
+            .expect("memory state store snapshots poisoned")
+            .get(&key.slug())
+            .cloned();
+        Ok(snapshot)
     }
 }
 
@@ -802,6 +960,51 @@ mod tests {
     async fn filesystem_snapshot_is_last_writer_wins() {
         let (_dir, store) = filesystem_store();
         snapshot_is_last_writer_wins(&store).await;
+    }
+
+    // --- in-memory backend (default-on): same harness, different backend ---
+
+    #[tokio::test]
+    async fn memory_persists_and_returns_latest_state() {
+        persists_and_returns_latest_state(&super::MemoryStateStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_lock_excludes_concurrent_acquisition() {
+        lock_excludes_concurrent_acquisition(&super::MemoryStateStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_records_and_reads_events_in_order() {
+        records_and_reads_events_in_order(&super::MemoryStateStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_snapshot_is_last_writer_wins() {
+        snapshot_is_last_writer_wins(&super::MemoryStateStore::new()).await;
+    }
+
+    /// Clones of a [`MemoryStateStore`] share one backing store — the property
+    /// embedders rely on to hand the same store to a saga and still read its
+    /// state afterwards (the in-memory analogue of two `FilesystemStateStore`
+    /// handles over the same root).
+    #[tokio::test]
+    async fn memory_clones_share_one_backing_store() {
+        let store = super::MemoryStateStore::new();
+        let clone = store.clone();
+        let key = FraiseKey::new("checkout", "production");
+
+        store
+            .record_state(&key, &DeploymentState::new(SagaState::Committed, None))
+            .await
+            .expect("record via the original handle");
+
+        let latest = clone
+            .current_state(&key)
+            .await
+            .expect("query via the clone")
+            .expect("the clone observes the original's write");
+        assert_eq!(latest.state, SagaState::Committed);
     }
 
     // --- sqlite backend instantiation (Cycle 1.4): same harness, different backend ---

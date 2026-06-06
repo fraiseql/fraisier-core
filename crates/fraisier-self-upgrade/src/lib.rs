@@ -23,9 +23,13 @@
 //! re-exec model is rejected: re-exec into a boots-then-dies binary kills the very
 //! process that would revert.
 
+mod apply;
+mod notify;
 mod source;
 mod swap;
 
+pub use apply::{apply, ApplyOutcome, Health, Plan, Supervisor};
+pub use notify::{FailurePayload, NoopNotifier, Notifier};
 pub use source::{Source, Verified};
 pub use swap::Layout;
 

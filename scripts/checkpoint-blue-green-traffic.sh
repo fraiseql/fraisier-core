@@ -98,7 +98,9 @@ class H(http.server.BaseHTTPRequestHandler):
         code = 500 if self._sick() else 200
         self.send_response(code); self.end_headers(); self.wfile.write(NAME.encode())
     def log_message(self, *a): pass
-http.server.HTTPServer(("127.0.0.1", PORT), H).serve_forever()
+# Threaded so concurrent probes (fraisier health polls + the checkpoint's curls)
+# don't serialize and intermittently time out.
+http.server.ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
 PY
 
 install_unit() { # <unit> <port> <name> <mode>
@@ -224,6 +226,17 @@ EOF
 }
 
 served() { curl -fsS --max-time 4 "http://127.0.0.1:$LB_PORT/" 2>/dev/null || echo DOWN; }
+# What a backend serves on its own port (decouples "is the fleet up" from routing).
+backend() { curl -fsS --max-time 4 "http://127.0.0.1:$1/" 2>/dev/null || echo DOWN; }
+# Poll until $1 is served (through the LB) or time out — absorbs startup/reload races.
+wait_served() { # <name>
+  for _ in $(seq 1 40); do [ "$(served)" = "$1" ] && return 0; sleep 0.25; done
+  return 1
+}
+wait_backend() { # <port> <name>
+  for _ in $(seq 1 40); do [ "$(backend "$1")" = "$2" ] && return 0; sleep 0.25; done
+  return 1
+}
 
 DEPLOY_OUT=""
 deploy() {
@@ -242,12 +255,14 @@ reset_state() { # <green-mode> <hold-secs>
   install_unit "$GREEN_UNIT" "$GREEN_PORT" green "$1"
   "${SC[@]}" restart "$BLUE_UNIT"
   "${SC[@]}" stop "$GREEN_UNIT" >/dev/null 2>&1 || true
+  # Confirm blue is actually serving on its own port BEFORE pointing nginx at it,
+  # so a reload never races blue's restart (the cause of intermittent 502s).
+  wait_backend "$BLUE_PORT" blue || die "blue did not come up on :$BLUE_PORT after restart"
   upstream_file blue "$BLUE_PORT"
   ln -sfn "$WORK/nginx/blue.upstream.conf" "$WORK/nginx/active.upstream"
   "$WORK/nginx-reload" -s reload >/dev/null 2>&1 || true
   rm -rf "$WORK/state"; mkdir -p "$WORK/state"
-  for _ in $(seq 1 20); do [ "$(served)" = blue ] && break; sleep 0.25; done
-  [ "$(served)" = blue ] || die "fixture not in the blue steady state (served: $(served))"
+  wait_served blue || die "fixture not in the blue steady state (served: $(served))"
 }
 
 # ==========================================================================
@@ -259,7 +274,7 @@ reset_state ok 4
 deploy
 echo "$DEPLOY_OUT"
 echo "$DEPLOY_OUT" | grep -q '"outcome": *"committed"' || die "happy deploy must commit:\n$DEPLOY_OUT"
-[ "$(served)" = green ] || die "nginx must serve green after the swap (served: $(served))"
+wait_served green || die "nginx must serve green after the swap (served: $(served))"
 "${SC[@]}" is-active "$BLUE_UNIT" >/dev/null 2>&1 && die "blue must be reaped after commit"
 ok "traffic swapped to green; deploy committed; blue reaped"
 
@@ -270,7 +285,7 @@ deploy
 echo "$DEPLOY_OUT"
 echo "$DEPLOY_OUT" | grep -q "step 'health-gate-green'" \
   || die "a sick green must fail at the pre-swap health gate:\n$DEPLOY_OUT"
-[ "$(served)" = blue ] || die "traffic must NOT move when green fails the gate (served: $(served))"
+wait_served blue || die "traffic must NOT move when green fails the gate (served: $(served))"
 ok "pre-swap health gate held the line; nginx still serves blue"
 
 # --- Gate: post-swap degradation -> swap back to still-hot blue ------------
@@ -280,7 +295,7 @@ deploy
 echo "$DEPLOY_OUT"
 echo "$DEPLOY_OUT" | grep -q "step 'hold'" \
   || die "a green that degrades in the hold window must fail at 'hold':\n$DEPLOY_OUT"
-[ "$(served)" = blue ] || die "traffic must swap back to blue (served: $(served))"
+wait_served blue || die "traffic must swap back to blue (served: $(served))"
 "${SC[@]}" is-active "$BLUE_UNIT" >/dev/null 2>&1 || die "blue must still be hot for the swap-back"
 ok "green degradation swapped traffic back to still-hot blue"
 

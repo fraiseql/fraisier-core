@@ -58,11 +58,11 @@ const PRESET_HEALTH_URL: &str = "http://{host.address}:8080/health";
 #[serde(deny_unknown_fields)]
 pub struct SpecqlPreset {
     /// The deployable's name. Required because `[deploy].name` is required and
-    /// reading it from the SpecQL `schema` is deferred past Phase 1.
+    /// it is not (yet) read from the SpecQL `schema`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// The path to the SpecQL `schema.toml`. Recorded but not read in Phase 1;
-    /// it only seeds the default `migrations_path`.
+    /// The path to the SpecQL `schema.toml`. Recorded but not parsed; it only
+    /// seeds the default `migrations_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<PathBuf>,
     /// The target environment.

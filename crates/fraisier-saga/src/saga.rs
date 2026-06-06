@@ -3,7 +3,7 @@
 //!
 //! # Stability
 //!
-//! Frozen as of the Phase 1 owner review: [`Saga`], [`Step`], [`StepContext`],
+//! Frozen as the stable v1.0 contract: [`Saga`], [`Step`], [`StepContext`],
 //! [`SagaError`], and [`SagaOutcome`] are the load-bearing engine API. The types
 //! expected to grow as the deploy layer matures ([`StepContext`], [`SagaError`],
 //! [`SagaOutcome`]) are `#[non_exhaustive]`, so that growth stays additive

@@ -1,7 +1,7 @@
 //! Single-host deploy composition (PRD §5.2) — the deploy layer over the saga.
 //!
 //! [`SingleHostDeploy`] wraps the four single-host adapter axes (artifact,
-//! migration, service, health — load-balancing is multi-host, Phase 4) into
+//! migration, service, health — load-balancing is a multi-host concern) into
 //! [`fraisier_saga`] [`Step`]s and drives them through the saga state machine:
 //!
 //! ```text

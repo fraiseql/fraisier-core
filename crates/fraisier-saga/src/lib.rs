@@ -12,9 +12,9 @@
 //! ## Stability
 //!
 //! The [`StateStore`] trait and the [`SagaEvent`] / [`SagaState`] types are
-//! designed against the hardest backend (Postgres with N writers, per PRD risk
-//! row). The saga *driver* API ([`Saga`], [`Step`], etc.) was stabilised at the
-//! Phase 1 owner review; types expected to grow are `#[non_exhaustive]`.
+//! designed against the hardest backend (Postgres with N writers). The saga
+//! *driver* API ([`Saga`], [`Step`], etc.) is the stable v1.0 contract; types
+//! expected to grow are `#[non_exhaustive]`.
 //!
 //! [`Saga`]: crate::saga::Saga
 //! [`Step`]: crate::saga::Step

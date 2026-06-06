@@ -19,7 +19,7 @@
 //! [`single_host`] composes the axes into the single-host deploy flow (PRD §5.2),
 //! wrapping each axis as a saga [`Step`](fraisier_saga::saga::Step) with atomic
 //! rollback and a durable release ledger for artifact rollback. [`multi_host`]
-//! reserves the multi-host plan shape (executed in Phase 4).
+//! composes the same axes into a rolling deploy across a fleet.
 //!
 //! ## The convergence rule
 //!

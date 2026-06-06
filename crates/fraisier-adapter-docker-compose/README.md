@@ -30,5 +30,5 @@ automatically, inferred from the program's basename.
 
 ## Integration testing
 
-Real Compose exercises need a Docker daemon and are deferred to Phase 5; the argv
-construction and `ps` parsing are unit-tested here on any platform.
+Real Compose exercises need a Docker daemon; the argv construction and `ps`
+parsing are unit-tested here on any platform.

@@ -1,8 +1,8 @@
-# Phase 1 demo — single-host deploy with atomic rollback
+# Demo — single-host deploy with atomic rollback
 
-This is the end-of-week-1 gut-check: the adapter axes, the saga engine, the config
-parser, and the CLI compose to deploy something real, and a failure rolls the
-whole thing back atomically.
+A reproducible walkthrough: the adapter axes, the saga engine, the config parser,
+and the CLI compose to deploy something real, and a failure rolls the whole thing
+back atomically.
 
 ## What is verified automatically (reproducible / CI-able)
 
@@ -195,7 +195,7 @@ fix under a *real* rate-limited systemd. The remote matrix store is the referenc
 sqlx adapter (SQLite); criterion 1 against real Postgres is Part B below (`--keep`,
 then drive your real config).
 
-### Multi-host IPC — `scripts/checkpoint-hetzner-multihost.sh` (§6.4 GA gate)
+### Multi-host IPC — `scripts/checkpoint-hetzner-multihost.sh` (multi-host GA gate)
 
 Runs the proven 2a/2b/2c multi-host rollout across **real Hetzner VMs over the
 real network** with the **IPC-over-SSH artifact** — the environmental delta the
@@ -283,31 +283,32 @@ This proves the Confiture-on-Postgres pipeline and de-risks Part B; it is **not*
 
 Drives the real `fraisier deploy --strategy blue-green` through its **preflight
 gates** against **real confiture** and a **real Postgres**. The gate consumes
-confiture's first-class **`window_safe`** verdict (confiture#154 Phase 3) — one
-typed boolean, no code pattern-matching. The script probes for it:
+confiture's first-class **`window_safe`** verdict — one typed boolean, no code
+pattern-matching (confiture ≥ 0.23.0). The script probes for it:
 
-- **with `window_safe` (Phase 3):** a `DROP COLUMN` migration → `window_safe =
-  false` → **refused** before any instance/traffic change; an `ADD COLUMN`
-  (nullable) **expand** → `window_safe = true` → clears the gate; and with green's
-  pool larger than the shared DB's headroom the pre-swap **connection-budget**
-  probe (a real `psql` query) refuses before the swap;
-- **without it (older confiture):** any migration → *no verdict* → **refused**
+- **with `window_safe`:** a `DROP COLUMN` migration → `window_safe = false` →
+  **refused** before any instance/traffic change; an `ADD COLUMN` (nullable)
+  **expand** → `window_safe = true` → clears the gate; a `CREATE INDEX
+  CONCURRENTLY` (replica-safe but non-transactional) also clears it; and with
+  green's pool larger than the shared DB's headroom the pre-swap
+  **connection-budget** probe (a real `psql` query) refuses before the swap;
+- **without it (confiture < 0.23):** any migration → *no verdict* → **refused**
   (the fail-safe — an un-upgraded confiture can't certify the window). The script
-  asserts this and notes the full gates need Phase 3.
+  asserts this fail-safe and skips the full gates.
 
 ```sh
 scripts/checkpoint-blue-green.sh                 # throwaway Postgres (cached *-alpine), zero spend
 scripts/checkpoint-blue-green.sh --db-dsn <url>  # query an existing Postgres for the budget gate
 ```
 
-These are three of the four phase-07 §4 gates (window-safety refuse/allow +
+These are three of the four blue-green gates (window-safety refuse/allow +
 connection budget). The two **traffic-tier** gates run against a **real nginx** in
 the companion fixture below.
 
 ### Blue-green traffic — `scripts/checkpoint-blue-green-traffic.sh` (real nginx)
 
-The traffic-tier half of §7.5: drives the real `fraisier deploy --strategy
-blue-green` through the full flow against a **real nginx** routing real HTTP
+The traffic-tier half of the blue-green gates: drives the real `fraisier deploy
+--strategy blue-green` through the full flow against a **real nginx** routing real HTTP
 between a blue and a green fleet (two `python3` HTTP servers as user systemd
 units), with a throwaway Postgres + confiture for the migrate/window-safety step.
 It asserts what nginx actually serves:
@@ -325,8 +326,8 @@ scripts/checkpoint-blue-green-traffic.sh          # rootless podman + user syste
 
 The include dir is bind-mounted into the nginx container at its *same absolute
 path*, so fraisier's absolute swap symlink resolves identically inside. Together
-with `checkpoint-blue-green.sh`, all four phase-07 §4 gates are proven end-to-end
+with `checkpoint-blue-green.sh`, all four blue-green gates are proven end-to-end
 against real infra. (This fixture needs a confiture that emits `window_safe`
-(confiture#154 Phase 3) — the swap requires the window-safety gate to *pass*; it
-dies early with a clear message otherwise. The traffic-tier gates are also proven
+(≥ 0.23.0) — the swap requires the window-safety gate to *pass*; it dies early
+with a clear message otherwise. The traffic-tier gates are also proven
 hermetically in `fraisier-core::blue_green`.)

@@ -2,7 +2,7 @@
 //!
 //! # Frozen
 //!
-//! These traits are **frozen** as of the Phase 1 owner review. Every argument and
+//! These traits are the **frozen** v1.0 adapter contract. Every argument and
 //! return type is `Serialize + Deserialize` so the in-process adapters and the
 //! IPC (JSON-RPC over stdio) adapters implement the *same* trait — the IPC
 //! adapter is just a transport (the convergence rule, see the crate docs).

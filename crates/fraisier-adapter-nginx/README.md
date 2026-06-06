@@ -5,7 +5,7 @@ The reference **load-balancer** adapter for fraisier — the `LbAdapter` axis (P
 `down` flag on the host's `server` directive and reloading nginx.
 
 The trait is public so others can add HAProxy / Caddy / cloud-LB adapters; this is
-the reference implementation Phase 4's multi-host rollout drives.
+the reference implementation the multi-host rollout drives.
 
 ## Configuration (`[lb]` table → `AdapterCtx.settings`)
 

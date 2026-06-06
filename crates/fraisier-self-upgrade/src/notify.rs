@@ -1,8 +1,8 @@
 //! The failure-notification primitive shared by the unattended flows.
 //!
 //! When an unattended action fails in a way an operator would want to know about
-//! — `self-upgrade apply` reverting or hitting a manual-intervention state, and
-//! (Phase 6.2) a scheduled deploy rolling back — fraisier fires a [`Notifier`].
+//! — `self-upgrade apply` reverting or hitting a manual-intervention state, or a
+//! scheduled deploy rolling back — fraisier fires a [`Notifier`].
 //! The contract is deliberately generic: a structured [`FailurePayload`], not an
 //! SMTP/email client (out of scope). The concrete sink is an exec-hook plus an
 //! OpenTelemetry span event.

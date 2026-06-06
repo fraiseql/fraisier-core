@@ -22,11 +22,11 @@ name = "fraiseql"     # the rc.d service name (the `service <name> …` argument
 Note the argument order: `service` takes the name *before* the command
 (`service nginx restart`), unlike `systemctl restart nginx`.
 
-Override the binary with `FRAISIER_SERVICE_BIN` (used in tests). Phase 1/2 run
-`service` locally; the `host` argument is reserved for the Phase 3+ SSH dispatch
-layer. The adapter assumes no privilege — escalation is the operator's concern.
+Override the binary with `FRAISIER_SERVICE_BIN` (used in tests). The adapter runs
+`service` locally; the `host` argument is reserved for the SSH dispatch layer. The
+adapter assumes no privilege — escalation is the operator's concern.
 
 ## Integration testing
 
-Real `service(8)` exercises need a FreeBSD host or jail and are deferred to
-Phase 5; the parsing and argv construction are unit-tested here on any platform.
+Real `service(8)` exercises need a FreeBSD host or jail; the parsing and argv
+construction are unit-tested here on any platform.

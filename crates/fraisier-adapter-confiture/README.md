@@ -22,7 +22,7 @@ and passes it to Confiture by setting **`CONFITURE_DATABASE_URL`** on the child
 process together with **`--no-config`**. Under `--no-config`, Confiture treats the
 environment as the *sole* DSN source, so a stray `db/environments/*.yaml` in the
 deploy workdir cannot shadow the operator's DSN. The DSN never appears in argv,
-honouring Phase 1 review Decision 5 and the in-process ⇄ IPC convergence rule.
+and the adapter honours the in-process ⇄ IPC convergence rule.
 
 ## Method mapping
 

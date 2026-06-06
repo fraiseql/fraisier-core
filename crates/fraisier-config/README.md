@@ -40,8 +40,8 @@ SpecQL:
 | hosts/lb  | populated only when `hosts` lists more than one address     |
 
 The preset takes a `name` field (the deployable's name) because `[deploy].name`
-is required and reading it from the SpecQL `schema.toml` is deferred to a later
-phase. The `schema` path is recorded but not read in Phase 1.
+is required and is not read from the SpecQL `schema.toml`. The `schema` path is
+recorded but not parsed.
 
 ## Example
 

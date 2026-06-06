@@ -1,4 +1,4 @@
-//! The validation pass (PRD §7.1, Cycle 1.12 REFACTOR).
+//! The configuration validation pass.
 //!
 //! Validation is deliberately a **separate pass** from parsing: a
 //! [`DeployConfig`] always parses into a structurally-valid value (every section
@@ -113,7 +113,7 @@ impl std::fmt::Display for ValidationReport {
 }
 
 impl DeployConfig {
-    /// Validate the config, returning every located issue (Cycle 1.12).
+    /// Validate the config, returning every located issue.
     ///
     /// This is pure: it performs no filesystem or network access. Call it after
     /// [`from_toml_str`](DeployConfig::from_toml_str); [`load`](DeployConfig::load)

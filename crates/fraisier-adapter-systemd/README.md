@@ -20,7 +20,6 @@ user = false              # optional: systemctl --user
   the unit reports `active`. `is-active` exits non-zero for an inactive unit, so
   the exit code is informational — only a spawn failure is an error.
 
-Override the binary with `FRAISIER_SYSTEMCTL_BIN` (used in tests). Phase 1 runs
-`systemctl` locally; the `host` argument is reserved for the Phase 3+ SSH
-dispatch layer. The adapter assumes no privilege — escalation is the operator's
-concern.
+Override the binary with `FRAISIER_SYSTEMCTL_BIN` (used in tests). The adapter
+runs `systemctl` locally; the `host` argument is reserved for the SSH dispatch
+layer. The adapter assumes no privilege — escalation is the operator's concern.

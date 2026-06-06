@@ -64,8 +64,8 @@ impl fmt::Display for SagaState {
 ///
 /// Events are both persisted (via the state store) and surfaced as OTel spans,
 /// so an operator's tracing backend reconstructs "what happened" (PRD §5.6).
-/// The enum is intentionally small in Phase 1 and will grow (adapter calls,
-/// rollback markers) as later cycles need it.
+/// The set of event kinds is intentionally small; it may grow (adapter calls,
+/// rollback markers) in future versions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SagaEvent {

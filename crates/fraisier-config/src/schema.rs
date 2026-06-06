@@ -118,7 +118,7 @@ pub struct DeploySection {
     pub strategy: Option<String>,
 }
 
-/// The `[hosts]` section. Parsed in Phase 1; *executed* in Phase 4.
+/// The `[hosts]` section — the multi-host fleet inventory.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostsSection {

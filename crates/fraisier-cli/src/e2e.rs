@@ -1,5 +1,5 @@
 //! End-to-end single-host deploy against the **real** adapters and local
-//! fixtures — the reproducible core of the Cycle 1.14 demo.
+//! fixtures — a reproducible, no-infrastructure demo of the deploy saga.
 //!
 //! It exercises the whole stack with no external services and no root:
 //! `ReleaseArtifact` really downloads + sha256-verifies + symlink-activates from a
@@ -8,8 +8,7 @@
 //! real units needs root — the honest stand-in). The narrative is two deploys:
 //! the first commits and records the durable release ledger; the second is forced
 //! to fail its health check after activation, and the saga rolls back by
-//! re-activating the **previously-active artifact** from the ledger — the exact
-//! mechanism the Cycle 1.13 trait-freeze escalation resolved.
+//! re-activating the **previously-active artifact** from the ledger.
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};

@@ -9,7 +9,9 @@ multi-step operation whose steps each have a forward action and a compensating
 action, persisting progress through a `StateStore` and rolling back in reverse
 on failure.
 
-> **Stability:** Phase 1 foundation. The public API is not yet frozen.
+> **Stability:** the saga driver API (`Saga`, `Step`, `StepContext`, `SagaError`,
+> `SagaOutcome`) is the frozen v1.0 contract; types expected to grow are
+> `#[non_exhaustive]`.
 
 ## License
 

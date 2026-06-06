@@ -1,8 +1,7 @@
 //! Capstone end-to-end: a `fraisier.toml` whose `[migration].adapter = "sqlx"`
 //! deploys through the **real `fraisier` binary**, discovering the external
 //! `fraisier-adapter-sqlx` reference adapter on `PATH` and driving it over the
-//! IPC protocol — the first time the IPC migration adapter runs inside the full
-//! saga deploy (Cycle 2.11).
+//! IPC protocol — the IPC migration adapter running inside the full saga deploy.
 //!
 //! Unlike the in-workspace `src/e2e.rs` (which builds a `SingleHostDeploy`
 //! directly from in-process adapters), this exercises the whole CLI path: argv →

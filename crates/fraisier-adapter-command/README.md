@@ -27,4 +27,4 @@ at construction.
 Declared secrets (`AdapterCtx::env_secrets`) are resolved and exported to the
 command's environment under their logical names (read `$DATABASE_URL`, etc.). The
 `up`/`down_to` target revision is exported as `$FRAISIER_TARGET`. Nothing secret
-is ever placed in argv — consistent with Phase 1 review Decision 5.
+is ever placed in argv.

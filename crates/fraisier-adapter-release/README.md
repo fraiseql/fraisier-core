@@ -38,5 +38,4 @@ adapter. No secret crosses the wire.
 cargo install --path crates/fraisier-adapter-release   # or copy the built binary
 ```
 
-A real `fraisier bootstrap` (Phase 3) will place it on each host; the multi-host
-fixture `scp`s it.
+`fraisier bootstrap` places it on each host; the multi-host fixture `scp`s it.

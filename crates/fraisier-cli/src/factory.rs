@@ -760,7 +760,7 @@ fn build_health(config: &DeployConfig) -> Result<Arc<dyn HealthAdapter>> {
     match config.health.as_ref().and_then(|h| h.adapter.as_deref()) {
         Some("http") => Ok(Arc::new(fraisier_adapter_http::HttpHealth::new())),
         Some(other) => bail!(
-            "health adapter '{other}' is not available in this build (only 'http' ships in Phase 1)"
+            "health adapter '{other}' is not available in this build (only 'http' is built in)"
         ),
         None => bail!("[health].adapter is required"),
     }

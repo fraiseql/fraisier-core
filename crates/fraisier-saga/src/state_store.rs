@@ -1065,7 +1065,7 @@ mod tests {
         assert_eq!(keys, vec![a, b], "both keys enumerated, no duplicates");
     }
 
-    // --- filesystem backend instantiation (Cycle 1.3) ---
+    // --- filesystem backend instantiation ---
 
     fn filesystem_store() -> (tempfile::TempDir, FilesystemStateStore) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1153,7 +1153,7 @@ mod tests {
         assert_eq!(latest.state, SagaState::Committed);
     }
 
-    // --- sqlite backend instantiation (Cycle 1.4): same harness, different backend ---
+    // --- sqlite backend instantiation: same harness, different backend ---
 
     #[cfg(feature = "sqlite")]
     async fn sqlite_store() -> (tempfile::TempDir, super::SqliteStateStore) {

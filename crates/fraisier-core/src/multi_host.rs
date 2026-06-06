@@ -70,9 +70,9 @@ use crate::adapter_axes::{
 
 /// One host in a multi-host deploy's inventory.
 ///
-/// `overrides` reserves per-host adapter-axis configuration (a canary host on a
-/// different artifact source, an LB segment with different drain semantics, …).
-/// Phase 1 only reserves the field; Phase 4 interprets it.
+/// `overrides` carries per-host adapter-axis configuration (a canary host on a
+/// different artifact source, an LB segment with different drain semantics, …),
+/// merged over the deploy-wide config.
 ///
 /// # Example
 /// ```
@@ -87,8 +87,8 @@ pub struct HostEntry {
     pub host: HostId,
     /// The address fraisier reaches it at (hostname or IP).
     pub address: String,
-    /// Per-host partial adapter config, merged over the deploy-wide config in
-    /// Phase 4. Keyed by axis name (`"artifact"`, `"lb"`, …).
+    /// Per-host partial adapter config, merged over the deploy-wide config.
+    /// Keyed by axis name (`"artifact"`, `"lb"`, …).
     #[serde(default)]
     pub overrides: BTreeMap<String, serde_json::Value>,
 }
@@ -1759,7 +1759,7 @@ mod tests {
         assert!(matches!(back, RolloutStrategy::Rolling(2)));
     }
 
-    // ----- Cycle 4.3: forced-failure rollback at each phase + PartialRollback ----
+    // ----- forced-failure rollback at each phase + PartialRollback ---------------
 
     #[tokio::test]
     async fn fetch_failure_rolls_back_without_touching_hosts_or_db() {
@@ -1941,7 +1941,7 @@ mod tests {
         );
     }
 
-    // ----- Cycle 4.4: VerifyGlobal -----------------------------------------------
+    // ----- VerifyGlobal ----------------------------------------------------------
 
     #[tokio::test]
     async fn global_verify_runs_once_after_the_rollout_and_reprobes_the_fleet() {

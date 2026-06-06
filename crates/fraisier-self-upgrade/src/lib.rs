@@ -27,11 +27,13 @@ mod apply;
 mod notify;
 mod source;
 mod swap;
+mod system;
 
 pub use apply::{apply, ApplyOutcome, Health, Plan, Supervisor};
-pub use notify::{ExecHookNotifier, FailurePayload, NoopNotifier, Notifier};
+pub use notify::{ExecHookNotifier, FailurePayload, NoopNotifier, Notifier, TracingNotifier};
 pub use source::{Source, Verified};
 pub use swap::Layout;
+pub use system::{systemd_available, HttpHealth, SystemctlSupervisor};
 
 /// A fetch/verify/IO failure that aborts an upgrade **before** any swap.
 #[derive(Debug, Clone, PartialEq, Eq)]

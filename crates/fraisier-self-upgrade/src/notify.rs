@@ -31,13 +31,37 @@ pub trait Notifier: Send + Sync {
     async fn notify(&self, payload: &FailurePayload);
 }
 
-/// A [`Notifier`] that does nothing — the default when no sink is configured.
+/// A [`Notifier`] that does nothing — the silent default for tests/embedding.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopNotifier;
 
 #[async_trait]
 impl Notifier for NoopNotifier {
     async fn notify(&self, _payload: &FailurePayload) {}
+}
+
+/// Emit the OTel/tracing span event for a failure (visible in logs without a
+/// collector). Shared by every real notifier.
+fn emit_event(payload: &FailurePayload) {
+    tracing::error!(
+        event = %payload.event,
+        failed = ?payload.failed,
+        restored = ?payload.restored,
+        reason = %payload.reason,
+        "fraisier unattended-failure notification"
+    );
+}
+
+/// A [`Notifier`] that emits only the OTel/tracing event — the default sink when
+/// no exec-hook command is configured (a failure is always at least observable).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TracingNotifier;
+
+#[async_trait]
+impl Notifier for TracingNotifier {
+    async fn notify(&self, payload: &FailurePayload) {
+        emit_event(payload);
+    }
 }
 
 /// The concrete failure sink: an operator-supplied exec hook plus an OTel event.
@@ -76,14 +100,7 @@ impl ExecHookNotifier {
 #[async_trait]
 impl Notifier for ExecHookNotifier {
     async fn notify(&self, payload: &FailurePayload) {
-        // The OTel span event (also visible in logs without a collector).
-        tracing::error!(
-            event = %payload.event,
-            failed = ?payload.failed,
-            restored = ?payload.restored,
-            reason = %payload.reason,
-            "fraisier unattended-failure notification"
-        );
+        emit_event(payload);
 
         let json = serde_json::to_string(payload).unwrap_or_default();
         let mut command = tokio::process::Command::new("sh");

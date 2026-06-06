@@ -66,6 +66,10 @@ enum Command {
     /// Run the signed-webhook deploy trigger server (socket-activated or standalone).
     WebhookServer(WebhookServerArgs),
 
+    /// Coordinated management of fraisier's own service (restart for now).
+    #[command(subcommand)]
+    SelfUpgrade(SelfUpgradeCommand),
+
     /// Back up the database to a custom-format archive (`pg_dump -Fc`).
     Backup(BackupArgs),
 
@@ -413,6 +417,23 @@ struct DbResetArgs {
     yes: bool,
 }
 
+#[derive(Debug, Subcommand)]
+enum SelfUpgradeCommand {
+    /// Coordinated restart of fraisier's own long-running unit (webhook server).
+    Restart(SelfUpgradeRestartArgs),
+}
+
+#[derive(Debug, Args)]
+struct SelfUpgradeRestartArgs {
+    /// The systemd unit to restart (fraisier's own service).
+    #[arg(long, default_value = "fraisier-webhook.service")]
+    unit: String,
+
+    /// Use the user systemd manager (`systemctl --user`).
+    #[arg(long)]
+    user: bool,
+}
+
 #[derive(Debug, Args)]
 struct ProviderTestArgs {
     /// The provider name: a built-in adapter, or an IPC adapter discovered on
@@ -490,6 +511,9 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         }
         Command::Providers => Ok(commands::providers()),
         Command::ProviderTest(args) => commands::provider_test(&args.name).await,
+        Command::SelfUpgrade(SelfUpgradeCommand::Restart(args)) => {
+            commands::self_upgrade_restart(&args.unit, args.user).await
+        }
         Command::Version(VersionCommand::Show(args)) => commands::version_show(&args.path),
         Command::Version(VersionCommand::Bump { level, project }) => {
             commands::version_bump(&project.path, (*level).into())

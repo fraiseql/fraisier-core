@@ -174,23 +174,36 @@ pub async fn acquire(addr: &str) -> std::io::Result<(TcpListener, ListenSource)>
     ))
 }
 
-/// Accept connections forever, serving each with [`serve_connection`].
+/// Accept connections, serving each with [`serve_connection`], until `SIGTERM`.
 ///
 /// Connections are handled one at a time: webhook volume is low and deploys
 /// serialize on the state-store lock anyway, so sequential handling keeps the
-/// server simple and avoids unbounded concurrent deploys. Returns only if
-/// accepting a connection fails.
+/// server simple and avoids unbounded concurrent deploys.
+///
+/// On `SIGTERM` it shuts down **gracefully**: an in-flight request runs to
+/// completion (it is awaited outside the accept/signal select), then `serve`
+/// returns `Ok(())`. This is what makes `systemctl restart` a *coordinated*
+/// restart — the request being processed is not cut off mid-deploy.
 ///
 /// # Errors
-/// [`std::io::Error`] from [`TcpListener::accept`].
+/// [`std::io::Error`] from installing the signal handler or from
+/// [`TcpListener::accept`].
 pub async fn serve(
     listener: TcpListener,
     config: &ServerConfig,
     handler: &dyn WebhookHandler,
 ) -> std::io::Result<()> {
+    let mut shutdown = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
-        let (stream, _peer) = listener.accept().await?;
-        let _ = serve_connection(stream, config, handler, now_unix()).await;
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _peer) = accepted?;
+                // Awaited here, not inside the select, so a SIGTERM that arrives
+                // mid-request is latched and observed only after it completes.
+                let _ = serve_connection(stream, config, handler, now_unix()).await;
+            }
+            _ = shutdown.recv() => return Ok(()),
+        }
     }
 }
 

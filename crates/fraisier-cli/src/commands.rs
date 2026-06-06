@@ -1542,6 +1542,44 @@ pub(crate) async fn webhook_server(
     })
 }
 
+/// Build the `systemctl [--user] restart <unit>` command (kept separate so its
+/// construction is unit-testable without a systemd manager present).
+fn systemctl_restart_command(unit: &str, user: bool) -> std::process::Command {
+    let mut command = std::process::Command::new("systemctl");
+    if user {
+        command.arg("--user");
+    }
+    command.arg("restart").arg(unit);
+    command
+}
+
+/// `self-upgrade restart`: a coordinated restart of fraisier's own long-running
+/// unit (the webhook server) via systemd, so an externally-updated binary takes
+/// effect. The restart is graceful: on `SIGTERM` the server drains its in-flight
+/// request before exiting (see `fraisier_webhook::serve`), then systemd starts
+/// the new binary. Binary fetch/verify/swap is a separate, still-to-come
+/// `self-upgrade apply` (it needs keep-old + post-restart health-check + revert).
+pub(crate) async fn self_upgrade_restart(unit: &str, user: bool) -> Result<CommandOutput> {
+    let output = tokio::process::Command::from(systemctl_restart_command(unit, user))
+        .output()
+        .await
+        .with_context(|| format!("running systemctl restart {unit}"))?;
+    if output.status.success() {
+        Ok(CommandOutput {
+            exit_code: 0,
+            pretty: format!("restarted {unit} (coordinated)\n"),
+            json: json!({ "ok": true, "unit": unit }),
+        })
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok(CommandOutput {
+            exit_code: 1,
+            pretty: format!("systemctl restart {unit} failed:\n{}\n", stderr.trim()),
+            json: json!({ "ok": false, "unit": unit, "stderr": stderr.trim() }),
+        })
+    }
+}
+
 /// Map a saga outcome onto `(exit code, label, detail)` for both deploy paths.
 fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
     match outcome {
@@ -2322,6 +2360,25 @@ current_revision = "true"
             "pretty: {}",
             out.pretty
         );
+    }
+
+    #[test]
+    fn systemctl_restart_command_is_built_correctly() {
+        use super::systemctl_restart_command;
+        let system = systemctl_restart_command("fraisier-webhook.service", false);
+        assert_eq!(system.get_program().to_string_lossy(), "systemctl");
+        let args: Vec<String> = system
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["restart", "fraisier-webhook.service"]);
+
+        let user = systemctl_restart_command("u.service", true);
+        let args: Vec<String> = user
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["--user", "restart", "u.service"]);
     }
 
     #[tokio::test]

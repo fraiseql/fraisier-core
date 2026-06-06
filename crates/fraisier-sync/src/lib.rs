@@ -60,10 +60,13 @@ pub enum PushOutcome {
     /// The remote already held this exact state — nothing to do.
     UpToDate,
     /// The push was rejected as a non-fast-forward: the remote diverged. The
-    /// state was **not** forced; `remote_head` is the remote's current tip.
-    /// Reconcile with [`pull_state`], then push again.
+    /// state was **not** forced. `local_head` is the commit we tried to push and
+    /// `remote_head` is the remote's current tip — the divergence, for the caller
+    /// to surface. Reconcile with [`pull_state`], then push again.
     Conflict {
-        /// The remote ref's current commit.
+        /// The local commit that was rejected (what we tried to push).
+        local_head: String,
+        /// The remote ref's current commit (what the remote already has).
         remote_head: String,
     },
 }
@@ -110,7 +113,7 @@ pub fn push_state(
         "update-ref",
     )?;
 
-    push(sync_dir, remote, &refname)
+    push(sync_dir, remote, &refname, &commit)
 }
 
 /// Fetch the remote state for `key` into the local sync base (accepting the
@@ -256,11 +259,24 @@ fn commit_tree(
     Ok(String::from_utf8_lossy(&out).trim().to_owned())
 }
 
+/// The argv for a plain, **non-forcing** push. Factored out and locked by a test
+/// so a forcing flag or `+refspec` can never slip in: a divergent push must
+/// always surface as a [`PushOutcome::Conflict`], never clobber the remote.
+const fn push_args<'a>(remote: &'a str, refname: &'a str) -> [&'a str; 3] {
+    ["push", remote, refname]
+}
+
 /// Push `refname` to `remote`, mapping a non-fast-forward rejection onto
-/// [`PushOutcome::Conflict`] (never forcing).
-fn push(sync_dir: &Path, remote: &str, refname: &str) -> Result<PushOutcome, SyncError> {
+/// [`PushOutcome::Conflict`] (never forcing). `local_head` is the commit being
+/// pushed, surfaced in the conflict so the caller can show the divergence.
+fn push(
+    sync_dir: &Path,
+    remote: &str,
+    refname: &str,
+    local_head: &str,
+) -> Result<PushOutcome, SyncError> {
     let mut command = base_git(Some(sync_dir));
-    command.args(["push", remote, refname]);
+    command.args(push_args(remote, refname));
     let output = command.output().map_err(SyncError::Spawn)?;
     let combined = format!(
         "{}{}",
@@ -277,7 +293,10 @@ fn push(sync_dir: &Path, remote: &str, refname: &str) -> Result<PushOutcome, Syn
         && (combined.contains("non-fast-forward") || combined.contains("fetch first"))
     {
         let remote_head = ls_remote_head(remote, refname)?.unwrap_or_default();
-        return Ok(PushOutcome::Conflict { remote_head });
+        return Ok(PushOutcome::Conflict {
+            local_head: local_head.to_owned(),
+            remote_head,
+        });
     }
     Err(SyncError::Git {
         op: "push".to_owned(),
@@ -411,14 +430,47 @@ mod tests {
         // B, with an independent sync base (root commit, no shared ancestor),
         // tries to push — git rejects the non-fast-forward; B does NOT clobber A.
         let outcome = push_state(&operator_b, &remote, key, r#"{"rev":"b"}"#).expect("b push");
-        assert!(
-            matches!(outcome, PushOutcome::Conflict { .. }),
-            "{outcome:?}"
-        );
+        let PushOutcome::Conflict {
+            local_head,
+            remote_head,
+        } = outcome
+        else {
+            panic!("expected a Conflict, got {outcome:?}");
+        };
+        // The divergence is surfaced: B's rejected commit vs the remote's tip,
+        // and they genuinely differ (no shared ancestor).
+        assert!(!local_head.is_empty(), "local head surfaced");
+        assert!(!remote_head.is_empty(), "remote head surfaced");
+        assert_ne!(local_head, remote_head, "the heads diverge");
 
         // A's state still stands on the remote.
         let still = pull_state(&tmp.path().join("c.git"), &remote, key).expect("pull");
         assert_eq!(still.as_deref(), Some(r#"{"rev":"a"}"#));
+    }
+
+    #[test]
+    fn push_uses_a_plain_non_forcing_push() {
+        // The argv is exactly `push <remote> <ref>` — no `--force`, no `+refspec`.
+        assert_eq!(
+            super::push_args("origin", "refs/fraisier/sync/x/y"),
+            ["push", "origin", "refs/fraisier/sync/x/y"]
+        );
+    }
+
+    #[test]
+    fn no_force_push_path_exists_in_production_source() {
+        // Locks the absence: a divergent push must always surface as a Conflict.
+        // Scan only the production half (before the test module, which necessarily
+        // names the flag) and build the needle at runtime so this test's own text
+        // can never match. The sole force in the crate is the `+refspec` *fetch* in
+        // pull_state (accept-remote into the LOCAL base), never a push to the remote.
+        let src = include_str!("lib.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let force_flag = format!("--{}", "force");
+        assert!(
+            !production.contains(&force_flag),
+            "no force-push flag may appear in production sync code"
+        );
     }
 
     #[test]

@@ -90,6 +90,10 @@ pub struct DeployConfig {
     /// (experimental). Absent when state is not shared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncSection>,
+    /// The `[blue_green]` section: the green fleet + swap knobs, used when
+    /// `[deploy].strategy = "blue-green"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blue_green: Option<BlueGreenSection>,
     /// The `[specql]` preset. Present only in the *unexpanded* form; both
     /// [`from_toml_str`](DeployConfig::from_toml_str) and
     /// [`load`](DeployConfig::load) consume it and leave this `None`.
@@ -107,6 +111,11 @@ pub struct DeploySection {
     /// The target environment (e.g. `"production"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+    /// The deploy strategy. Absent / `"rolling"` keeps the existing single- or
+    /// multi-host behavior; `"blue-green"` selects the HTTP-tier traffic-swap flow
+    /// (requires `[blue_green]` + `[lb]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
 }
 
 /// The `[hosts]` section. Parsed in Phase 1; *executed* in Phase 4.
@@ -350,6 +359,50 @@ pub struct LbSection {
     /// `nginx`: the upstream block to manage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<String>,
+    /// `nginx` (blue-green): the directory holding the per-target upstream
+    /// includes + the `active.upstream` symlink the `TrafficDirector` repoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_dir: Option<PathBuf>,
+}
+
+/// The `[blue_green]` section: the green fleet's coordinates + the swap knobs for
+/// the HTTP-tier blue-green strategy (`[deploy].strategy = "blue-green"`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlueGreenSection {
+    /// The blue (currently-live) traffic target id. Defaults to `"blue"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blue: Option<String>,
+    /// The green (new) traffic target id. Defaults to `"green"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub green: Option<String>,
+    /// Green's systemd unit (the second app instance to start + health-gate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub green_unit: Option<String>,
+    /// Green's health-probe URL (the pre-swap gate + the hold-window watch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub green_health_url: Option<String>,
+    /// Green's artifact `active_path` symlink (defaults to the `[artifact]` one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub green_active_path: Option<PathBuf>,
+    /// Green's artifact `staging_dir` (defaults to the `[artifact]` one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub green_staging_dir: Option<PathBuf>,
+    /// The blue fleet's backend `server`s for the nginx upstream include.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blue_servers: Vec<String>,
+    /// The green fleet's backend `server`s for the nginx upstream include.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub green_servers: Vec<String>,
+    /// How long blue is kept hot while green is watched, in seconds (default 30).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_secs: Option<u64>,
+    /// Green's connection-pool size, for the pre-swap connection-budget check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub green_pool: Option<u32>,
+    /// The connection-budget warn margin below `max_connections` (default 10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_margin: Option<u32>,
 }
 
 impl DeployConfig {

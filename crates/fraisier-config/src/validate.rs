@@ -131,6 +131,7 @@ impl DeployConfig {
         validate_webhook(self, &mut report);
         validate_schedule(self, &mut report);
         validate_sync(self, &mut report);
+        validate_blue_green(self, &mut report);
         report
     }
 
@@ -506,6 +507,75 @@ fn validate_schedule(cfg: &DeployConfig, report: &mut ValidationReport) {
     }
 }
 
+fn validate_blue_green(cfg: &DeployConfig, report: &mut ValidationReport) {
+    match cfg.deploy.as_ref().and_then(|d| d.strategy.as_deref()) {
+        None => return, // default single/rolling behavior
+        Some("blue-green") => {}
+        Some(other) => {
+            report.error(
+                "deploy.strategy",
+                format!("unknown deploy strategy '{other}' (expected: blue-green)"),
+            );
+            return;
+        }
+    }
+
+    // Blue-green needs the green fleet's coordinates, the nginx traffic director,
+    // and a migration adapter (for the window-safety gate).
+    let Some(bg) = &cfg.blue_green else {
+        report.error(
+            "blue_green",
+            "[deploy].strategy = \"blue-green\" requires a [blue_green] section",
+        );
+        return;
+    };
+    if !is_set(bg.green_unit.as_ref()) {
+        report.error(
+            "blue_green.green_unit",
+            "blue-green requires green_unit (the green fleet's service unit)",
+        );
+    }
+    if !is_set(bg.green_health_url.as_ref()) {
+        report.error(
+            "blue_green.green_health_url",
+            "blue-green requires green_health_url (green's pre-swap health gate)",
+        );
+    }
+    if bg.green_servers.is_empty() {
+        report.error(
+            "blue_green.green_servers",
+            "blue-green requires green_servers (green's nginx upstream backends)",
+        );
+    }
+    match &cfg.lb {
+        Some(lb) if lb.adapter.as_deref() == Some("nginx") => {
+            if !is_set(lb.upstream.as_ref()) {
+                report.error("lb.upstream", "blue-green requires [lb].upstream");
+            }
+            if lb.include_dir.is_none() {
+                report.error(
+                    "lb.include_dir",
+                    "blue-green requires [lb].include_dir (the traffic-swap include dir)",
+                );
+            }
+        }
+        _ => report.error(
+            "lb.adapter",
+            "blue-green requires an [lb] section with adapter = \"nginx\" (the traffic director)",
+        ),
+    }
+    if cfg
+        .migration
+        .as_ref()
+        .is_none_or(|m| !is_set(m.adapter.as_ref()))
+    {
+        report.error(
+            "migration.adapter",
+            "blue-green requires a [migration] adapter for the window-safety gate",
+        );
+    }
+}
+
 fn validate_lb(cfg: &DeployConfig, report: &mut ValidationReport) {
     let Some(lb) = &cfg.lb else {
         return; // optional
@@ -514,8 +584,13 @@ fn validate_lb(cfg: &DeployConfig, report: &mut ValidationReport) {
         report.error("lb.adapter", "[lb].adapter is required");
     }
     if lb.adapter.as_deref() == Some("nginx") {
-        if lb.config_path.is_none() {
-            report.error("lb.config_path", "the nginx adapter requires config_path");
+        // Rolling drains rewrite `config_path`; blue-green swaps `include_dir`.
+        // One of them is required (the strategy-specific validator pins which).
+        if lb.config_path.is_none() && lb.include_dir.is_none() {
+            report.error(
+                "lb.config_path",
+                "the nginx adapter requires config_path (rolling) or include_dir (blue-green)",
+            );
         }
         if !is_set(lb.upstream.as_ref()) {
             report.error("lb.upstream", "the nginx adapter requires upstream");

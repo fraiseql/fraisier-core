@@ -85,6 +85,7 @@ impl SpecqlPreset {
             deploy: Some(DeploySection {
                 name: name.clone(),
                 environment: self.environment.clone(),
+                strategy: None,
             }),
             hosts: multi_host.then(|| self.host_defaults()),
             artifact: Some(ArtifactSection {
@@ -114,6 +115,7 @@ impl SpecqlPreset {
             webhook: None,
             schedule: None,
             sync: None,
+            blue_green: None,
             specql: None,
         }
     }
@@ -154,6 +156,7 @@ impl SpecqlPreset {
             adapter: Some(PRESET_LB_ADAPTER.to_owned()),
             config_path: Some(PathBuf::from(format!("/etc/nginx/sites-available/{name}"))),
             upstream: Some(format!("{name}_upstream")),
+            include_dir: None,
         }
     }
 }
@@ -188,6 +191,7 @@ impl Overlay for DeploySection {
         Self {
             name: prefer(self.name, over.name),
             environment: prefer(self.environment, over.environment),
+            strategy: prefer(self.strategy, over.strategy),
         }
     }
 }
@@ -277,6 +281,7 @@ impl Overlay for LbSection {
             adapter: prefer(self.adapter, over.adapter),
             config_path: prefer(self.config_path, over.config_path),
             upstream: prefer(self.upstream, over.upstream),
+            include_dir: prefer(self.include_dir, over.include_dir),
         }
     }
 }
@@ -301,6 +306,8 @@ impl DeployConfig {
             schedule: prefer(base.schedule, self.schedule),
             // The preset never emits [sync]; an author-supplied one wins.
             sync: prefer(base.sync, self.sync),
+            // The preset never emits [blue_green]; an author-supplied one wins.
+            blue_green: prefer(base.blue_green, self.blue_green),
             specql: None,
         }
     }

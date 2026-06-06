@@ -73,8 +73,8 @@ mod validate;
 pub use error::ConfigError;
 pub use preset::SpecqlPreset;
 pub use schema::{
-    ArtifactSection, DeployConfig, DeploySection, HealthSection, HostSpec, HostsSection, LbSection,
-    MigrationSection, ScheduleSection, ServiceSection, SshSection,
+    ArtifactSection, BlueGreenSection, DeployConfig, DeploySection, HealthSection, HostSpec,
+    HostsSection, LbSection, MigrationSection, ScheduleSection, ServiceSection, SshSection,
 };
 pub use validate::{ValidationIssue, ValidationReport};
 

@@ -636,6 +636,76 @@ fn unattended_deploy_requires_the_optin_and_a_notify_sink() {
     assert!(report.ok(), "opted-in unattended deploy is valid: {report}");
 }
 
+const BLUE_GREEN: &str = r#"
+[deploy]
+name = "checkout"
+environment = "production"
+strategy = "blue-green"
+
+[artifact]
+source = "local"
+path = "/srv/checkout/build"
+active_path = "/srv/checkout/current"
+
+[migration]
+adapter = "command"
+
+[service]
+adapter = "systemd"
+unit = "checkout.service"
+
+[health]
+adapter = "http"
+url = "http://127.0.0.1:8080/health"
+
+[lb]
+adapter = "nginx"
+upstream = "checkout_upstream"
+include_dir = "/etc/nginx/fraisier"
+
+[blue_green]
+green_unit = "checkout-green.service"
+green_health_url = "http://127.0.0.1:8081/healthz"
+green_servers = ["127.0.0.1:8081"]
+blue_servers = ["127.0.0.1:8080"]
+hold_secs = 30
+green_pool = 20
+connection_margin = 10
+"#;
+
+#[test]
+fn blue_green_config_validates_clean() {
+    let report = DeployConfig::from_toml_str(BLUE_GREEN)
+        .expect("parses")
+        .validate();
+    assert!(report.ok(), "fully-specified blue-green is valid: {report}");
+}
+
+#[test]
+fn blue_green_requires_its_section_and_lb() {
+    // strategy = blue-green but no [blue_green] / [lb].include_dir.
+    let toml = BLUE_GREEN
+        .replace("include_dir = \"/etc/nginx/fraisier\"\n", "")
+        .replace(
+            "[blue_green]\ngreen_unit = \"checkout-green.service\"\n",
+            "[blue_green]\n",
+        );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "blue_green.green_unit"), "{report}");
+    assert!(has_error(&report, "lb.include_dir"), "{report}");
+}
+
+#[test]
+fn an_unknown_deploy_strategy_is_rejected() {
+    let toml = BLUE_GREEN.replace("strategy = \"blue-green\"", "strategy = \"canary\"");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "deploy.strategy"), "{report}");
+}
+
 #[test]
 fn the_old_on_calendar_key_no_longer_parses() {
     // The pre-GA breaking rename: `on_calendar` is gone (renamed on_calendar_raw).

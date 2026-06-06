@@ -16,10 +16,9 @@ It ships three ways:
   workflows over the same engine),
 - an **adapter protocol** you can implement in any language over JSON-RPC.
 
-> **Status: pre-release (`1.0.0-alpha.1`).** The engine and adapter contracts are
+> **Status: pre-release (`1.0.0-beta.1`).** The engine and adapter contracts are
 > frozen for v1.0 and exercised end-to-end against real infrastructure (real
-> Postgres + confiture, real systemd, real nginx, real multi-host over SSH). Not
-> yet published to crates.io.
+> Postgres + confiture, real systemd, real nginx, real multi-host over SSH).
 
 ---
 
@@ -62,6 +61,9 @@ with each step's compensation registered as it completes.
 ## Quickstart (single host)
 
 ```sh
+# 0. install (binary: `fraisier`)
+cargo install fraisier
+
 # 1. write a starter config
 fraisier init
 

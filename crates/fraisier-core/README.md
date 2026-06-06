@@ -11,7 +11,7 @@ generic; the deploy semantics live here.
 
 `fraisier-core` defines the adapter traits and depends on `fraisier-saga` only.
 It must **never** depend on `fraisier-ipc` — concrete adapter selection
-(in-process vs IPC) is wired at the `fraisier-cli` / embedder layer. This keeps
+(in-process vs IPC) is wired at the `fraisier` binary / embedder layer. This keeps
 the trait definitions strictly upstream of every implementation.
 
 ## License

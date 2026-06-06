@@ -52,7 +52,7 @@ back atomically.
 
   ```sh
   ( cd ../fraisier-adapter-sqlx && cargo build )   # produces the adapter binary
-  cargo test -p fraisier-cli --test e2e_ipc_sqlx   # or set FRAISIER_SQLX_ADAPTER_BIN
+  cargo test -p fraisier --test e2e_ipc_sqlx   # or set FRAISIER_SQLX_ADAPTER_BIN
   ```
 
   To drive it by hand, put the adapter on `PATH` and deploy normally:

@@ -34,11 +34,10 @@ members = [
 exclude = ["spikes", "examples/training-field"]
 
 [workspace.package]
-version = "1.0.0-alpha.1"
+version = "1.0.0-beta.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-# NOTE: repository/homepage are placeholders pending the real crates.io coordinates.
-repository = "https://github.com/fraiseql/fraisier"
+repository = "https://github.com/fraiseql/fraisier-core"
 homepage = "https://fraiseql.dev"
 authors = ["Lionel Hamayon <evolution.digitale@gmail.com>"]
 keywords = ["deploy", "migration", "orchestration", "saga", "postgres"]

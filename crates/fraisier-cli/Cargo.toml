@@ -1,6 +1,6 @@
 [package]
-name = "fraisier-cli"
-description = "The fraisier command-line binary: deploy, validate-config, status, and adapter discovery over the in-process and IPC adapter paths."
+name = "fraisier"
+description = "Atomic, migration-safe deploys across one host or a fleet — the fraisier command-line binary (deploy, multi-host rolling, blue-green, rollback)."
 version.workspace = true
 readme = "README.md"
 edition.workspace = true
@@ -38,39 +38,39 @@ tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
 # Vocabulary, engine, config, and the IPC transport. Per the crate-graph rule the
 # CLI is the layer that depends on *both* fraisier-core and fraisier-ipc and wires
 # in-process vs IPC adapter selection.
-fraisier-core = { path = "../fraisier-core", version = "1.0.0-alpha.1" }
-fraisier-config = { path = "../fraisier-config", version = "1.0.0-alpha.1" }
-fraisier-saga = { path = "../fraisier-saga", version = "1.0.0-alpha.1" }
-fraisier-ipc = { path = "../fraisier-ipc", version = "1.0.0-alpha.1" }
+fraisier-core = { path = "../fraisier-core", version = "1.0.0-beta.1" }
+fraisier-config = { path = "../fraisier-config", version = "1.0.0-beta.1" }
+fraisier-saga = { path = "../fraisier-saga", version = "1.0.0-beta.1" }
+fraisier-ipc = { path = "../fraisier-ipc", version = "1.0.0-beta.1" }
 
 # In-process adapters selected by name from the config.
-fraisier-adapter-support = { path = "../fraisier-adapter-support", version = "1.0.0-alpha.1" }
-fraisier-adapter-confiture = { path = "../fraisier-adapter-confiture", version = "1.0.0-alpha.1" }
-fraisier-adapter-command = { path = "../fraisier-adapter-command", version = "1.0.0-alpha.1" }
-fraisier-adapter-systemd = { path = "../fraisier-adapter-systemd", version = "1.0.0-alpha.1" }
-fraisier-adapter-rc = { path = "../fraisier-adapter-rc", version = "1.0.0-alpha.1" }
-fraisier-adapter-docker-compose = { path = "../fraisier-adapter-docker-compose", version = "1.0.0-alpha.1" }
-fraisier-adapter-http = { path = "../fraisier-adapter-http", version = "1.0.0-alpha.1" }
-fraisier-adapter-nginx = { path = "../fraisier-adapter-nginx", version = "1.0.0-alpha.1" }
-fraisier-artifact-release = { path = "../fraisier-artifact-release", version = "1.0.0-alpha.1" }
-fraisier-artifact-pull = { path = "../fraisier-artifact-pull", version = "1.0.0-alpha.1" }
-fraisier-artifact-local = { path = "../fraisier-artifact-local", version = "1.0.0-alpha.1" }
-fraisier-artifact-git = { path = "../fraisier-artifact-git", version = "1.0.0-alpha.1" }
+fraisier-adapter-support = { path = "../fraisier-adapter-support", version = "1.0.0-beta.1" }
+fraisier-adapter-confiture = { path = "../fraisier-adapter-confiture", version = "1.0.0-beta.1" }
+fraisier-adapter-command = { path = "../fraisier-adapter-command", version = "1.0.0-beta.1" }
+fraisier-adapter-systemd = { path = "../fraisier-adapter-systemd", version = "1.0.0-beta.1" }
+fraisier-adapter-rc = { path = "../fraisier-adapter-rc", version = "1.0.0-beta.1" }
+fraisier-adapter-docker-compose = { path = "../fraisier-adapter-docker-compose", version = "1.0.0-beta.1" }
+fraisier-adapter-http = { path = "../fraisier-adapter-http", version = "1.0.0-beta.1" }
+fraisier-adapter-nginx = { path = "../fraisier-adapter-nginx", version = "1.0.0-beta.1" }
+fraisier-artifact-release = { path = "../fraisier-artifact-release", version = "1.0.0-beta.1" }
+fraisier-artifact-pull = { path = "../fraisier-artifact-pull", version = "1.0.0-beta.1" }
+fraisier-artifact-local = { path = "../fraisier-artifact-local", version = "1.0.0-beta.1" }
+fraisier-artifact-git = { path = "../fraisier-artifact-git", version = "1.0.0-beta.1" }
 
 # On-disk file generators (the `init` starter config; `scaffold` templates).
-fraisier-scaffold = { path = "../fraisier-scaffold", version = "1.0.0-alpha.1" }
+fraisier-scaffold = { path = "../fraisier-scaffold", version = "1.0.0-beta.1" }
 # Version reading/bumping and the `ship` release workflow.
-fraisier-ship = { path = "../fraisier-ship", version = "1.0.0-alpha.1" }
+fraisier-ship = { path = "../fraisier-ship", version = "1.0.0-beta.1" }
 # Generic-Postgres database lifecycle ops (backup/restore/reset).
-fraisier-db = { path = "../fraisier-db", version = "1.0.0-alpha.1" }
+fraisier-db = { path = "../fraisier-db", version = "1.0.0-beta.1" }
 # SSH-based host bootstrap (prepare deploy directories over the transport).
-fraisier-bootstrap = { path = "../fraisier-bootstrap", version = "1.0.0-alpha.1" }
+fraisier-bootstrap = { path = "../fraisier-bootstrap", version = "1.0.0-beta.1" }
 # Signed-webhook server (HMAC + replay) that triggers a deploy.
-fraisier-webhook = { path = "../fraisier-webhook", version = "1.0.0-alpha.1" }
+fraisier-webhook = { path = "../fraisier-webhook", version = "1.0.0-beta.1" }
 # Git-ref deploy-ledger sync across operators (experimental).
-fraisier-sync = { path = "../fraisier-sync", version = "1.0.0-alpha.1" }
+fraisier-sync = { path = "../fraisier-sync", version = "1.0.0-beta.1" }
 # Self-upgrade engine (fetch/verify/swap/health/auto-revert of fraisier's binary).
-fraisier-self-upgrade = { path = "../fraisier-self-upgrade", version = "1.0.0-alpha.1" }
+fraisier-self-upgrade = { path = "../fraisier-self-upgrade", version = "1.0.0-beta.1" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

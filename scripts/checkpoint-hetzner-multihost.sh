@@ -143,7 +143,7 @@ ok "SSH ready on all hosts"
 # Build the IPC adapter on a ubi9 builder (glibc-compatible with Rocky 9), so it
 # runs on the hosts unchanged — no Rust toolchain on the VMs.
 say "building fraisier (orchestrator) + the IPC adapter (ubi9 builder)"
-( cd "$REPO" && cargo build -q -p fraisier-cli )
+( cd "$REPO" && cargo build -q -p fraisier )
 FRAISIER="$REPO/target/debug/fraisier"
 [ -x "$FRAISIER" ] || die "fraisier binary missing"
 # shellcheck disable=SC2016

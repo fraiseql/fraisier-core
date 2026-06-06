@@ -32,7 +32,7 @@
 //! ## Crate-graph rule
 //!
 //! `fraisier-core` depends on `fraisier-saga` only and must never depend on
-//! `fraisier-ipc`; concrete adapter wiring happens at the `fraisier-cli` /
+//! `fraisier-ipc`; concrete adapter wiring happens at the `fraisier` binary /
 //! embedder layer (see the crate README).
 
 pub mod adapter_axes;

@@ -1,4 +1,4 @@
-# fraisier-cli
+# fraisier
 
 The `fraisier` command-line binary. Per the crate-graph rule this is the layer
 that depends on **both** `fraisier-core` (the deploy composition + adapter axes)

@@ -17,7 +17,7 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1.89"
-fraisier-saga = { path = "../fraisier-saga", version = "1.0.0-alpha.1" }
+fraisier-saga = { path = "../fraisier-saga", version = "1.0.0-beta.1" }
 # `futures` is used only for its `join_all` combinator (concurrent per-host
 # fetch / batch rollout); no executor is pulled in (the CLI owns the runtime).
 futures = { version = "0.3.31", default-features = false, features = ["std", "async-await"] }

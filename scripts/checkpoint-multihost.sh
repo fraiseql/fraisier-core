@@ -101,7 +101,7 @@ build_ipc_adapter() {
 
 # ---------------------------------------------------------------------------
 say "building fraisier + container images"
-( cd "$REPO" && cargo build -q -p fraisier-cli )
+( cd "$REPO" && cargo build -q -p fraisier )
 FRAISIER="$REPO/target/debug/fraisier"
 "$PODMAN" build -q -t "$APP_IMG" -f "$FIXTURE/Containerfile.app" "$FIXTURE" >/dev/null
 "$PODMAN" build -q -t "$NGINX_IMG" -f "$FIXTURE/Containerfile.nginx" "$FIXTURE" >/dev/null

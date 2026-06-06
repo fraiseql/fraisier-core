@@ -14,8 +14,8 @@ The wire protocol every adapter author implements against is specified in
 ## Crate-graph
 
 `fraisier-ipc` depends on `fraisier-core` (to implement its trait). `fraisier-core`
-never depends on `fraisier-ipc`; concrete adapter wiring lives at the `fraisier-cli`
-/ embedder layer.
+never depends on `fraisier-ipc`; concrete adapter wiring lives at the `fraisier`
+binary / embedder layer.
 
 ## License
 

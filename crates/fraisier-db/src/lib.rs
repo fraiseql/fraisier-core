@@ -17,6 +17,8 @@
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
+use std::path::Path;
+use std::process::Command;
 
 use percent_encoding::percent_decode_str;
 use url::Url;
@@ -36,6 +38,14 @@ pub enum DbError {
     /// The DSN has no database name, which these ops require.
     #[error("the database DSN does not name a database (expected postgres://…/<dbname>)")]
     MissingDatabase,
+    /// A database tool (`pg_dump`/`pg_restore`/`psql`) could not be launched.
+    #[error("could not run `{program}` (is it installed and on PATH?): {source}")]
+    Spawn {
+        /// The program that failed to spawn.
+        program: String,
+        /// The underlying spawn error.
+        source: std::io::Error,
+    },
 }
 
 /// PostgreSQL connection parameters resolved from a DSN.
@@ -160,6 +170,113 @@ impl PgConn {
     }
 }
 
+/// SQL that drops every user schema and recreates an empty `public`.
+///
+/// This is the generic "reset to empty database" step; after running it the
+/// caller re-applies migrations through the migration adapter (this crate does
+/// not migrate). System schemas (`pg_catalog`, `information_schema`,
+/// `pg_toast*`, `pg_temp*`) are left untouched, and `%I` quoting in the `DO`
+/// block makes the drop safe for any schema name.
+pub const RESET_SQL: &str = "\
+DO $$
+DECLARE schema_name text;
+BEGIN
+  FOR schema_name IN
+    SELECT nspname FROM pg_namespace
+    WHERE nspname NOT IN ('pg_catalog', 'information_schema')
+      AND nspname NOT LIKE 'pg\\_toast%'
+      AND nspname NOT LIKE 'pg\\_temp%'
+  LOOP
+    EXECUTE format('DROP SCHEMA IF EXISTS %I CASCADE', schema_name);
+  END LOOP;
+END $$;
+CREATE SCHEMA IF NOT EXISTS public;";
+
+/// Build the `pg_dump` command for a custom-format (`-Fc`) backup to `out`.
+///
+/// The connection comes entirely from [`PgConn::pg_env`] (set on the child's
+/// environment); the only argv entries are non-secret flags and the output path.
+/// `-w` makes it non-interactive (never prompt for a password).
+#[must_use]
+pub fn backup_command(conn: &PgConn, out: &Path) -> Command {
+    let mut command = Command::new("pg_dump");
+    command.envs(conn.pg_env());
+    command.arg("-Fc").arg("-w").arg("-f").arg(out);
+    command
+}
+
+/// Build the `pg_restore` command restoring `archive` into the database.
+///
+/// With `clean`, existing objects are dropped first (`--clean --if-exists`). The
+/// target database name (not a secret) is the only connection value on argv;
+/// everything else comes from [`PgConn::pg_env`].
+#[must_use]
+pub fn restore_command(conn: &PgConn, archive: &Path, clean: bool) -> Command {
+    let mut command = Command::new("pg_restore");
+    command.envs(conn.pg_env());
+    command.arg("-w").arg("-d").arg(conn.database());
+    if clean {
+        command.arg("--clean").arg("--if-exists");
+    }
+    command.arg(archive);
+    command
+}
+
+/// Build a non-interactive `psql` command that runs `sql` with
+/// `ON_ERROR_STOP=1` (so a failing statement makes psql exit non-zero) and
+/// skips `~/.psqlrc` (`-X`) for reproducibility.
+#[must_use]
+pub fn psql_command(conn: &PgConn, sql: &str) -> Command {
+    let mut command = Command::new("psql");
+    command.envs(conn.pg_env());
+    command
+        .arg("-w")
+        .arg("-X")
+        .arg("-v")
+        .arg("ON_ERROR_STOP=1")
+        .arg("-c")
+        .arg(sql);
+    command
+}
+
+/// The captured result of a finished database tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    /// The process exit code, or `None` if it was killed by a signal.
+    pub code: Option<i32>,
+    /// Captured standard output (lossy UTF-8).
+    pub stdout: String,
+    /// Captured standard error (lossy UTF-8).
+    pub stderr: String,
+}
+
+impl Outcome {
+    /// Whether the process exited with code 0.
+    #[must_use]
+    pub fn succeeded(&self) -> bool {
+        self.code == Some(0)
+    }
+}
+
+/// Run a built command to completion, capturing its output.
+///
+/// # Errors
+/// [`DbError::Spawn`] if the program cannot be launched (e.g. the tool is not
+/// installed). A non-zero exit is **not** an error here — it is reported in the
+/// returned [`Outcome`] so the caller decides what a failure means.
+pub async fn run(command: Command) -> Result<Outcome, DbError> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let output = tokio::process::Command::from(command)
+        .output()
+        .await
+        .map_err(|source| DbError::Spawn { program, source })?;
+    Ok(Outcome {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DbError, PgConn};
@@ -248,5 +365,136 @@ mod tests {
         let conn = PgConn::parse("postgres://localhost/db").expect("parses");
         let pairs: Vec<(OsString, OsString)> = conn.pg_env();
         assert!(pairs.iter().any(|(k, _)| k == "PGDATABASE"));
+    }
+
+    use super::{backup_command, psql_command, restore_command, RESET_SQL};
+    use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn args_of(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn envs_of(command: &Command) -> BTreeMap<String, String> {
+        command
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// The shared invariant: a built command must carry the connection in its
+    /// environment, never on argv (Decision 5).
+    fn assert_no_secret_on_argv(command: &Command, password: &str) {
+        for arg in args_of(command) {
+            assert!(!arg.contains(password), "password leaked onto argv: {arg}");
+        }
+        assert_eq!(
+            envs_of(command).get("PGPASSWORD").map(String::as_str),
+            Some(password),
+            "the password must travel as PGPASSWORD in the environment",
+        );
+    }
+
+    fn conn_with_secret() -> PgConn {
+        PgConn::parse("postgresql://alice:s3cret@db.example.com:6432/shop").expect("parses")
+    }
+
+    #[test]
+    fn backup_builds_pg_dump_with_custom_format() {
+        let conn = conn_with_secret();
+        let command = backup_command(&conn, Path::new("/backups/shop.pgdump"));
+        assert_eq!(command.get_program().to_string_lossy(), "pg_dump");
+        let args = args_of(&command);
+        assert!(args.contains(&"-Fc".to_owned()), "custom format: {args:?}");
+        assert!(args.contains(&"-f".to_owned()), "output flag: {args:?}");
+        assert!(
+            args.contains(&"/backups/shop.pgdump".to_owned()),
+            "output path: {args:?}"
+        );
+        let env = envs_of(&command);
+        assert_eq!(env["PGDATABASE"], "shop");
+        assert_no_secret_on_argv(&command, "s3cret");
+    }
+
+    #[test]
+    fn restore_targets_the_database_and_can_clean() {
+        let conn = conn_with_secret();
+
+        let plain = restore_command(&conn, Path::new("/backups/shop.pgdump"), false);
+        assert_eq!(plain.get_program().to_string_lossy(), "pg_restore");
+        let args = args_of(&plain);
+        assert!(args.contains(&"-d".to_owned()), "target db flag: {args:?}");
+        assert!(
+            args.contains(&"shop".to_owned()),
+            "target db name: {args:?}"
+        );
+        assert!(
+            args.contains(&"/backups/shop.pgdump".to_owned()),
+            "archive path: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "--clean"),
+            "no clean without the flag: {args:?}"
+        );
+        assert_no_secret_on_argv(&plain, "s3cret");
+
+        let clean = restore_command(&conn, Path::new("/backups/shop.pgdump"), true);
+        let args = args_of(&clean);
+        assert!(args.contains(&"--clean".to_owned()), "clean: {args:?}");
+        assert!(
+            args.contains(&"--if-exists".to_owned()),
+            "if-exists: {args:?}"
+        );
+    }
+
+    #[test]
+    fn psql_runs_sql_with_on_error_stop() {
+        let conn = conn_with_secret();
+        let command = psql_command(&conn, "SELECT 1");
+        assert_eq!(command.get_program().to_string_lossy(), "psql");
+        let args = args_of(&command);
+        assert!(args.contains(&"-c".to_owned()), "command flag: {args:?}");
+        assert!(args.contains(&"SELECT 1".to_owned()), "sql arg: {args:?}");
+        assert!(
+            args.iter().any(|a| a.contains("ON_ERROR_STOP=1")),
+            "on-error-stop set: {args:?}"
+        );
+        assert_no_secret_on_argv(&command, "s3cret");
+    }
+
+    #[test]
+    fn reset_sql_drops_user_schemas_and_recreates_public() {
+        assert!(RESET_SQL.contains("DROP SCHEMA"), "drops schemas");
+        assert!(
+            RESET_SQL.contains("CREATE SCHEMA IF NOT EXISTS public"),
+            "recreates public"
+        );
+        assert!(RESET_SQL.contains("pg_catalog"), "spares system schemas");
+    }
+
+    #[tokio::test]
+    async fn run_reports_a_spawn_failure_clearly() {
+        // A program that does not exist surfaces DbError::Spawn, not a panic.
+        let command = Command::new("fraisier-db-no-such-tool-xyz");
+        let err = super::run(command).await.expect_err("spawn fails");
+        assert!(matches!(err, super::DbError::Spawn { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn run_captures_output_and_exit_code() {
+        // `true` exits 0 with no output; a portable, dependency-free smoke test.
+        let outcome = super::run(Command::new("true")).await.expect("runs");
+        assert!(outcome.succeeded(), "true exits 0: {outcome:?}");
     }
 }

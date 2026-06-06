@@ -60,6 +60,9 @@ enum Command {
     /// Show the recorded saga state and release ledger for a deploy.
     Status(StatusArgs),
 
+    /// Prepare each target host's deploy directories over SSH (or locally).
+    Bootstrap(BootstrapArgs),
+
     /// Back up the database to a custom-format archive (`pg_dump -Fc`).
     Backup(BackupArgs),
 
@@ -330,6 +333,21 @@ struct DbMigrateArgs {
 }
 
 #[derive(Debug, Args)]
+struct BootstrapArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Prepare only this host (inventory name or address).
+    #[arg(long)]
+    host: Option<String>,
+
+    /// Show what would be created without creating anything.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Args)]
 struct BackupArgs {
     /// Path to the `fraisier.toml`.
     #[arg(long, default_value = "fraisier.toml")]
@@ -434,6 +452,9 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         }
         Command::Status(args) => {
             commands::status(&args.config, &args.state_dir, args.per_host).await
+        }
+        Command::Bootstrap(args) => {
+            commands::bootstrap(&args.config, args.host.as_deref(), args.dry_run).await
         }
         Command::Backup(args) => {
             commands::db_backup(&args.config, args.output.as_deref(), args.force).await

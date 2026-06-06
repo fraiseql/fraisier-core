@@ -680,6 +680,66 @@ pub fn build_artifact_probe(config: &DeployConfig) -> Result<ArtifactProbePlan> 
     })
 }
 
+/// A ready-to-run host bootstrap: the transport, a base context, the hosts to
+/// prepare, and the directories each needs (`fraisier bootstrap`).
+pub struct BootstrapPlan {
+    /// The transport reaching each host (`Local` single-host, `Ssh` multi-host).
+    pub transport: Transport,
+    /// The base context (artifact settings); the caller sets `host`/`address`.
+    pub ctx: AdapterCtx,
+    /// The hosts to prepare: each inventory host, or a lone `localhost`.
+    pub hosts: Vec<(HostId, Option<String>)>,
+    /// The directories to create on each host (empty when none are configured).
+    pub dirs: Vec<String>,
+}
+
+/// Build the bootstrap plan from a config: the transport, the host set, and the
+/// deploy directories derived from `[artifact]` (`staging_dir` + the parent of
+/// `active_path`). Touches no migration/service/health axis.
+#[must_use]
+pub fn build_bootstrap(config: &DeployConfig) -> BootstrapPlan {
+    let transport = build_transport(config);
+    let deploy = config.deploy.as_ref();
+    let fraise = deploy
+        .and_then(|d| d.name.clone())
+        .unwrap_or_else(|| "<none>".to_owned());
+    let environment = deploy
+        .and_then(|d| d.environment.clone())
+        .unwrap_or_else(|| "<none>".to_owned());
+    let mut ctx = AdapterCtx::new(fraise, environment);
+    ctx.workdir = PathBuf::from(".");
+    ctx.settings = settings_map(config, None);
+
+    let staging = config
+        .artifact
+        .as_ref()
+        .and_then(|a| a.staging_dir.as_deref())
+        .map(|p| p.to_string_lossy().into_owned());
+    let active = config
+        .artifact
+        .as_ref()
+        .and_then(|a| a.active_path.as_deref())
+        .map(|p| p.to_string_lossy().into_owned());
+    let dirs = fraisier_bootstrap::deploy_dirs(staging.as_deref(), active.as_deref());
+
+    let hosts = config.host_inventory().map_or_else(
+        || vec![(HostId::new("localhost"), None)],
+        |inventory| {
+            inventory
+                .hosts()
+                .iter()
+                .map(|host| (host.host.clone(), Some(host.address.clone())))
+                .collect()
+        },
+    );
+    BootstrapPlan {
+        transport,
+        ctx,
+        hosts,
+        dirs,
+    }
+}
+
 fn build_health(config: &DeployConfig) -> Result<Arc<dyn HealthAdapter>> {
     match config.health.as_ref().and_then(|h| h.adapter.as_deref()) {
         Some("http") => Ok(Arc::new(fraisier_adapter_http::HttpHealth::new())),

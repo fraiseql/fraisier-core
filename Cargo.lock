@@ -597,6 +597,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fraisier-bootstrap"
+version = "1.0.0-alpha.1"
+dependencies = [
+ "fraisier-adapter-support",
+ "fraisier-core",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "fraisier-cli"
 version = "1.0.0-alpha.1"
 dependencies = [
@@ -614,6 +624,7 @@ dependencies = [
  "fraisier-artifact-local",
  "fraisier-artifact-pull",
  "fraisier-artifact-release",
+ "fraisier-bootstrap",
  "fraisier-config",
  "fraisier-core",
  "fraisier-db",

@@ -1274,6 +1274,110 @@ pub(crate) async fn db_reset(
     })
 }
 
+/// `bootstrap`: prepare each target host's deploy directories over the transport
+/// (`Local` single-host, `Ssh` per host). With `dry_run`, only the plan is shown.
+pub(crate) async fn bootstrap(
+    config_path: &Path,
+    host_filter: Option<&str>,
+    dry_run: bool,
+) -> Result<CommandOutput> {
+    let config = load(config_path)?;
+    let plan = factory::build_bootstrap(&config);
+
+    if plan.dirs.is_empty() {
+        return Ok(CommandOutput {
+            exit_code: 0,
+            pretty:
+                "nothing to prepare: set [artifact].staging_dir and/or [artifact].active_path\n"
+                    .to_owned(),
+            json: json!({ "ok": true, "prepared": 0, "dirs": [] }),
+        });
+    }
+
+    let mut results = Vec::new();
+    let mut all_ok = true;
+    let mut prepared = 0usize;
+    for (host, address) in &plan.hosts {
+        if let Some(filter) = host_filter {
+            if host.as_str() != filter && address.as_deref() != Some(filter) {
+                continue;
+            }
+        }
+        prepared += 1;
+        if dry_run {
+            results.push(json!({ "host": host.as_str(), "address": address }));
+            continue;
+        }
+        let mut ctx = plan.ctx.clone();
+        ctx.host = Some(host.clone());
+        if let Some(addr) = address {
+            ctx.settings
+                .insert("address".to_owned(), Value::String(addr.clone()));
+        }
+        match fraisier_bootstrap::ensure_dirs(&plan.transport, &ctx, &plan.dirs).await {
+            Ok(()) => results.push(json!({ "host": host.as_str(), "ok": true })),
+            Err(error) => {
+                all_ok = false;
+                results.push(
+                    json!({ "host": host.as_str(), "ok": false, "error": error.to_string() }),
+                );
+            }
+        }
+    }
+
+    if prepared == 0 {
+        let pretty = host_filter.map_or_else(
+            || "no hosts to bootstrap\n".to_owned(),
+            |f| format!("no host matching '{f}'\n"),
+        );
+        return Ok(CommandOutput {
+            exit_code: 1,
+            pretty,
+            json: json!({ "ok": false, "prepared": 0 }),
+        });
+    }
+
+    let mut pretty = String::new();
+    if dry_run {
+        let hosts: Vec<&str> = results.iter().filter_map(|r| r["host"].as_str()).collect();
+        let _ = writeln!(
+            pretty,
+            "bootstrap plan ({} host(s): {}): mkdir -p",
+            prepared,
+            hosts.join(", ")
+        );
+        for dir in &plan.dirs {
+            let _ = writeln!(pretty, "  {dir}");
+        }
+        pretty.push_str("(dry run — nothing was created)\n");
+    } else {
+        for result in &results {
+            let mark = if result["ok"] == json!(true) {
+                "ok"
+            } else {
+                "FAILED"
+            };
+            let host = result["host"].as_str().unwrap_or("?");
+            let detail = result["error"]
+                .as_str()
+                .map_or(String::new(), |e| format!(" — {e}"));
+            let _ = writeln!(pretty, "  [{mark}] {host}{detail}");
+        }
+    }
+
+    Ok(CommandOutput {
+        exit_code: i32::from(!all_ok),
+        pretty,
+        json: json!({
+            "ok": all_ok,
+            "prepared": prepared,
+            "dirs": plan.dirs,
+            "hosts": results,
+            "dry_run": dry_run,
+        }),
+    })
+}
+
 /// Map a saga outcome onto `(exit code, label, detail)` for both deploy paths.
 fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
     match outcome {
@@ -1294,9 +1398,9 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapter_list, db_backup, db_migrate, db_reset, db_restore, deploy, discover_adapters,
-        health, init, list, rollback, scaffold, scaffold_install, ship, status, validate_config,
-        version_bump, version_show, ShipArgs,
+        adapter_list, bootstrap, db_backup, db_migrate, db_reset, db_restore, deploy,
+        discover_adapters, health, init, list, rollback, scaffold, scaffold_install, ship, status,
+        validate_config, version_bump, version_show, ShipArgs,
     };
     use fraisier_core::single_host::DeployRecord;
     use fraisier_saga::events::SagaState;
@@ -1974,6 +2078,62 @@ current_revision = "true"
         assert!(
             out.pretty.contains("database_url_env"),
             "points at the missing config: {}",
+            out.pretty
+        );
+    }
+
+    /// A single-host (Local transport) config whose artifact paths live under
+    /// `dir`, so bootstrap's `mkdir -p` runs locally and is observable.
+    fn bootstrap_config(dir: &Path) -> String {
+        format!(
+            "[deploy]\nname = \"app\"\nenvironment = \"test\"\n\n\
+             [artifact]\nsource = \"local\"\npath = \"/x\"\n\
+             staging_dir = \"{}/releases\"\nactive_path = \"{}/srv/current\"\n",
+            dir.display(),
+            dir.display(),
+        )
+    }
+
+    #[tokio::test]
+    async fn bootstrap_creates_deploy_directories_locally() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", &bootstrap_config(dir.path()));
+
+        let out = bootstrap(&config, None, false).await.expect("bootstrap");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert!(dir.path().join("releases").is_dir(), "staging dir created");
+        assert!(dir.path().join("srv").is_dir(), "active parent created");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_dry_run_creates_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", &bootstrap_config(dir.path()));
+
+        let out = bootstrap(&config, None, true).await.expect("dry run");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert!(out.pretty.contains("dry run"), "pretty: {}", out.pretty);
+        assert!(
+            !dir.path().join("releases").exists(),
+            "dry run created nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_reports_nothing_to_prepare_without_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // [artifact] with no staging_dir / active_path → nothing host-specific.
+        let config = write(
+            dir.path(),
+            "fraisier.toml",
+            "[deploy]\nname = \"app\"\nenvironment = \"test\"\n\n\
+             [artifact]\nsource = \"local\"\npath = \"/x\"\n",
+        );
+        let out = bootstrap(&config, None, false).await.expect("run");
+        assert_eq!(out.exit_code, 0);
+        assert!(
+            out.pretty.contains("nothing to prepare"),
+            "pretty: {}",
             out.pretty
         );
     }

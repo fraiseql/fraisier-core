@@ -62,6 +62,8 @@ fraisier-scaffold = { path = "../fraisier-scaffold", version = "1.0.0-alpha.1" }
 fraisier-ship = { path = "../fraisier-ship", version = "1.0.0-alpha.1" }
 # Generic-Postgres database lifecycle ops (backup/restore/reset).
 fraisier-db = { path = "../fraisier-db", version = "1.0.0-alpha.1" }
+# SSH-based host bootstrap (prepare deploy directories over the transport).
+fraisier-bootstrap = { path = "../fraisier-bootstrap", version = "1.0.0-alpha.1" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -22,6 +22,7 @@ members = [
     "crates/fraisier-scaffold",
     "crates/fraisier-ship",
     "crates/fraisier-db",
+    "crates/fraisier-bootstrap",
 ]
 # Exploratory spikes are standalone crates, not held to the production lint bar.
 # examples/training-field is test scaffolding (a deploy fixture), kept out of the

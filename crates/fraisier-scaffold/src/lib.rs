@@ -12,7 +12,7 @@ use std::path::PathBuf;
 mod generate;
 mod install;
 
-pub use generate::{generate, GeneratedFile, MARKER};
+pub use generate::{generate, generate_scheduled, GeneratedFile, MARKER};
 pub use install::{install, install_targets, prune, prune_plan, write_tree};
 
 /// An error from generating, installing, or pruning scaffold files.

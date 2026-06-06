@@ -82,6 +82,10 @@ pub struct DeployConfig {
     /// when no webhook server is run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook: Option<WebhookSection>,
+    /// The `[schedule]` section: a systemd timer that runs fraisier on a
+    /// calendar schedule. Absent when nothing is scheduled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleSection>,
     /// The `[specql]` preset. Present only in the *unexpanded* form; both
     /// [`from_toml_str`](DeployConfig::from_toml_str) and
     /// [`load`](DeployConfig::load) consume it and leave this `None`.
@@ -278,6 +282,23 @@ pub struct WebhookSection {
     /// Defaults to `30`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_timeout_secs: Option<u64>,
+}
+
+/// The `[schedule]` section: a systemd timer that runs fraisier on a schedule.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleSection {
+    /// The systemd `OnCalendar=` expression (e.g. `*-*-* 03:00:00`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_calendar: Option<String>,
+    /// Which fraisier command the timer runs: `"deploy"` or `"backup"`.
+    /// Defaults to `"deploy"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The `--config` path the scheduled unit passes to fraisier on the host.
+    /// Defaults to `/etc/fraisier/<name>.toml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<PathBuf>,
 }
 
 /// The `[lb]` section.

@@ -323,6 +323,57 @@ pub(crate) fn scaffold_install(
     })
 }
 
+/// `scheduled install`: generate the systemd timer + service that run fraisier on
+/// a calendar schedule and install them under `root`. Unlike `scaffold-install`
+/// it does **not** prune: scheduled units share the systemd directory (and the
+/// fraisier marker) with the scaffold units, so a scoped-by-presence prune would
+/// wrongly remove the other set. Writes only on `apply`; otherwise shows the plan.
+pub(crate) fn scheduled_install(
+    config_path: &Path,
+    root: &Path,
+    apply: bool,
+    dry_run: bool,
+) -> Result<CommandOutput> {
+    let config = load(config_path)?;
+    let files = fraisier_scaffold::generate_scheduled(&config)?;
+    let targets = fraisier_scaffold::install_targets(&files, root);
+
+    if dry_run || !apply {
+        let mut pretty = format!("scheduled install plan (root {}):\n", root.display());
+        for path in &targets {
+            let _ = writeln!(pretty, "  + {}", path.display());
+        }
+        if !dry_run {
+            pretty.push_str("pass --yes to apply\n");
+        }
+        pretty.push_str("then: systemctl daemon-reload && systemctl enable --now <timer>\n");
+        return Ok(CommandOutput {
+            exit_code: 0,
+            pretty,
+            json: json!({
+                "applied": false,
+                "install": targets.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            }),
+        });
+    }
+
+    let installed = fraisier_scaffold::install(&files, root)?;
+    let mut pretty = format!(
+        "installed {} scheduled unit(s) (root {})\n",
+        installed.len(),
+        root.display()
+    );
+    pretty.push_str("next: systemctl daemon-reload && systemctl enable --now <timer>\n");
+    Ok(CommandOutput {
+        exit_code: 0,
+        pretty,
+        json: json!({
+            "applied": true,
+            "installed": installed.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        }),
+    })
+}
+
 /// `validate-config`: parse, expand, and validate, reporting every located issue.
 pub(crate) fn validate_config(config_path: &Path) -> Result<CommandOutput> {
     let toml = std::fs::read_to_string(config_path)
@@ -1601,8 +1652,9 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
 mod tests {
     use super::{
         bootstrap, db_backup, db_migrate, db_reset, db_restore, deploy, discover_adapters, health,
-        init, list, provider_test, providers, rollback, scaffold, scaffold_install, ship, status,
-        validate_config, version_bump, version_show, webhook_server, ShipArgs,
+        init, list, provider_test, providers, rollback, scaffold, scaffold_install,
+        scheduled_install, ship, status, validate_config, version_bump, version_show,
+        webhook_server, ShipArgs,
     };
     use fraisier_core::single_host::DeployRecord;
     use fraisier_saga::events::SagaState;
@@ -2379,6 +2431,31 @@ current_revision = "true"
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args, vec!["--user", "restart", "u.service"]);
+    }
+
+    #[test]
+    fn scheduled_install_plans_then_installs_a_timer_and_service() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = format!(
+            "{VALID}\n[schedule]\non_calendar = \"*-*-* 03:00:00\"\ncommand = \"deploy\"\n"
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+
+        // Plan only (no --yes): nothing written.
+        let plan = scheduled_install(&config, &root, false, false).expect("plan");
+        assert_eq!(plan.json["applied"], serde_json::json!(false));
+        assert!(!root.exists(), "planning wrote nothing");
+
+        // Apply installs the timer + service under the root.
+        let done = scheduled_install(&config, &root, true, false).expect("install");
+        assert_eq!(done.json["applied"], serde_json::json!(true));
+        assert!(root
+            .join("etc/systemd/system/fraisier-checkout-staging-scheduled.timer")
+            .exists());
+        assert!(root
+            .join("etc/systemd/system/fraisier-checkout-staging-scheduled.service")
+            .exists());
     }
 
     #[tokio::test]

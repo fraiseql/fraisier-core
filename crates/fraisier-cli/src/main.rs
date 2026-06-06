@@ -70,6 +70,10 @@ enum Command {
     #[command(subcommand)]
     SelfUpgrade(SelfUpgradeCommand),
 
+    /// Manage scheduled fraisier runs via systemd timers.
+    #[command(subcommand)]
+    Scheduled(ScheduledCommand),
+
     /// Back up the database to a custom-format archive (`pg_dump -Fc`).
     Backup(BackupArgs),
 
@@ -418,6 +422,32 @@ struct DbResetArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum ScheduledCommand {
+    /// Generate + install the systemd timer + service for scheduled runs.
+    Install(ScheduledInstallArgs),
+}
+
+#[derive(Debug, Args)]
+struct ScheduledInstallArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Filesystem prefix the unit files are installed under (override for
+    /// sandboxed installs; defaults to the real root).
+    #[arg(long, default_value = "/")]
+    root: PathBuf,
+
+    /// Apply the changes (without this, only the plan is shown).
+    #[arg(long)]
+    yes: bool,
+
+    /// Show the install plan without applying it.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Subcommand)]
 enum SelfUpgradeCommand {
     /// Coordinated restart of fraisier's own long-running unit (webhook server).
     Restart(SelfUpgradeRestartArgs),
@@ -513,6 +543,9 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::ProviderTest(args) => commands::provider_test(&args.name).await,
         Command::SelfUpgrade(SelfUpgradeCommand::Restart(args)) => {
             commands::self_upgrade_restart(&args.unit, args.user).await
+        }
+        Command::Scheduled(ScheduledCommand::Install(args)) => {
+            commands::scheduled_install(&args.config, &args.root, args.yes, args.dry_run)
         }
         Command::Version(VersionCommand::Show(args)) => commands::version_show(&args.path),
         Command::Version(VersionCommand::Bump { level, project }) => {

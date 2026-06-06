@@ -112,6 +112,7 @@ impl SpecqlPreset {
             lb: multi_host.then(|| Self::lb_defaults(name.as_deref())),
             ssh: None,
             webhook: None,
+            schedule: None,
             specql: None,
         }
     }
@@ -295,6 +296,8 @@ impl DeployConfig {
             ssh: prefer(base.ssh, self.ssh),
             // The preset never emits [webhook]; an author-supplied one wins.
             webhook: prefer(base.webhook, self.webhook),
+            // The preset never emits [schedule]; an author-supplied one wins.
+            schedule: prefer(base.schedule, self.schedule),
             specql: None,
         }
     }

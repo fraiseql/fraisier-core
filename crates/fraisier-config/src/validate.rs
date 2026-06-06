@@ -129,6 +129,7 @@ impl DeployConfig {
         validate_hosts(self, &mut report);
         validate_lb(self, &mut report);
         validate_webhook(self, &mut report);
+        validate_schedule(self, &mut report);
         report
     }
 
@@ -427,6 +428,29 @@ fn validate_webhook(cfg: &DeployConfig, report: &mut ValidationReport) {
             "the [webhook] server requires secret_env \
              (the name of the env var holding the shared HMAC secret)",
         );
+    }
+}
+
+/// Recognised `[schedule].command` values (what the timer runs).
+const SCHEDULE_COMMANDS: [&str; 2] = ["deploy", "backup"];
+
+fn validate_schedule(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(schedule) = &cfg.schedule else {
+        return; // optional
+    };
+    if !is_set(schedule.on_calendar.as_ref()) {
+        report.error(
+            "schedule.on_calendar",
+            "the [schedule] timer requires on_calendar (a systemd OnCalendar= expression)",
+        );
+    }
+    if let Some(command) = schedule.command.as_deref() {
+        if !SCHEDULE_COMMANDS.contains(&command) {
+            report.error(
+                "schedule.command",
+                format!("unknown schedule command '{command}' (expected: deploy, backup)"),
+            );
+        }
     }
 }
 

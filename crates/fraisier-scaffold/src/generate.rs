@@ -104,6 +104,87 @@ pub fn generate(config: &DeployConfig) -> Result<Vec<GeneratedFile>, ScaffoldErr
     ])
 }
 
+/// Render the systemd timer + service that run fraisier on a calendar schedule.
+///
+/// Produces `fraisier-<name>-<environment>-scheduled.{service,timer}` (a oneshot
+/// service the timer triggers). The service's `ExecStart` runs `fraisier
+/// <command> --config <config_path>` on the host; `<command>` defaults to
+/// `deploy`, `<config_path>` to `/etc/fraisier/<name>.toml`.
+///
+/// # Errors
+/// [`ScaffoldError::MissingField`] if `[deploy].name`/`[deploy].environment` or
+/// `[schedule].on_calendar` is absent.
+pub fn generate_scheduled(config: &DeployConfig) -> Result<Vec<GeneratedFile>, ScaffoldError> {
+    let deploy = config.deploy.as_ref();
+    let name = required(deploy.and_then(|d| d.name.as_deref()), "deploy", "name")?;
+    let environment = required(
+        deploy.and_then(|d| d.environment.as_deref()),
+        "deploy",
+        "environment",
+    )?;
+    let schedule = config.schedule.as_ref();
+    let on_calendar = required(
+        schedule.and_then(|s| s.on_calendar.as_deref()),
+        "schedule",
+        "on_calendar",
+    )?;
+    let command = schedule
+        .and_then(|s| s.command.as_deref())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("deploy")
+        .to_owned();
+    let config_path = schedule.and_then(|s| s.config_path.as_deref()).map_or_else(
+        || format!("/etc/fraisier/{name}.toml"),
+        |p| p.display().to_string(),
+    );
+    let env_file = format!("/etc/{name}/{environment}.env");
+
+    let base = format!("fraisier-{name}-{environment}-scheduled");
+    let service_unit = format!("{base}.service");
+    let timer_unit = format!("{base}.timer");
+
+    let service = with_header(
+        &SCHEDULED_SERVICE
+            .replace("{name}", &name)
+            .replace("{environment}", &environment)
+            .replace("{command}", &command)
+            .replace("{config_path}", &config_path)
+            .replace("{env_file}", &env_file),
+    );
+    let timer = with_header(
+        &SCHEDULED_TIMER
+            .replace("{name}", &name)
+            .replace("{environment}", &environment)
+            .replace("{command}", &command)
+            .replace("{on_calendar}", &on_calendar),
+    );
+
+    Ok(vec![
+        GeneratedFile {
+            rel_path: PathBuf::from(format!("systemd/{service_unit}")),
+            install_dest: Some(PathBuf::from(format!("/etc/systemd/system/{service_unit}"))),
+            contents: service,
+        },
+        GeneratedFile {
+            rel_path: PathBuf::from(format!("systemd/{timer_unit}")),
+            install_dest: Some(PathBuf::from(format!("/etc/systemd/system/{timer_unit}"))),
+            contents: timer,
+        },
+    ])
+}
+
+/// A required string field, or [`ScaffoldError::MissingField`].
+fn required(
+    value: Option<&str>,
+    section: &'static str,
+    field: &'static str,
+) -> Result<String, ScaffoldError> {
+    value
+        .filter(|s| !s.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or(ScaffoldError::MissingField { section, field })
+}
+
 /// The fields the templates are rendered from, resolved (with defaults) once.
 struct Resolved {
     name: String,
@@ -234,6 +315,29 @@ Accept=no
 WantedBy=sockets.target
 ";
 
+const SCHEDULED_SERVICE: &str = "[Unit]
+Description=fraisier scheduled {command} for {name} ({environment})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs fraisier on the host; edit --config / add flags as needed.
+ExecStart=fraisier {command} --config {config_path}
+EnvironmentFile=-{env_file}
+";
+
+const SCHEDULED_TIMER: &str = "[Unit]
+Description=fraisier scheduled {command} timer for {name} ({environment})
+
+[Timer]
+OnCalendar={on_calendar}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+";
+
 const NGINX_SITE: &str = "upstream {upstream} {
 {server_block}
 }
@@ -275,7 +379,7 @@ const ENV_EXAMPLE: &str = "# Environment for {name} ({environment}).
 
 #[cfg(test)]
 mod tests {
-    use super::{generate, MARKER};
+    use super::{generate, generate_scheduled, MARKER};
     use fraisier_config::DeployConfig;
 
     const MULTI: &str = r#"
@@ -403,5 +507,47 @@ upstream = "checkout_upstream"
     fn generate_requires_name_and_environment() {
         let cfg = DeployConfig::from_toml_str("[service]\nadapter = \"systemd\"\n").expect("parse");
         assert!(generate(&cfg).is_err());
+    }
+
+    #[test]
+    fn generate_scheduled_produces_a_timer_and_oneshot_service() {
+        let toml = format!(
+            "{MULTI}\n[schedule]\non_calendar = \"*-*-* 03:00:00\"\ncommand = \"deploy\"\n"
+        );
+        let cfg = DeployConfig::from_toml_str(&toml).expect("parse");
+        let files = generate_scheduled(&cfg).expect("generate");
+        assert_eq!(files.len(), 2, "timer + service: {files:?}");
+
+        let service = find(&files, "scheduled.service");
+        assert!(
+            service
+                .contents
+                .contains("ExecStart=fraisier deploy --config"),
+            "{service:?}"
+        );
+        assert!(service.contents.contains(MARKER), "marker: {service:?}");
+        assert_eq!(
+            service.install_dest.as_deref(),
+            Some(std::path::Path::new(
+                "/etc/systemd/system/fraisier-checkout-production-scheduled.service"
+            ))
+        );
+
+        let timer = find(&files, "scheduled.timer");
+        assert!(
+            timer.contents.contains("OnCalendar=*-*-* 03:00:00"),
+            "{timer:?}"
+        );
+        assert!(
+            timer.contents.contains("WantedBy=timers.target"),
+            "{timer:?}"
+        );
+    }
+
+    #[test]
+    fn generate_scheduled_requires_on_calendar() {
+        // MULTI has no [schedule] section.
+        let cfg = DeployConfig::from_toml_str(MULTI).expect("parse");
+        assert!(generate_scheduled(&cfg).is_err());
     }
 }

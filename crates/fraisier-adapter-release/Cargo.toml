@@ -20,9 +20,9 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-fraisier-core = { path = "../fraisier-core", version = "1.0.0-beta.1" }
-fraisier-artifact-release = { path = "../fraisier-artifact-release", version = "1.0.0-beta.1" }
-fraisier-ipc = { path = "../fraisier-ipc", version = "1.0.0-beta.1" }
+fraisier-core = { path = "../fraisier-core", version = "1.0.0-beta.2" }
+fraisier-artifact-release = { path = "../fraisier-artifact-release", version = "1.0.0-beta.2" }
+fraisier-ipc = { path = "../fraisier-ipc", version = "1.0.0-beta.2" }
 serde = "1.0.228"
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["macros", "rt"] }

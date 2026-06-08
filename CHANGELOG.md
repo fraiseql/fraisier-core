@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-beta.2] - 2026-06-08
+
 ### Added
 
 - **Project checks** (`fraisier check` + `fraisier-check` crate): a declarative

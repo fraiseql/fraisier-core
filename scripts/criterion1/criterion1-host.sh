@@ -17,10 +17,27 @@ UNIT=fraiseql-ecom.service
 UNIT_DIR=/etc/systemd/system
 PG_NAME=criterion1-pg
 PG_PORT=5432
+# Postgres image. Override to the org's ghcr mirror to skip Docker Hub (429-prone
+# on shared runner IPs), e.g. PG_IMAGE=ghcr.io/fraiseql/postgres:16 GHCR_TOKEN=$PAT
+PG_IMAGE="${PG_IMAGE:-postgres:16}"
 
 say(){ printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok(){ printf '\033[1;32m  ✓\033[0m %s\n' "$*"; }
 die(){ printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Log in to ghcr.io when $PG_IMAGE is a ghcr ref and a token is available, so the
+# org's private mirror can be pulled (Docker-Hub-free, no 429). A no-op for
+# Docker Hub images or when no token is set. The token is passed on stdin.
+ghcr_login(){
+  case "$PG_IMAGE" in ghcr.io/*) ;; *) return 0 ;; esac
+  local token="${GHCR_TOKEN:-${GITHUB_TOKEN:-}}"
+  [ -n "$token" ] || { say "ghcr: no GHCR_TOKEN/GITHUB_TOKEN; trying anonymous pull of $PG_IMAGE"; return 0; }
+  if printf '%s' "$token" | docker login ghcr.io -u "${GHCR_USER:-${GITHUB_ACTOR:-x}}" --password-stdin >/dev/null; then
+    say "ghcr: logged in"
+  else
+    die "ghcr.io login failed"
+  fi
+}
 
 [ -d /run/systemd/system ] || die "pid 1 is not systemd"
 [ "$(id -u)" = 0 ] || die "must run as root"
@@ -42,10 +59,11 @@ mkdir -p "$WORK/www" "$WORK/migrations" "$WORK/staging" "$WORK/state"
 cp "$SRC_MIGR"/*.sql "$WORK/migrations/"
 
 # Throwaway Postgres (container), published on loopback only
-say "starting Postgres container"
+say "starting Postgres container ($PG_IMAGE)"
+ghcr_login
 docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
 docker run -d --name "$PG_NAME" -e POSTGRES_PASSWORD=ecompw -e POSTGRES_DB=postgres \
-  -p 127.0.0.1:$PG_PORT:5432 postgres:16 >/dev/null
+  -p 127.0.0.1:$PG_PORT:5432 "$PG_IMAGE" >/dev/null
 for _ in $(seq 1 30); do docker exec "$PG_NAME" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
 docker exec "$PG_NAME" pg_isready -U postgres >/dev/null 2>&1 || die "Postgres did not come up"
 docker exec "$PG_NAME" psql -U postgres -q -c "DROP DATABASE IF EXISTS ecom;" >/dev/null

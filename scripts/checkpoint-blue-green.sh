@@ -31,6 +31,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PG_PORT="${PG_PORT:-55434}"
 PG_NAME="fraisier-bg-pg"
+# Postgres image. Override to the org's ghcr mirror to skip Docker Hub (blocked
+# on the dev box; 429-prone on shared CI/runner IPs), e.g.
+#   PG_IMAGE=ghcr.io/fraiseql/postgres:16-alpine GHCR_TOKEN=$PAT ./scripts/checkpoint-blue-green.sh
 PG_IMAGE="${PG_IMAGE:-postgres:16-alpine}"
 KEEP=0
 DB_DSN=""
@@ -46,6 +49,21 @@ done
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()  { printf '\033[1;32m  ✓\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Log in to ghcr.io when $PG_IMAGE is a ghcr ref and a token is available, so the
+# org's private mirror can be pulled (Docker-Hub-free, no 429). A no-op for
+# Docker Hub images or when no token is set (anonymous pulls, e.g. on a Hetzner
+# host). The token is passed on stdin, never in argv. Usage: ghcr_login <runtime>
+ghcr_login() {
+  case "$PG_IMAGE" in ghcr.io/*) ;; *) return 0 ;; esac
+  local token="${GHCR_TOKEN:-${GITHUB_TOKEN:-}}"
+  [ -n "$token" ] || { say "ghcr: no GHCR_TOKEN/GITHUB_TOKEN; trying anonymous pull of $PG_IMAGE"; return 0; }
+  if printf '%s' "$token" | "$1" login ghcr.io -u "${GHCR_USER:-${GITHUB_ACTOR:-x}}" --password-stdin >/dev/null; then
+    say "ghcr: logged in"
+  else
+    die "ghcr.io login failed"
+  fi
+}
 
 command -v confiture >/dev/null || die "confiture not on PATH (>= 0.22 for the window-safety gate)"
 command -v cargo >/dev/null     || die "cargo not on PATH"
@@ -264,6 +282,7 @@ if [ -z "$DB_DSN" ] && [ -z "$CONTAINER" ]; then
 else
   if [ -z "$DB_DSN" ]; then
     say "starting throwaway Postgres ($PG_IMAGE) with a low max_connections"
+    ghcr_login "$CONTAINER"
     $CONTAINER rm -f "$PG_NAME" >/dev/null 2>&1 || true
     $CONTAINER run -d --name "$PG_NAME" -e POSTGRES_PASSWORD=bgpw \
       -p "$PG_PORT:5432" "$PG_IMAGE" -c max_connections=20 >/dev/null \

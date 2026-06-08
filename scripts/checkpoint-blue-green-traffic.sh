@@ -36,6 +36,10 @@ GREEN_PORT="${GREEN_PORT:-8081}"
 PG_NAME="fraisier-bgt-pg"
 LB_CTR="fraisier-bgt-nginx"
 NGINX_IMG="${NGINX_IMG:-fraisier-mh-nginx}"
+# Postgres image. Override to the org's ghcr mirror to skip Docker Hub (blocked
+# on the dev box; 429-prone on shared CI/runner IPs), e.g.
+#   PG_IMAGE=ghcr.io/fraiseql/postgres:16-alpine GHCR_TOKEN=$PAT ./scripts/checkpoint-blue-green-traffic.sh
+PG_IMAGE="${PG_IMAGE:-postgres:16-alpine}"
 BLUE_UNIT="fraisier-bgt-blue.service"
 GREEN_UNIT="fraisier-bgt-green.service"
 KEEP=0
@@ -44,6 +48,21 @@ KEEP=0
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()  { printf '\033[1;32m  ✓\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Log in to ghcr.io when $PG_IMAGE is a ghcr ref and a token is available, so the
+# org's private mirror can be pulled (Docker-Hub-free, no 429). A no-op for
+# Docker Hub images or when no token is set. The token is passed on stdin, never
+# in argv. Usage: ghcr_login <runtime>
+ghcr_login() {
+  case "$PG_IMAGE" in ghcr.io/*) ;; *) return 0 ;; esac
+  local token="${GHCR_TOKEN:-${GITHUB_TOKEN:-}}"
+  [ -n "$token" ] || { say "ghcr: no GHCR_TOKEN/GITHUB_TOKEN; trying anonymous pull of $PG_IMAGE"; return 0; }
+  if printf '%s' "$token" | "$1" login ghcr.io -u "${GHCR_USER:-${GITHUB_ACTOR:-x}}" --password-stdin >/dev/null; then
+    say "ghcr: logged in"
+  else
+    die "ghcr.io login failed"
+  fi
+}
 
 command -v "$PODMAN" >/dev/null || die "podman not on PATH"
 command -v confiture >/dev/null || die "confiture not on PATH (>= 0.22)"
@@ -161,9 +180,10 @@ $PODMAN exec "$LB_CTR" nginx -t >/dev/null 2>&1 || die "nginx config invalid"
 ok "nginx LB on :$LB_PORT (active upstream -> blue)"
 
 # --- Postgres + confiture migration ---------------------------------------
-say "starting throwaway Postgres"
+say "starting throwaway Postgres ($PG_IMAGE)"
+ghcr_login "$PODMAN"
 $PODMAN run -d --name "$PG_NAME" -e POSTGRES_PASSWORD=bgpw \
-  -p "$PG_PORT:5432" postgres:16-alpine >/dev/null || die "Postgres failed"
+  -p "$PG_PORT:5432" "$PG_IMAGE" >/dev/null || die "Postgres failed"
 for _ in $(seq 1 40); do
   $PODMAN exec "$PG_NAME" pg_isready -U postgres >/dev/null 2>&1 && break; sleep 0.5
 done

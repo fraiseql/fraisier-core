@@ -105,7 +105,8 @@ The honestly-disclosed trade: more architectural work in week 1, less adapter-po
 | Webhook server | socket-activated | ✅ Required + standalone HTTP fallback |
 | Bootstrap | SSH-based | ✅ Required (Python-subprocess fallback acceptable for beta) |
 | Scaffold | `scaffold`, `scaffold-install` | ✅ Required, with `--prune` |
-| Release workflow | `ship` | ✅ For `Cargo.toml` and `pyproject.toml` |
+| Release workflow | `ship` | ✅ For `Cargo.toml` and `pyproject.toml`; runs `[[checks]]` as a pre-bump gate (`--no-check` to skip) |
+| Project checks | `check` | ✅ Declarative `[[checks]]`, cross-check parallelism (`-j`), single source of truth local + CI |
 | Versioning | `version show`, `version bump` | ✅ Required |
 | DB operations | `db migrate`, `db restore`, `db reset`, `backup` | ✅ Required |
 | Status / introspection | `deployment-status`, `list`, `health` | ✅ Required |

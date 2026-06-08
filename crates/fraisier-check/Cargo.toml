@@ -1,0 +1,26 @@
+[package]
+name = "fraisier-check"
+description = "Declarative, parallel project checks: the `fraisier check` runner and the gate `fraisier ship` runs before a release."
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fraisier-adapter-support = { path = "../fraisier-adapter-support", version = "1.0.0-beta.1" }
+# Used only for `join_all` (batched cross-check concurrency); no executor is
+# pulled in — the CLI owns the tokio runtime.
+futures = { version = "0.3.31", default-features = false, features = ["std", "async-await"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread"] }

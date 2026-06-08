@@ -94,6 +94,12 @@ pub struct DeployConfig {
     /// `[deploy].strategy = "blue-green"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blue_green: Option<BlueGreenSection>,
+    /// The `[[checks]]` array-of-tables: project checks (lint/test/typecheck)
+    /// fraisier runs with cross-check parallelism, both locally
+    /// (`fraisier check`) and as the gate `fraisier ship` runs before bumping the
+    /// version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<CheckSection>,
     /// The `[specql]` preset. Present only in the *unexpanded* form; both
     /// [`from_toml_str`](DeployConfig::from_toml_str) and
     /// [`load`](DeployConfig::load) consume it and leave this `None`.
@@ -143,6 +149,24 @@ pub struct HostSpec {
     /// The address fraisier reaches it at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+}
+
+/// One `[[checks]]` entry: a named shell command fraisier runs as a check.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckSection {
+    /// The check's name — required, non-empty, and unique across `[[checks]]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The shell command, run via `sh -c`. Required and non-empty. Intra-check
+    /// parallelism (e.g. `pytest -n auto`) lives in this string; cross-check
+    /// parallelism is the `fraisier check` `-j` flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The directory the command runs in, relative to the config file's
+    /// directory. Absent runs in the project root the command is invoked from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<PathBuf>,
 }
 
 /// The `[artifact]` section. `source` selects which of the source-specific

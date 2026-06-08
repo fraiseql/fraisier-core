@@ -6,6 +6,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Project checks** (`fraisier check` + `fraisier-check` crate): a declarative
+  `[[checks]]` list in `fraisier.toml` — named shell commands run via `sh -c`
+  with cross-check parallelism (`-j`, default auto). One source of truth runnable
+  locally and in CI. A check passes iff its command exits `0`; output is captured
+  and shown for failures (and always under `--json`).
+- **`ship` check gate**: `fraisier ship` runs `[[checks]]` before the version
+  bump and refuses to release if any fails. On by default; `--no-check` skips it;
+  a project with no `[[checks]]` ships exactly as before; `--dry-run` reports the
+  checks would run without executing them.
+
 ## [1.0.0-beta.1]
 
 The first public release: a deploy-orchestration engine with atomic,

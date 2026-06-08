@@ -191,8 +191,28 @@ sync              Share the deploy ledger across operators over git refs (experi
 backup / db       Database lifecycle: backup, migrate, restore, reset
 providers         List the adapters available to this binary, per axis
 provider-test     Probe one provider (IPC handshake or built-in presence)
-version / ship    Show/bump the project version; bump + commit + push + deploy
+check             Run the project's [[checks]] with cross-check parallelism (-j)
+version / ship    Show/bump the version; ship = checks → bump → commit → push → deploy
 scaffold[-install] Generate/install the systemd/socket/nginx/CI deploy files
+```
+
+### Project checks
+
+A project can declare `[[checks]]` in its `fraisier.toml` — named shell commands
+(lint / test / typecheck) that `fraisier check` runs with cross-check parallelism
+(`-j`, default auto). The same list gates a release: `fraisier ship` runs the
+checks first and refuses to bump the version if any fails (`--no-check` skips the
+gate). Intra-check parallelism (e.g. `pytest -n auto`) lives in the command
+string, so the runner needs no per-framework knowledge.
+
+```toml
+[[checks]]
+name = "lint"
+command = "cargo clippy --all-targets -- -D warnings"
+
+[[checks]]
+name = "test"
+command = "cargo test --workspace"
 ```
 
 ## Observability

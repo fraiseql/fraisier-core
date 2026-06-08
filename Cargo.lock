@@ -475,6 +475,7 @@ dependencies = [
  "fraisier-artifact-pull",
  "fraisier-artifact-release",
  "fraisier-bootstrap",
+ "fraisier-check",
  "fraisier-config",
  "fraisier-core",
  "fraisier-db",
@@ -649,6 +650,16 @@ version = "1.0.0-beta.1"
 dependencies = [
  "fraisier-adapter-support",
  "fraisier-core",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "fraisier-check"
+version = "1.0.0-beta.1"
+dependencies = [
+ "fraisier-adapter-support",
+ "futures",
  "tempfile",
  "tokio",
 ]

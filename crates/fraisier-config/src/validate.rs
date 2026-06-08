@@ -132,6 +132,7 @@ impl DeployConfig {
         validate_schedule(self, &mut report);
         validate_sync(self, &mut report);
         validate_blue_green(self, &mut report);
+        validate_checks(self, &mut report);
         report
     }
 
@@ -149,11 +150,48 @@ impl DeployConfig {
         validate_migration(self, &mut report);
         report
     }
+
+    /// Validate only the `[[checks]]` section.
+    ///
+    /// `fraisier check` runs the project checks and does not need a full, valid
+    /// deploy config — a project may carry only `[[checks]]` and no `[deploy]`.
+    /// This is the same pure, no-I/O check restricted to that one section.
+    #[must_use]
+    pub fn validate_checks_only(&self) -> ValidationReport {
+        let mut report = ValidationReport::default();
+        validate_checks(self, &mut report);
+        report
+    }
 }
 
 /// Whether an optional string field is present and non-blank.
 fn is_set(field: Option<&String>) -> bool {
     field.is_some_and(|s| !s.trim().is_empty())
+}
+
+/// Validate the `[[checks]]` list: every entry needs a non-empty name and
+/// command, and names must be unique. An absent / empty list is not an error.
+fn validate_checks(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let mut seen = BTreeSet::new();
+    for (index, check) in cfg.checks.iter().enumerate() {
+        if !is_set(check.name.as_ref()) {
+            report.error(
+                &format!("checks[{index}].name"),
+                "each check requires a non-empty name",
+            );
+        }
+        if !is_set(check.command.as_ref()) {
+            report.error(
+                &format!("checks[{index}].command"),
+                "each check requires a non-empty command",
+            );
+        }
+        if let Some(name) = &check.name {
+            if !seen.insert(name.as_str()) {
+                report.error("checks", format!("duplicate check name '{name}'"));
+            }
+        }
+    }
 }
 
 fn validate_deploy(cfg: &DeployConfig, report: &mut ValidationReport) {

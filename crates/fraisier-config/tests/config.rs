@@ -717,3 +717,95 @@ fn the_old_on_calendar_key_no_longer_parses() {
         "deny_unknown_fields must reject the removed `on_calendar` key"
     );
 }
+
+const TWO_CHECKS: &str = "
+[[checks]]
+name = \"lint\"
+command = \"cargo clippy\"
+
+[[checks]]
+name = \"test\"
+command = \"cargo test\"
+";
+
+#[test]
+fn checks_parse_from_array_of_tables_and_validate_clean() {
+    let toml = format!("{PRD_7_1}{TWO_CHECKS}");
+    let cfg = DeployConfig::from_toml_str(&toml).expect("parses");
+    assert_eq!(cfg.checks.len(), 2);
+    assert_eq!(cfg.checks[0].name.as_deref(), Some("lint"));
+    assert_eq!(cfg.checks[1].command.as_deref(), Some("cargo test"));
+    let report = cfg.validate();
+    assert!(report.ok(), "{report}");
+}
+
+#[test]
+fn check_missing_name_is_an_error() {
+    let toml = format!("{PRD_7_1}\n[[checks]]\ncommand = \"cargo test\"\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "checks[0].name"), "{report}");
+}
+
+#[test]
+fn check_missing_command_is_an_error() {
+    let toml = format!("{PRD_7_1}\n[[checks]]\nname = \"test\"\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "checks[0].command"), "{report}");
+}
+
+#[test]
+fn duplicate_check_names_are_an_error() {
+    let toml = format!(
+        "{PRD_7_1}\n[[checks]]\nname = \"lint\"\ncommand = \"a\"\n\n\
+         [[checks]]\nname = \"lint\"\ncommand = \"b\"\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "checks"), "{report}");
+}
+
+#[test]
+fn unknown_check_field_is_rejected() {
+    let toml = format!("{PRD_7_1}\n[[checks]]\nname = \"x\"\ncommand = \"y\"\nbogus = 1\n");
+    assert!(
+        DeployConfig::from_toml_str(&toml).is_err(),
+        "deny_unknown_fields must reject an unknown check key"
+    );
+}
+
+#[test]
+fn a_checks_only_config_validates_via_validate_checks_only() {
+    // A project may carry only [[checks]] and no deploy sections.
+    let toml = "[[checks]]\nname = \"lint\"\ncommand = \"cargo clippy\"\n";
+    let cfg = DeployConfig::from_toml_str(toml).expect("parses");
+    assert!(
+        !cfg.validate().ok(),
+        "a checks-only config is missing the deploy sections a full deploy needs"
+    );
+    let report = cfg.validate_checks_only();
+    assert!(report.ok(), "{report}");
+}
+
+#[test]
+fn an_absent_checks_list_is_not_an_error() {
+    let cfg = DeployConfig::from_toml_str(PRD_7_1).expect("parses");
+    assert!(cfg.checks.is_empty());
+    assert!(cfg.validate_checks_only().ok());
+}
+
+#[test]
+fn preset_overlay_keeps_author_checks() {
+    // The [specql] preset emits no checks; an author-supplied [[checks]] must
+    // survive preset expansion.
+    let toml = format!(
+        "[specql]\nname = \"app\"\nenvironment = \"production\"\nhosts = [\"h1.internal\"]\n{TWO_CHECKS}"
+    );
+    let cfg = DeployConfig::from_toml_str(&toml).expect("parses");
+    assert_eq!(cfg.checks.len(), 2, "author checks must survive overlay");
+    assert!(cfg.validate().ok(), "{}", cfg.validate());
+}

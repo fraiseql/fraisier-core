@@ -97,6 +97,9 @@ enum Command {
     /// Bump the version, commit, push, and (unless `--no-deploy`) deploy it.
     Ship(ShipCliArgs),
 
+    /// Run the project's `[[checks]]` (lint/test/typecheck) with cross-check parallelism.
+    Check(CheckCliArgs),
+
     /// Generate the systemd/socket/nginx/CI deploy files into a local tree.
     Scaffold(ScaffoldArgs),
 
@@ -143,6 +146,9 @@ struct ScaffoldInstallArgs {
     dry_run: bool,
 }
 
+// Reason: these are independent ship flags (dry-run / no-deploy / no-check /
+// no-push); folding them into enums would be more ceremony than signal.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args)]
 struct ShipCliArgs {
     /// Which component to bump.
@@ -160,6 +166,10 @@ struct ShipCliArgs {
     /// Skip the follow-on deploy.
     #[arg(long)]
     no_deploy: bool,
+
+    /// Skip the pre-bump `[[checks]]` gate (checks run before the bump by default).
+    #[arg(long)]
+    no_check: bool,
 
     /// Do not push the release commit.
     #[arg(long)]
@@ -180,6 +190,21 @@ struct ShipCliArgs {
     /// The single-host override (used only when a deploy follows).
     #[arg(long)]
     host: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct CheckCliArgs {
+    /// The `fraisier.toml` to read `[[checks]]` from.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// The directory checks run in (the base for a check with no `workdir`).
+    #[arg(long, default_value = ".")]
+    path: PathBuf,
+
+    /// Max checks to run concurrently. 0 = auto (number of logical CPUs).
+    #[arg(short = 'j', long, default_value_t = 0)]
+    jobs: usize,
 }
 
 #[derive(Debug, Subcommand)]
@@ -676,6 +701,7 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
                 level: args.level.into(),
                 dry_run: args.dry_run,
                 no_deploy: args.no_deploy,
+                no_check: args.no_check,
                 push: !args.no_push,
                 remote: args.remote.clone(),
                 config: &args.config,
@@ -684,6 +710,7 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
             })
             .await
         }
+        Command::Check(args) => commands::check(&args.config, &args.path, args.jobs).await,
         Command::Scaffold(args) => commands::scaffold(&args.config, &args.out, args.dry_run),
         Command::ScaffoldInstall(args) => {
             commands::scaffold_install(&args.config, &args.root, args.prune, args.yes, args.dry_run)

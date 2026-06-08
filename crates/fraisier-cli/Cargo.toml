@@ -61,6 +61,8 @@ fraisier-artifact-git = { path = "../fraisier-artifact-git", version = "1.0.0-be
 fraisier-scaffold = { path = "../fraisier-scaffold", version = "1.0.0-beta.1" }
 # Version reading/bumping and the `ship` release workflow.
 fraisier-ship = { path = "../fraisier-ship", version = "1.0.0-beta.1" }
+# The declarative project-check runner (`fraisier check` + the `ship` gate).
+fraisier-check = { path = "../fraisier-check", version = "1.0.0-beta.1" }
 # Generic-Postgres database lifecycle ops (backup/restore/reset).
 fraisier-db = { path = "../fraisier-db", version = "1.0.0-beta.1" }
 # SSH-based host bootstrap (prepare deploy directories over the transport).

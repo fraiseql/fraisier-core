@@ -116,6 +116,8 @@ impl SpecqlPreset {
             schedule: None,
             sync: None,
             blue_green: None,
+            // The preset emits no checks; an author-supplied [[checks]] wins.
+            checks: Vec::new(),
             specql: None,
         }
     }
@@ -308,6 +310,13 @@ impl DeployConfig {
             sync: prefer(base.sync, self.sync),
             // The preset never emits [blue_green]; an author-supplied one wins.
             blue_green: prefer(base.blue_green, self.blue_green),
+            // The preset never emits [[checks]]; an author-supplied list wins,
+            // replacing wholesale (a list can't be field-merged).
+            checks: if self.checks.is_empty() {
+                base.checks
+            } else {
+                self.checks
+            },
             specql: None,
         }
     }

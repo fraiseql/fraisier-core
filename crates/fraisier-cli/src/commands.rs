@@ -109,6 +109,9 @@ pub(crate) fn version_bump(dir: &Path, level: fraisier_ship::Bump) -> Result<Com
 }
 
 /// Everything `ship` needs: the version bump plus the follow-on deploy inputs.
+// Reason: these mirror the independent ship CLI flags (dry-run / no-deploy /
+// no-check / push); a flat arg bundle, not a state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct ShipArgs<'a> {
     /// The project directory holding the version file.
     pub dir: &'a Path,
@@ -118,6 +121,8 @@ pub(crate) struct ShipArgs<'a> {
     pub dry_run: bool,
     /// Skip the follow-on deploy.
     pub no_deploy: bool,
+    /// Skip the pre-bump `[[checks]]` gate.
+    pub no_check: bool,
     /// Push the release commit.
     pub push: bool,
     /// The git remote to push to.
@@ -133,6 +138,20 @@ pub(crate) struct ShipArgs<'a> {
 /// `ship <level>`: bump → commit → push, then (unless `--no-deploy`) deploy the
 /// freshly-bumped version.
 pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
+    // Pre-bump check gate (default on; `--no-check` skips; a dry run reports the
+    // checks would run but does not execute them). Runs before any bump/commit,
+    // so a gate failure leaves the version file and git history untouched.
+    let checks_json = if args.dry_run {
+        json!({ "would_run": count_checks(args.config) })
+    } else if args.no_check {
+        json!({ "ran": false, "reason": "skipped (--no-check)" })
+    } else {
+        match ship_check_gate(args.dir, args.config).await? {
+            ShipGateOutcome::Abort(output) => return Ok(output),
+            ShipGateOutcome::Proceed(value) => value,
+        }
+    };
+
     let opts = fraisier_ship::ShipOptions {
         dry_run: args.dry_run,
         no_deploy: args.no_deploy,
@@ -179,6 +198,7 @@ pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
                 "pushed": report.pushed,
                 "deployed": false,
                 "dry_run": report.dry_run,
+                "checks": checks_json,
             }),
         });
     }
@@ -203,7 +223,197 @@ pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
             "pushed": report.pushed,
             "deployed": true,
             "deploy": deploy_out.json,
+            "checks": checks_json,
         }),
+    })
+}
+
+/// The decision the pre-bump check gate hands back to [`ship`].
+enum ShipGateOutcome {
+    /// Checks failed (or were invalid): do not ship; return this output as-is.
+    Abort(CommandOutput),
+    /// Checks passed (or none are configured): proceed, embedding this JSON.
+    Proceed(Value),
+}
+
+/// Run the configured `[[checks]]` before a ship, from `config_path`, in
+/// `base_dir`. A missing config file means "no checks" (a pure version bump
+/// without a `fraisier.toml` still ships). A present-but-invalid checks section,
+/// or any failing check, aborts the ship.
+async fn ship_check_gate(base_dir: &Path, config_path: &Path) -> Result<ShipGateOutcome> {
+    if !config_path.exists() {
+        return Ok(ShipGateOutcome::Proceed(
+            json!({ "ran": false, "reason": "no config" }),
+        ));
+    }
+    let config = load(config_path)?;
+    let report = config.validate_checks_only();
+    if !report.ok() {
+        return Ok(ShipGateOutcome::Abort(CommandOutput {
+            exit_code: 1,
+            pretty: format!(
+                "{}refusing to ship: invalid checks\n",
+                render_issues(&report)
+            ),
+            json: json!({
+                "shipped": false,
+                "checks": { "ran": true, "ok": false, "issues": serde_json::to_value(&report.issues)? },
+            }),
+        }));
+    }
+    if config.checks.is_empty() {
+        return Ok(ShipGateOutcome::Proceed(
+            json!({ "ran": false, "reason": "no checks configured" }),
+        ));
+    }
+    let checks = build_checks(&config, config_path);
+    let run = fraisier_check::run(&checks, resolve_jobs(0), base_dir).await;
+    if run.ok() {
+        let mut value = check_report_json(&run);
+        value["ran"] = json!(true);
+        Ok(ShipGateOutcome::Proceed(value))
+    } else {
+        Ok(ShipGateOutcome::Abort(CommandOutput {
+            exit_code: 1,
+            pretty: format!(
+                "{}refusing to ship: checks failed\n",
+                render_check_report(&run)
+            ),
+            json: json!({ "shipped": false, "checks": check_report_json(&run) }),
+        }))
+    }
+}
+
+/// How many `[[checks]]` a config declares (0 if the file is absent or
+/// unparseable — used only to preview a dry-run plan).
+fn count_checks(config_path: &Path) -> usize {
+    if !config_path.exists() {
+        return 0;
+    }
+    load(config_path).map_or(0, |config| config.checks.len())
+}
+
+/// `check`: run the project's `[[checks]]` with cross-check parallelism. Exits 0
+/// iff every check passes. Captured output is shown for failing checks (and
+/// always under `--json`); it is never streamed.
+pub(crate) async fn check(config_path: &Path, base: &Path, jobs: usize) -> Result<CommandOutput> {
+    let config = load(config_path)?;
+    let report = config.validate_checks_only();
+    if !report.ok() {
+        return Ok(CommandOutput {
+            exit_code: 1,
+            pretty: format!("{}refusing to run invalid checks\n", render_issues(&report)),
+            json: json!({ "ok": false, "issues": serde_json::to_value(&report.issues)? }),
+        });
+    }
+    if config.checks.is_empty() {
+        return Ok(CommandOutput {
+            exit_code: 0,
+            pretty: "no [[checks]] configured\n".to_owned(),
+            json: json!({ "ok": true, "checks": [], "total_ms": 0 }),
+        });
+    }
+    let checks = build_checks(&config, config_path);
+    let run = fraisier_check::run(&checks, resolve_jobs(jobs), base).await;
+    Ok(CommandOutput {
+        exit_code: i32::from(!run.ok()),
+        pretty: render_check_report(&run),
+        json: check_report_json(&run),
+    })
+}
+
+/// Build runnable checks from a parsed config, resolving each `workdir` against
+/// the config file's directory (absolute workdirs pass through unchanged).
+fn build_checks(config: &DeployConfig, config_path: &Path) -> Vec<fraisier_check::Check> {
+    let config_dir = config_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    config
+        .checks
+        .iter()
+        .map(|check| {
+            let workdir = check.workdir.as_ref().map(|dir| {
+                if dir.is_absolute() {
+                    dir.clone()
+                } else {
+                    config_dir.join(dir)
+                }
+            });
+            fraisier_check::Check {
+                name: check.name.clone().unwrap_or_default(),
+                command: check.command.clone().unwrap_or_default(),
+                workdir,
+            }
+        })
+        .collect()
+}
+
+/// Resolve the requested job count: `0` means auto (logical CPUs, at least 1).
+fn resolve_jobs(jobs: usize) -> usize {
+    if jobs == 0 {
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    } else {
+        jobs
+    }
+}
+
+/// Milliseconds of a duration, saturating rather than overflowing `u64`.
+fn duration_ms(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The human-readable check report: one line per check (captured output shown
+/// for failures), then a pass/total summary.
+fn render_check_report(run: &fraisier_check::CheckRunReport) -> String {
+    use fraisier_check::CheckStatus;
+    let mut out = String::new();
+    for outcome in &run.outcomes {
+        let tag = match outcome.status {
+            CheckStatus::Passed => "ok",
+            CheckStatus::Failed => "FAIL",
+            CheckStatus::SpawnError => "ERROR",
+        };
+        let ms = duration_ms(outcome.duration);
+        let _ = writeln!(out, "  [{tag}] {} ({ms} ms)", outcome.name);
+        if !outcome.passed() {
+            for line in outcome.stdout.lines().chain(outcome.stderr.lines()) {
+                let _ = writeln!(out, "      {line}");
+            }
+        }
+    }
+    let total = run.outcomes.len();
+    let passed = total - run.failed_count();
+    let _ = writeln!(out, "{passed}/{total} checks passed");
+    out
+}
+
+/// The machine-readable check report (the frozen `check` JSON shape).
+fn check_report_json(run: &fraisier_check::CheckRunReport) -> Value {
+    use fraisier_check::CheckStatus;
+    let checks: Vec<Value> = run
+        .outcomes
+        .iter()
+        .map(|outcome| {
+            let status = match outcome.status {
+                CheckStatus::Passed => "passed",
+                CheckStatus::Failed => "failed",
+                CheckStatus::SpawnError => "spawn_error",
+            };
+            json!({
+                "name": outcome.name,
+                "status": status,
+                "code": outcome.code,
+                "duration_ms": duration_ms(outcome.duration),
+                "stdout": outcome.stdout,
+                "stderr": outcome.stderr,
+            })
+        })
+        .collect();
+    json!({
+        "ok": run.ok(),
+        "total_ms": duration_ms(run.total_duration),
+        "checks": checks,
     })
 }
 
@@ -2127,7 +2337,7 @@ async fn notify_deploy_failure(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_exit, bootstrap, classify_source, db_backup, db_migrate, db_reset, db_restore,
+        apply_exit, bootstrap, check, classify_source, db_backup, db_migrate, db_reset, db_restore,
         deploy, discover_adapters, health, init, list, notify_deploy_failure, provider_test,
         providers, rollback, scaffold, scaffold_install, scheduled_install, scheduled_list,
         scheduled_uninstall, ship, status, sync, validate_config, version_bump, version_show,
@@ -2284,6 +2494,7 @@ url = "http://127.0.0.1:8080/health"
             level: fraisier_ship::Bump::Patch,
             dry_run: true,
             no_deploy: true,
+            no_check: false,
             push: false,
             remote: "origin".to_owned(),
             config: Path::new("fraisier.toml"),
@@ -2299,6 +2510,173 @@ url = "http://127.0.0.1:8080/health"
         assert!(std::fs::read_to_string(dir.path().join("Cargo.toml"))
             .unwrap()
             .contains("0.1.5"));
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// A git repo with a committed `Cargo.toml` at `version` and a committed
+    /// `fraisier.toml` holding `config_body`, so the tree is clean for `ship`.
+    fn ship_repo(dir: &Path, version: &str, config_body: &str) {
+        run_git(dir, &["init", "-b", "main", "-q"]);
+        run_git(dir, &["config", "user.email", "t@example.com"]);
+        run_git(dir, &["config", "user.name", "Test"]);
+        run_git(dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"app\"\nversion = \"{version}\"\n"),
+        )
+        .expect("write Cargo.toml");
+        std::fs::write(dir.join("fraisier.toml"), config_body).expect("write fraisier.toml");
+        run_git(dir, &["add", "-A"]);
+        run_git(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    fn head_subject(dir: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["log", "-1", "--format=%s"])
+            .output()
+            .expect("git log");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// Build `ShipArgs` for a gate test against `dir` (no deploy, no push).
+    fn ship_gate_args<'a>(dir: &'a Path, config: &'a Path, no_check: bool) -> ShipArgs<'a> {
+        ShipArgs {
+            dir,
+            level: fraisier_ship::Bump::Patch,
+            dry_run: false,
+            no_deploy: true,
+            no_check,
+            push: false,
+            remote: "origin".to_owned(),
+            config,
+            state_dir: Path::new(".fraisier/state"),
+            host: None,
+        }
+    }
+
+    const FAILING_CHECK: &str = "[[checks]]\nname = \"test\"\ncommand = \"false\"\n";
+    const PASSING_CHECK: &str = "[[checks]]\nname = \"test\"\ncommand = \"true\"\n";
+
+    #[tokio::test]
+    async fn ship_aborts_before_bump_when_a_check_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ship_repo(dir.path(), "0.1.5", FAILING_CHECK);
+        let config = dir.path().join("fraisier.toml");
+        let out = ship(ship_gate_args(dir.path(), &config, false))
+            .await
+            .expect("ship runs");
+        assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
+        assert_eq!(out.json["shipped"], serde_json::json!(false));
+        // The gate ran before the bump: version file and history are untouched.
+        assert!(std::fs::read_to_string(dir.path().join("Cargo.toml"))
+            .unwrap()
+            .contains("0.1.5"));
+        assert_eq!(head_subject(dir.path()), "init");
+    }
+
+    #[tokio::test]
+    async fn ship_no_check_bypasses_a_failing_gate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ship_repo(dir.path(), "0.1.5", FAILING_CHECK);
+        let config = dir.path().join("fraisier.toml");
+        let out = ship(ship_gate_args(dir.path(), &config, true))
+            .await
+            .expect("ship runs");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert_eq!(out.json["new_version"], serde_json::json!("0.1.6"));
+        assert_eq!(out.json["checks"]["ran"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn ship_with_no_checks_configured_bumps_normally() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ship_repo(dir.path(), "0.1.5", "# no checks here\n");
+        let config = dir.path().join("fraisier.toml");
+        let out = ship(ship_gate_args(dir.path(), &config, false))
+            .await
+            .expect("ship runs");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert_eq!(out.json["new_version"], serde_json::json!("0.1.6"));
+        assert_eq!(out.json["checks"]["ran"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn ship_runs_passing_checks_then_bumps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        ship_repo(dir.path(), "0.1.5", PASSING_CHECK);
+        let config = dir.path().join("fraisier.toml");
+        let out = ship(ship_gate_args(dir.path(), &config, false))
+            .await
+            .expect("ship runs");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert_eq!(out.json["new_version"], serde_json::json!("0.1.6"));
+        assert_eq!(out.json["checks"]["ran"], serde_json::json!(true));
+        assert_eq!(out.json["checks"]["ok"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn ship_dry_run_does_not_execute_checks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A failing check that *would* abort a real ship is never executed.
+        ship_repo(dir.path(), "0.1.5", FAILING_CHECK);
+        let config = dir.path().join("fraisier.toml");
+        let mut args = ship_gate_args(dir.path(), &config, false);
+        args.dry_run = true;
+        let out = ship(args).await.expect("ship dry run");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert_eq!(out.json["checks"]["would_run"], serde_json::json!(1));
+        assert!(std::fs::read_to_string(dir.path().join("Cargo.toml"))
+            .unwrap()
+            .contains("0.1.5"));
+    }
+
+    #[tokio::test]
+    async fn check_exits_zero_when_all_pass() {
+        // A checks-only config (no [deploy]) must run without a full deploy config.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", PASSING_CHECK);
+        let out = check(&config, dir.path(), 1).await.expect("check");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert_eq!(out.json["ok"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn check_exits_nonzero_when_a_check_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", FAILING_CHECK);
+        let out = check(&config, dir.path(), 1).await.expect("check");
+        assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
+        assert_eq!(out.json["ok"], serde_json::json!(false));
+        assert_eq!(out.json["checks"][0]["status"], serde_json::json!("failed"));
+    }
+
+    #[tokio::test]
+    async fn check_refuses_an_invalid_checks_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A check with a name but no command is invalid.
+        let config = write(dir.path(), "fraisier.toml", "[[checks]]\nname = \"a\"\n");
+        let out = check(&config, dir.path(), 1).await.expect("check");
+        assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
+        assert_eq!(out.json["ok"], serde_json::json!(false));
+        assert!(out.json["issues"].is_array());
+    }
+
+    #[tokio::test]
+    async fn check_with_no_checks_is_a_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", "# nothing\n");
+        let out = check(&config, dir.path(), 1).await.expect("check");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert_eq!(out.json["checks"], serde_json::json!([]));
     }
 
     #[test]

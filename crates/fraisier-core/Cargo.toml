@@ -1,0 +1,32 @@
+[package]
+name = "fraisier-core"
+description = "Deploy-specific composition over the fraisier-saga engine: the five adapter axes (artifact, migration, service, health, load-balancer) and the multi-host plan."
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+fraisier-saga = { path = "../fraisier-saga", version = "1.0.0-beta.2" }
+# `futures` is used only for its `join_all` combinator (concurrent per-host
+# fetch / batch rollout); no executor is pulled in (the CLI owns the runtime).
+futures = { version = "0.3.31", default-features = false, features = ["std", "async-await"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.17"
+# A logging facade only (no runtime); used for advisory connection-budget warnings.
+tracing = "0.1.41"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread"] }

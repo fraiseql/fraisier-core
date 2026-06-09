@@ -1,0 +1,14 @@
+# release-plz configuration — https://release-plz.dev/docs/config
+#
+# Versioning, changelogs, and crates.io publishing for the workspace are driven by
+# conventional-commit history. release-plz publishes in dependency order; the
+# workspace ordering (fraisier-saga → fraisier-core → … → fraisier) is computed
+# automatically, so no manual sequence is maintained here.
+
+[workspace]
+# Cut a GitHub release (with the generated changelog notes) per published version.
+git_release_enable = true
+# Block a release that breaks SemVer against what is already on crates.io
+# (release-plz runs cargo-semver-checks) — a guard for the frozen v1.0
+# adapter/saga API. Only takes effect once a crate has a published baseline.
+semver_check = true

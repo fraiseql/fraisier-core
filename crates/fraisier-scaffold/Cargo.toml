@@ -1,0 +1,24 @@
+[package]
+name = "fraisier-scaffold"
+description = "Generators for fraisier's on-disk files: the `init` starter `fraisier.toml` and the `scaffold` systemd/socket/nginx/CI templates."
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The `scaffold` templates are parameterized by the parsed deploy config.
+fraisier-config = { path = "../fraisier-config", version = "1.0.0-beta.2" }
+thiserror = "2.0.17"
+
+[dev-dependencies]
+tempfile = "3.27.0"

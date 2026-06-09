@@ -1,0 +1,9 @@
+# ShellCheck configuration for the repo's helper scripts.
+#
+# SC2317 ("command appears to be unreachable") false-positives on the
+# cleanup/teardown functions in scripts/, which are invoked only via
+# `trap ... EXIT/INT/TERM`. ShellCheck's static analysis can't see the trap as a
+# use, so it flags the whole function body. Newer ShellCheck (>= 0.11) is
+# trap-aware and stays quiet, but older versions (e.g. the one on CI runners)
+# still report it — disable it repo-wide so local and CI agree across versions.
+disable=SC2317

@@ -1,0 +1,83 @@
+name: release-plz
+
+# Automated, dependency-ordered releases for the workspace.
+#
+#   * release-pr  — on every push to main, open/update a "release" PR that bumps
+#     versions and updates changelogs from the conventional-commit history.
+#   * release     — on every push to main, publish to crates.io any crate whose
+#     Cargo.toml version is not yet on the registry (i.e. right after a release PR
+#     is merged), in dependency order, then tag + cut a GitHub release.
+#
+# The first publish of the 25 brand-new crate names is done MANUALLY (it claims
+# the names deliberately); release-plz takes over every release after that.
+#
+# Auth: a short-lived GitHub App token (the `fraiseql-promot` app) instead of a
+# PAT — so release-plz's PRs/tags trigger CI and nothing long-lived is stored.
+# The app must be installed on this repo with Contents + Pull requests = write.
+# Actions are pinned by commit SHA (matches the fraiseql repo's hardening).
+on:
+  push:
+    branches: [main]
+
+# The GITHUB_TOKEN only needs to clone; the App token does all the writes.
+permissions:
+  contents: read
+
+jobs:
+  release-pr:
+    name: release-plz PR
+    runs-on: ubuntu-latest
+    # Never run on forks.
+    if: github.repository == 'fraiseql/fraisier-core'
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+      - name: Mint a GitHub App token (fraiseql-promot)
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: release-plz — maintain the release PR
+        uses: release-plz/action@064f4d1e36c843611ddf013be726beaa4ad804db # v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  release:
+    name: release-plz release
+    runs-on: ubuntu-latest
+    if: github.repository == 'fraiseql/fraisier-core'
+    # The crates.io token lives in this protected Environment (restricted to the
+    # main branch; add required reviewers here for an extra manual gate).
+    environment: release
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+      - name: Mint a GitHub App token (fraiseql-promot)
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: release-plz — publish unreleased crates
+        uses: release-plz/action@064f4d1e36c843611ddf013be726beaa4ad804db # v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          # crates.io token (`CARGO_TOKEN` secret name shared with fraiseql),
+          # mapped to the env var cargo/release-plz expect.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}

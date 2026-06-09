@@ -1,0 +1,4 @@
+# `cargo xtask <task>` runs the workspace task runner in crates/xtask — the single
+# source of truth for the CI gate (CI invokes the same `cargo xtask ci`).
+[alias]
+xtask = "run --quiet --package xtask --"

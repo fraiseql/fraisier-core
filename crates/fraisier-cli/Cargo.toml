@@ -1,0 +1,78 @@
+[package]
+name = "fraisier"
+description = "Atomic, migration-safe deploys across one host or a fleet — the fraisier command-line binary (deploy, multi-host rolling, blue-green, rollback)."
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "fraisier"
+path = "src/main.rs"
+
+[features]
+default = []
+# Export saga spans over OTLP/HTTP (Jaeger, etc.). Off by default so the stock
+# binary stays lean; the PRD §10.3 checkpoint builds with it. Enables the
+# export pipeline in fraisier-saga and is initialised in `main` when an OTLP
+# endpoint is configured in the environment.
+otel = ["fraisier-saga/otel"]
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.100"
+async-trait = "0.1.89"
+clap = { version = "4.5.51", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "process", "time"] }
+
+# Vocabulary, engine, config, and the IPC transport. Per the crate-graph rule the
+# CLI is the layer that depends on *both* fraisier-core and fraisier-ipc and wires
+# in-process vs IPC adapter selection.
+fraisier-core = { path = "../fraisier-core", version = "1.0.0-beta.2" }
+fraisier-config = { path = "../fraisier-config", version = "1.0.0-beta.2" }
+fraisier-saga = { path = "../fraisier-saga", version = "1.0.0-beta.2" }
+fraisier-ipc = { path = "../fraisier-ipc", version = "1.0.0-beta.2" }
+
+# In-process adapters selected by name from the config.
+fraisier-adapter-support = { path = "../fraisier-adapter-support", version = "1.0.0-beta.2" }
+fraisier-adapter-confiture = { path = "../fraisier-adapter-confiture", version = "1.0.0-beta.2" }
+fraisier-adapter-command = { path = "../fraisier-adapter-command", version = "1.0.0-beta.2" }
+fraisier-adapter-systemd = { path = "../fraisier-adapter-systemd", version = "1.0.0-beta.2" }
+fraisier-adapter-rc = { path = "../fraisier-adapter-rc", version = "1.0.0-beta.2" }
+fraisier-adapter-docker-compose = { path = "../fraisier-adapter-docker-compose", version = "1.0.0-beta.2" }
+fraisier-adapter-http = { path = "../fraisier-adapter-http", version = "1.0.0-beta.2" }
+fraisier-adapter-nginx = { path = "../fraisier-adapter-nginx", version = "1.0.0-beta.2" }
+fraisier-artifact-release = { path = "../fraisier-artifact-release", version = "1.0.0-beta.2" }
+fraisier-artifact-pull = { path = "../fraisier-artifact-pull", version = "1.0.0-beta.2" }
+fraisier-artifact-local = { path = "../fraisier-artifact-local", version = "1.0.0-beta.2" }
+fraisier-artifact-git = { path = "../fraisier-artifact-git", version = "1.0.0-beta.2" }
+
+# On-disk file generators (the `init` starter config; `scaffold` templates).
+fraisier-scaffold = { path = "../fraisier-scaffold", version = "1.0.0-beta.2" }
+# Version reading/bumping and the `ship` release workflow.
+fraisier-ship = { path = "../fraisier-ship", version = "1.0.0-beta.2" }
+# The declarative project-check runner (`fraisier check` + the `ship` gate).
+fraisier-check = { path = "../fraisier-check", version = "1.0.0-beta.2" }
+# Generic-Postgres database lifecycle ops (backup/restore/reset).
+fraisier-db = { path = "../fraisier-db", version = "1.0.0-beta.2" }
+# SSH-based host bootstrap (prepare deploy directories over the transport).
+fraisier-bootstrap = { path = "../fraisier-bootstrap", version = "1.0.0-beta.2" }
+# Signed-webhook server (HMAC + replay) that triggers a deploy.
+fraisier-webhook = { path = "../fraisier-webhook", version = "1.0.0-beta.2" }
+# Git-ref deploy-ledger sync across operators (experimental).
+fraisier-sync = { path = "../fraisier-sync", version = "1.0.0-beta.2" }
+# Self-upgrade engine (fetch/verify/swap/health/auto-revert of fraisier's binary).
+fraisier-self-upgrade = { path = "../fraisier-self-upgrade", version = "1.0.0-beta.2" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

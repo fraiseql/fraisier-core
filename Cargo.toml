@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fraisier-saga",
+    "crates/fraisier-core",
+    "crates/fraisier-config",
+    "crates/fraisier-cli",
+    "crates/fraisier-ipc",
+    "crates/fraisier-adapter-confiture",
+    "crates/fraisier-adapter-support",
+    "crates/fraisier-adapter-command",
+    "crates/fraisier-adapter-systemd",
+    "crates/fraisier-adapter-rc",
+    "crates/fraisier-adapter-docker-compose",
+    "crates/fraisier-adapter-http",
+    "crates/fraisier-adapter-nginx",
+    "crates/fraisier-artifact-release",
+    "crates/fraisier-artifact-pull",
+    "crates/fraisier-artifact-local",
+    "crates/fraisier-artifact-git",
+    "crates/fraisier-adapter-release",
+    "crates/fraisier-scaffold",
+    "crates/fraisier-ship",
+    "crates/fraisier-check",
+    "crates/fraisier-db",
+    "crates/fraisier-bootstrap",
+    "crates/fraisier-webhook",
+    "crates/fraisier-sync",
+    "crates/fraisier-self-upgrade",
+    "crates/xtask",
+]
+# examples/training-field is test scaffolding (a deploy fixture), kept out of the
+# shipped workspace but linted on its own (see its Cargo.toml `[lints]`).
+exclude = ["examples/training-field"]
+
+[workspace.package]
+version = "1.0.0-beta.2"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/fraiseql/fraisier-core"
+homepage = "https://fraiseql.dev"
+authors = ["Lionel Hamayon <evolution.digitale@gmail.com>"]
+keywords = ["deploy", "migration", "orchestration", "saga", "postgres"]
+categories = ["development-tools"]
+rust-version = "1.95"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Strict per the global methodology: deny all + pedantic + cargo, warn nursery.
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Reason: cosmetic for an engine crate whose types intentionally echo their module.
+module_name_repetitions = "allow"
+# Reason: transitive version skew (sqlx / tokio / opentelemetry pull duplicate
+# sub-crates) is outside our control; denying it would fail CI for upstream churn.
+multiple_crate_versions = "allow"

@@ -1,0 +1,13 @@
+[Unit]
+Description=fraisier multi-host fixture app
+
+[Service]
+# Type=notify so a crash build (which never signals readiness) is a real start
+# failure; NotifyAccess=all lets the app's `systemd-notify` subprocess report it.
+Type=notify
+NotifyAccess=all
+ExecStart=/usr/bin/python3 /opt/app.py /var/lib/app/current 8080
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

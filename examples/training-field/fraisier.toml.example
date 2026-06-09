@@ -1,0 +1,38 @@
+# fraisier deploy config for the training-field app.
+#
+# This is the shape `scripts/checkpoint-training.sh` generates at runtime (with
+# absolute paths and a real Postgres DSN env var). It deploys the tiny DB-backed
+# `fraisier-training-app` through the *real* engine using the in-process Confiture
+# migration adapter against a real Postgres — the path no other checkpoint covers
+# (the matrix and checkpoint-local.sh use sqlx/SQLite over IPC).
+
+[deploy]
+name = "training-field"
+environment = "training"
+
+[artifact]
+# A `release`-source artifact, minted per version like the production matrix: the
+# payload is opaque and the running binary is fixed infra; the app reads its
+# version off the activated `current` symlink.
+source = "release"
+release_url = "http://127.0.0.1:8751/app-{version}.tar.gz"
+checksum_url = "http://127.0.0.1:8751/app-{version}.tar.gz.sha256"
+staging_dir = "/var/lib/fraisier-training/staging"
+active_path = "/var/lib/fraisier-training/current"
+
+[migration]
+# The in-process Confiture adapter (requires Confiture >= 0.22 for the default
+# forward-compat preflight). The DSN is read from the named env var and handed to
+# Confiture via CONFITURE_DATABASE_URL + --no-config — never in argv.
+adapter = "confiture"
+database_url_env = "TRAINING_DATABASE_URL"
+migrations_path = "/path/to/examples/training-field/migrations"
+
+[service]
+adapter = "systemd"
+unit = "fraisier-training.service"
+
+[health]
+adapter = "http"
+url = "http://127.0.0.1:8752/health"
+expected_status = 200

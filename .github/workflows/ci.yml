@@ -1,0 +1,40 @@
+name: CI
+
+# The gate is defined once, in `crates/xtask`. This workflow runs the exact same
+# command a developer runs locally — `cargo xtask ci` — so local and CI never drift.
+on:
+  push:
+    branches: [main, phase-02]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: cargo xtask ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      # Installs the channel + clippy/rustfmt components pinned in rust-toolchain.toml.
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2
+        with:
+          tool: cargo-deny
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Run the gate
+        run: cargo xtask ci

@@ -62,7 +62,7 @@ The honestly-disclosed trade: more architectural work in week 1, less adapter-po
 - **G3**: IPC adapter protocol (JSON-RPC over stdio) for migration and load-balancer adapters; adapters are external processes discovered via PATH.
 - **G4**: Multi-host deploy plan with `all-at-once` and `rolling(n)` strategies, marked `experimental` in v1.0.0-beta.1, promoted to stable at v1.0.0 GA after production validation.
 - **G5**: Atomic rollback across multiple hosts: migration runs once against shared DB, host-level fetch/restart/health is per-host, failure at any point rolls back DB once + all hosts.
-- **G6**: `fraises.yaml` parses unchanged for the single-host Python fraisier compatibility corpus; multi-host configs use the new schema.
+- **G6** *(withdrawn 2026-06-02)*: `fraises.yaml` runtime compatibility. Withdrawn before implementation — the project has a single Python fraisier user, who hand-converts to `fraisier.toml`. New and migrating configs use the native schema only. See the Decision log.
 - **G7**: OpenTelemetry-native observability; every state transition is a span, every adapter call a child span.
 - **G8**: specql-platform embeds the engine crate and deploys a fixture app via library call.
 
@@ -70,7 +70,7 @@ The honestly-disclosed trade: more architectural work in week 1, less adapter-po
 
 - **G9**: Three-axis adapter contract (migration / service / health) plus an artifact axis and a load-balancer axis for multi-host.
 - **G10**: Webhook server (socket-activated on systemd, standalone HTTP elsewhere).
-- **G11**: Forward-compatibility lint on Confiture migrations (the integration moat: fraisier owns Confiture, so blue-green safety can be enforced at config-time).
+- **G11**: Forward-compatibility lint, surfaced via the migration adapter's `preflight` capability. Confiture implements it natively (`migrate preflight`: reversibility, non-transactional statements, duplicate versions, checksum integrity); the `command` adapter declines (no `preflight` capability advertised); other framework adapters implement it as their ecosystems allow. The moat is making it a first-class, advertisable contract every migration adapter can opt into — not a Confiture-unique trick. Enforced at config-time so blue-green safety is checked before deploy.
 
 ### 3.3 Non-goals (this release)
 
@@ -82,7 +82,7 @@ The honestly-disclosed trade: more architectural work in week 1, less adapter-po
 - **Not** a Postgres state backend in v1.0.0-beta.1. Filesystem + SQLite ship; Postgres is v1.1.
 - **Not** D-Bus systemd integration. Shell out to `systemctl` in v1.0; D-Bus is v1.1+.
 - **Not** PyPI republishing or PyO3 bindings.
-- **Not** a configuration migrator beyond the documented `fraises.yaml` compat surface.
+- **Not** a `fraises.yaml` parser or configuration migrator. Python fraisier's format is not read at runtime; the sole Python user hand-converts to `fraisier.toml` (decision 2026-06-02).
 
 ### 3.4 Feature scope matrix
 
@@ -100,12 +100,13 @@ The honestly-disclosed trade: more architectural work in week 1, less adapter-po
 | Health checks | HTTP probe | ✅ Required |
 | Load balancer adapter | (none) | ✅ Reference: nginx; trait open for HAProxy/cloud |
 | Artifact source | git pull | ✅ `release` (URL+sha256), `git`, `local` |
-| Config | `fraises.yaml` + `!envvar` | ✅ + `fraisier.toml` native format |
+| Config | `fraises.yaml` + `!envvar` | ✅ `fraisier.toml` native format only (`fraises.yaml` runtime compat withdrawn 2026-06-02) |
 | Post-migration verification | `post_migrate` hooks, `smoke_tests` | ✅ Required |
 | Webhook server | socket-activated | ✅ Required + standalone HTTP fallback |
 | Bootstrap | SSH-based | ✅ Required (Python-subprocess fallback acceptable for beta) |
 | Scaffold | `scaffold`, `scaffold-install` | ✅ Required, with `--prune` |
-| Release workflow | `ship` | ✅ For `Cargo.toml` and `pyproject.toml` |
+| Release workflow | `ship` | ✅ For `Cargo.toml` and `pyproject.toml`; runs `[[checks]]` as a pre-bump gate (`--no-check` to skip) |
+| Project checks | `check` | ✅ Declarative `[[checks]]`, cross-check parallelism (`-j`), single source of truth local + CI |
 | Versioning | `version show`, `version bump` | ✅ Required |
 | DB operations | `db migrate`, `db restore`, `db reset`, `backup` | ✅ Required |
 | Status / introspection | `deployment-status`, `list`, `health` | ✅ Required |
@@ -116,7 +117,7 @@ The honestly-disclosed trade: more architectural work in week 1, less adapter-po
 | Self-upgrade restart | v0.31 coordinated restart | ✅ Required |
 | Scheduled install | v0.30/v0.32 features | ✅ Required |
 | Observability | logs only | ✅ OpenTelemetry traces + structured logs |
-| Forward-compat migration lint | (none) | ✅ With Confiture |
+| Forward-compat migration lint | (none) | ✅ Via the migration adapter's `preflight` capability (Confiture native; `command` declines) |
 
 Rows marked ✅ ship in v1.0.0-beta.1. ⏳ indicates designed-in but deferred. Anything not in this matrix is out of scope.
 
@@ -144,7 +145,7 @@ The platform crate embeds `fraisier-saga` (the engine) directly. Atomic deploy i
 
 ### 4.4 Existing Python fraisier user
 
-Same `fraises.yaml`, new binary. Single-host configs work unchanged. Django/Alembic/etc. users install the corresponding IPC adapter package on their PATH (`fraisier-adapter-django`, etc.).
+There is exactly one, on the FraiseQL/Confiture stack. They hand-convert their `fraises.yaml` to `fraisier.toml` once and switch to the Rust binary (decision 2026-06-02 — `fraises.yaml` is not parsed at runtime). The external Python framework adapters (`fraisier-adapter-django`, etc.) remain available on PATH for anyone who wants them, but are no longer load-bearing for this audience.
 
 ### 4.5 Rust ecosystem adopter
 
@@ -224,6 +225,8 @@ Five distinct axes, each with its own trait:
 
 In-process trait adapters live in the core for axes where the surface is stable and the ecosystem is small (artifact, service, health, LB). For **migration** — where the long tail is largest — adapters are external processes discovered via PATH, speaking **JSON-RPC over stdio**.
 
+**The convergence rule (Phase 1 review):** the in-process `MigrationAdapter` trait and the IPC protocol are *the same shape* — the IPC adapter is a transport that implements the same trait by serializing each call. This is enforced mechanically: **every argument and return type on every adapter trait method is `Serialize + Deserialize`.** A method that would require a non-serializable type is a wrong method, not a missing capability. This is the only constraint that prevents the in-process and IPC paths from drifting over the project's lifetime.
+
 Protocol shape:
 
 ```
@@ -232,7 +235,7 @@ Response:  {"jsonrpc":"2.0","id":1,"result":{"revision":"20260531_abc123"}}
 Error:     {"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"...","data":{...}}}
 ```
 
-Methods: `current_revision`, `up`, `down_to`, `verify`, `post_migrate`, `describe` (returns adapter capabilities).
+Methods: `describe` (capability + protocol-version handshake), `current_revision`, `up`, `down_to`, `verify`, `preflight` (forward-compat lint — Phase 1 review Decision 4), `post_migrate`. `preflight` and `post_migrate` are optional: an adapter advertises support via `describe.capabilities`. Secrets are passed to subprocess adapters via environment variables (the core sets `env[logical] = value` at spawn), never in JSON params or argv (Phase 1 review Decision 5).
 
 Discovery: binaries on PATH matching `fraisier-adapter-<name>`. Selected by `migration.adapter = "<name>"` in config. The core spawns the binary as a child process, communicates over stdin/stdout, terminates on completion.
 
@@ -249,7 +252,7 @@ Benefits:
 | Axis | Adapter | Notes |
 |---|---|---|
 | Artifact | `ReleaseArtifact`, `GitArtifact`, `LocalArtifact` | Three sources |
-| Migration | `ConfitureMigration` | Native, not via IPC (intimate integration: forward-compat lint, blue-green prep) |
+| Migration | `ConfitureMigration` | Native, not via IPC. Wraps the `confiture migrate <subcommand>` CLI. Note: Confiture exposes **no** `current_revision`/`down_to`/`post_migrate` subcommands — the adapter derives `current_revision` from `migrate status --format json`, implements `down_to(target)` by computing `--steps N` from that status, and treats `post_migrate` as configured hooks. Connection-model translation (Confiture takes `--config <yaml>`, not a DSN) per Phase 1 review §3. Forward-compat lint via `migrate preflight`; blue-green prep. |
 | Migration | `CommandMigration` | Universal escape hatch |
 | Service | `SystemdService`, `RcService`, `DockerComposeService` | All three |
 | Health | `HttpHealth` | |
@@ -299,6 +302,11 @@ adapter = "confiture"
 database_url_env = "FRAISEQL_DATABASE_URL"
 migrations_path = "./migrations"
 forward_compatible_lint = true
+# `database_url_env` is the *source* env var name. The core exposes it to the
+# adapter as `AdapterCtx.env_secrets["DATABASE_URL"] = "FRAISEQL_DATABASE_URL"`;
+# the adapter resolves the value via `ctx.secret("DATABASE_URL")`. For IPC
+# adapters the core reads the source var and re-exposes the value under the
+# logical name `DATABASE_URL` on the spawned child (Phase 1 review Decision 5).
 
 [service]
 adapter = "systemd"
@@ -328,9 +336,9 @@ hosts = ["web1.internal", "web2.internal"]
 
 The preset expands at config-load time into the full `[deploy]` / `[artifact]` / `[migration]` / `[service]` / `[health]` / `[lb]` set with Fraise-stack-conventional defaults. Users who need to override any field can still write the explicit blocks alongside — explicit blocks win. The preset is implemented in `fraisier-config` as a config-time macro, not a runtime layer.
 
-### 7.2 `fraises.yaml` compatibility
+### 7.2 `fraises.yaml` compatibility — withdrawn (2026-06-02)
 
-Existing single-host configs parse and run unchanged. The compat layer maps Python's monolithic `framework: django` to the IPC adapter discovery (`migration.adapter = "django"` → spawn `fraisier-adapter-django` from PATH). Multi-host configs are net-new and live in `fraisier.toml`.
+The runtime `fraises.yaml` compatibility layer was dropped before implementation: the project has a single Python fraisier user, who hand-converts to `fraisier.toml`. The mapping the compat layer would have performed — Python's monolithic `framework: django` → IPC adapter discovery (`migration.adapter = "django"` → spawn `fraisier-adapter-django` from PATH) — is instead expressed directly in the native config. `fraisier.toml` is the only configuration format the binary reads.
 
 ### 7.3 State backend configuration
 
@@ -461,11 +469,11 @@ Single deploy execution is sequential by design at the saga level. Multi-host fa
 ### 10.1 Functional acceptance (v1.0.0-beta.1)
 
 - [ ] Every row of §3.4 marked ✅ holds.
-- [ ] Single-host deploy of fraiseql v2 through the Rust binary works three consecutive times.
+- [x] Single-host deploy of fraiseql v2 through the Rust binary works three consecutive times. *(Met 2026-06-05 — real `fraiseql-server` v2.4.0 + `ecommerce_api` Confiture schema, 3× on a real Hetzner pid-1 host; see §10.3.)*
 - [ ] Multi-host deploy against a 3-host fixture cluster (rolling strategy) succeeds, including forced-failure rollback at each phase.
-- [ ] At least one Python `fraises.yaml` from Python fraisier's test corpus deploys identically through the Rust binary using the appropriate external IPC adapter package.
+- [ ] ~~At least one Python `fraises.yaml` from Python fraisier's test corpus deploys identically through the Rust binary~~ — withdrawn with the `fraises.yaml` compat layer (2026-06-02). The IPC-adapter coverage it implied is met by the reference adapters below.
 - [ ] specql-platform embeds `fraisier-saga` and deploys a fixture app via library call.
-- [ ] IPC adapter protocol exercised against at least three external adapters (sqlx reference, one Python adapter, one community-contributed if available).
+- [x] IPC adapter protocol exercised against an external adapter over a real subprocess (the `fraisier-adapter-sqlx` reference, Cycle 2.2). *(Revised 2026-06-02 from "at least three (sqlx + Python + community)" — the Python adapters were withdrawn; a non-Rust adapter remains the open way to prove the protocol is genuinely language-agnostic, deferred until a real non-Rust consumer exists.)*
 - [ ] OTel traces visible in a Jaeger or Tempo instance for every deploy.
 
 ### 10.2 Quality acceptance
@@ -480,10 +488,10 @@ Single deploy execution is sequential by design at the saga level. Multi-host fa
 
 Gate for promoting `fraisier-core` → `fraisier v1.0.0-beta.1`:
 
-- [ ] Fraiseql v2 deploys successfully three consecutive times in production (single-host).
+- [x] Fraiseql v2 deploys successfully three consecutive times in production (single-host). **Met 2026-06-05:** fraisier's deploy saga deployed the real `fraiseql-server` v2.4.0 against the confiture-migrated `ecommerce_api` schema 3× consecutively, each committed + `/health` 200, on a real Hetzner debian-13 **pid-1 systemd** host over the network (and locally). See `.phases/part-b-fraiseql-canonical-migrations.md`.
 - [ ] Multi-host fixture cluster deploys successfully three consecutive times (experimental flag set).
 - [ ] specql-platform library embedding works.
-- [ ] At least one Python `fraises.yaml` deploys identically via external IPC adapter.
+- [ ] ~~At least one Python `fraises.yaml` deploys identically via external IPC adapter~~ — withdrawn (2026-06-02); the IPC protocol is validated by the reference sqlx adapter instead.
 - [ ] Adapter trait shape (in-process + IPC contract) unchanged since week 1 freeze.
 
 If all five hold, rename + publish. If any fail, name the gap, defer the rename, continue under `fraisier-core` until the bar is met.
@@ -551,3 +559,4 @@ If all five hold, rename + publish. If any fail, name the gap, defer the rename,
 | 2026-05-31 | Confiture migration adapter stays in-process, not IPC. | Intimate integration enables forward-compat lint and blue-green prep — unique competitive moat. |
 | 2026-05-31 | Blue-green deferred to v1.0.0 GA, designed-in via the multi-host plan. | LB integration surface is real work; ship `rolling` first, prove it, then blue-green. |
 | 2026-05-31 | Postgres state backend deferred to v1.1. | Trait shape supports it; concrete implementation can wait. |
+| 2026-06-02 | **Drop `fraises.yaml` runtime compatibility (G6 / §7.2 / §10.1).** | The project has one Python fraisier user, who will hand-convert to `fraisier.toml`. A runtime parser plus a synthesized fixture corpus would prove only that it parses configs we invented — the real Python corpus is not in this repo. The native format is the single source of truth; the `framework → adapter` mapping survives as direct native config. Withdraws Cycles 2.8–2.11. |

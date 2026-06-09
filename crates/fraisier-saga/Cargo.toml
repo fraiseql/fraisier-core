@@ -1,0 +1,57 @@
+[package]
+name = "fraisier-saga"
+description = "Generic atomic saga state machine with a pluggable state store and OpenTelemetry-native events — the orchestration engine behind fraisier."
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# OTLP span export pipeline. Off by default so library embedders (e.g.
+# specql-platform) don't pay the dependency weight; the CLI turns it on.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:tracing-subscriber",
+]
+# SQLite state-store backend. Recommended for multi-host (atomic per-fraise
+# locks); off by default so filesystem-only users don't pull sqlx.
+sqlite = ["dep:sqlx"]
+
+[dependencies]
+async-trait = "0.1.89"
+chrono = { version = "0.4.44", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.17"
+tracing = "0.1.44"
+
+# --- sqlite feature only ---
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite"], optional = true }
+
+# --- otel feature only ---
+opentelemetry = { version = "0.32.0", optional = true }
+opentelemetry-otlp = { version = "0.32.0", optional = true }
+opentelemetry_sdk = { version = "0.32.1", optional = true }
+tracing-opentelemetry = { version = "0.33.0", optional = true }
+tracing-subscriber = { version = "0.3.23", features = ["registry", "std"], optional = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3.23", features = ["std", "fmt", "registry"] }
+
+[target."cfg(unix)".dependencies]
+nix = { version = "0.31.3", features = ["fs"] }

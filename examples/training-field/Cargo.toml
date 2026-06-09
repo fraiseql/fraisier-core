@@ -1,0 +1,28 @@
+[package]
+name = "fraisier-training-app"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Tiny DB-backed app used to exercise the real fraisier deploy pipeline (Confiture + Postgres) end-to-end. Test scaffolding, not shipped."
+
+[[bin]]
+name = "fraisier-training-app"
+path = "src/main.rs"
+
+# Excluded from the workspace (see the root Cargo.toml `exclude`), so it carries
+# its own copy of the strict lint bar rather than inheriting workspace.lints.
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+# default-features off + no TLS backend: the training field connects to a local /
+# throwaway Postgres with `sslmode=disable`, so no TLS stack is needed.
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres"] }
+sd-notify = "0.4"

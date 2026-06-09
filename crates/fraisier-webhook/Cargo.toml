@@ -1,0 +1,27 @@
+[package]
+name = "fraisier-webhook"
+description = "Webhook server for fraisier: HMAC-signed, replay-protected POSTs that trigger a deploy, over socket activation (systemd) or a standalone HTTP listener."
+version.workspace = true
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+hex = "0.4.3"
+hmac = "0.12.1"
+listenfd = "1.0.2"
+sha2 = "0.10.9"
+tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt", "signal", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt", "rt-multi-thread"] }

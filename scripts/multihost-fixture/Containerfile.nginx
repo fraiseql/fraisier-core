@@ -1,0 +1,6 @@
+# The load balancer for the fixture: nginx on the host network so it reaches the
+# app hosts at their published 127.0.0.x:8080 ports and the fraisier nginx LB
+# adapter (which edits the mounted config and reloads it) drives a real nginx.
+FROM registry.access.redhat.com/ubi9/ubi
+RUN dnf -y install nginx && dnf clean all
+CMD ["nginx", "-g", "daemon off;"]

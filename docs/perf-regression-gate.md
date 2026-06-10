@@ -8,14 +8,45 @@ its thresholds, and exits 0 otherwise. Operational errors (database unreachable,
 bad DSN) always exit non-zero, so "a regression appeared" is distinguishable from
 "the scan could not run."
 
-## Works today: the command-migration `verify` hook
+## Recommended: the `command` health adapter
+
+The first-class gate is `[health].adapter = "command"`: a health adapter that runs
+the perf scan as the saga's **`Health`** step. It works for **any** project —
+`confiture` included — and carries the scan's output into the rollback reason and
+the `[schedule].notify` failure webhook.
+
+```toml
+[migration]
+adapter          = "confiture"   # or any adapter — the gate is migration-agnostic
+# The scan reads $DATABASE_URL. The health command inherits this same mapping, so
+# the DSN travels by environment, never on argv (see "Security" below).
+database_url_env = "DATABASE_URL"
+
+[health]
+adapter    = "command"
+command    = "fraiseql perf regression-scan --fail-on-regression"
+timeout_ms = 60000   # optional; fail-closed probe timeout (default 60000)
+```
+
+The gate passes iff the command exits 0. On a regression the scan exits 1, the
+deploy ends in `RolledBack { failed_step = "health" }`, and the saga restores the
+previously-active release and reverts the migration. The scan's output excerpt is
+folded into the rollback reason (and the failure webhook payload when
+`[schedule].notify` is configured), so the alert says *what* regressed, not just
+"health check failed."
+
+Fail-closed by construction: a spawn failure (missing `fraiseql` binary) or a
+timeout is an *operational* error, distinct from "unhealthy" — both still roll the
+deploy back rather than committing a release as healthy. The DSN is inherited from
+`[migration].database_url_env`; no separate `[health]` DSN field is needed.
+
+## Fallback: the command-migration `verify` hook
 
 If your project drives migrations through the **`command`** migration adapter
-(`[migration].adapter = "command"`), its post-migration `verify` command already
+(`[migration].adapter = "command"`), its post-migration `verify` command also
 gates the deploy: the saga's `Verify` step runs it, and a non-zero exit rolls the
-release back — re-activating the prior artifact and reverting the migration.
-
-Point `verify` at the perf scan:
+release back. Prefer the health adapter above; reach for this only if you are
+already on the `command` migration adapter and want the gate inline with verify.
 
 ```toml
 [migration]
@@ -36,20 +67,15 @@ verify           = "fraiseql perf regression-scan --fail-on-regression"
 On a regression the deploy ends in `RolledBack { failed_step = "verify" }`, and
 the saga restores the previously-active release.
 
-## Limitations (why this is a fallback, not the feature)
+Two reasons this is the fallback, not the recommendation:
 
 1. **`command` migrations only.** A project using `[migration].adapter =
    "confiture"` (the FraiseQL default) cannot use this recipe — there is one
-   migration adapter per deploy, and `confiture` owns `verify`.
+   migration adapter per deploy, and `confiture` owns `verify`. The health adapter
+   has no such restriction.
 2. **The rollback reason does not name the regression.** The `Verify` step reports
    a generic `post-migration verify failed N check(s)`; the scan's per-operation
-   detail (which `(object_type, modification_type)` regressed, and by how much) is
-   not carried into the rollback reason or the failure notification.
-
-A first-class, adapter-agnostic perf health gate — `[health].adapter = "command"`
-— that works for **any** project (confiture included) and names the regressed
-operations in the rollback reason and the `[schedule].notify` webhook is tracked
-in GitHub issue #11.
+   detail is discarded. The health adapter carries the detail through instead.
 
 ## Security
 

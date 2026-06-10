@@ -2428,6 +2428,38 @@ url = "http://127.0.0.1:8080/health"
     }
 
     #[test]
+    fn notify_deploy_failure_carries_the_rollback_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("payload.txt");
+        // A [schedule].notify sink that records the reason the webhook carries.
+        // A TOML literal string sidesteps escaping the shell's double quotes.
+        let notify = format!(
+            "notify = 'printf \"%s\" \"$FRAISIER_NOTIFY_REASON\" > {}'",
+            out.display()
+        );
+        let toml = format!("{VALID}\n[schedule]\n{notify}\n");
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+
+        // The named perf detail rides in via HealthStatus.detail → SagaError.message
+        // → RolledBack.reason → FailurePayload.reason (the recommended zero-API-change
+        // path, Decision 3); with [schedule].notify set it reaches the webhook sink.
+        let outcome = SagaOutcome::RolledBack {
+            failed_step: "health".to_owned(),
+            reason: "health check reported the host unhealthy: order/UPDATE p50 +42% (12ms->17ms)"
+                .to_owned(),
+        };
+        block_on(notify_deploy_failure(
+            &config, "checkout", "staging", &outcome,
+        ));
+
+        let recorded = std::fs::read_to_string(&out).expect("notify wrote the payload");
+        assert!(
+            recorded.contains("order/UPDATE"),
+            "the webhook reason names the regression: {recorded}",
+        );
+    }
+
+    #[test]
     fn init_writes_starter_then_guards_against_overwrite() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("fraisier.toml");

@@ -374,6 +374,38 @@ impl CommandHealth {
     }
 }
 
+/// Format a one-line, greppable detail from a perf `regression-scan --json`
+/// report on `stdout`, naming the top regressed `(object_type, modification_type)`
+/// with its p50 delta and a count of any others
+/// (e.g. `perf regression: order/UPDATE p50 +42% (12ms→17ms), 3 more`).
+///
+/// Returns `None` — so the caller falls back to the plain excerpt — when stdout
+/// is not the expected shape: human-format output, a different tool, malformed
+/// JSON, or an empty `findings` list. Parsing is total and defensive: a contract
+/// drift degrades gracefully, never panicking the gate.
+///
+/// Targets the fraiseql v2.6.0 `RegressionReport` contract (FraiseQL #392).
+fn format_perf_detail(stdout: &str) -> Option<String> {
+    let report: Value = serde_json::from_str(stdout.trim()).ok()?;
+    let findings = report.get("findings")?.as_array()?;
+    let first = findings.first()?;
+    let object_type = first.get("object_type")?.as_str()?;
+    let modification_type = first.get("modification_type")?.as_str()?;
+    let pct_change = first.get("pct_change")?.as_f64()?;
+    let baseline_p50 = first.get("baseline_p50")?.as_f64()?;
+    let recent_p50 = first.get("recent_p50")?.as_f64()?;
+    let more = findings.len() - 1;
+    let suffix = if more > 0 {
+        format!(", {more} more")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "perf regression: {object_type}/{modification_type} \
+         p50 {pct_change:+.0}% ({baseline_p50:.0}ms→{recent_p50:.0}ms){suffix}"
+    ))
+}
+
 #[async_trait]
 impl HealthAdapter for CommandHealth {
     async fn check(&self, ctx: &AdapterCtx, _host: &HostId) -> Result<HealthStatus, AdapterError> {
@@ -427,27 +459,97 @@ impl HealthAdapter for CommandHealth {
             });
         }
         // A non-zero exit is a *result* (unhealthy), not an adapter error — the
-        // command ran. Surface a trimmed stderr (else stdout) excerpt as detail.
-        let stderr = captured.stderr.trim();
-        let excerpt = if stderr.is_empty() {
-            captured.stdout.trim()
-        } else {
-            stderr
-        };
+        // command ran. Prefer a structured, named detail parsed from the scan's
+        // `--json` stdout; fall back to a trimmed stderr (else stdout) excerpt for
+        // human output or any other command.
+        let detail = format_perf_detail(&captured.stdout).or_else(|| {
+            let stderr = captured.stderr.trim();
+            let excerpt = if stderr.is_empty() {
+                captured.stdout.trim()
+            } else {
+                stderr
+            };
+            (!excerpt.is_empty()).then(|| excerpt.to_owned())
+        });
         Ok(HealthStatus {
             healthy: false,
-            detail: (!excerpt.is_empty()).then(|| excerpt.to_owned()),
+            detail,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_secret_env, CommandHealth, CommandMigration, CommandSpec};
+    use super::{
+        format_perf_detail, resolve_secret_env, CommandHealth, CommandMigration, CommandSpec,
+    };
     use fraisier_core::adapter_axes::{AdapterCtx, HealthAdapter, HostId, MigrationAdapter};
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
+
+    /// A perf regression-scan `--json` report carrying `findings` (the pinned
+    /// fraiseql v2.6.0 shape).
+    fn report(findings: &Value) -> String {
+        json!({
+            "findings": findings.clone(),
+            "skipped": [],
+            "summary": { "groups_analyzed": 2, "regressions": 1, "total_samples": 200, "excluded_samples": 0 },
+        })
+        .to_string()
+    }
+
+    fn order_update_finding() -> Value {
+        json!({
+            "object_type": "order",
+            "modification_type": "UPDATE",
+            "baseline_p50": 12.0,
+            "baseline_p95": 20.0,
+            "recent_p50": 17.0,
+            "recent_p95": 28.0,
+            "pct_change": 41.67,
+            "baseline_samples": 120,
+            "recent_samples": 140,
+        })
+    }
+
+    #[test]
+    fn perf_detail_names_the_single_finding() {
+        let detail = format_perf_detail(&report(&json!([order_update_finding()])))
+            .expect("a findings report formats");
+        assert_eq!(detail, "perf regression: order/UPDATE p50 +42% (12ms→17ms)");
+    }
+
+    #[test]
+    fn perf_detail_counts_additional_findings() {
+        let second = json!({
+            "object_type": "invoice",
+            "modification_type": "INSERT",
+            "baseline_p50": 5.0,
+            "baseline_p95": 9.0,
+            "recent_p50": 8.0,
+            "recent_p95": 14.0,
+            "pct_change": 60.0,
+            "baseline_samples": 80,
+            "recent_samples": 90,
+        });
+        let detail = format_perf_detail(&report(&json!([order_update_finding(), second])))
+            .expect("a findings report formats");
+        assert_eq!(
+            detail,
+            "perf regression: order/UPDATE p50 +42% (12ms→17ms), 1 more"
+        );
+    }
+
+    #[test]
+    fn perf_detail_degrades_on_non_report_output() {
+        // Human-format output, malformed JSON, an empty findings list, and a
+        // wrong shape must all degrade to None so the caller falls back.
+        assert!(format_perf_detail("WARN order/UPDATE p50 +42%").is_none());
+        assert!(format_perf_detail("{not json").is_none());
+        assert!(format_perf_detail(&report(&json!([]))).is_none());
+        assert!(format_perf_detail(&json!({"other": 1}).to_string()).is_none());
+    }
 
     /// An `AdapterCtx` whose `[health]` settings carry `command`.
     fn health_ctx(command: Value) -> AdapterCtx {

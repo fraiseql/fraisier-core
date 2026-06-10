@@ -289,12 +289,14 @@ async fn command_health_regression_rolls_back_naming_the_detail() {
     let store = FilesystemStateStore::new(&state_dir).expect("store");
     let stub = perf_scan_stub();
 
-    // A `[health].command` string that runs the stub; REGRESS toggles the gate.
-    // The DSN would travel by env (none needed: the stub has no DB).
+    // A `[health].command` string that runs the stub the way the recommended
+    // recipe does (`--fail-on-regression --json`), so a regression is both the
+    // exit-1 gate *and* a JSON report the adapter parses into a named detail.
+    // REGRESS toggles the gate. The DSN would travel by env (none here: a stub).
     let scan = |regress: bool| {
         let prefix = if regress { "REGRESS=1 " } else { "" };
         json!(format!(
-            "{prefix}bash {} regression-scan --fail-on-regression",
+            "{prefix}bash {} regression-scan --fail-on-regression --json",
             stub.display(),
         ))
     };
@@ -337,8 +339,8 @@ async fn command_health_regression_rolls_back_naming_the_detail() {
     };
     assert_eq!(failed_step, "health", "the health gate failed the deploy");
     assert!(
-        reason.contains("order/UPDATE"),
-        "the rollback reason carries the perf-scan detail: {reason}",
+        reason.contains("perf regression: order/UPDATE p50 +42% (12ms→17ms)"),
+        "the rollback reason carries the parsed, named perf detail: {reason}",
     );
     assert_eq!(
         link_target_name(&active),

@@ -24,16 +24,20 @@ database_url_env = "DATABASE_URL"
 
 [health]
 adapter    = "command"
-command    = "fraiseql perf regression-scan --fail-on-regression"
+command    = "fraiseql perf regression-scan --fail-on-regression --json"
 timeout_ms = 60000   # optional; fail-closed probe timeout (default 60000)
 ```
 
+Requires **fraiseql v2.6.0+** (the perf-observability seam, FraiseQL #392).
+
 The gate passes iff the command exits 0. On a regression the scan exits 1, the
 deploy ends in `RolledBack { failed_step = "health" }`, and the saga restores the
-previously-active release and reverts the migration. The scan's output excerpt is
-folded into the rollback reason (and the failure webhook payload when
-`[schedule].notify` is configured), so the alert says *what* regressed, not just
-"health check failed."
+previously-active release and reverts the migration. With `--json`, the adapter
+parses the scan's report and names the top regressed operation in the rollback
+reason (and the failure webhook payload when `[schedule].notify` is configured) —
+e.g. `perf regression: order/UPDATE p50 +42% (12ms→17ms), 3 more` — so the alert
+says *what* regressed, not just "health check failed." Drop `--json` and the gate
+still works, but the detail degrades to the scan's plain output excerpt.
 
 Fail-closed by construction: a spawn failure (missing `fraiseql` binary) or a
 timeout is an *operational* error, distinct from "unhealthy" — both still roll the

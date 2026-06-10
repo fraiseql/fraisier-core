@@ -2443,9 +2443,11 @@ url = "http://127.0.0.1:8080/health"
         // The named perf detail rides in via HealthStatus.detail → SagaError.message
         // → RolledBack.reason → FailurePayload.reason (the recommended zero-API-change
         // path, Decision 3); with [schedule].notify set it reaches the webhook sink.
+        // The reason here is the shape CommandHealth produces from a --json scan.
         let outcome = SagaOutcome::RolledBack {
             failed_step: "health".to_owned(),
-            reason: "health check reported the host unhealthy: order/UPDATE p50 +42% (12ms->17ms)"
+            reason: "health check reported the host unhealthy: \
+                     perf regression: order/UPDATE p50 +42% (12ms→17ms)"
                 .to_owned(),
         };
         block_on(notify_deploy_failure(
@@ -2454,7 +2456,7 @@ url = "http://127.0.0.1:8080/health"
 
         let recorded = std::fs::read_to_string(&out).expect("notify wrote the payload");
         assert!(
-            recorded.contains("order/UPDATE"),
+            recorded.contains("perf regression: order/UPDATE p50 +42%"),
             "the webhook reason names the regression: {recorded}",
         );
     }

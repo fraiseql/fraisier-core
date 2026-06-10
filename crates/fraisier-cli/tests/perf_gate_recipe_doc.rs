@@ -39,8 +39,9 @@ fn documented_perf_gate_recipes_parse() {
     assert_eq!(health.adapter.as_deref(), Some("command"));
     assert_eq!(
         health.command.as_deref(),
-        Some("fraiseql perf regression-scan --fail-on-regression"),
-        "the recommended gate is the perf scan, wired into the health adapter",
+        Some("fraiseql perf regression-scan --fail-on-regression --json"),
+        "the recommended gate is the perf scan (--json for the named detail), \
+         wired into the health adapter",
     );
 
     // Fallback recipe: the command-migration verify hook.

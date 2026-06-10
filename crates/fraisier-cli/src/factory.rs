@@ -152,6 +152,13 @@ fn settings_map(config: &DeployConfig, app_version: Option<&str>) -> BTreeMap<St
             "expected_status".to_owned(),
             Value::from(config.health_expected_status()),
         );
+        // The command health adapter reads these from ctx.settings at probe time
+        // (config-blind, like HttpHealth). timeout_ms additionally makes HTTP's
+        // probe timeout operator-settable.
+        put_str(&mut settings, "command", health.command.as_deref());
+        if let Some(timeout_ms) = health.timeout_ms {
+            settings.insert("timeout_ms".to_owned(), Value::from(timeout_ms));
+        }
     }
     if let Some(lb) = &config.lb {
         put_path(&mut settings, "config_path", lb.config_path.as_deref());
@@ -621,8 +628,11 @@ pub struct HealthProbePlan {
     pub hosts: Vec<(HostId, Option<String>)>,
 }
 
-/// Build the health-probe plan from a config, *without* touching the migration
-/// axis — a health check needs no database secret.
+/// Build the health-probe plan from a config, *without* building the migration
+/// adapter. The migration axis's DSN mapping is still inherited into the context
+/// so the command health adapter can read `$DATABASE_URL` (the deploy path gets
+/// this for free by cloning the migration ctx; a standalone `fraisier health`
+/// must wire it explicitly). An http probe simply ignores the unused mapping.
 ///
 /// # Errors
 /// Fails if `[health].adapter` is missing or unsupported in this build.
@@ -637,6 +647,7 @@ pub fn build_health_probe(config: &DeployConfig) -> Result<HealthProbePlan> {
         .unwrap_or_else(|| "<none>".to_owned());
     let mut ctx = AdapterCtx::new(fraise, environment);
     ctx.settings = settings_map(config, None);
+    ctx.env_secrets = config.migration_env_secrets();
     let hosts = config.host_inventory().map_or_else(
         || vec![(HostId::new("localhost"), None)],
         |inventory| {
@@ -759,8 +770,9 @@ pub fn build_bootstrap(config: &DeployConfig) -> BootstrapPlan {
 fn build_health(config: &DeployConfig) -> Result<Arc<dyn HealthAdapter>> {
     match config.health.as_ref().and_then(|h| h.adapter.as_deref()) {
         Some("http") => Ok(Arc::new(fraisier_adapter_http::HttpHealth::new())),
+        Some("command") => Ok(Arc::new(fraisier_adapter_command::CommandHealth::new())),
         Some(other) => bail!(
-            "health adapter '{other}' is not available in this build (only 'http' is built in)"
+            "health adapter '{other}' is not available in this build (only 'http' and 'command' are built in)"
         ),
         None => bail!("[health].adapter is required"),
     }
@@ -1163,8 +1175,85 @@ pub fn build_blue_green(
 
 #[cfg(test)]
 mod tests {
-    use super::{build, build_multi_host, summarize, summarize_multi_host};
+    use super::{
+        build, build_health, build_health_probe, build_multi_host, summarize, summarize_multi_host,
+    };
     use fraisier_config::DeployConfig;
+
+    /// A single-host config whose `[health]` block is command-driven, with the
+    /// given extra health lines appended (e.g. `timeout_ms = …`).
+    fn single_host_command_health(extra_health: &str) -> String {
+        format!(
+            "[deploy]\nname = \"app\"\nenvironment = \"prod\"\n\n\
+             [artifact]\nsource = \"local\"\npath = \"/builds/app\"\nactive_path = \"/srv/app/current\"\n\n\
+             [migration]\nadapter = \"confiture\"\ndatabase_url_env = \"APP_DATABASE_URL\"\n\n\
+             [service]\nadapter = \"systemd\"\nunit = \"app.service\"\n\n\
+             [health]\nadapter = \"command\"\ncommand = \"scan\"\n{extra_health}"
+        )
+    }
+
+    #[test]
+    fn command_health_adapter_builds_and_plumbs_settings_and_dsn() {
+        let toml = single_host_command_health("timeout_ms = 30000\n");
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+
+        // The `command` arm yields an adapter.
+        assert!(build_health(&config).is_ok(), "command health builds");
+
+        // `command` + `timeout_ms` reach ctx.settings (read by CommandHealth).
+        let plan = build_health_probe(&config).expect("builds command health probe");
+        assert_eq!(
+            plan.ctx
+                .settings
+                .get("command")
+                .and_then(serde_json::Value::as_str),
+            Some("scan"),
+        );
+        assert_eq!(
+            plan.ctx
+                .settings
+                .get("timeout_ms")
+                .and_then(serde_json::Value::as_u64),
+            Some(30_000),
+        );
+
+        // Standalone-health gap fix: the DSN mapping is inherited so the command
+        // can read $DATABASE_URL, exactly as the deploy-path health step does.
+        assert_eq!(
+            plan.ctx.env_secrets.get("DATABASE_URL").map(String::as_str),
+            Some("APP_DATABASE_URL"),
+        );
+    }
+
+    #[test]
+    fn command_health_renders_in_the_summary() {
+        let toml = single_host_command_health("");
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+        let summary = summarize(&config, Some("localhost"), None).expect("summarize");
+        assert_eq!(summary.health, "command");
+        assert!(
+            summary.settings_keys.iter().any(|k| k == "command"),
+            "command is in the assembled settings: {:?}",
+            summary.settings_keys,
+        );
+    }
+
+    #[test]
+    fn unknown_health_adapter_bails() {
+        let toml = single_host_command_health("").replace(
+            "[health]\nadapter = \"command\"\ncommand = \"scan\"\n",
+            "[health]\nadapter = \"telepathy\"\n",
+        );
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+        // `.err()` drops the `Arc<dyn HealthAdapter>` Ok value (which isn't Debug).
+        let err = build_health(&config)
+            .err()
+            .expect("unknown health adapter bails");
+        assert!(
+            err.to_string().contains("telepathy"),
+            "error names the adapter: {err}",
+        );
+    }
 
     /// A single-host config with the given artifact source block.
     fn single_host_with_artifact(artifact: &str) -> String {

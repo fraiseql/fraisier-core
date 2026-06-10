@@ -5,6 +5,11 @@
 //! migration tool fraisier does not natively wrap be driven through the same
 //! frozen trait — "if you can run it from a shell, you can deploy it".
 //!
+//! This crate also provides [`CommandHealth`], a sibling [`HealthAdapter`] that
+//! runs a configured shell command as the post-deploy health gate (exit 0 →
+//! healthy; any non-zero exit → unhealthy; spawn failure or timeout → error). It
+//! reuses the same `sh -c`/argv command shape and secret-env handling.
+//!
 //! ## Configuration
 //!
 //! The adapter is built from its `[migration.command]` settings table (via
@@ -37,12 +42,13 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use fraisier_adapter_support::{error, run_command, Captured};
 use fraisier_core::adapter_axes::{
-    AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, MigrationAdapter,
-    MigrationOutcome, Revision, VerifyCheck, VerifyReport,
+    AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, HealthAdapter, HealthStatus,
+    HostId, MigrationAdapter, MigrationOutcome, Revision, VerifyCheck, VerifyReport,
 };
 use serde_json::Value;
 
@@ -321,13 +327,207 @@ impl MigrationAdapter for CommandMigration {
     }
 }
 
+/// The health-axis identity name for the command adapter.
+const HEALTH_NAME: &str = "command";
+
+/// Default fail-closed timeout for a command health probe, in milliseconds.
+/// Generous on purpose: a perf/regression scan can legitimately take tens of
+/// seconds, and a premature timeout would roll back a healthy deploy.
+const DEFAULT_HEALTH_TIMEOUT_MS: u64 = 60_000;
+
+/// A [`HealthAdapter`] that runs a configured shell command as the saga health gate.
+///
+/// Exit `0` → healthy; any non-zero exit → unhealthy (with a captured detail
+/// excerpt); a spawn failure or a timeout → [`AdapterError`] (the probe could not
+/// be performed). Both the unhealthy and error paths roll the deploy back, so the
+/// gate fails closed.
+///
+/// # Configuration
+/// Read per call from [`AdapterCtx::settings`] (the `[health]` table), mirroring
+/// the HTTP adapter:
+/// - `command` — a shell string (run via `sh -c`) or an argv array (no shell).
+///   Required.
+/// - `timeout_ms` — the fail-closed timeout (default 60000).
+///
+/// Secrets (including the DSN) reach the command via the environment, never
+/// argv: every entry in [`AdapterCtx::env_secrets`] is exported under its logical
+/// name, exactly as for the migration command adapter.
+///
+/// # Example
+/// ```
+/// use fraisier_adapter_command::CommandHealth;
+///
+/// let adapter = CommandHealth::new();
+/// let _ = adapter;
+/// ```
+#[derive(Default)]
+pub struct CommandHealth {
+    _private: (),
+}
+
+impl CommandHealth {
+    /// Create a command health adapter. Its configuration is read from the
+    /// [`AdapterCtx`] at probe time, so the constructor takes no arguments.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+#[async_trait]
+impl HealthAdapter for CommandHealth {
+    async fn check(&self, ctx: &AdapterCtx, _host: &HostId) -> Result<HealthStatus, AdapterError> {
+        let spec = ctx
+            .settings
+            .get("command")
+            .and_then(CommandSpec::from_value)
+            .ok_or_else(|| {
+                error(
+                    AdapterErrorKind::InvalidConfig,
+                    HEALTH_NAME,
+                    "check",
+                    "no 'command' configured in [health] settings".to_owned(),
+                    None,
+                )
+            })?;
+        let timeout = Duration::from_millis(
+            ctx.settings
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_HEALTH_TIMEOUT_MS),
+        );
+        let envs = resolve_secret_env(ctx, HEALTH_NAME)?;
+        let (program, args) = spec.program_and_args();
+
+        let run = run_command(
+            &program,
+            &args,
+            &envs,
+            Some(ctx.workdir.as_path()),
+            HEALTH_NAME,
+            "check",
+        );
+        let captured = match tokio::time::timeout(timeout, run).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(error(
+                    AdapterErrorKind::Execution,
+                    HEALTH_NAME,
+                    "check",
+                    format!("health command timed out after {}ms", timeout.as_millis()),
+                    None,
+                ));
+            }
+        };
+
+        if captured.succeeded() {
+            return Ok(HealthStatus {
+                healthy: true,
+                detail: None,
+            });
+        }
+        // A non-zero exit is a *result* (unhealthy), not an adapter error — the
+        // command ran. Surface a trimmed stderr (else stdout) excerpt as detail.
+        let stderr = captured.stderr.trim();
+        let excerpt = if stderr.is_empty() {
+            captured.stdout.trim()
+        } else {
+            stderr
+        };
+        Ok(HealthStatus {
+            healthy: false,
+            detail: (!excerpt.is_empty()).then(|| excerpt.to_owned()),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{resolve_secret_env, CommandMigration, CommandSpec};
-    use fraisier_core::adapter_axes::{AdapterCtx, MigrationAdapter};
+    use super::{resolve_secret_env, CommandHealth, CommandMigration, CommandSpec};
+    use fraisier_core::adapter_axes::{AdapterCtx, HealthAdapter, HostId, MigrationAdapter};
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
+
+    /// An `AdapterCtx` whose `[health]` settings carry `command`.
+    fn health_ctx(command: Value) -> AdapterCtx {
+        let mut ctx = AdapterCtx::new("checkout", "production");
+        ctx.settings.insert("command".to_owned(), command);
+        ctx
+    }
+
+    #[tokio::test]
+    async fn command_health_exit_zero_is_healthy() {
+        let status = CommandHealth::new()
+            .check(&health_ctx(json!("true")), &HostId::new("localhost"))
+            .await
+            .expect("check runs");
+        assert!(status.healthy);
+        assert!(status.detail.is_none());
+    }
+
+    #[tokio::test]
+    async fn command_health_nonzero_is_unhealthy_with_stderr_detail() {
+        let status = CommandHealth::new()
+            .check(
+                &health_ctx(json!("echo boom >&2; exit 1")),
+                &HostId::new("localhost"),
+            )
+            .await
+            .expect("check runs");
+        assert!(!status.healthy);
+        assert_eq!(status.detail.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn command_health_nonzero_falls_back_to_stdout_detail() {
+        let status = CommandHealth::new()
+            .check(
+                &health_ctx(json!("echo from-stdout; exit 2")),
+                &HostId::new("localhost"),
+            )
+            .await
+            .expect("check runs");
+        assert!(!status.healthy);
+        assert_eq!(status.detail.as_deref(), Some("from-stdout"));
+    }
+
+    #[tokio::test]
+    async fn command_health_spawn_failure_is_adapter_error() {
+        // Argv form with a missing binary → a real spawn failure (the program is
+        // the binary itself, not `sh`), distinct from a non-zero exit.
+        let err = CommandHealth::new()
+            .check(
+                &health_ctx(json!(["/definitely/not/a/real/binary-xyz"])),
+                &HostId::new("localhost"),
+            )
+            .await
+            .expect_err("spawn fails");
+        assert_eq!(err.adapter.as_deref(), Some("command"));
+    }
+
+    #[tokio::test]
+    async fn command_health_timeout_is_adapter_error() {
+        let mut ctx = health_ctx(json!("sleep 5"));
+        ctx.settings.insert("timeout_ms".to_owned(), json!(50));
+        let err = CommandHealth::new()
+            .check(&ctx, &HostId::new("localhost"))
+            .await
+            .expect_err("times out");
+        assert_eq!(err.adapter.as_deref(), Some("command"));
+    }
+
+    #[tokio::test]
+    async fn command_health_requires_a_command() {
+        let err = CommandHealth::new()
+            .check(
+                &AdapterCtx::new("checkout", "production"),
+                &HostId::new("localhost"),
+            )
+            .await
+            .expect_err("missing command");
+        assert_eq!(err.adapter.as_deref(), Some("command"));
+    }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

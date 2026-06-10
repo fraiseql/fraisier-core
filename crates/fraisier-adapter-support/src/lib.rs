@@ -109,6 +109,10 @@ pub async fn run_command(
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
+    // If this future is dropped before the child exits (e.g. a caller wraps the
+    // call in a timeout that elapses), kill the child rather than leaving it
+    // running detached. Harmless on the normal path: the child has already exited.
+    command.kill_on_drop(true);
 
     let output = spawn_with_etxtbsy_retry(&mut command)
         .await

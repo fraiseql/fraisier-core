@@ -809,3 +809,87 @@ fn preset_overlay_keeps_author_checks() {
     assert_eq!(cfg.checks.len(), 2, "author checks must survive overlay");
     assert!(cfg.validate().ok(), "{}", cfg.validate());
 }
+
+/// A clean single-host config missing only its `[health]` section, so each
+/// command-health test can append the health variant it exercises.
+const HEALTH_BASE: &str = r#"
+[deploy]
+name = "checkout"
+environment = "production"
+
+[artifact]
+source = "release"
+release_url = "https://example.com/checkout-{version}.tar.gz"
+checksum_url = "https://example.com/checkout-{version}.tar.gz.sha256"
+
+[migration]
+adapter = "confiture"
+database_url_env = "CHECKOUT_DATABASE_URL"
+
+[service]
+adapter = "systemd"
+unit = "checkout.service"
+"#;
+
+#[test]
+fn command_health_section_parses_and_round_trips() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"command\"\n\
+         command = \"fraiseql perf regression-scan --fail-on-regression\"\ntimeout_ms = 30000\n"
+    );
+    let cfg = DeployConfig::from_toml_str(&toml).expect("parses");
+    let health = cfg.health.as_ref().expect("health");
+    assert_eq!(health.adapter.as_deref(), Some("command"));
+    assert_eq!(
+        health.command.as_deref(),
+        Some("fraiseql perf regression-scan --fail-on-regression")
+    );
+    assert_eq!(health.timeout_ms, Some(30_000));
+    assert!(cfg.validate().ok(), "{}", cfg.validate());
+
+    // serde round-trip: re-serialize and re-parse, the [health] section is stable.
+    let serialized = toml::to_string(&cfg).expect("serialize");
+    let reparsed = DeployConfig::from_toml_str(&serialized).expect("reparse");
+    assert_eq!(reparsed.health, cfg.health);
+}
+
+#[test]
+fn command_health_requires_a_command() {
+    let toml = format!("{HEALTH_BASE}\n[health]\nadapter = \"command\"\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "health.command"), "{report}");
+}
+
+#[test]
+fn command_health_rejects_url() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"command\"\ncommand = \"scan\"\n\
+         url = \"http://127.0.0.1:8080/health\"\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "health.url"), "{report}");
+}
+
+#[test]
+fn command_health_rejects_expected_status() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"command\"\ncommand = \"scan\"\nexpected_status = 200\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "health.expected_status"), "{report}");
+}
+
+#[test]
+fn http_health_still_requires_url() {
+    let toml = format!("{HEALTH_BASE}\n[health]\nadapter = \"http\"\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "health.url"), "{report}");
+}

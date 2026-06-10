@@ -263,7 +263,7 @@ pub struct ServiceSection {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HealthSection {
-    /// The health adapter (`"http"`).
+    /// The health adapter (`"http"` or `"command"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<String>,
     /// `http`: the probe URL (may contain a `{host.address}` placeholder
@@ -273,6 +273,17 @@ pub struct HealthSection {
     /// `http`: the expected status code (defaults to `200`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_status: Option<u16>,
+    /// `command`: the shell command run as the post-deploy health gate (via
+    /// `sh -c`); the gate passes iff it exits 0. The DSN reaches it through the
+    /// environment (inherited from the migration's `database_url_env`), never
+    /// argv. Required when `adapter = "command"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// `command`: the fail-closed probe timeout in milliseconds. A perf scan can
+    /// legitimately run for tens of seconds; the adapter applies a generous
+    /// default when unset. Also widens HTTP's timeout to be operator-settable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 /// The `[ssh]` section: the connection parameters fraisier uses to run per-host

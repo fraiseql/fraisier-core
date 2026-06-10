@@ -109,6 +109,7 @@ impl SpecqlPreset {
                 adapter: Some(PRESET_HEALTH_ADAPTER.to_owned()),
                 url: Some(PRESET_HEALTH_URL.to_owned()),
                 expected_status: Some(DEFAULT_EXPECTED_STATUS),
+                ..HealthSection::default()
             }),
             lb: multi_host.then(|| Self::lb_defaults(name.as_deref())),
             ssh: None,
@@ -273,6 +274,8 @@ impl Overlay for HealthSection {
             adapter: prefer(self.adapter, over.adapter),
             url: prefer(self.url, over.url),
             expected_status: prefer(self.expected_status, over.expected_status),
+            command: prefer(self.command, over.command),
+            timeout_ms: prefer(self.timeout_ms, over.timeout_ms),
         }
     }
 }

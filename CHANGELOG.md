@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-beta.3] - 2026-06-11
+
 ### Added
 
 - **Command health adapter** (`[health].adapter = "command"`): a `HealthAdapter`

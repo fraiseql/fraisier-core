@@ -6,6 +6,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-beta.3] - 2026-06-11
+
+### Added
+
+- **Command health adapter** (`[health].adapter = "command"`): a `HealthAdapter`
+  that runs a configured shell command as the saga's post-deploy `health` step —
+  the gate passes iff the command exits `0`. Spawn failure and a (configurable,
+  default 60s) timeout fail closed: every ambiguous outcome rolls the deploy back
+  rather than committing a release as healthy. The DSN reaches the command by
+  environment (inherited from `[migration].database_url_env`), never argv.
+- **Perf-regression rollback gate**: with `fraiseql perf regression-scan
+  --fail-on-regression --json` (FraiseQL v2.6.0+), the command health adapter
+  parses the scan's report and names the top regressed operation — e.g.
+  `perf regression: order/UPDATE p50 +42% (12ms→17ms), 3 more` — in the rollback
+  reason and the `[schedule].notify` failure webhook. Without `--json` the gate
+  still works; the detail degrades to a plain output excerpt. A migration-agnostic
+  alternative to the command-migration `verify` hook. See
+  `docs/perf-regression-gate.md`.
+
 ## [1.0.0-beta.2] - 2026-06-08
 
 ### Added

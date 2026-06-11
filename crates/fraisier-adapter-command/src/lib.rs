@@ -5,6 +5,11 @@
 //! migration tool fraisier does not natively wrap be driven through the same
 //! frozen trait — "if you can run it from a shell, you can deploy it".
 //!
+//! This crate also provides [`CommandHealth`], a sibling [`HealthAdapter`] that
+//! runs a configured shell command as the post-deploy health gate (exit 0 →
+//! healthy; any non-zero exit → unhealthy; spawn failure or timeout → error). It
+//! reuses the same `sh -c`/argv command shape and secret-env handling.
+//!
 //! ## Configuration
 //!
 //! The adapter is built from its `[migration.command]` settings table (via
@@ -37,12 +42,13 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use fraisier_adapter_support::{error, run_command, Captured};
 use fraisier_core::adapter_axes::{
-    AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, MigrationAdapter,
-    MigrationOutcome, Revision, VerifyCheck, VerifyReport,
+    AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, HealthAdapter, HealthStatus,
+    HostId, MigrationAdapter, MigrationOutcome, Revision, VerifyCheck, VerifyReport,
 };
 use serde_json::Value;
 
@@ -321,13 +327,309 @@ impl MigrationAdapter for CommandMigration {
     }
 }
 
+/// The health-axis identity name for the command adapter.
+const HEALTH_NAME: &str = "command";
+
+/// Default fail-closed timeout for a command health probe, in milliseconds.
+/// Generous on purpose: a perf/regression scan can legitimately take tens of
+/// seconds, and a premature timeout would roll back a healthy deploy.
+const DEFAULT_HEALTH_TIMEOUT_MS: u64 = 60_000;
+
+/// A [`HealthAdapter`] that runs a configured shell command as the saga health gate.
+///
+/// Exit `0` → healthy; any non-zero exit → unhealthy (with a captured detail
+/// excerpt); a spawn failure or a timeout → [`AdapterError`] (the probe could not
+/// be performed). Both the unhealthy and error paths roll the deploy back, so the
+/// gate fails closed.
+///
+/// # Configuration
+/// Read per call from [`AdapterCtx::settings`] (the `[health]` table), mirroring
+/// the HTTP adapter:
+/// - `command` — a shell string (run via `sh -c`) or an argv array (no shell).
+///   Required.
+/// - `timeout_ms` — the fail-closed timeout (default 60000).
+///
+/// Secrets (including the DSN) reach the command via the environment, never
+/// argv: every entry in [`AdapterCtx::env_secrets`] is exported under its logical
+/// name, exactly as for the migration command adapter.
+///
+/// # Example
+/// ```
+/// use fraisier_adapter_command::CommandHealth;
+///
+/// let adapter = CommandHealth::new();
+/// let _ = adapter;
+/// ```
+#[derive(Default)]
+pub struct CommandHealth {
+    _private: (),
+}
+
+impl CommandHealth {
+    /// Create a command health adapter. Its configuration is read from the
+    /// [`AdapterCtx`] at probe time, so the constructor takes no arguments.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Format a one-line, greppable detail from a perf `regression-scan --json`
+/// report on `stdout`, naming the top regressed `(object_type, modification_type)`
+/// with its p50 delta and a count of any others
+/// (e.g. `perf regression: order/UPDATE p50 +42% (12ms→17ms), 3 more`).
+///
+/// Returns `None` — so the caller falls back to the plain excerpt — when stdout
+/// is not the expected shape: human-format output, a different tool, malformed
+/// JSON, or an empty `findings` list. Parsing is total and defensive: a contract
+/// drift degrades gracefully, never panicking the gate.
+///
+/// Targets the fraiseql v2.6.0 `RegressionReport` contract (FraiseQL #392).
+fn format_perf_detail(stdout: &str) -> Option<String> {
+    let report: Value = serde_json::from_str(stdout.trim()).ok()?;
+    let findings = report.get("findings")?.as_array()?;
+    let first = findings.first()?;
+    let object_type = first.get("object_type")?.as_str()?;
+    let modification_type = first.get("modification_type")?.as_str()?;
+    let pct_change = first.get("pct_change")?.as_f64()?;
+    let baseline_p50 = first.get("baseline_p50")?.as_f64()?;
+    let recent_p50 = first.get("recent_p50")?.as_f64()?;
+    let more = findings.len() - 1;
+    let suffix = if more > 0 {
+        format!(", {more} more")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "perf regression: {object_type}/{modification_type} \
+         p50 {pct_change:+.0}% ({baseline_p50:.0}ms→{recent_p50:.0}ms){suffix}"
+    ))
+}
+
+#[async_trait]
+impl HealthAdapter for CommandHealth {
+    async fn check(&self, ctx: &AdapterCtx, _host: &HostId) -> Result<HealthStatus, AdapterError> {
+        let spec = ctx
+            .settings
+            .get("command")
+            .and_then(CommandSpec::from_value)
+            .ok_or_else(|| {
+                error(
+                    AdapterErrorKind::InvalidConfig,
+                    HEALTH_NAME,
+                    "check",
+                    "no 'command' configured in [health] settings".to_owned(),
+                    None,
+                )
+            })?;
+        let timeout = Duration::from_millis(
+            ctx.settings
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_HEALTH_TIMEOUT_MS),
+        );
+        let envs = resolve_secret_env(ctx, HEALTH_NAME)?;
+        let (program, args) = spec.program_and_args();
+
+        let run = run_command(
+            &program,
+            &args,
+            &envs,
+            Some(ctx.workdir.as_path()),
+            HEALTH_NAME,
+            "check",
+        );
+        let captured = match tokio::time::timeout(timeout, run).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(error(
+                    AdapterErrorKind::Execution,
+                    HEALTH_NAME,
+                    "check",
+                    format!("health command timed out after {}ms", timeout.as_millis()),
+                    None,
+                ));
+            }
+        };
+
+        if captured.succeeded() {
+            return Ok(HealthStatus {
+                healthy: true,
+                detail: None,
+            });
+        }
+        // A non-zero exit is a *result* (unhealthy), not an adapter error — the
+        // command ran. Prefer a structured, named detail parsed from the scan's
+        // `--json` stdout; fall back to a trimmed stderr (else stdout) excerpt for
+        // human output or any other command.
+        let detail = format_perf_detail(&captured.stdout).or_else(|| {
+            let stderr = captured.stderr.trim();
+            let excerpt = if stderr.is_empty() {
+                captured.stdout.trim()
+            } else {
+                stderr
+            };
+            (!excerpt.is_empty()).then(|| excerpt.to_owned())
+        });
+        Ok(HealthStatus {
+            healthy: false,
+            detail,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{resolve_secret_env, CommandMigration, CommandSpec};
-    use fraisier_core::adapter_axes::{AdapterCtx, MigrationAdapter};
+    use super::{
+        format_perf_detail, resolve_secret_env, CommandHealth, CommandMigration, CommandSpec,
+    };
+    use fraisier_core::adapter_axes::{AdapterCtx, HealthAdapter, HostId, MigrationAdapter};
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
     use std::ffi::OsString;
+
+    /// A perf regression-scan `--json` report carrying `findings` (the pinned
+    /// fraiseql v2.6.0 shape).
+    fn report(findings: &Value) -> String {
+        json!({
+            "findings": findings.clone(),
+            "skipped": [],
+            "summary": { "groups_analyzed": 2, "regressions": 1, "total_samples": 200, "excluded_samples": 0 },
+        })
+        .to_string()
+    }
+
+    fn order_update_finding() -> Value {
+        json!({
+            "object_type": "order",
+            "modification_type": "UPDATE",
+            "baseline_p50": 12.0,
+            "baseline_p95": 20.0,
+            "recent_p50": 17.0,
+            "recent_p95": 28.0,
+            "pct_change": 41.67,
+            "baseline_samples": 120,
+            "recent_samples": 140,
+        })
+    }
+
+    #[test]
+    fn perf_detail_names_the_single_finding() {
+        let detail = format_perf_detail(&report(&json!([order_update_finding()])))
+            .expect("a findings report formats");
+        assert_eq!(detail, "perf regression: order/UPDATE p50 +42% (12ms→17ms)");
+    }
+
+    #[test]
+    fn perf_detail_counts_additional_findings() {
+        let second = json!({
+            "object_type": "invoice",
+            "modification_type": "INSERT",
+            "baseline_p50": 5.0,
+            "baseline_p95": 9.0,
+            "recent_p50": 8.0,
+            "recent_p95": 14.0,
+            "pct_change": 60.0,
+            "baseline_samples": 80,
+            "recent_samples": 90,
+        });
+        let detail = format_perf_detail(&report(&json!([order_update_finding(), second])))
+            .expect("a findings report formats");
+        assert_eq!(
+            detail,
+            "perf regression: order/UPDATE p50 +42% (12ms→17ms), 1 more"
+        );
+    }
+
+    #[test]
+    fn perf_detail_degrades_on_non_report_output() {
+        // Human-format output, malformed JSON, an empty findings list, and a
+        // wrong shape must all degrade to None so the caller falls back.
+        assert!(format_perf_detail("WARN order/UPDATE p50 +42%").is_none());
+        assert!(format_perf_detail("{not json").is_none());
+        assert!(format_perf_detail(&report(&json!([]))).is_none());
+        assert!(format_perf_detail(&json!({"other": 1}).to_string()).is_none());
+    }
+
+    /// An `AdapterCtx` whose `[health]` settings carry `command`.
+    fn health_ctx(command: Value) -> AdapterCtx {
+        let mut ctx = AdapterCtx::new("checkout", "production");
+        ctx.settings.insert("command".to_owned(), command);
+        ctx
+    }
+
+    #[tokio::test]
+    async fn command_health_exit_zero_is_healthy() {
+        let status = CommandHealth::new()
+            .check(&health_ctx(json!("true")), &HostId::new("localhost"))
+            .await
+            .expect("check runs");
+        assert!(status.healthy);
+        assert!(status.detail.is_none());
+    }
+
+    #[tokio::test]
+    async fn command_health_nonzero_is_unhealthy_with_stderr_detail() {
+        let status = CommandHealth::new()
+            .check(
+                &health_ctx(json!("echo boom >&2; exit 1")),
+                &HostId::new("localhost"),
+            )
+            .await
+            .expect("check runs");
+        assert!(!status.healthy);
+        assert_eq!(status.detail.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn command_health_nonzero_falls_back_to_stdout_detail() {
+        let status = CommandHealth::new()
+            .check(
+                &health_ctx(json!("echo from-stdout; exit 2")),
+                &HostId::new("localhost"),
+            )
+            .await
+            .expect("check runs");
+        assert!(!status.healthy);
+        assert_eq!(status.detail.as_deref(), Some("from-stdout"));
+    }
+
+    #[tokio::test]
+    async fn command_health_spawn_failure_is_adapter_error() {
+        // Argv form with a missing binary → a real spawn failure (the program is
+        // the binary itself, not `sh`), distinct from a non-zero exit.
+        let err = CommandHealth::new()
+            .check(
+                &health_ctx(json!(["/definitely/not/a/real/binary-xyz"])),
+                &HostId::new("localhost"),
+            )
+            .await
+            .expect_err("spawn fails");
+        assert_eq!(err.adapter.as_deref(), Some("command"));
+    }
+
+    #[tokio::test]
+    async fn command_health_timeout_is_adapter_error() {
+        let mut ctx = health_ctx(json!("sleep 5"));
+        ctx.settings.insert("timeout_ms".to_owned(), json!(50));
+        let err = CommandHealth::new()
+            .check(&ctx, &HostId::new("localhost"))
+            .await
+            .expect_err("times out");
+        assert_eq!(err.adapter.as_deref(), Some("command"));
+    }
+
+    #[tokio::test]
+    async fn command_health_requires_a_command() {
+        let err = CommandHealth::new()
+            .check(
+                &AdapterCtx::new("checkout", "production"),
+                &HostId::new("localhost"),
+            )
+            .await
+            .expect_err("missing command");
+        assert_eq!(err.adapter.as_deref(), Some("command"));
+    }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

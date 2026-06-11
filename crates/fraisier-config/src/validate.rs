@@ -355,6 +355,26 @@ fn validate_health(cfg: &DeployConfig, report: &mut ValidationReport) {
     if health.adapter.as_deref() == Some("http") && !is_set(health.url.as_ref()) {
         report.error("health.url", "the http adapter requires url");
     }
+    if health.adapter.as_deref() == Some("command") {
+        if !is_set(health.command.as_ref()) {
+            report.error("health.command", "the command adapter requires command");
+        }
+        // `url`/`expected_status` are http-only knobs; mixing them with the
+        // command adapter is a config mistake (deny_unknown_fields cannot catch
+        // it — both are known HealthSection fields).
+        if is_set(health.url.as_ref()) {
+            report.error(
+                "health.url",
+                "url applies only to the http adapter, not the command adapter",
+            );
+        }
+        if health.expected_status.is_some() {
+            report.error(
+                "health.expected_status",
+                "expected_status applies only to the http adapter, not the command adapter",
+            );
+        }
+    }
     if let Some(status) = health.expected_status {
         if !HTTP_STATUS_RANGE.contains(&status) {
             report.error(

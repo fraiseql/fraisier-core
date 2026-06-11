@@ -1,6 +1,6 @@
 [package]
 name = "fraisier-adapter-command"
-description = "Universal escape-hatch migration adapter for fraisier: runs configured shell commands behind the frozen MigrationAdapter trait."
+description = "Universal escape-hatch command adapters for fraisier: a migration adapter and a health gate that run configured shell commands behind the frozen traits."
 version.workspace = true
 readme = "README.md"
 edition.workspace = true
@@ -17,9 +17,10 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1.89"
-fraisier-core = { path = "../fraisier-core", version = "1.0.0-beta.2" }
-fraisier-adapter-support = { path = "../fraisier-adapter-support", version = "1.0.0-beta.2" }
+fraisier-core = { path = "../fraisier-core", version = "1.0.0-beta.3" }
+fraisier-adapter-support = { path = "../fraisier-adapter-support", version = "1.0.0-beta.3" }
 serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["time"] }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread", "sync"] }

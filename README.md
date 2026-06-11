@@ -41,7 +41,7 @@ A deploy is composed from five **adapter axes**, each a small trait:
 | `artifact` | fetch + verify + atomically activate a release | release tarball, git, local path, host-pull, IPC |
 | `migration` | apply / roll back / preflight schema changes | confiture, command, IPC (e.g. sqlx) |
 | `service`   | start / stop / restart the app | systemd, rc, docker-compose |
-| `health`    | probe that the new release is live | http |
+| `health`    | probe that the new release is live | http, command |
 | `lb`        | drain / reattach / swap traffic | nginx |
 
 Each adapter runs either **in-process** (a Rust trait impl) or **out-of-process**
@@ -214,6 +214,17 @@ command = "cargo clippy --all-targets -- -D warnings"
 name = "test"
 command = "cargo test --workspace"
 ```
+
+### Perf-regression rollback gate
+
+The `command` health adapter turns the saga's post-deploy `health` step into an
+arbitrary gate: it runs a configured shell command, passes iff the command exits
+`0`, and folds the command's output into the rollback reason. Its headline use is
+FraiseQL's `fraiseql perf regression-scan --fail-on-regression --json` — a deploy
+that makes a database mutation slower rolls back automatically, naming the
+regressed operation (`perf regression: order/UPDATE p50 +42% (12ms→17ms)`) in the
+rollback reason and the `[schedule].notify` webhook. The DSN reaches the scan by
+environment, never argv. See [`docs/perf-regression-gate.md`](docs/perf-regression-gate.md).
 
 ## Observability
 

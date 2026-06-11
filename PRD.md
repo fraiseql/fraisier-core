@@ -97,7 +97,8 @@ The honestly-disclosed trade: more architectural work in week 1, less adapter-po
 | Migration adapters in core | Django, Alembic, Flask-Migrate, Peewee, Confiture | ✅ Confiture + `command` + reference sqlx adapter only |
 | Migration adapters as external IPC packages | (n/a) | ✅ Django, Alembic, Flask-Migrate, Peewee — separate repos, separate release cadence |
 | Service managers | systemd, rc.d, docker-compose | ✅ All three |
-| Health checks | HTTP probe | ✅ Required |
+| Health checks | HTTP probe | ✅ `http` + `command` adapters |
+| Perf-regression rollback gate | (none) | ✅ `command` health adapter runs `fraiseql perf regression-scan --fail-on-regression --json`; a regression rolls the deploy back and names the operation in the reason/webhook |
 | Load balancer adapter | (none) | ✅ Reference: nginx; trait open for HAProxy/cloud |
 | Artifact source | git pull | ✅ `release` (URL+sha256), `git`, `local` |
 | Config | `fraises.yaml` + `!envvar` | ✅ `fraisier.toml` native format only (`fraises.yaml` runtime compat withdrawn 2026-06-02) |

@@ -88,3 +88,31 @@ Pass the DSN by **environment**, never on argv. Do **not** write
 the DSN into the process arguments, where it is visible in process listings
 (`ps`) to every user on the host. The `[migration].database_url_env` mapping above
 exports the DSN to the scan's environment instead, keeping it out of argv and logs.
+
+The health command runs via `sh -c` from your `fraisier.toml` — the same trust
+boundary as the migration `command` adapter and `[[checks]]`: it is operator-authored
+config, never untrusted input. The scan child inherits the fraisier process
+environment (the adapter does not `env_clear`), exactly as the migration command
+adapter does.
+
+**Detail in the rollback reason / webhook.** On `--json`, the adapter folds only a
+**structured, secret-free** line into the reason and the `[schedule].notify`
+webhook — the regressed operation name and its p50 numbers, nothing else. Without
+`--json` (or if the scan emits a non-report error), the gate falls back to echoing
+a **verbatim excerpt** of the scan's stderr (else stdout) into that same reason and
+webhook — the same propagation the migration `verify` hook and adapter errors use
+engine-wide. Prefer `--json`, and keep secrets (e.g. a full DSN in a connection
+error) out of the scan's stderr, since the `[schedule].notify` sink may be a
+broader-audience channel than your local logs.
+
+## Scheduled monitoring (out of scope)
+
+The gate is **deploy-time**: it catches a regression a *release* introduces, at the
+moment that release is rolled out. Catching a regression that creeps in *between*
+deploys — a data-volume or plan shift with no deploy to trigger the saga — is a
+standalone monitoring concern that fraisier deliberately does not own (there is no
+deploy in flight to compensate, so there is nothing to roll back). Wire it with
+external cron and the inbound `fraisier-webhook` trigger instead: run
+`fraiseql perf regression-scan --json` on a cadence and alert on
+`summary.regressions > 0`. No engine support is required, and keeping fraisier
+deploy-time-only keeps the rollback semantics unambiguous.

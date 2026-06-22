@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use fraisier_core::adapter_axes::{AdapterCtx, HostId};
 use fraisier_core::multi_host::{HostEntry, HostInventory, RolloutStrategy};
 use fraisier_core::single_host::PreflightMode;
+use fraisier_core::token_provider::TokenProvider;
 use serde::{Deserialize, Serialize};
 
 use crate::SpecqlPreset;
@@ -317,6 +318,14 @@ pub struct HealthSection {
     /// default when unset. Also widens HTTP's timeout to be operator-settable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// `http`: static request headers sent with the probe (e.g. a fixed API key).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// `http`: a token provider that acquires a short-lived bearer credential at
+    /// deploy time and injects it into the probe (default header `Authorization`,
+    /// template `Bearer {token}`). Resolved once per deploy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_provider: Option<TokenProvider>,
 }
 
 /// The `[ssh]` section: the connection parameters fraisier uses to run per-host

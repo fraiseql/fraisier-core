@@ -274,6 +274,93 @@ url = "http://127.0.0.1/health"
     );
 }
 
+/// A health entry parses a `token_provider` and validates clean.
+#[test]
+fn health_token_provider_parses_and_validates() {
+    let toml = r#"
+[deploy]
+name = "x"
+environment = "production"
+[artifact]
+source = "local"
+path = "/srv/x"
+[migration]
+adapter = "confiture"
+database_url_env = "X_DB"
+[service]
+adapter = "systemd"
+unit = "x.service"
+[health]
+adapter = "http"
+url = "http://127.0.0.1/health"
+[health.headers]
+X-Trace-Id = "deploy"
+[health.token_provider]
+type = "oauth2_client_credentials"
+token_url = "https://idp/token"
+client_id = "svc"
+client_secret_env = "IDP_SECRET"
+scope = "api.read"
+"#;
+    let cfg = DeployConfig::from_toml_str(toml).expect("parses");
+    assert!(cfg.validate().ok(), "{:?}", cfg.validate().issues);
+    let provider = cfg
+        .health
+        .as_ref()
+        .and_then(|h| h.token_provider.as_ref())
+        .expect("token provider parsed");
+    assert_eq!(provider.header(), "Authorization");
+}
+
+/// A bad `format`, a header collision, and a non-http adapter are each rejected.
+#[test]
+fn health_token_provider_validation_rejects_bad_configs() {
+    let with = |health: &str| {
+        format!(
+            r#"
+[deploy]
+name = "x"
+environment = "production"
+[artifact]
+source = "local"
+path = "/srv/x"
+[migration]
+adapter = "confiture"
+database_url_env = "X_DB"
+[service]
+adapter = "systemd"
+unit = "x.service"
+{health}
+"#
+        )
+    };
+
+    // Bad format (no {{token}}).
+    let cfg = DeployConfig::from_toml_str(&with(
+        "[health]\nadapter = \"http\"\nurl = \"http://h/health\"\n\
+         [health.token_provider]\ntype = \"exec\"\ncommand = [\"t\"]\nformat = \"Bearer ABC\"\n",
+    ))
+    .expect("parses");
+    assert!(!cfg.validate().ok(), "bad format must fail");
+
+    // Header collision (case-insensitive) with a static header.
+    let cfg = DeployConfig::from_toml_str(&with(
+        "[health]\nadapter = \"http\"\nurl = \"http://h/health\"\n\
+         [health.headers]\nauthorization = \"static\"\n\
+         [health.token_provider]\ntype = \"exec\"\ncommand = [\"t\"]\n",
+    ))
+    .expect("parses");
+    assert!(!cfg.validate().ok(), "header collision must fail");
+
+    // token_provider on a non-http adapter.
+    let cfg = DeployConfig::from_toml_str(&with(
+        "[health]\nadapter = \"command\"\ncommand = \"scan\"\n\
+         [health.token_provider]\ntype = \"exec\"\ncommand = [\"t\"]\n",
+    ))
+    .expect("parses");
+    assert!(!cfg.validate().ok(), "token_provider needs http adapter");
+}
+
 /// `preflight_mode = "restore_rehearsal"` requires the confiture adapter, since
 /// the rehearsal composes a generic-Postgres restore.
 #[test]

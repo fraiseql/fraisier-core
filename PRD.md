@@ -331,6 +331,20 @@ unit = "fraiseql.service"
 adapter = "http"
 url = "http://{host.address}:8080/health"
 expected_status = 200
+# Optional static probe headers and a deploy-time bearer-token provider. The
+# token is resolved once per deploy and injected via `format` (default
+# `Bearer {token}`) into `header` (default `Authorization`). Three provider
+# types: `exec` (run an argv, stdout is the token), `oauth2_client_credentials`,
+# `oauth2_refresh_token`. Secrets are referenced by *source env var name* and
+# resolved via `AdapterCtx::secret` (Decision 5); tokens/secrets are never logged.
+# [health.headers]
+# X-Trace-Id = "deploy"
+# [health.token_provider]
+# type = "oauth2_client_credentials"
+# token_url = "https://idp.example/oauth/token"
+# client_id = "deploy-probe"
+# client_secret_env = "FRAISEQL_PROBE_CLIENT_SECRET"
+# scope = "health.read"
 
 [lb]
 adapter = "nginx"

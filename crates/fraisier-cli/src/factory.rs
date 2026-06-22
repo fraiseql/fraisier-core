@@ -89,6 +89,35 @@ pub struct ResolvedDeploy {
     pub health: Arc<dyn HealthAdapter>,
 }
 
+/// Map a health token provider's secret (`client_secret` / `refresh_token`) into
+/// `env_secrets` under its fixed logical name, so the http adapter resolves it via
+/// `ctx.secret(...)` — the value never enters config or argv (Decision 5). The
+/// `exec` provider brings its own environment and needs no mapping.
+fn add_token_provider_secrets(config: &DeployConfig, env_secrets: &mut BTreeMap<String, String>) {
+    use fraisier_core::token_provider::{
+        TokenProvider, CLIENT_SECRET_LOGICAL, REFRESH_TOKEN_LOGICAL,
+    };
+    match config
+        .health
+        .as_ref()
+        .and_then(|h| h.token_provider.as_ref())
+    {
+        Some(TokenProvider::Oauth2ClientCredentials(p)) => {
+            env_secrets.insert(
+                CLIENT_SECRET_LOGICAL.to_owned(),
+                p.client_secret_env.clone(),
+            );
+        }
+        Some(TokenProvider::Oauth2RefreshToken(p)) => {
+            env_secrets.insert(
+                REFRESH_TOKEN_LOGICAL.to_owned(),
+                p.refresh_token_env.clone(),
+            );
+        }
+        Some(TokenProvider::Exec(_)) | None => {}
+    }
+}
+
 /// Resolve the preflight knobs from `[migration]`: the live forward-compat lint
 /// toggle and the optional restore-rehearsal `(db, backup)` pair.
 fn resolve_preflight(config: &DeployConfig) -> (bool, Option<RestoreRehearsalPlan>) {
@@ -190,6 +219,22 @@ fn settings_map(config: &DeployConfig, app_version: Option<&str>) -> BTreeMap<St
         put_str(&mut settings, "command", health.command.as_deref());
         if let Some(timeout_ms) = health.timeout_ms {
             settings.insert("timeout_ms".to_owned(), Value::from(timeout_ms));
+        }
+        // Static probe headers + the token-provider config flow to the http adapter
+        // through ctx.settings (the adapter is config-blind); the provider's secret
+        // is wired through env_secrets below, never as a value here.
+        if !health.headers.is_empty() {
+            let map: serde_json::Map<String, Value> = health
+                .headers
+                .iter()
+                .map(|(key, value)| (key.clone(), Value::from(value.clone())))
+                .collect();
+            settings.insert("headers".to_owned(), Value::Object(map));
+        }
+        if let Some(provider) = &health.token_provider {
+            if let Ok(value) = serde_json::to_value(provider) {
+                settings.insert("token_provider".to_owned(), value);
+            }
         }
     }
     if let Some(lb) = &config.lb {
@@ -363,6 +408,7 @@ pub fn build(
         .and_then(|m| m.database_url_env.clone());
     let mut env_secrets = BTreeMap::new();
     let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
+    add_token_provider_secrets(config, &mut env_secrets);
 
     // The forward-compat lint and (opt-in) restore-rehearsal are selected by
     // `[migration].preflight_mode` (default `live`, legacy flag honoured).
@@ -459,6 +505,7 @@ pub fn build_multi_host(
         .and_then(|m| m.database_url_env.clone());
     let mut env_secrets = BTreeMap::new();
     let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
+    add_token_provider_secrets(config, &mut env_secrets);
 
     let forward_compatible_lint = config
         .migration
@@ -842,6 +889,7 @@ pub fn build_migration_only(config: &DeployConfig) -> Result<ResolvedMigration> 
         .and_then(|m| m.database_url_env.clone());
     let mut env_secrets = BTreeMap::new();
     let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
+    add_token_provider_secrets(config, &mut env_secrets);
 
     let forward_compatible_lint = config
         .migration
@@ -1126,6 +1174,7 @@ pub fn build_blue_green(
         .and_then(|m| m.database_url_env.clone());
     let mut env_secrets = BTreeMap::new();
     let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
+    add_token_provider_secrets(config, &mut env_secrets);
 
     let mut ctx = AdapterCtx::new(fraise.clone(), environment.clone());
     ctx.host = Some(host.clone());

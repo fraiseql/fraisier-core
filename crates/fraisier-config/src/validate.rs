@@ -395,6 +395,24 @@ fn validate_health(cfg: &DeployConfig, report: &mut ValidationReport) {
             );
         }
     }
+    if let Some(provider) = &health.token_provider {
+        // A token provider only makes sense injecting a header into the http probe.
+        if health.adapter.as_deref() != Some("http") {
+            report.error(
+                "health.token_provider",
+                "token_provider applies only to the http adapter (it injects a bearer \
+                 credential into the HTTP probe)",
+            );
+        }
+        if let Err(error) = provider.validate() {
+            report.error("health.token_provider", error.to_string());
+        }
+        if let Err(error) =
+            provider.validate_against_headers(health.headers.keys().map(String::as_str))
+        {
+            report.error("health.token_provider.header", error.to_string());
+        }
+    }
 }
 
 fn validate_hosts(cfg: &DeployConfig, report: &mut ValidationReport) {

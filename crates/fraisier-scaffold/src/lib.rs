@@ -14,7 +14,8 @@ mod install;
 
 pub use generate::{generate, generate_scheduled, GeneratedFile, MARKER};
 pub use install::{
-    install, install_targets, list_installed, prune, prune_plan, uninstall, write_tree,
+    classify, install, install_targets, list_installed, prune, prune_plan, uninstall, write_tree,
+    Drift,
 };
 
 /// An error from generating, installing, or pruning scaffold files.

@@ -115,8 +115,11 @@ pub(crate) fn version_bump(dir: &Path, level: fraisier_ship::Bump) -> Result<Com
 pub(crate) struct ShipArgs<'a> {
     /// The project directory holding the version file.
     pub dir: &'a Path,
-    /// Which component to bump.
+    /// Which component to bump (ignored when `no_bump` is set).
     pub level: fraisier_ship::Bump,
+    /// Re-ship the current version without bumping (mutually exclusive with a
+    /// bump level — the CLI rejects the combination at parse time).
+    pub no_bump: bool,
     /// Compute the plan without writing/committing/pushing.
     pub dry_run: bool,
     /// Skip the follow-on deploy.
@@ -156,6 +159,7 @@ pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
         dry_run: args.dry_run,
         no_deploy: args.no_deploy,
         push: args.push,
+        no_bump: args.no_bump,
         remote: args.remote,
         message_template: None,
     };
@@ -198,6 +202,7 @@ pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
                 "pushed": report.pushed,
                 "deployed": false,
                 "dry_run": report.dry_run,
+                "race_detected": report.race_detected,
                 "checks": checks_json,
             }),
         });
@@ -209,6 +214,7 @@ pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
         args.state_dir,
         args.host,
         Some(&report.new_version),
+        false,
         false,
     )
     .await?;
@@ -223,6 +229,7 @@ pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
             "pushed": report.pushed,
             "deployed": true,
             "deploy": deploy_out.json,
+            "race_detected": report.race_detected,
             "checks": checks_json,
         }),
     })
@@ -538,11 +545,17 @@ pub(crate) fn scaffold_install(
 /// it does **not** prune: scheduled units share the systemd directory (and the
 /// fraisier marker) with the scaffold units, so a scoped-by-presence prune would
 /// wrongly remove the other set. Writes only on `apply`; otherwise shows the plan.
+// Reason: the four bools mirror the independent `scheduled-install` CLI flags
+// (--yes / --dry-run / --force / --prune); the branches (plan / refuse-on-drift /
+// install-subset / prune) are one cohesive flow, not separable units.
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_lines)]
 pub(crate) fn scheduled_install(
     config_path: &Path,
     root: &Path,
     apply: bool,
     dry_run: bool,
+    force: bool,
+    prune: bool,
 ) -> Result<CommandOutput> {
     let config = load(config_path)?;
 
@@ -576,12 +589,32 @@ pub(crate) fn scheduled_install(
     }
 
     let files = fraisier_scaffold::generate_scheduled(&config)?;
-    let targets = fraisier_scaffold::install_targets(&files, root);
+    // Classify each unit against what is on disk (drift policy), and (with
+    // --prune) find marker-bearing units no longer declared.
+    let drift = fraisier_scaffold::classify(&files, root);
+    let installable: Vec<&fraisier_scaffold::GeneratedFile> =
+        files.iter().filter(|f| f.install_dest.is_some()).collect();
+    let drifted: Vec<String> = drift
+        .iter()
+        .filter(|(_, d)| *d == fraisier_scaffold::Drift::Drifted)
+        .map(|(path, _)| path.display().to_string())
+        .collect();
+    let prune_candidates = if prune {
+        fraisier_scaffold::prune_plan(&files, root)?
+    } else {
+        Vec::new()
+    };
 
     if dry_run || !apply {
         let mut pretty = format!("scheduled install plan (root {}):\n", root.display());
-        for path in &targets {
-            let _ = writeln!(pretty, "  + {}", path.display());
+        for (path, class) in &drift {
+            let _ = writeln!(pretty, "  [{}] {}", class.label(), path.display());
+        }
+        for path in &prune_candidates {
+            let _ = writeln!(pretty, "  [prune] {}", path.display());
+        }
+        if !drifted.is_empty() && !force {
+            pretty.push_str("note: drifted units will be refused without --force\n");
         }
         if !dry_run {
             pretty.push_str("pass --yes to apply\n");
@@ -592,16 +625,50 @@ pub(crate) fn scheduled_install(
             pretty,
             json: json!({
                 "applied": false,
-                "install": targets.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "drift": drift.iter().map(|(p, c)| json!({"path": p.display().to_string(), "class": c.label()})).collect::<Vec<_>>(),
+                "prune": prune_candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             }),
         });
     }
 
-    let installed = fraisier_scaffold::install(&files, root)?;
+    // Fail closed on drift unless the operator opts into overwriting.
+    if !drifted.is_empty() && !force {
+        let mut pretty =
+            String::from("refusing to install: drifted units (pass --force to overwrite)\n");
+        for path in &drifted {
+            let _ = writeln!(pretty, "  [drifted] {path}");
+        }
+        return Ok(CommandOutput {
+            exit_code: 1,
+            pretty,
+            json: json!({ "applied": false, "drifted": drifted }),
+        });
+    }
+
+    // Install only what is absent or (with --force) drifted; identical is a no-op.
+    let to_install: Vec<fraisier_scaffold::GeneratedFile> = installable
+        .iter()
+        .zip(&drift)
+        .filter(|(_, (_, class))| {
+            *class == fraisier_scaffold::Drift::Absent
+                || (*class == fraisier_scaffold::Drift::Drifted && force)
+        })
+        .map(|(file, _)| (*file).clone())
+        .collect();
+    let installed = fraisier_scaffold::install(&to_install, root)?;
+    let pruned = if prune {
+        fraisier_scaffold::prune(&prune_candidates)?;
+        prune_candidates
+    } else {
+        Vec::new()
+    };
+
     let mut pretty = format!(
-        "installed {} scheduled unit(s) (root {})\n",
+        "installed {} unit(s), pruned {} orphan(s) (root {}); {} identical unit(s) unchanged\n",
         installed.len(),
-        root.display()
+        pruned.len(),
+        root.display(),
+        drift.len() - installed.len(),
     );
     pretty.push_str("next: systemctl daemon-reload && systemctl enable --now <timer>\n");
     Ok(CommandOutput {
@@ -610,6 +677,7 @@ pub(crate) fn scheduled_install(
         json: json!({
             "applied": true,
             "installed": installed.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "pruned": pruned.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         }),
     })
 }
@@ -679,7 +747,7 @@ pub(crate) fn scheduled_uninstall(
 }
 
 /// `validate-config`: parse, expand, and validate, reporting every located issue.
-pub(crate) fn validate_config(config_path: &Path) -> Result<CommandOutput> {
+pub(crate) fn validate_config(config_path: &Path, resolve_envvars: bool) -> Result<CommandOutput> {
     let toml = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading config {}", config_path.display()))?;
     match DeployConfig::from_toml_str(&toml) {
@@ -689,18 +757,41 @@ pub(crate) fn validate_config(config_path: &Path) -> Result<CommandOutput> {
             json: json!({ "ok": false, "parse_error": error.to_string() }),
         }),
         Ok(config) => {
+            let structurally_ok = config.validate().ok();
+            // Default: structure-only (no secrets resolved). `--resolve-envvars`
+            // additionally requires every referenced `*_env` source var to be set.
+            let unset_secrets: Vec<String> = if resolve_envvars {
+                crate::doctor::referenced_secrets(&config)
+                    .into_iter()
+                    .filter(|(_, source)| {
+                        !std::env::var(source).is_ok_and(|value| !value.is_empty())
+                    })
+                    .map(|(purpose, source)| format!("{purpose}: ${source}"))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let report = config.validate();
-            let ok = report.ok();
+            let ok = structurally_ok && unset_secrets.is_empty();
             let mut pretty = render_issues(&report);
-            pretty.push_str(match (ok, report.issues.is_empty()) {
-                (true, true) => "config is valid\n",
-                (true, false) => "config is valid (warnings only)\n",
-                (false, _) => "config is INVALID\n",
-            });
+            for unset in &unset_secrets {
+                let _ = writeln!(pretty, "  [error] unresolved secret: {unset}");
+            }
+            pretty.push_str(
+                match (ok, report.issues.is_empty() && unset_secrets.is_empty()) {
+                    (true, true) => "config is valid\n",
+                    (true, false) => "config is valid (warnings only)\n",
+                    (false, _) => "config is INVALID\n",
+                },
+            );
             Ok(CommandOutput {
                 exit_code: i32::from(!ok),
                 pretty,
-                json: json!({ "ok": ok, "issues": serde_json::to_value(&report.issues)? }),
+                json: json!({
+                    "ok": ok,
+                    "issues": serde_json::to_value(&report.issues)?,
+                    "unresolved_secrets": unset_secrets,
+                }),
             })
         }
     }
@@ -1217,6 +1308,7 @@ pub(crate) async fn deploy(
     host: Option<&str>,
     app_version: Option<&str>,
     dry_run: bool,
+    skip_preflight: bool,
 ) -> Result<CommandOutput> {
     let config = load(config_path)?;
     let report = config.validate();
@@ -1264,18 +1356,25 @@ pub(crate) async fn deploy(
     }
 
     let resolved = factory::build(&config, host, app_version)?;
-    let plan = SingleHostDeploy::builder(
+    // `--skip-preflight` is the per-run escape hatch: it forces every preflight off
+    // regardless of `[migration].preflight_mode`.
+    let mut builder = SingleHostDeploy::builder(
         resolved.fraise.clone(),
         resolved.environment.clone(),
         resolved.host.clone(),
     )
     .context(resolved.ctx)
-    .forward_compatible_lint(resolved.forward_compatible_lint)
+    .forward_compatible_lint(resolved.forward_compatible_lint && !skip_preflight)
     .artifact(resolved.artifact)
     .migration(resolved.migration)
     .service(resolved.service)
-    .health(resolved.health)
-    .build()?;
+    .health(resolved.health);
+    if !skip_preflight {
+        if let Some((db, backup)) = resolved.restore_rehearsal {
+            builder = builder.restore_rehearsal(db, backup);
+        }
+    }
+    let plan = builder.build()?;
 
     let outcome = plan.run(store).await?;
     notify_deploy_failure(&config, &resolved.fraise, &resolved.environment, &outcome).await;
@@ -1864,6 +1963,7 @@ impl fraisier_webhook::WebhookHandler for DeployHandler {
             None,
             version.as_deref(),
             false,
+            false,
         )
         .await
         .map_err(|error| format!("{error:#}"))?;
@@ -1922,6 +2022,18 @@ pub(crate) async fn webhook_server(
         tolerance_secs: webhook.tolerance_secs.unwrap_or(300),
         max_body_bytes: webhook.max_body_bytes.unwrap_or(1024 * 1024),
         read_timeout: std::time::Duration::from_secs(webhook.read_timeout_secs.unwrap_or(30)),
+        // A self-upgrade restart raises this flag (in the state dir) to drain
+        // in-flight deploys; while it exists, new deploys get a retriable 503.
+        drain: fraisier_webhook::Drain {
+            flag_path: Some(state_dir.join(".draining")),
+            retry_after_s: webhook.self_upgrade_retry_after_s.unwrap_or(60),
+            refused: config
+                .deploy
+                .as_ref()
+                .and_then(|d| d.name.clone())
+                .into_iter()
+                .collect(),
+        },
     };
     let (listener, source) = fraisier_webhook::acquire(&listen)
         .await
@@ -2408,7 +2520,8 @@ url = "http://127.0.0.1:8080/health"
     fn validate_config_accepts_a_valid_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write(dir.path(), "fraisier.toml", VALID);
-        let out = validate_config(&path).expect("run");
+        // Structure-only by default: no secrets need be set.
+        let out = validate_config(&path, false).expect("run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
         assert_eq!(out.json["ok"], serde_json::json!(true));
     }
@@ -2419,12 +2532,35 @@ url = "http://127.0.0.1:8080/health"
         // confiture without database_url_env.
         let bad = VALID.replace("database_url_env = \"CHECKOUT_DATABASE_URL\"\n", "");
         let path = write(dir.path(), "fraisier.toml", &bad);
-        let out = validate_config(&path).expect("run");
+        let out = validate_config(&path, false).expect("run");
         assert_eq!(out.exit_code, 1);
         let issues = out.json["issues"].as_array().expect("issues array");
         assert!(issues
             .iter()
             .any(|i| i["path"] == "migration.database_url_env"));
+    }
+
+    #[test]
+    fn validate_config_resolve_envvars_fails_on_an_unset_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Reference a uniquely-named env var that is never set in the test env.
+        let cfg = VALID.replace(
+            "database_url_env = \"CHECKOUT_DATABASE_URL\"",
+            "database_url_env = \"VALIDATE_RESOLVE_NEVER_SET\"",
+        );
+        let path = write(dir.path(), "fraisier.toml", &cfg);
+        // Structure-only still passes…
+        assert_eq!(validate_config(&path, false).expect("run").exit_code, 0);
+        // …but resolving secrets fails because the source var is unset.
+        let out = validate_config(&path, true).expect("run");
+        assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
+        assert!(
+            out.json["unresolved_secrets"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+            "json: {}",
+            out.json
+        );
     }
 
     #[test]
@@ -2526,6 +2662,7 @@ url = "http://127.0.0.1:8080/health"
         let out = ship(ShipArgs {
             dir: dir.path(),
             level: fraisier_ship::Bump::Patch,
+            no_bump: false,
             dry_run: true,
             no_deploy: true,
             no_check: false,
@@ -2586,6 +2723,7 @@ url = "http://127.0.0.1:8080/health"
         ShipArgs {
             dir,
             level: fraisier_ship::Bump::Patch,
+            no_bump: false,
             dry_run: false,
             no_deploy: true,
             no_check,
@@ -2800,9 +2938,16 @@ url = "http://127.0.0.1:8080/health"
         let dir = tempfile::tempdir().expect("tempdir");
         let config = write(dir.path(), "fraisier.toml", VALID);
         let state = dir.path().join("state");
-        let out = deploy(&config, &state, Some("127.0.0.1"), Some("1.2.3"), true)
-            .await
-            .expect("dry run");
+        let out = deploy(
+            &config,
+            &state,
+            Some("127.0.0.1"),
+            Some("1.2.3"),
+            true,
+            false,
+        )
+        .await
+        .expect("dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
         assert_eq!(
             out.json["migration"],
@@ -2828,7 +2973,7 @@ url = "http://127.0.0.1:8080/health"
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let state = dir.path().join("state");
         // Dry run: the strategy is recognized and routed; nothing is executed.
-        let out = deploy(&config, &state, None, Some("1.2.3"), true)
+        let out = deploy(&config, &state, None, Some("1.2.3"), true, false)
             .await
             .expect("dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
@@ -2842,7 +2987,7 @@ url = "http://127.0.0.1:8080/health"
         let bad = VALID.replace("database_url_env = \"CHECKOUT_DATABASE_URL\"\n", "");
         let config = write(dir.path(), "fraisier.toml", &bad);
         let state = dir.path().join("state");
-        let out = deploy(&config, &state, None, None, false)
+        let out = deploy(&config, &state, None, None, false, false)
             .await
             .expect("run");
         assert_eq!(out.exit_code, 1);
@@ -3041,7 +3186,7 @@ upstream = "checkout_upstream"
         let config = write(dir.path(), "fraisier.toml", MULTI_HOST);
         let state = dir.path().join("state");
         // No --host override: [hosts] selects the multi-host path.
-        let out = deploy(&config, &state, None, Some("1.2.3"), true)
+        let out = deploy(&config, &state, None, Some("1.2.3"), true, false)
             .await
             .expect("multi-host dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
@@ -3071,9 +3216,16 @@ upstream = "checkout_upstream"
         let dir = tempfile::tempdir().expect("tempdir");
         let config = write(dir.path(), "fraisier.toml", MULTI_HOST);
         let state = dir.path().join("state");
-        let out = deploy(&config, &state, Some("web1.internal"), Some("1.2.3"), true)
-            .await
-            .expect("single-host dry run");
+        let out = deploy(
+            &config,
+            &state,
+            Some("web1.internal"),
+            Some("1.2.3"),
+            true,
+            false,
+        )
+        .await
+        .expect("single-host dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
         assert_eq!(out.json["host"], serde_json::json!("web1.internal"));
     }
@@ -3086,7 +3238,7 @@ upstream = "checkout_upstream"
         let pull = MULTI_HOST.replace("source = \"release\"", "source = \"pull\"");
         let config = write(dir.path(), "fraisier.toml", &pull);
         let state = dir.path().join("state");
-        let out = deploy(&config, &state, None, Some("1.2.3"), true)
+        let out = deploy(&config, &state, None, Some("1.2.3"), true, false)
             .await
             .expect("multi-host pull dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
@@ -3550,12 +3702,12 @@ current_revision = "true"
         let root = dir.path().join("root");
 
         // Plan only (no --yes): nothing written.
-        let plan = scheduled_install(&config, &root, false, false).expect("plan");
+        let plan = scheduled_install(&config, &root, false, false, false, false).expect("plan");
         assert_eq!(plan.json["applied"], serde_json::json!(false));
         assert!(!root.exists(), "planning wrote nothing");
 
         // Apply installs the timer + service under the root.
-        let done = scheduled_install(&config, &root, true, false).expect("install");
+        let done = scheduled_install(&config, &root, true, false, false, false).expect("install");
         assert_eq!(done.json["applied"], serde_json::json!(true));
         assert!(root
             .join("etc/systemd/system/fraisier-checkout-staging-scheduled.timer")
@@ -3574,7 +3726,7 @@ current_revision = "true"
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
 
-        let out = scheduled_install(&config, &root, true, false).expect("runs");
+        let out = scheduled_install(&config, &root, true, false, false, false).expect("runs");
         assert_eq!(out.exit_code, 1, "refused: {}", out.pretty);
         assert_eq!(out.json["refused"], serde_json::json!(true));
         assert!(!root.exists(), "nothing installed on refusal");
@@ -3589,7 +3741,7 @@ current_revision = "true"
         );
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
-        let out = scheduled_install(&config, &root, true, false).expect("install");
+        let out = scheduled_install(&config, &root, true, false, false, false).expect("install");
         assert_eq!(
             out.json["applied"],
             serde_json::json!(true),
@@ -3606,7 +3758,7 @@ current_revision = "true"
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
 
-        scheduled_install(&config, &root, true, false).expect("install");
+        scheduled_install(&config, &root, true, false, false, false).expect("install");
         let listed = scheduled_list(&root).expect("list");
         let units = listed.json["units"].as_array().expect("units array");
         assert_eq!(units.len(), 2, "timer + service listed: {}", listed.pretty);
@@ -3623,6 +3775,61 @@ current_revision = "true"
             "systemd dir clean after uninstall: {}",
             after.pretty
         );
+    }
+
+    #[test]
+    fn scheduled_install_fails_closed_on_drift_then_force_overwrites() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg =
+            format!("{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        scheduled_install(&config, &root, true, false, false, false).expect("install");
+
+        // Operator edits an installed unit (keeping the marker) → it drifts.
+        let timer = root.join("etc/systemd/system/fraisier-checkout-staging-scheduled.timer");
+        let marker = fraisier_scaffold::MARKER;
+        std::fs::write(&timer, format!("# {marker}\n[Timer]\nOnCalendar=hourly\n")).unwrap();
+
+        // Re-install without --force fails closed (the hand-edit is preserved).
+        let refused = scheduled_install(&config, &root, true, false, false, false).expect("runs");
+        assert_eq!(
+            refused.exit_code, 1,
+            "drift must fail closed: {}",
+            refused.pretty
+        );
+        assert!(std::fs::read_to_string(&timer).unwrap().contains("hourly"));
+
+        // With --force the drifted unit is overwritten back to the generated body.
+        let forced = scheduled_install(&config, &root, true, false, true, false).expect("force");
+        assert_eq!(forced.exit_code, 0, "{}", forced.pretty);
+        assert!(!std::fs::read_to_string(&timer).unwrap().contains("hourly"));
+    }
+
+    #[test]
+    fn scheduled_install_prune_removes_orphan_marker_units() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg =
+            format!("{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        scheduled_install(&config, &root, true, false, false, false).expect("install");
+
+        // A leftover fraisier-managed unit no longer declared by the config.
+        let orphan = root.join("etc/systemd/system/fraisier-old-job.timer");
+        std::fs::write(
+            &orphan,
+            format!("# {}\n[Timer]\n", fraisier_scaffold::MARKER),
+        )
+        .unwrap();
+
+        // --prune --yes removes the orphan; the current units survive.
+        let out = scheduled_install(&config, &root, true, false, false, true).expect("prune");
+        assert_eq!(out.exit_code, 0, "{}", out.pretty);
+        assert!(!orphan.exists(), "orphan pruned: {}", out.pretty);
+        assert!(root
+            .join("etc/systemd/system/fraisier-checkout-staging-scheduled.timer")
+            .exists());
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@
 
 use fraisier_config::{DeployConfig, Severity};
 use fraisier_core::multi_host::RolloutStrategy;
+use fraisier_core::single_host::PreflightMode;
 
 /// The canonical PRD §7.1 `fraisier.toml` example.
 const PRD_7_1: &str = r#"
@@ -175,6 +176,225 @@ hosts = ["web1.internal", "web2.internal"]
     assert!(cfg.lb.is_some());
 
     assert!(cfg.validate().ok(), "preset output should validate clean");
+}
+
+/// `[migration].preflight_mode` parses each of the three values.
+#[test]
+fn preflight_mode_parses_each_value() {
+    for (raw, expected) in [
+        ("live", PreflightMode::Live),
+        ("restore_rehearsal", PreflightMode::RestoreRehearsal),
+        ("off", PreflightMode::Off),
+    ] {
+        let toml = format!(
+            r#"
+[deploy]
+name = "x"
+environment = "production"
+[artifact]
+source = "local"
+path = "/srv/x"
+[migration]
+adapter = "confiture"
+database_url_env = "X_DB"
+preflight_mode = "{raw}"
+[service]
+adapter = "systemd"
+unit = "x.service"
+[health]
+adapter = "http"
+url = "http://127.0.0.1/health"
+"#
+        );
+        let cfg = DeployConfig::from_toml_str(&toml).expect("parses");
+        let migration = cfg.migration.as_ref().expect("migration");
+        assert_eq!(migration.preflight_mode, Some(expected), "raw = {raw}");
+        assert_eq!(
+            migration.effective_preflight_mode(),
+            expected,
+            "raw = {raw}"
+        );
+    }
+}
+
+/// When `preflight_mode` is unset the effective mode defaults to `Live`, and the
+/// legacy `forward_compatible_lint = false` flag still maps onto `Off` so existing
+/// configs keep their opt-out semantics.
+#[test]
+fn preflight_mode_defaults_and_legacy_flag_mapping() {
+    let base = |extra: &str| {
+        format!(
+            r#"
+[deploy]
+name = "x"
+environment = "production"
+[artifact]
+source = "local"
+path = "/srv/x"
+[migration]
+adapter = "confiture"
+database_url_env = "X_DB"
+{extra}
+[service]
+adapter = "systemd"
+unit = "x.service"
+[health]
+adapter = "http"
+url = "http://127.0.0.1/health"
+"#
+        )
+    };
+
+    // Nothing set → Live.
+    let cfg = DeployConfig::from_toml_str(&base("")).expect("parses");
+    let migration = cfg.migration.as_ref().expect("migration");
+    assert_eq!(migration.preflight_mode, None);
+    assert_eq!(migration.effective_preflight_mode(), PreflightMode::Live);
+
+    // Legacy opt-out → Off.
+    let cfg =
+        DeployConfig::from_toml_str(&base("forward_compatible_lint = false")).expect("parses");
+    let migration = cfg.migration.as_ref().expect("migration");
+    assert_eq!(migration.effective_preflight_mode(), PreflightMode::Off);
+
+    // Legacy opt-in → Live.
+    let cfg = DeployConfig::from_toml_str(&base("forward_compatible_lint = true")).expect("parses");
+    let migration = cfg.migration.as_ref().expect("migration");
+    assert_eq!(migration.effective_preflight_mode(), PreflightMode::Live);
+
+    // Explicit preflight_mode wins over the legacy flag.
+    let cfg = DeployConfig::from_toml_str(&base(
+        "forward_compatible_lint = false\npreflight_mode = \"restore_rehearsal\"",
+    ))
+    .expect("parses");
+    let migration = cfg.migration.as_ref().expect("migration");
+    assert_eq!(
+        migration.effective_preflight_mode(),
+        PreflightMode::RestoreRehearsal
+    );
+}
+
+/// A health entry parses a `token_provider` and validates clean.
+#[test]
+fn health_token_provider_parses_and_validates() {
+    let toml = r#"
+[deploy]
+name = "x"
+environment = "production"
+[artifact]
+source = "local"
+path = "/srv/x"
+[migration]
+adapter = "confiture"
+database_url_env = "X_DB"
+[service]
+adapter = "systemd"
+unit = "x.service"
+[health]
+adapter = "http"
+url = "http://127.0.0.1/health"
+[health.headers]
+X-Trace-Id = "deploy"
+[health.token_provider]
+type = "oauth2_client_credentials"
+token_url = "https://idp/token"
+client_id = "svc"
+client_secret_env = "IDP_SECRET"
+scope = "api.read"
+"#;
+    let cfg = DeployConfig::from_toml_str(toml).expect("parses");
+    assert!(cfg.validate().ok(), "{:?}", cfg.validate().issues);
+    let provider = cfg
+        .health
+        .as_ref()
+        .and_then(|h| h.token_provider.as_ref())
+        .expect("token provider parsed");
+    assert_eq!(provider.header(), "Authorization");
+}
+
+/// A bad `format`, a header collision, and a non-http adapter are each rejected.
+#[test]
+fn health_token_provider_validation_rejects_bad_configs() {
+    let with = |health: &str| {
+        format!(
+            r#"
+[deploy]
+name = "x"
+environment = "production"
+[artifact]
+source = "local"
+path = "/srv/x"
+[migration]
+adapter = "confiture"
+database_url_env = "X_DB"
+[service]
+adapter = "systemd"
+unit = "x.service"
+{health}
+"#
+        )
+    };
+
+    // Bad format (no {{token}}).
+    let cfg = DeployConfig::from_toml_str(&with(
+        "[health]\nadapter = \"http\"\nurl = \"http://h/health\"\n\
+         [health.token_provider]\ntype = \"exec\"\ncommand = [\"t\"]\nformat = \"Bearer ABC\"\n",
+    ))
+    .expect("parses");
+    assert!(!cfg.validate().ok(), "bad format must fail");
+
+    // Header collision (case-insensitive) with a static header.
+    let cfg = DeployConfig::from_toml_str(&with(
+        "[health]\nadapter = \"http\"\nurl = \"http://h/health\"\n\
+         [health.headers]\nauthorization = \"static\"\n\
+         [health.token_provider]\ntype = \"exec\"\ncommand = [\"t\"]\n",
+    ))
+    .expect("parses");
+    assert!(!cfg.validate().ok(), "header collision must fail");
+
+    // token_provider on a non-http adapter.
+    let cfg = DeployConfig::from_toml_str(&with(
+        "[health]\nadapter = \"command\"\ncommand = \"scan\"\n\
+         [health.token_provider]\ntype = \"exec\"\ncommand = [\"t\"]\n",
+    ))
+    .expect("parses");
+    assert!(!cfg.validate().ok(), "token_provider needs http adapter");
+}
+
+/// `preflight_mode = "restore_rehearsal"` requires the confiture adapter, since
+/// the rehearsal composes a generic-Postgres restore.
+#[test]
+fn restore_rehearsal_requires_the_confiture_adapter() {
+    let toml = r#"
+[deploy]
+name = "x"
+environment = "production"
+[artifact]
+source = "local"
+path = "/srv/x"
+[migration]
+adapter = "command"
+preflight_mode = "restore_rehearsal"
+[migration.settings]
+up = "true"
+[service]
+adapter = "systemd"
+unit = "x.service"
+[health]
+adapter = "http"
+url = "http://127.0.0.1/health"
+"#;
+    let cfg = DeployConfig::from_toml_str(toml).expect("parses");
+    let report = cfg.validate();
+    assert!(!report.ok(), "restore_rehearsal + non-confiture must error");
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|i| i.path == "migration.preflight_mode" && i.severity == Severity::Error),
+        "expected a preflight_mode error, got {:?}",
+        report.issues
+    );
 }
 
 #[test]

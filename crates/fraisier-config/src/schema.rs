@@ -12,6 +12,8 @@ use std::path::PathBuf;
 
 use fraisier_core::adapter_axes::{AdapterCtx, HostId};
 use fraisier_core::multi_host::{HostEntry, HostInventory, RolloutStrategy};
+use fraisier_core::single_host::PreflightMode;
+use fraisier_core::token_provider::TokenProvider;
 use serde::{Deserialize, Serialize};
 
 use crate::SpecqlPreset;
@@ -225,12 +227,44 @@ pub struct MigrationSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migrations_path: Option<PathBuf>,
     /// Whether to run the adapter's forward-compatibility `preflight` lint.
+    ///
+    /// Superseded by [`Self::preflight_mode`]; retained for back-compatibility and
+    /// folded into the effective mode by [`Self::effective_preflight_mode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forward_compatible_lint: Option<bool>,
+    /// Which preflight to run before migrating the live database: `"live"`
+    /// (default — the forward-compat lint), `"restore_rehearsal"` (DR-grade:
+    /// rehearse a real restore + migrate on a throwaway copy first), or `"off"`.
+    /// Additive and back-compatible: when unset, [`Self::forward_compatible_lint`]
+    /// selects `"live"`/`"off"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight_mode: Option<PreflightMode>,
+    /// `restore_rehearsal`: the backup archive to restore for the rehearsal. When
+    /// unset, a fresh dump of the live database is taken at deploy time. An
+    /// absolute path is recommended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight_backup_path: Option<PathBuf>,
     /// Adapter-specific settings (the `[migration.settings]` sub-table), passed
     /// through verbatim to `AdapterCtx.settings`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub settings: BTreeMap<String, serde_json::Value>,
+}
+
+impl MigrationSection {
+    /// The effective preflight mode, folding the legacy `forward_compatible_lint`
+    /// flag into [`PreflightMode`]: an explicit `preflight_mode` always wins;
+    /// otherwise `forward_compatible_lint = false` is [`PreflightMode::Off`] and
+    /// anything else is [`PreflightMode::Live`].
+    #[must_use]
+    pub const fn effective_preflight_mode(&self) -> PreflightMode {
+        if let Some(mode) = self.preflight_mode {
+            return mode;
+        }
+        match self.forward_compatible_lint {
+            Some(false) => PreflightMode::Off,
+            _ => PreflightMode::Live,
+        }
+    }
 }
 
 /// The `[service]` section.
@@ -284,6 +318,14 @@ pub struct HealthSection {
     /// default when unset. Also widens HTTP's timeout to be operator-settable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// `http`: static request headers sent with the probe (e.g. a fixed API key).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// `http`: a token provider that acquires a short-lived bearer credential at
+    /// deploy time and injects it into the probe (default header `Authorization`,
+    /// template `Bearer {token}`). Resolved once per deploy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_provider: Option<TokenProvider>,
 }
 
 /// The `[ssh]` section: the connection parameters fraisier uses to run per-host
@@ -331,6 +373,23 @@ pub struct WebhookSection {
     /// Defaults to `30`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_timeout_secs: Option<u64>,
+    /// Self-upgrade drain: how long (seconds) to wait for in-flight deploys to
+    /// finish before restarting. Default `600`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_upgrade_drain_timeout_s: Option<u64>,
+    /// Self-upgrade drain: how often (seconds) to poll for in-flight deploys.
+    /// Default `1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_upgrade_drain_poll_s: Option<u64>,
+    /// Self-upgrade drain: settle window (seconds) after setting the drain flag,
+    /// so dispatch-accepted deploys reach their lock before the wait begins.
+    /// Default `2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_upgrade_drain_settle_s: Option<u64>,
+    /// Self-upgrade drain: the `Retry-After` (seconds) returned on a 503 drain
+    /// refusal. Default `60`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_upgrade_retry_after_s: Option<u64>,
 }
 
 /// The `[sync]` section: how the deploy ledger is shared across operators

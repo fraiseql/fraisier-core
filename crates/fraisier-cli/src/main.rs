@@ -13,9 +13,11 @@
 #![allow(clippy::redundant_pub_crate)]
 
 mod commands;
+mod doctor;
 #[cfg(test)]
 mod e2e;
 mod factory;
+mod pg_rehearsal;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -32,6 +34,13 @@ struct Cli {
     /// Emit machine-readable JSON instead of the human-readable rendering.
     #[arg(long, global = true)]
     json: bool,
+
+    /// Increase verbosity (repeatable: `-v` rich, `-vv` debug). Output is
+    /// compact by default — fraisier never auto-upgrades to verbose under
+    /// `CI=1`/`CLAUDECODE=1`/no-TTY, so machine callers stay terse. Mutually
+    /// exclusive with `--json`.
+    #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count, conflicts_with = "json")]
+    verbose: u8,
 
     #[command(subcommand)]
     command: Command,
@@ -105,6 +114,33 @@ enum Command {
 
     /// Install the generated system files (and optionally prune stale ones).
     ScaffoldInstall(ScaffoldInstallArgs),
+
+    /// Diagnose the install: config loads/validates, secrets readable, toolchain.
+    Doctor(DoctorArgs),
+
+    /// Report which env vars a subcommand would read, and which are unset.
+    EnvCheck(EnvCheckArgs),
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Run only the named check(s) (repeatable). Empty = all checks.
+    #[arg(long = "check")]
+    checks: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct EnvCheckArgs {
+    /// The subcommand to inspect (e.g. `deploy`, `webhook-server`).
+    subcommand: String,
+
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -151,9 +187,15 @@ struct ScaffoldInstallArgs {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args)]
 struct ShipCliArgs {
-    /// Which component to bump.
-    #[arg(value_enum)]
-    level: BumpLevel,
+    /// Which component to bump. Omit it (and pass `--no-bump`) to re-ship the
+    /// current version unchanged.
+    #[arg(value_enum, required_unless_present = "no_bump")]
+    level: Option<BumpLevel>,
+
+    /// Re-ship the current version without bumping (a redeploy / bring-your-own
+    /// release-batcher workflow). Mutually exclusive with a bump level.
+    #[arg(long, conflicts_with = "level")]
+    no_bump: bool,
 
     /// The project directory holding `Cargo.toml` / `pyproject.toml`.
     #[arg(long, default_value = ".")]
@@ -250,6 +292,12 @@ struct ConfigArgs {
     /// Path to the `fraisier.toml`.
     #[arg(long, default_value = "fraisier.toml")]
     config: PathBuf,
+
+    /// Also resolve secrets: fail if any referenced `*_env` source variable is
+    /// unset. Off by default (structure-only validation, no secrets required);
+    /// turn it on for a pre-deploy CI gate.
+    #[arg(long)]
+    resolve_envvars: bool,
 }
 
 #[derive(Debug, Args)]
@@ -284,6 +332,12 @@ struct DeployArgs {
     /// Resolve and print the plan without executing anything.
     #[arg(long)]
     dry_run: bool,
+
+    /// Skip every migration preflight for this run — both the forward-compat lint
+    /// and the restore rehearsal (the emergency escape hatch from a preflight that
+    /// blocks a deploy you know is safe). Overrides `[migration].preflight_mode`.
+    #[arg(long)]
+    skip_preflight: bool,
 }
 
 #[derive(Debug, Args)]
@@ -502,6 +556,9 @@ struct ScheduledUninstallArgs {
     yes: bool,
 }
 
+// Reason: independent install flags (--yes / --dry-run / --force / --prune),
+// each mapping to a distinct CLI option.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args)]
 struct ScheduledInstallArgs {
     /// Path to the `fraisier.toml`.
@@ -520,6 +577,16 @@ struct ScheduledInstallArgs {
     /// Show the install plan without applying it.
     #[arg(long)]
     dry_run: bool,
+
+    /// Overwrite units that have drifted from the generated content (operator
+    /// hand-edits). Without it, a drifted unit fails the install closed.
+    #[arg(long)]
+    force: bool,
+
+    /// Also remove marker-bearing scheduled units no longer declared in the
+    /// config (orphans). Lists them on a dry run; removes them with `--yes`.
+    #[arg(long)]
+    prune: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -610,7 +677,7 @@ async fn main() -> ExitCode {
     let _otel_guard = init_otel();
     match dispatch(&cli).await {
         Ok(output) => {
-            render(&output, cli.json);
+            render(&output, cli.json, cli.verbose);
             // Exit codes are small and non-negative; the clamp is just for safety.
             ExitCode::from(u8::try_from(output.exit_code).unwrap_or(1))
         }
@@ -621,10 +688,15 @@ async fn main() -> ExitCode {
     }
 }
 
+// Reason: a flat one-arm-per-subcommand dispatch; splitting it would scatter the
+// command table without reducing complexity.
+#[allow(clippy::too_many_lines)]
 async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
     match &cli.command {
         Command::Init(args) => commands::init(&args.config, args.force),
-        Command::ValidateConfig(args) => commands::validate_config(&args.config),
+        Command::ValidateConfig(args) => {
+            commands::validate_config(&args.config, args.resolve_envvars)
+        }
         Command::Deploy(args) => {
             commands::deploy(
                 &args.config,
@@ -632,6 +704,7 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
                 args.host.as_deref(),
                 args.app_version.as_deref(),
                 args.dry_run,
+                args.skip_preflight,
             )
             .await
         }
@@ -675,9 +748,14 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
             commands::self_upgrade_restart(&args.unit, args.user).await
         }
         Command::SelfUpgrade(SelfUpgradeCommand::Apply(args)) => self_upgrade_apply(args).await,
-        Command::Scheduled(ScheduledCommand::Install(args)) => {
-            commands::scheduled_install(&args.config, &args.root, args.yes, args.dry_run)
-        }
+        Command::Scheduled(ScheduledCommand::Install(args)) => commands::scheduled_install(
+            &args.config,
+            &args.root,
+            args.yes,
+            args.dry_run,
+            args.force,
+            args.prune,
+        ),
         Command::Scheduled(ScheduledCommand::List(args)) => commands::scheduled_list(&args.root),
         Command::Scheduled(ScheduledCommand::Uninstall(args)) => {
             commands::scheduled_uninstall(&args.config, &args.root, args.yes)
@@ -698,7 +776,12 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::Ship(args) => {
             commands::ship(commands::ShipArgs {
                 dir: &args.path,
-                level: args.level.into(),
+                // When `--no-bump` is set the level is unused; default to Patch so
+                // the bundle is well-formed (clap guarantees exactly one is set).
+                level: args
+                    .level
+                    .map_or(fraisier_ship::Bump::Patch, fraisier_ship::Bump::from),
+                no_bump: args.no_bump,
                 dry_run: args.dry_run,
                 no_deploy: args.no_deploy,
                 no_check: args.no_check,
@@ -715,6 +798,8 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::ScaffoldInstall(args) => {
             commands::scaffold_install(&args.config, &args.root, args.prune, args.yes, args.dry_run)
         }
+        Command::Doctor(args) => Ok(doctor::doctor(&args.config, &args.checks)),
+        Command::EnvCheck(args) => Ok(doctor::env_check(&args.config, &args.subcommand)),
     }
 }
 
@@ -764,7 +849,7 @@ fn init_otel() -> Option<fraisier_saga::otel::OtelGuard> {
     }
 }
 
-fn render(output: &CommandOutput, json: bool) {
+fn render(output: &CommandOutput, json: bool, verbose: u8) {
     if json {
         match serde_json::to_string_pretty(&output.json) {
             Ok(rendered) => println!("{rendered}"),
@@ -772,5 +857,53 @@ fn render(output: &CommandOutput, json: bool) {
         }
     } else {
         print!("{}", output.pretty);
+        // Verbose adds the structured detail on stderr (kept off stdout so CI
+        // greps of the compact output are unaffected). `--json`/`--verbose` are
+        // mutually exclusive, so this never double-prints the JSON.
+        if verbose > 0 {
+            if let Ok(rendered) = serde_json::to_string_pretty(&output.json) {
+                eprintln!("{rendered}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::Cli;
+    use clap::Parser as _;
+
+    /// The clap definition is internally consistent (catches arg-graph mistakes).
+    #[test]
+    fn cli_definition_is_valid() {
+        use clap::CommandFactory as _;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn ship_no_bump_parses_without_a_level() {
+        assert!(Cli::try_parse_from(["fraisier", "ship", "--no-bump"]).is_ok());
+    }
+
+    #[test]
+    fn ship_rejects_no_bump_with_an_explicit_level() {
+        // `--no-bump` plus a bump level is contradictory — rejected at parse time.
+        assert!(Cli::try_parse_from(["fraisier", "ship", "patch", "--no-bump"]).is_err());
+    }
+
+    #[test]
+    fn ship_requires_a_level_or_no_bump() {
+        assert!(Cli::try_parse_from(["fraisier", "ship"]).is_err());
+        assert!(Cli::try_parse_from(["fraisier", "ship", "patch"]).is_ok());
+    }
+
+    #[test]
+    fn verbose_and_json_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["fraisier", "-v", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["fraisier", "--json", "list"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["fraisier", "-v", "--json", "list"]).is_err(),
+            "--verbose and --json must conflict"
+        );
     }
 }

@@ -20,8 +20,28 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::process::Command;
 
-use percent_encoding::percent_decode_str;
+use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 use url::Url;
+
+/// The URL characters that must be percent-encoded inside a DSN's userinfo
+/// (username / password) so a rendered DSN round-trips back through [`PgConn::parse`].
+const USERINFO: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b':')
+    .add(b'@')
+    .add(b'\\')
+    .add(b'[')
+    .add(b']')
+    .add(b'%');
 
 /// An error from parsing a DSN or running a database operation.
 #[derive(Debug, thiserror::Error)]
@@ -38,6 +58,13 @@ pub enum DbError {
     /// The DSN has no database name, which these ops require.
     #[error("the database DSN does not name a database (expected postgres://…/<dbname>)")]
     MissingDatabase,
+    /// A database name handed to [`create_database_command`] /
+    /// [`drop_database_command`] is not a safe SQL identifier.
+    #[error(
+        "'{0}' is not a valid database name (expected 1–63 chars of [A-Za-z0-9_], \
+         starting with a letter or underscore)"
+    )]
+    InvalidDatabaseName(String),
     /// A database tool (`pg_dump`/`pg_restore`/`psql`) could not be launched.
     #[error("could not run `{program}` (is it installed and on PATH?): {source}")]
     Spawn {
@@ -147,6 +174,45 @@ impl PgConn {
         env
     }
 
+    /// A clone of this connection pointing at a different database on the same
+    /// server (same host/port/user/password/sslmode). Used to reach a maintenance
+    /// database (`postgres`) and to address a throwaway rehearsal database.
+    #[must_use]
+    pub fn with_database(&self, database: impl Into<String>) -> Self {
+        Self {
+            database: database.into(),
+            ..self.clone()
+        }
+    }
+
+    /// The full DSN **including the password**, percent-encoded so it round-trips
+    /// back through [`PgConn::parse`]. Carries a secret — keep it in-process; never
+    /// log it or place it on argv. For display use [`Self::redacted`].
+    #[must_use]
+    pub fn dsn(&self) -> String {
+        let mut out = String::from("postgres://");
+        if let Some(user) = &self.user {
+            out.push_str(&utf8_percent_encode(user, USERINFO).to_string());
+            if let Some(password) = &self.password {
+                out.push(':');
+                out.push_str(&utf8_percent_encode(password, USERINFO).to_string());
+            }
+            out.push('@');
+        }
+        if let Some(host) = &self.host {
+            out.push_str(host);
+        }
+        if let Some(port) = self.port {
+            let _ = write!(out, ":{port}");
+        }
+        out.push('/');
+        out.push_str(&self.database);
+        if let Some(sslmode) = &self.sslmode {
+            let _ = write!(out, "?sslmode={sslmode}");
+        }
+        out
+    }
+
     /// A password-free rendering of the connection, safe to print in plans/logs.
     #[must_use]
     pub fn redacted(&self) -> String {
@@ -239,6 +305,53 @@ pub fn psql_command(conn: &PgConn, sql: &str) -> Command {
     command
 }
 
+/// Whether `name` is a safe, unquoted-ish PostgreSQL database identifier: 1–63
+/// characters of `[A-Za-z0-9_]` starting with a letter or underscore. Names that
+/// pass can be double-quoted into DDL without any injection risk.
+fn validate_db_name(name: &str) -> Result<(), DbError> {
+    let mut chars = name.chars();
+    let head_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if head_ok && rest_ok && name.len() <= 63 {
+        Ok(())
+    } else {
+        Err(DbError::InvalidDatabaseName(name.to_owned()))
+    }
+}
+
+/// Build a `psql` command that runs `CREATE DATABASE "<new_db>"`.
+///
+/// Runs against the `maintenance` connection (point it at a database *other* than
+/// `new_db`, e.g. `postgres`). `new_db` is validated as a safe identifier first.
+///
+/// # Errors
+/// [`DbError::InvalidDatabaseName`] if `new_db` is not a safe identifier.
+pub fn create_database_command(maintenance: &PgConn, new_db: &str) -> Result<Command, DbError> {
+    validate_db_name(new_db)?;
+    Ok(psql_command(
+        maintenance,
+        &format!("CREATE DATABASE \"{new_db}\""),
+    ))
+}
+
+/// Build a `psql` command that runs `DROP DATABASE IF EXISTS "<db>" WITH (FORCE)`.
+///
+/// Runs against the `maintenance` connection (point it at a database *other* than
+/// `db`). `FORCE` (PostgreSQL 13+) disconnects any lingering sessions so a
+/// throwaway rehearsal database can always be reaped. `db` is validated first.
+///
+/// # Errors
+/// [`DbError::InvalidDatabaseName`] if `db` is not a safe identifier.
+pub fn drop_database_command(maintenance: &PgConn, db: &str) -> Result<Command, DbError> {
+    validate_db_name(db)?;
+    Ok(psql_command(
+        maintenance,
+        &format!("DROP DATABASE IF EXISTS \"{db}\" WITH (FORCE)"),
+    ))
+}
+
 /// The captured result of a finished database tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
@@ -279,7 +392,7 @@ pub async fn run(command: Command) -> Result<Outcome, DbError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DbError, PgConn};
+    use super::{create_database_command, drop_database_command, DbError, PgConn};
     use std::ffi::OsString;
 
     fn env_of(conn: &PgConn) -> std::collections::BTreeMap<String, String> {
@@ -316,6 +429,61 @@ mod tests {
         let conn = PgConn::parse("postgres://u:p%40ss%2Fword@h/db").expect("parses");
         let env = env_of(&conn);
         assert_eq!(env["PGPASSWORD"], "p@ss/word");
+    }
+
+    #[test]
+    fn rendered_dsn_round_trips_through_parse_including_reserved_chars() {
+        // A reserved-char password must survive render → re-parse intact, so a
+        // throwaway DSN handed to a migration adapter resolves to the same secret.
+        let conn =
+            PgConn::parse("postgres://u:p%40ss%2Fword@h:5432/db?sslmode=require").expect("parses");
+        let reparsed = PgConn::parse(&conn.dsn()).expect("rendered DSN re-parses");
+        assert_eq!(conn, reparsed);
+        assert_eq!(env_of(&reparsed)["PGPASSWORD"], "p@ss/word");
+    }
+
+    #[test]
+    fn with_database_swaps_only_the_database_name() {
+        let conn = PgConn::parse("postgres://alice:pw@h:5432/app?sslmode=require").expect("parses");
+        let maintenance = conn.with_database("postgres");
+        assert_eq!(maintenance.database(), "postgres");
+        let env = env_of(&maintenance);
+        assert_eq!(env["PGHOST"], "h");
+        assert_eq!(env["PGUSER"], "alice");
+        assert_eq!(env["PGDATABASE"], "postgres");
+    }
+
+    #[test]
+    fn create_and_drop_validate_the_database_name() {
+        let conn = PgConn::parse("postgres://u:pw@h/postgres").expect("parses");
+        // A safe name builds a psql command carrying the quoted DDL.
+        let create = create_database_command(&conn, "app_fraisier_rehearsal_1").expect("valid");
+        let args: Vec<String> = create
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter()
+                .any(|a| a == "CREATE DATABASE \"app_fraisier_rehearsal_1\""),
+            "{args:?}"
+        );
+        assert!(drop_database_command(&conn, "app_fraisier_rehearsal_1").is_ok());
+
+        // Injection attempts and malformed names are rejected before any DDL.
+        for bad in [
+            "a\"; DROP DATABASE postgres;--",
+            "has space",
+            "1leading",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    create_database_command(&conn, bad),
+                    Err(DbError::InvalidDatabaseName(_))
+                ),
+                "name {bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]

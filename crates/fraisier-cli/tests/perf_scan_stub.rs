@@ -1,7 +1,7 @@
-//! Phase 1 fixture test: `scripts/perf-scan-stub.sh` reproduces the pinned
-//! fraiseql v2.6.0 perf `regression-scan` seam (exit-code contract + `--json`
-//! shape) so the command health adapter and its rollback e2e (Phases 2–3) can be
-//! built and CI-tested with no live database and no released `fraiseql`.
+//! Fixture test: `scripts/perf-scan-stub.sh` reproduces the pinned fraiseql
+//! v2.6.0 perf `regression-scan` seam (exit-code contract + `--json` shape) so
+//! the command health adapter and its rollback e2e can be built and CI-tested
+//! with no live database and no released `fraiseql`.
 
 #![cfg(unix)]
 

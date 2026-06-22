@@ -13,10 +13,12 @@
 //! - [`serve_connection`] / [`WebhookHandler`] — the minimal HTTP/1.1 receiver
 //!   that verifies a request and dispatches the verified body.
 
+mod drain;
 mod server;
 mod sign;
 
+pub use drain::{drain_in_flight, DrainOutcome, DrainTuning};
 pub use server::{
-    acquire, serve, serve_connection, ListenSource, Served, ServerConfig, WebhookHandler,
+    acquire, serve, serve_connection, Drain, ListenSource, Served, ServerConfig, WebhookHandler,
 };
 pub use sign::{sign, verify, Rejection, SIGNATURE_HEADER, TIMESTAMP_HEADER};

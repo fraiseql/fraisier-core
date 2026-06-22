@@ -106,17 +106,19 @@ The honestly-disclosed trade: more architectural work in week 1, less adapter-po
 | Webhook server | socket-activated | ✅ Required + standalone HTTP fallback |
 | Bootstrap | SSH-based | ✅ Required (Python-subprocess fallback acceptable for beta) |
 | Scaffold | `scaffold`, `scaffold-install` | ✅ Required, with `--prune` |
-| Release workflow | `ship` | ✅ For `Cargo.toml` and `pyproject.toml`; runs `[[checks]]` as a pre-bump gate (`--no-check` to skip) |
+| Release workflow | `ship` | ✅ For `Cargo.toml` and `pyproject.toml`; runs `[[checks]]` as a pre-bump gate (`--no-check`); `--no-bump` re-ships the current version; version-race detection against `origin` (rolls back the bump + rebase recipe). GitHub-PR/auto-merge releases stay in CI / `gh` / release-plz (Decision 2026-06-22). |
 | Project checks | `check` | ✅ Declarative `[[checks]]`, cross-check parallelism (`-j`), single source of truth local + CI |
 | Versioning | `version show`, `version bump` | ✅ Required |
 | DB operations | `db migrate`, `db restore`, `db reset`, `backup` | ✅ Required |
 | Status / introspection | `deployment-status`, `list`, `health` | ✅ Required |
 | Rollback (manual) | `rollback` | ✅ Required |
-| Sync | `fraisier/sync/*` namespace + orphan reclaim | ✅ Required |
+| Sync (deploy-state ledger) | (Python `sync` is git source-branch promotion — a *different* feature) | ✅ Shares deploy state over `refs/fraisier/sync/<fraise>/<env>`. Git source-branch promotion + orphan reclaim is **out of scope** (CI / `gh`; Decision 2026-06-22). |
 | Providers | `providers`, `provider-test` | ✅ Required |
 | Init | `fraisier init` | ✅ Required |
-| Self-upgrade restart | v0.31 coordinated restart | ✅ Required |
-| Scheduled install | v0.30/v0.32 features | ✅ Required |
+| Self-upgrade restart | v0.31 coordinated restart | ✅ Graceful SIGTERM + a drain flag: a draining server refuses new deploys with `503` + `Retry-After`; the bounded drain coordinator clears in-flight deploys before restart (the restart-command probe wiring is a follow-up). |
+| Scheduled install | v0.30/v0.32 features | ✅ install/list/uninstall + drift classification (Absent/Identical/Drifted, fail-closed unless `--force`) + `--prune` orphan removal on the shared marker machinery. |
+| Restore-rehearsal preflight | (none — exceeds Python) | ✅ Opt-in DR preflight: restore a backup into a throwaway DB and rehearse the pending migrations there before touching live; self-consistent by construction. |
+| Smoke-test token providers | v0.22 `token_provider` | ✅ `exec` / `oauth2_client_credentials` / `oauth2_refresh_token` acquire a deploy-time bearer for the http health probe; resolved once per deploy; secrets via `AdapterCtx::secret`. |
 | Observability | logs only | ✅ OpenTelemetry traces + structured logs |
 | Forward-compat migration lint | (none) | ✅ Via the migration adapter's `preflight` capability (Confiture native; `command` declines) |
 
@@ -308,6 +310,20 @@ forward_compatible_lint = true
 # the adapter resolves the value via `ctx.secret("DATABASE_URL")`. For IPC
 # adapters the core reads the source var and re-exposes the value under the
 # logical name `DATABASE_URL` on the spawned child (Phase 1 review Decision 5).
+#
+# preflight_mode selects the pre-migration safety check (additive; defaults to
+# "live", and the legacy `forward_compatible_lint = false` still maps to "off"):
+#   "live"              run the adapter's forward-compat lint against the live DB
+#                       (the default — equivalent to forward_compatible_lint = true)
+#   "restore_rehearsal" DR-grade: restore a backup into a throwaway database and
+#                       rehearse the pending migrations there before touching the
+#                       live DB (requires the confiture adapter). Complementary to
+#                       the live lint, which still runs.
+#   "off"              skip every preflight
+# preflight_mode = "restore_rehearsal"
+# preflight_backup_path = "/backups/fraiseql-latest.dump"  # else a fresh dump is taken
+# The rehearsal is opt-in because a full restore is heavy on a large primary;
+# `fraisier trigger-deploy --skip-preflight` bypasses every preflight for one run.
 
 [service]
 adapter = "systemd"
@@ -317,12 +333,32 @@ unit = "fraiseql.service"
 adapter = "http"
 url = "http://{host.address}:8080/health"
 expected_status = 200
+# Optional static probe headers and a deploy-time bearer-token provider. The
+# token is resolved once per deploy and injected via `format` (default
+# `Bearer {token}`) into `header` (default `Authorization`). Three provider
+# types: `exec` (run an argv, stdout is the token), `oauth2_client_credentials`,
+# `oauth2_refresh_token`. Secrets are referenced by *source env var name* and
+# resolved via `AdapterCtx::secret` (Decision 5); tokens/secrets are never logged.
+# [health.headers]
+# X-Trace-Id = "deploy"
+# [health.token_provider]
+# type = "oauth2_client_credentials"
+# token_url = "https://idp.example/oauth/token"
+# client_id = "deploy-probe"
+# client_secret_env = "FRAISEQL_PROBE_CLIENT_SECRET"
+# scope = "health.read"
 
 [lb]
 adapter = "nginx"
 config_path = "/etc/nginx/sites-available/fraiseql"
 upstream = "fraiseql_upstream"
 ```
+
+A `[webhook]` server additionally accepts four defaulted self-upgrade-drain
+tunables — `self_upgrade_drain_timeout_s` (600), `self_upgrade_drain_poll_s` (1),
+`self_upgrade_drain_settle_s` (2), `self_upgrade_retry_after_s` (60) — that bound
+the coordinated-restart drain (a draining server answers new deploys `503` +
+`Retry-After`; see `docs/operations/self-upgrade.md`).
 
 ### 7.1a SpecQL-deployed app preset
 
@@ -355,7 +391,9 @@ Filesystem is the default for single-host; SQLite recommended for multi-host (at
 
 ## 8. Scope: the CLI
 
-Mirrors the Python v0.32 surface with multi-host additions:
+Mirrors the Python v0.32 surface with multi-host additions. A global `--verbose`/
+`-v` (repeatable, mutually exclusive with `--json`) opts into verbose output;
+output is compact by default and never auto-upgrades under `CI`/`CLAUDECODE`/no-TTY.
 
 ```
 fraisier init
@@ -363,10 +401,11 @@ fraisier list [--flat]
 fraisier health [--json] [--host <name>]
 fraisier deployment-status <fraise> [--per-host]
 
-fraisier trigger-deploy <fraise> <env> [--dry-run] [--force] [--strategy <name>] [--hosts <list>]
+fraisier trigger-deploy <fraise> <env> [--dry-run] [--force] [--strategy <name>] [--hosts <list>] [--skip-preflight]
 fraisier rollback <fraise> <env> [--to <revision>] [--hosts <list>]
 
 fraisier ship patch|minor|major [--dry-run] [--no-deploy]
+fraisier ship --no-bump [--dry-run] [--no-deploy]   # re-ship the current version (no bump/commit)
 fraisier version show
 fraisier version bump patch|minor|major
 
@@ -378,12 +417,15 @@ fraisier backup <fraise> -e <env>
 fraisier bootstrap -e <env> [--dry-run] [--host <name>]
 fraisier scaffold [--dry-run]
 fraisier scaffold-install [--dry-run] [--yes] [--prune]
+fraisier scheduled install [--yes] [--dry-run] [--force] [--prune]   # drift policy + orphan prune
 fraisier providers
 fraisier provider-test <type>
 
 fraisier sync
 fraisier webhook-server
-fraisier validate-config
+fraisier validate-config [--resolve-envvars]   # structure-only by default; resolve secrets as a CI gate
+fraisier doctor [--check <name>]                # host self-diagnosis; exit 0/1/2 = pass/fail/warn
+fraisier env-check <subcommand>                 # which env-var secrets a subcommand reads, and which are unset
 
 fraisier adapter list           # discovered IPC adapters on PATH
 fraisier adapter describe <name>
@@ -561,3 +603,6 @@ If all five hold, rename + publish. If any fail, name the gap, defer the rename,
 | 2026-05-31 | Blue-green deferred to v1.0.0 GA, designed-in via the multi-host plan. | LB integration surface is real work; ship `rolling` first, prove it, then blue-green. |
 | 2026-05-31 | Postgres state backend deferred to v1.1. | Trait shape supports it; concrete implementation can wait. |
 | 2026-06-02 | **Drop `fraises.yaml` runtime compatibility (G6 / §7.2 / §10.1).** | The project has one Python fraisier user, who will hand-convert to `fraisier.toml`. A runtime parser plus a synthesized fixture corpus would prove only that it parses configs we invented — the real Python corpus is not in this repo. The native format is the single source of truth; the `framework → adapter` mapping survives as direct native config. Withdraws Cycles 2.8–2.11. |
+| 2026-06-22 | **Adopt `fraisier doctor` + `fraisier env-check` (gap-matrix Row 9).** | Host self-diagnosis (toolchain/config/secret-readability checks, exit 0/1/2) and per-subcommand env-var introspection are cheap, read-only, and high-leverage for operators; they compose with the lazy-secret introspection map. Built in the operational-parity phase; added to §8 CLI. |
+| 2026-06-22 | **`ship` stays direct-push; no GitHub-PR/auto-merge flow in core (gap-matrix Row 5 — WON'T).** | fraisier-core `ship` bumps + commits + pushes (+ optional deploy) and runs `[[checks]]` as a pre-bump gate. GitHub PR creation + `--auto`-merge releases already live in CI / `gh` / release-plz, which is the project's release model. Duplicating that flow in `ship` would contradict it. Version-race detection (model-agnostic) is still added to `ship`. |
+| 2026-06-22 | **`sync` stays the deploy-state ledger; no git source-branch `promote` in core (gap-matrix Row 12 — WON'T).** | Python `sync` promotes git source branches dev→staging via PR; fraisier-core `sync` is a *different feature* — it shares the deploy state ledger over `refs/fraisier/sync/<fraise>/<env>`. Overloading `sync` (or adding a `promote`) would graft a git/`gh` branch-promotion subsystem onto a deploy-coordination tool. Branch promotion stays in CI / `gh` / Python fraisier. |

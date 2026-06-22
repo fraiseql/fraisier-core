@@ -6,6 +6,7 @@
 //! a hard cap on header and body size, so the parser stays small and auditable.
 //! Run it behind a reverse proxy or on a trusted network.
 
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -39,6 +40,47 @@ pub struct ServerConfig {
     pub max_body_bytes: usize,
     /// How long to wait for a complete request before giving up.
     pub read_timeout: Duration,
+    /// Self-upgrade drain behaviour: refuse new deploys with a retriable 503 while
+    /// a coordinated restart is settling in-flight deploys.
+    pub drain: Drain,
+}
+
+/// The self-upgrade drain state, shared with the restart coordinator via a file.
+///
+/// The two run as separate processes, so the flag is a **file**. While it exists,
+/// a verified deploy POST is refused with `503` + `Retry-After` so upstream callers
+/// (CI, monitors) record a loud, retriable failure instead of a dropped request.
+#[derive(Debug, Clone, Default)]
+pub struct Drain {
+    /// The drain-flag file. The server is draining iff it is set and exists.
+    /// `None` (the default) disables draining entirely.
+    pub flag_path: Option<PathBuf>,
+    /// The `Retry-After` value (seconds) sent on a drain refusal.
+    pub retry_after_s: u64,
+    /// The fraise names reported in the refusal body (informational, for callers).
+    pub refused: Vec<String>,
+}
+
+impl Drain {
+    /// Whether the server is currently draining (the flag file exists).
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.flag_path.as_ref().is_some_and(|path| path.exists())
+    }
+
+    /// The JSON refusal body: `{status, retry_after_s, refused}`.
+    fn refusal_body(&self) -> String {
+        let refused = self
+            .refused
+            .iter()
+            .map(|fraise| format!("{fraise:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"status\":\"draining\",\"retry_after_s\":{},\"refused\":[{refused}]}}",
+            self.retry_after_s
+        )
+    }
 }
 
 /// The outcome of serving one connection (returned for the accept loop / tests).
@@ -54,6 +96,9 @@ pub enum Served {
     BadRequest(String),
     /// The handler returned an error (HTTP 500).
     HandlerError(String),
+    /// A verified deploy was refused with a retriable `503` because the server is
+    /// draining for a self-upgrade restart.
+    Draining,
 }
 
 /// A parsed HTTP request.
@@ -132,6 +177,13 @@ where
     ) {
         let _ = respond(&mut stream, 401, "Unauthorized", &rejection.to_string()).await;
         return Served::Rejected(rejection);
+    }
+
+    // The request is authentic; if a self-upgrade restart is draining, refuse it
+    // with a retriable 503 rather than dropping it mid-restart.
+    if config.drain.is_draining() {
+        let _ = respond_draining(&mut stream, &config.drain).await;
+        return Served::Draining;
     }
 
     match handler.handle(&request.body).await {
@@ -322,6 +374,24 @@ async fn respond<S: AsyncWrite + Unpin>(
     stream.flush().await
 }
 
+/// Write the `503 Service Unavailable` drain refusal: a `Retry-After` header and
+/// a JSON body naming the refused fraises.
+async fn respond_draining<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    drain: &Drain,
+) -> std::io::Result<()> {
+    let payload = format!("{}\n", drain.refusal_body());
+    let head = format!(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n\
+         Retry-After: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        drain.retry_after_s,
+        payload.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(payload.as_bytes()).await?;
+    stream.flush().await
+}
+
 /// The index of the first occurrence of `needle` in `haystack`.
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
@@ -331,7 +401,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{serve_connection, Served, ServerConfig, WebhookHandler};
+    use super::{serve_connection, Drain, Served, ServerConfig, WebhookHandler};
     use crate::sign::sign;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -360,6 +430,7 @@ mod tests {
             tolerance_secs: 300,
             max_body_bytes: 1024,
             read_timeout: Duration::from_secs(5),
+            drain: Drain::default(),
         }
     }
 
@@ -474,6 +545,65 @@ mod tests {
         assert_eq!(outcome, Served::Ok);
         assert!(response.starts_with("HTTP/1.1 200"), "response: {response}");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "handler ran once");
+    }
+
+    #[tokio::test]
+    async fn a_draining_server_refuses_a_verified_deploy_with_503() {
+        use tokio::io::AsyncWriteExt;
+        let flag = std::env::temp_dir().join(format!("fraisier-drain-{}.flag", std::process::id()));
+        std::fs::write(&flag, b"").expect("write drain flag");
+        let cfg = ServerConfig {
+            secret: SECRET.to_vec(),
+            tolerance_secs: 300,
+            max_body_bytes: 1024,
+            read_timeout: Duration::from_secs(5),
+            drain: Drain {
+                flag_path: Some(flag.clone()),
+                retry_after_s: 42,
+                refused: vec!["checkout".to_owned()],
+            },
+        };
+        let body = br#"{"version":"1.2.3"}"#;
+        let request = raw_post(body, &NOW.to_string(), &sign(SECRET, NOW, body));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler = Recorder {
+            calls: calls.clone(),
+        };
+        let (client, server) = tokio::io::duplex(8192);
+        let write = tokio::spawn(async move {
+            let mut client_w = client;
+            client_w.write_all(&request).await.expect("write");
+            let mut response = String::new();
+            client_w.read_to_string(&mut response).await.expect("read");
+            response
+        });
+        let outcome = serve_connection(server, &cfg, &handler, NOW).await;
+        let response = write.await.expect("client task");
+        let _ = std::fs::remove_file(&flag);
+
+        assert_eq!(outcome, Served::Draining, "{outcome:?}");
+        assert!(response.starts_with("HTTP/1.1 503"), "response: {response}");
+        assert!(response.contains("Retry-After: 42"), "response: {response}");
+        assert!(
+            response.contains("\"status\":\"draining\"") && response.contains("\"checkout\""),
+            "drain body names the refused fraise: {response}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no deploy runs while draining"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_draining_server_serves_normally() {
+        // The same request, with no drain flag set, deploys as usual.
+        let body = br#"{"version":"1.2.3"}"#;
+        let request = raw_post(body, &NOW.to_string(), &sign(SECRET, NOW, body));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (outcome, response) = serve_once(&request, calls.clone()).await;
+        assert_eq!(outcome, Served::Ok);
+        assert!(response.starts_with("HTTP/1.1 200"), "response: {response}");
     }
 
     #[tokio::test]

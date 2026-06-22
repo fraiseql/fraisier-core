@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 
 use fraisier_core::adapter_axes::Severity;
+use fraisier_core::single_host::PreflightMode;
 use serde::{Deserialize, Serialize};
 
 use crate::schema::{STRATEGY_ALL_AT_ONCE, STRATEGY_ROLLING};
@@ -304,6 +305,17 @@ fn validate_migration(cfg: &DeployConfig, report: &mut ValidationReport) {
              forward_compatible_lint will be skipped",
         );
     }
+    // The restore-rehearsal preflight composes generic-Postgres backup/restore, so
+    // it is only meaningful for the in-process confiture (Postgres) adapter.
+    if migration.effective_preflight_mode() == PreflightMode::RestoreRehearsal
+        && adapter != Some("confiture")
+    {
+        report.error(
+            "migration.preflight_mode",
+            "preflight_mode = \"restore_rehearsal\" requires the confiture adapter \
+             (it rehearses a real Postgres restore + migrate on a throwaway database)",
+        );
+    }
 }
 
 fn validate_service(cfg: &DeployConfig, report: &mut ValidationReport) {
@@ -381,6 +393,24 @@ fn validate_health(cfg: &DeployConfig, report: &mut ValidationReport) {
                 "health.expected_status",
                 format!("expected_status {status} is not a valid HTTP status (100–599)"),
             );
+        }
+    }
+    if let Some(provider) = &health.token_provider {
+        // A token provider only makes sense injecting a header into the http probe.
+        if health.adapter.as_deref() != Some("http") {
+            report.error(
+                "health.token_provider",
+                "token_provider applies only to the http adapter (it injects a bearer \
+                 credential into the HTTP probe)",
+            );
+        }
+        if let Err(error) = provider.validate() {
+            report.error("health.token_provider", error.to_string());
+        }
+        if let Err(error) =
+            provider.validate_against_headers(health.headers.keys().map(String::as_str))
+        {
+            report.error("health.token_provider.header", error.to_string());
         }
     }
 }

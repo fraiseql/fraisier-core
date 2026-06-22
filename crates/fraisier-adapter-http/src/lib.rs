@@ -33,7 +33,11 @@ use fraisier_adapter_support::{error, retry_on_err};
 use fraisier_core::adapter_axes::{
     AdapterCtx, AdapterError, AdapterErrorKind, HealthAdapter, HealthStatus, HostId,
 };
+use fraisier_core::token_provider::TokenProvider;
 use serde_json::Value;
+use tokio::sync::OnceCell;
+
+mod token;
 
 /// The adapter's identity name.
 const ADAPTER_NAME: &str = "http";
@@ -135,14 +139,54 @@ fn u16_setting(ctx: &AdapterCtx, key: &str) -> Option<u16> {
 /// ```
 #[derive(Default)]
 pub struct HttpHealth {
-    _private: (),
+    /// The resolved `(header, value)` from the configured token provider, cached
+    /// so the provider is resolved **at most once per deploy** even though `check`
+    /// runs per host. Empty when no token provider is configured.
+    token: OnceCell<(String, String)>,
 }
 
 impl HttpHealth {
     /// Create an HTTP health adapter.
     #[must_use]
     pub const fn new() -> Self {
-        Self { _private: () }
+        Self {
+            token: OnceCell::const_new(),
+        }
+    }
+
+    /// Resolve the request headers for a probe: the static `[health].headers`
+    /// plus, if configured, the token provider's injected header (resolved once
+    /// per deploy via [`Self::token`]).
+    async fn resolve_headers(
+        &self,
+        ctx: &AdapterCtx,
+    ) -> Result<Vec<(String, String)>, AdapterError> {
+        let mut headers: Vec<(String, String)> = Vec::new();
+        if let Some(map) = ctx.settings.get("headers").and_then(Value::as_object) {
+            for (key, value) in map {
+                if let Some(value) = value.as_str() {
+                    headers.push((key.clone(), value.to_owned()));
+                }
+            }
+        }
+        if let Some(raw) = ctx.settings.get("token_provider") {
+            let provider: TokenProvider = serde_json::from_value(raw.clone()).map_err(|err| {
+                error(
+                    AdapterErrorKind::InvalidConfig,
+                    ADAPTER_NAME,
+                    "token",
+                    format!("invalid token_provider config: {err}"),
+                    None,
+                )
+            })?;
+            let (name, value) = self
+                .token
+                .get_or_try_init(|| token::resolve_header(&provider, ctx))
+                .await?
+                .clone();
+            headers.push((name, value));
+        }
+        Ok(headers)
     }
 }
 
@@ -151,8 +195,13 @@ async fn probe_once(
     client: &reqwest::Client,
     url: &str,
     expected: u16,
+    headers: &[(String, String)],
 ) -> Result<u16, ProbeFailure> {
-    match client.get(url).send().await {
+    let mut request = client.get(url);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    match request.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
             if status == expected {
@@ -169,6 +218,8 @@ async fn probe_once(
 impl HealthAdapter for HttpHealth {
     async fn check(&self, ctx: &AdapterCtx, host: &HostId) -> Result<HealthStatus, AdapterError> {
         let probe = Probe::from_ctx(ctx, host)?;
+        // Static headers + a (once-per-deploy) token-provider header, if configured.
+        let headers = self.resolve_headers(ctx).await?;
         let client = reqwest::Client::builder()
             .timeout(probe.timeout)
             .build()
@@ -183,7 +234,7 @@ impl HealthAdapter for HttpHealth {
             })?;
 
         let result = retry_on_err(probe.attempts, probe.retry_delay, || {
-            probe_once(&client, &probe.url, probe.expected_status)
+            probe_once(&client, &probe.url, probe.expected_status, &headers)
         })
         .await;
 

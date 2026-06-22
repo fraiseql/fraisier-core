@@ -250,6 +250,8 @@ impl Overlay for MigrationSection {
                 self.forward_compatible_lint,
                 over.forward_compatible_lint,
             ),
+            preflight_mode: prefer(self.preflight_mode, over.preflight_mode),
+            preflight_backup_path: prefer(self.preflight_backup_path, over.preflight_backup_path),
             settings,
         }
     }
@@ -276,6 +278,12 @@ impl Overlay for HealthSection {
             expected_status: prefer(self.expected_status, over.expected_status),
             command: prefer(self.command, over.command),
             timeout_ms: prefer(self.timeout_ms, over.timeout_ms),
+            headers: if over.headers.is_empty() {
+                self.headers
+            } else {
+                over.headers
+            },
+            token_provider: prefer(self.token_provider, over.token_provider),
         }
     }
 }

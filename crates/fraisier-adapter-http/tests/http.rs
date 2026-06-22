@@ -4,6 +4,7 @@
 //! no external HTTP fixture or extra dependency.
 
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use fraisier_adapter_http::HttpHealth;
 use fraisier_core::adapter_axes::{AdapterCtx, AdapterErrorKind, HealthAdapter, HostId};
@@ -87,6 +88,81 @@ async fn custom_expected_status_is_honoured() {
         .await
         .expect("probe");
     assert!(status.healthy);
+}
+
+/// Like [`start_server`], but records each request's head for header assertions.
+async fn start_recording_server(status: u16) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let sink = Arc::clone(&requests);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let mut buf = [0u8; 2048];
+            let n = socket.read(&mut buf).await.unwrap_or(0);
+            sink.lock()
+                .expect("requests")
+                .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+            let body = "ok";
+            let response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    (addr, requests)
+}
+
+#[tokio::test]
+async fn token_provider_injects_a_bearer_header() {
+    let (addr, requests) = start_recording_server(200).await;
+    let provider = json!({ "type": "exec", "command": ["printf", "tok-xyz"] });
+    let status = HttpHealth::new()
+        .check(
+            &ctx(
+                &format!("http://{addr}/health"),
+                &json!({ "token_provider": provider }),
+            ),
+            &host(),
+        )
+        .await
+        .expect("probe");
+    assert!(status.healthy);
+    let head = requests.lock().expect("requests")[0].to_lowercase();
+    assert!(
+        head.contains("authorization: bearer tok-xyz"),
+        "the resolved token was injected: {head}"
+    );
+}
+
+#[tokio::test]
+async fn token_provider_resolves_at_most_once_per_deploy() {
+    let (addr, _requests) = start_recording_server(200).await;
+    // The provider command appends a line each time it runs; one HttpHealth
+    // instance probed twice must resolve the token exactly once.
+    let marker = std::env::temp_dir().join(format!("fraisier-tok-once-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let script = format!("echo run >> {}; printf tok", marker.display());
+    let provider = json!({ "type": "exec", "command": ["sh", "-c", script] });
+    let adapter = HttpHealth::new();
+    let probe_ctx = ctx(
+        &format!("http://{addr}/health"),
+        &json!({ "token_provider": provider }),
+    );
+    adapter.check(&probe_ctx, &host()).await.expect("probe 1");
+    adapter.check(&probe_ctx, &host()).await.expect("probe 2");
+    let runs = std::fs::read_to_string(&marker).unwrap_or_default();
+    let _ = std::fs::remove_file(&marker);
+    assert_eq!(
+        runs.lines().count(),
+        1,
+        "the provider resolved once across two probes: {runs:?}"
+    );
 }
 
 #[tokio::test]

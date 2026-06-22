@@ -381,6 +381,7 @@ fraisier trigger-deploy <fraise> <env> [--dry-run] [--force] [--strategy <name>]
 fraisier rollback <fraise> <env> [--to <revision>] [--hosts <list>]
 
 fraisier ship patch|minor|major [--dry-run] [--no-deploy]
+fraisier ship --no-bump [--dry-run] [--no-deploy]   # re-ship the current version (no bump/commit)
 fraisier version show
 fraisier version bump patch|minor|major
 

@@ -115,8 +115,11 @@ pub(crate) fn version_bump(dir: &Path, level: fraisier_ship::Bump) -> Result<Com
 pub(crate) struct ShipArgs<'a> {
     /// The project directory holding the version file.
     pub dir: &'a Path,
-    /// Which component to bump.
+    /// Which component to bump (ignored when `no_bump` is set).
     pub level: fraisier_ship::Bump,
+    /// Re-ship the current version without bumping (mutually exclusive with a
+    /// bump level — the CLI rejects the combination at parse time).
+    pub no_bump: bool,
     /// Compute the plan without writing/committing/pushing.
     pub dry_run: bool,
     /// Skip the follow-on deploy.
@@ -156,6 +159,7 @@ pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
         dry_run: args.dry_run,
         no_deploy: args.no_deploy,
         push: args.push,
+        no_bump: args.no_bump,
         remote: args.remote,
         message_template: None,
     };
@@ -198,6 +202,7 @@ pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
                 "pushed": report.pushed,
                 "deployed": false,
                 "dry_run": report.dry_run,
+                "race_detected": report.race_detected,
                 "checks": checks_json,
             }),
         });
@@ -224,6 +229,7 @@ pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
             "pushed": report.pushed,
             "deployed": true,
             "deploy": deploy_out.json,
+            "race_detected": report.race_detected,
             "checks": checks_json,
         }),
     })
@@ -2536,6 +2542,7 @@ url = "http://127.0.0.1:8080/health"
         let out = ship(ShipArgs {
             dir: dir.path(),
             level: fraisier_ship::Bump::Patch,
+            no_bump: false,
             dry_run: true,
             no_deploy: true,
             no_check: false,
@@ -2596,6 +2603,7 @@ url = "http://127.0.0.1:8080/health"
         ShipArgs {
             dir,
             level: fraisier_ship::Bump::Patch,
+            no_bump: false,
             dry_run: false,
             no_deploy: true,
             no_check,

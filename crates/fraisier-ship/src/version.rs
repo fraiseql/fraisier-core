@@ -96,6 +96,16 @@ fn navigate<'a>(item: &'a toml_edit::Item, path: &[&str]) -> Option<&'a toml_edi
     }
 }
 
+/// Parse the version out of raw TOML `content` for the given project kind.
+///
+/// E.g. the bytes of `Cargo.toml` at a git ref (`git show <ref>:Cargo.toml`).
+/// Returns `None` if the content does not parse or carries no version field.
+#[must_use]
+pub fn version_in_toml(content: &str, kind: ProjectKind) -> Option<String> {
+    let doc = content.parse::<DocumentMut>().ok()?;
+    read_version(&doc, kind)
+}
+
 /// Read the version string out of `doc` for the given project kind.
 fn read_version(doc: &DocumentMut, kind: ProjectKind) -> Option<String> {
     for path in candidate_paths(kind) {

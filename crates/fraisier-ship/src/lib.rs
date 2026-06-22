@@ -11,7 +11,9 @@ mod ship;
 mod version;
 
 pub use ship::{ship, ShipOptions, ShipReport};
-pub use version::{bump, locate, next_version, show, Bump, ProjectKind, VersionInfo};
+pub use version::{
+    bump, locate, next_version, show, version_in_toml, Bump, ProjectKind, VersionInfo,
+};
 
 /// An error from reading or bumping a project's version.
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +74,23 @@ pub enum ShipError {
         op: String,
         /// The captured stderr or spawn error.
         detail: String,
+    },
+    /// Another ship advanced `origin/<branch>` past the version observed at the
+    /// start of this run, so committing the locally-computed bump would push a
+    /// duplicate-version commit that cannot fast-forward. The on-disk bump has been
+    /// rolled back; the message carries a copy-pasteable rebase recipe.
+    #[error(
+        "version race on {branch}: this run started from {observed} but origin/{branch} is now \
+         at {on_origin}. The version bump was rolled back. Reconcile and retry:\n  \
+         git fetch origin {branch}\n  git rebase origin/{branch}\n  fraisier ship <patch|minor|major>"
+    )]
+    VersionRace {
+        /// The version observed locally at the start of the run.
+        observed: String,
+        /// The version now present at `origin/<branch>`.
+        on_origin: String,
+        /// The branch the race was detected on.
+        branch: String,
     },
 }
 

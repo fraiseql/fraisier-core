@@ -152,9 +152,15 @@ struct ScaffoldInstallArgs {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args)]
 struct ShipCliArgs {
-    /// Which component to bump.
-    #[arg(value_enum)]
-    level: BumpLevel,
+    /// Which component to bump. Omit it (and pass `--no-bump`) to re-ship the
+    /// current version unchanged.
+    #[arg(value_enum, required_unless_present = "no_bump")]
+    level: Option<BumpLevel>,
+
+    /// Re-ship the current version without bumping (a redeploy / bring-your-own
+    /// release-batcher workflow). Mutually exclusive with a bump level.
+    #[arg(long, conflicts_with = "level")]
+    no_bump: bool,
 
     /// The project directory holding `Cargo.toml` / `pyproject.toml`.
     #[arg(long, default_value = ".")]
@@ -706,7 +712,12 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::Ship(args) => {
             commands::ship(commands::ShipArgs {
                 dir: &args.path,
-                level: args.level.into(),
+                // When `--no-bump` is set the level is unused; default to Patch so
+                // the bundle is well-formed (clap guarantees exactly one is set).
+                level: args
+                    .level
+                    .map_or(fraisier_ship::Bump::Patch, fraisier_ship::Bump::from),
+                no_bump: args.no_bump,
                 dry_run: args.dry_run,
                 no_deploy: args.no_deploy,
                 no_check: args.no_check,
@@ -780,5 +791,35 @@ fn render(output: &CommandOutput, json: bool) {
         }
     } else {
         print!("{}", output.pretty);
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::Cli;
+    use clap::Parser as _;
+
+    /// The clap definition is internally consistent (catches arg-graph mistakes).
+    #[test]
+    fn cli_definition_is_valid() {
+        use clap::CommandFactory as _;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn ship_no_bump_parses_without_a_level() {
+        assert!(Cli::try_parse_from(["fraisier", "ship", "--no-bump"]).is_ok());
+    }
+
+    #[test]
+    fn ship_rejects_no_bump_with_an_explicit_level() {
+        // `--no-bump` plus a bump level is contradictory — rejected at parse time.
+        assert!(Cli::try_parse_from(["fraisier", "ship", "patch", "--no-bump"]).is_err());
+    }
+
+    #[test]
+    fn ship_requires_a_level_or_no_bump() {
+        assert!(Cli::try_parse_from(["fraisier", "ship"]).is_err());
+        assert!(Cli::try_parse_from(["fraisier", "ship", "patch"]).is_ok());
     }
 }

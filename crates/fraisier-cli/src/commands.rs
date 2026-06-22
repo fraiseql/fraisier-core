@@ -545,11 +545,17 @@ pub(crate) fn scaffold_install(
 /// it does **not** prune: scheduled units share the systemd directory (and the
 /// fraisier marker) with the scaffold units, so a scoped-by-presence prune would
 /// wrongly remove the other set. Writes only on `apply`; otherwise shows the plan.
+// Reason: the four bools mirror the independent `scheduled-install` CLI flags
+// (--yes / --dry-run / --force / --prune); the branches (plan / refuse-on-drift /
+// install-subset / prune) are one cohesive flow, not separable units.
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_lines)]
 pub(crate) fn scheduled_install(
     config_path: &Path,
     root: &Path,
     apply: bool,
     dry_run: bool,
+    force: bool,
+    prune: bool,
 ) -> Result<CommandOutput> {
     let config = load(config_path)?;
 
@@ -583,12 +589,32 @@ pub(crate) fn scheduled_install(
     }
 
     let files = fraisier_scaffold::generate_scheduled(&config)?;
-    let targets = fraisier_scaffold::install_targets(&files, root);
+    // Classify each unit against what is on disk (drift policy), and (with
+    // --prune) find marker-bearing units no longer declared.
+    let drift = fraisier_scaffold::classify(&files, root);
+    let installable: Vec<&fraisier_scaffold::GeneratedFile> =
+        files.iter().filter(|f| f.install_dest.is_some()).collect();
+    let drifted: Vec<String> = drift
+        .iter()
+        .filter(|(_, d)| *d == fraisier_scaffold::Drift::Drifted)
+        .map(|(path, _)| path.display().to_string())
+        .collect();
+    let prune_candidates = if prune {
+        fraisier_scaffold::prune_plan(&files, root)?
+    } else {
+        Vec::new()
+    };
 
     if dry_run || !apply {
         let mut pretty = format!("scheduled install plan (root {}):\n", root.display());
-        for path in &targets {
-            let _ = writeln!(pretty, "  + {}", path.display());
+        for (path, class) in &drift {
+            let _ = writeln!(pretty, "  [{}] {}", class.label(), path.display());
+        }
+        for path in &prune_candidates {
+            let _ = writeln!(pretty, "  [prune] {}", path.display());
+        }
+        if !drifted.is_empty() && !force {
+            pretty.push_str("note: drifted units will be refused without --force\n");
         }
         if !dry_run {
             pretty.push_str("pass --yes to apply\n");
@@ -599,16 +625,50 @@ pub(crate) fn scheduled_install(
             pretty,
             json: json!({
                 "applied": false,
-                "install": targets.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "drift": drift.iter().map(|(p, c)| json!({"path": p.display().to_string(), "class": c.label()})).collect::<Vec<_>>(),
+                "prune": prune_candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             }),
         });
     }
 
-    let installed = fraisier_scaffold::install(&files, root)?;
+    // Fail closed on drift unless the operator opts into overwriting.
+    if !drifted.is_empty() && !force {
+        let mut pretty =
+            String::from("refusing to install: drifted units (pass --force to overwrite)\n");
+        for path in &drifted {
+            let _ = writeln!(pretty, "  [drifted] {path}");
+        }
+        return Ok(CommandOutput {
+            exit_code: 1,
+            pretty,
+            json: json!({ "applied": false, "drifted": drifted }),
+        });
+    }
+
+    // Install only what is absent or (with --force) drifted; identical is a no-op.
+    let to_install: Vec<fraisier_scaffold::GeneratedFile> = installable
+        .iter()
+        .zip(&drift)
+        .filter(|(_, (_, class))| {
+            *class == fraisier_scaffold::Drift::Absent
+                || (*class == fraisier_scaffold::Drift::Drifted && force)
+        })
+        .map(|(file, _)| (*file).clone())
+        .collect();
+    let installed = fraisier_scaffold::install(&to_install, root)?;
+    let pruned = if prune {
+        fraisier_scaffold::prune(&prune_candidates)?;
+        prune_candidates
+    } else {
+        Vec::new()
+    };
+
     let mut pretty = format!(
-        "installed {} scheduled unit(s) (root {})\n",
+        "installed {} unit(s), pruned {} orphan(s) (root {}); {} identical unit(s) unchanged\n",
         installed.len(),
-        root.display()
+        pruned.len(),
+        root.display(),
+        drift.len() - installed.len(),
     );
     pretty.push_str("next: systemctl daemon-reload && systemctl enable --now <timer>\n");
     Ok(CommandOutput {
@@ -617,6 +677,7 @@ pub(crate) fn scheduled_install(
         json: json!({
             "applied": true,
             "installed": installed.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "pruned": pruned.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         }),
     })
 }
@@ -3641,12 +3702,12 @@ current_revision = "true"
         let root = dir.path().join("root");
 
         // Plan only (no --yes): nothing written.
-        let plan = scheduled_install(&config, &root, false, false).expect("plan");
+        let plan = scheduled_install(&config, &root, false, false, false, false).expect("plan");
         assert_eq!(plan.json["applied"], serde_json::json!(false));
         assert!(!root.exists(), "planning wrote nothing");
 
         // Apply installs the timer + service under the root.
-        let done = scheduled_install(&config, &root, true, false).expect("install");
+        let done = scheduled_install(&config, &root, true, false, false, false).expect("install");
         assert_eq!(done.json["applied"], serde_json::json!(true));
         assert!(root
             .join("etc/systemd/system/fraisier-checkout-staging-scheduled.timer")
@@ -3665,7 +3726,7 @@ current_revision = "true"
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
 
-        let out = scheduled_install(&config, &root, true, false).expect("runs");
+        let out = scheduled_install(&config, &root, true, false, false, false).expect("runs");
         assert_eq!(out.exit_code, 1, "refused: {}", out.pretty);
         assert_eq!(out.json["refused"], serde_json::json!(true));
         assert!(!root.exists(), "nothing installed on refusal");
@@ -3680,7 +3741,7 @@ current_revision = "true"
         );
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
-        let out = scheduled_install(&config, &root, true, false).expect("install");
+        let out = scheduled_install(&config, &root, true, false, false, false).expect("install");
         assert_eq!(
             out.json["applied"],
             serde_json::json!(true),
@@ -3697,7 +3758,7 @@ current_revision = "true"
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
 
-        scheduled_install(&config, &root, true, false).expect("install");
+        scheduled_install(&config, &root, true, false, false, false).expect("install");
         let listed = scheduled_list(&root).expect("list");
         let units = listed.json["units"].as_array().expect("units array");
         assert_eq!(units.len(), 2, "timer + service listed: {}", listed.pretty);
@@ -3714,6 +3775,61 @@ current_revision = "true"
             "systemd dir clean after uninstall: {}",
             after.pretty
         );
+    }
+
+    #[test]
+    fn scheduled_install_fails_closed_on_drift_then_force_overwrites() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg =
+            format!("{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        scheduled_install(&config, &root, true, false, false, false).expect("install");
+
+        // Operator edits an installed unit (keeping the marker) → it drifts.
+        let timer = root.join("etc/systemd/system/fraisier-checkout-staging-scheduled.timer");
+        let marker = fraisier_scaffold::MARKER;
+        std::fs::write(&timer, format!("# {marker}\n[Timer]\nOnCalendar=hourly\n")).unwrap();
+
+        // Re-install without --force fails closed (the hand-edit is preserved).
+        let refused = scheduled_install(&config, &root, true, false, false, false).expect("runs");
+        assert_eq!(
+            refused.exit_code, 1,
+            "drift must fail closed: {}",
+            refused.pretty
+        );
+        assert!(std::fs::read_to_string(&timer).unwrap().contains("hourly"));
+
+        // With --force the drifted unit is overwritten back to the generated body.
+        let forced = scheduled_install(&config, &root, true, false, true, false).expect("force");
+        assert_eq!(forced.exit_code, 0, "{}", forced.pretty);
+        assert!(!std::fs::read_to_string(&timer).unwrap().contains("hourly"));
+    }
+
+    #[test]
+    fn scheduled_install_prune_removes_orphan_marker_units() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg =
+            format!("{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        scheduled_install(&config, &root, true, false, false, false).expect("install");
+
+        // A leftover fraisier-managed unit no longer declared by the config.
+        let orphan = root.join("etc/systemd/system/fraisier-old-job.timer");
+        std::fs::write(
+            &orphan,
+            format!("# {}\n[Timer]\n", fraisier_scaffold::MARKER),
+        )
+        .unwrap();
+
+        // --prune --yes removes the orphan; the current units survive.
+        let out = scheduled_install(&config, &root, true, false, false, true).expect("prune");
+        assert_eq!(out.exit_code, 0, "{}", out.pretty);
+        assert!(!orphan.exists(), "orphan pruned: {}", out.pretty);
+        assert!(root
+            .join("etc/systemd/system/fraisier-checkout-staging-scheduled.timer")
+            .exists());
     }
 
     #[tokio::test]

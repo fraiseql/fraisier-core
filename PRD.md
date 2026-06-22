@@ -389,7 +389,9 @@ Filesystem is the default for single-host; SQLite recommended for multi-host (at
 
 ## 8. Scope: the CLI
 
-Mirrors the Python v0.32 surface with multi-host additions:
+Mirrors the Python v0.32 surface with multi-host additions. A global `--verbose`/
+`-v` (repeatable, mutually exclusive with `--json`) opts into verbose output;
+output is compact by default and never auto-upgrades under `CI`/`CLAUDECODE`/no-TTY.
 
 ```
 fraisier init
@@ -413,12 +415,15 @@ fraisier backup <fraise> -e <env>
 fraisier bootstrap -e <env> [--dry-run] [--host <name>]
 fraisier scaffold [--dry-run]
 fraisier scaffold-install [--dry-run] [--yes] [--prune]
+fraisier scheduled install [--yes] [--dry-run] [--force] [--prune]   # drift policy + orphan prune
 fraisier providers
 fraisier provider-test <type>
 
 fraisier sync
 fraisier webhook-server
-fraisier validate-config
+fraisier validate-config [--resolve-envvars]   # structure-only by default; resolve secrets as a CI gate
+fraisier doctor [--check <name>]                # host self-diagnosis; exit 0/1/2 = pass/fail/warn
+fraisier env-check <subcommand>                 # which env-var secrets a subcommand reads, and which are unset
 
 fraisier adapter list           # discovered IPC adapters on PATH
 fraisier adapter describe <name>

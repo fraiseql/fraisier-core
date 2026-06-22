@@ -104,6 +104,52 @@ fn is_fraisier_generated(path: &Path) -> bool {
     std::fs::read_to_string(path).is_ok_and(|contents| contents.contains(MARKER))
 }
 
+/// How an installed destination compares to the file that would be generated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drift {
+    /// No file at the destination — a fresh install.
+    Absent,
+    /// Byte-identical to the generated file: installing is an idempotent no-op.
+    Identical,
+    /// Present but differs from the generated file (an operator edit, or a unit
+    /// left by an older generation). Installed only under `--force`.
+    Drifted,
+}
+
+impl Drift {
+    /// A stable lower-case label for output (`absent` / `identical` / `drifted`).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Identical => "identical",
+            Self::Drifted => "drifted",
+        }
+    }
+}
+
+/// Classify each generated file against its installed destination under `root`,
+/// returning `(dest, drift)` for every file that has an `install_dest`.
+///
+/// Drives the idempotent install policy: `Identical` is a no-op, `Absent` is a
+/// fresh write, and `Drifted` fails closed unless the operator passes `--force`.
+#[must_use]
+pub fn classify(files: &[GeneratedFile], root: &Path) -> Vec<(PathBuf, Drift)> {
+    files
+        .iter()
+        .filter_map(|file| {
+            let dest = file.install_dest.as_deref()?;
+            let path = under_root(root, dest);
+            let drift = match std::fs::read(&path) {
+                Err(_) => Drift::Absent,
+                Ok(existing) if existing == file.contents.as_bytes() => Drift::Identical,
+                Ok(_) => Drift::Drifted,
+            };
+            Some((path, drift))
+        })
+        .collect()
+}
+
 /// The systemd unit directory the installer targets (under the `root` prefix).
 const SYSTEMD_DIR: &str = "/etc/systemd/system";
 
@@ -318,6 +364,37 @@ upstream = "checkout_upstream"
             list_installed(root.path()).expect("list").is_empty(),
             "systemd dir clean after uninstall"
         );
+    }
+
+    #[test]
+    fn classify_detects_absent_identical_and_drifted() {
+        use super::{classify, Drift};
+        let root = tempfile::tempdir().unwrap();
+        let files = scheduled_files();
+
+        // Before install: every destination is ABSENT.
+        let before = classify(&files, root.path());
+        assert!(
+            before.iter().all(|(_, d)| *d == Drift::Absent),
+            "all absent: {before:?}"
+        );
+
+        // After install: every destination is IDENTICAL (idempotent).
+        install(&files, root.path()).expect("install");
+        let after = classify(&files, root.path());
+        assert!(
+            after.iter().all(|(_, d)| *d == Drift::Identical),
+            "all identical: {after:?}"
+        );
+
+        // Edit one installed unit → it classifies DRIFTED; the others stay identical.
+        let timer = root
+            .path()
+            .join("etc/systemd/system/fraisier-checkout-production-scheduled.timer");
+        std::fs::write(&timer, format!("# {MARKER}\n[Timer]\nOnCalendar=hourly\n")).unwrap();
+        let drifted = classify(&files, root.path());
+        let drifted_count = drifted.iter().filter(|(_, d)| *d == Drift::Drifted).count();
+        assert_eq!(drifted_count, 1, "exactly one drifted: {drifted:?}");
     }
 
     #[test]

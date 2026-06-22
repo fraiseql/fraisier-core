@@ -35,6 +35,13 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Increase verbosity (repeatable: `-v` rich, `-vv` debug). Output is
+    /// compact by default — fraisier never auto-upgrades to verbose under
+    /// `CI=1`/`CLAUDECODE=1`/no-TTY, so machine callers stay terse. Mutually
+    /// exclusive with `--json`.
+    #[arg(short = 'v', long, global = true, action = clap::ArgAction::Count, conflicts_with = "json")]
+    verbose: u8,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -549,6 +556,9 @@ struct ScheduledUninstallArgs {
     yes: bool,
 }
 
+// Reason: independent install flags (--yes / --dry-run / --force / --prune),
+// each mapping to a distinct CLI option.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args)]
 struct ScheduledInstallArgs {
     /// Path to the `fraisier.toml`.
@@ -567,6 +577,16 @@ struct ScheduledInstallArgs {
     /// Show the install plan without applying it.
     #[arg(long)]
     dry_run: bool,
+
+    /// Overwrite units that have drifted from the generated content (operator
+    /// hand-edits). Without it, a drifted unit fails the install closed.
+    #[arg(long)]
+    force: bool,
+
+    /// Also remove marker-bearing scheduled units no longer declared in the
+    /// config (orphans). Lists them on a dry run; removes them with `--yes`.
+    #[arg(long)]
+    prune: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -657,7 +677,7 @@ async fn main() -> ExitCode {
     let _otel_guard = init_otel();
     match dispatch(&cli).await {
         Ok(output) => {
-            render(&output, cli.json);
+            render(&output, cli.json, cli.verbose);
             // Exit codes are small and non-negative; the clamp is just for safety.
             ExitCode::from(u8::try_from(output.exit_code).unwrap_or(1))
         }
@@ -728,9 +748,14 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
             commands::self_upgrade_restart(&args.unit, args.user).await
         }
         Command::SelfUpgrade(SelfUpgradeCommand::Apply(args)) => self_upgrade_apply(args).await,
-        Command::Scheduled(ScheduledCommand::Install(args)) => {
-            commands::scheduled_install(&args.config, &args.root, args.yes, args.dry_run)
-        }
+        Command::Scheduled(ScheduledCommand::Install(args)) => commands::scheduled_install(
+            &args.config,
+            &args.root,
+            args.yes,
+            args.dry_run,
+            args.force,
+            args.prune,
+        ),
         Command::Scheduled(ScheduledCommand::List(args)) => commands::scheduled_list(&args.root),
         Command::Scheduled(ScheduledCommand::Uninstall(args)) => {
             commands::scheduled_uninstall(&args.config, &args.root, args.yes)
@@ -824,7 +849,7 @@ fn init_otel() -> Option<fraisier_saga::otel::OtelGuard> {
     }
 }
 
-fn render(output: &CommandOutput, json: bool) {
+fn render(output: &CommandOutput, json: bool, verbose: u8) {
     if json {
         match serde_json::to_string_pretty(&output.json) {
             Ok(rendered) => println!("{rendered}"),
@@ -832,6 +857,14 @@ fn render(output: &CommandOutput, json: bool) {
         }
     } else {
         print!("{}", output.pretty);
+        // Verbose adds the structured detail on stderr (kept off stdout so CI
+        // greps of the compact output are unaffected). `--json`/`--verbose` are
+        // mutually exclusive, so this never double-prints the JSON.
+        if verbose > 0 {
+            if let Ok(rendered) = serde_json::to_string_pretty(&output.json) {
+                eprintln!("{rendered}");
+            }
+        }
     }
 }
 
@@ -862,5 +895,15 @@ mod cli_tests {
     fn ship_requires_a_level_or_no_bump() {
         assert!(Cli::try_parse_from(["fraisier", "ship"]).is_err());
         assert!(Cli::try_parse_from(["fraisier", "ship", "patch"]).is_ok());
+    }
+
+    #[test]
+    fn verbose_and_json_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["fraisier", "-v", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["fraisier", "--json", "list"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["fraisier", "-v", "--json", "list"]).is_err(),
+            "--verbose and --json must conflict"
+        );
     }
 }

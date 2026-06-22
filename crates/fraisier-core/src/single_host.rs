@@ -48,6 +48,33 @@ use crate::adapter_axes::{
     AdapterCtx, AdapterError, ArtifactAdapter, HealthAdapter, HostId, MigrationAdapter, Revision,
     ServiceAdapter, Severity, StagedArtifact,
 };
+use crate::restore_rehearsal::{run_restore_rehearsal, BackupSource, RehearsalDb};
+
+/// Which preflight a deploy runs before touching the live database.
+///
+/// Selected by `[migration].preflight_mode` in `fraisier.toml`; the legacy
+/// `forward_compatible_lint` boolean maps onto [`Live`](Self::Live) /
+/// [`Off`](Self::Off) for back-compatibility.
+///
+/// # Example
+/// ```
+/// # use fraisier_core::single_host::PreflightMode;
+/// assert_eq!(PreflightMode::default(), PreflightMode::Live);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightMode {
+    /// Run the migration adapter's forward-compatibility lint against the **live**
+    /// database (the default; equivalent to legacy `forward_compatible_lint = true`).
+    #[default]
+    Live,
+    /// In addition to the live lint, rehearse a real restore + migrate on a
+    /// throwaway copy of the database *before* touching the live one
+    /// (a DR-grade preflight). See [`crate::restore_rehearsal`].
+    RestoreRehearsal,
+    /// Skip every preflight (equivalent to legacy `forward_compatible_lint = false`).
+    Off,
+}
 
 /// The durable record of what a committed deploy made live — the rollback target
 /// a *later* deploy reads back from the state store's snapshot slot.
@@ -98,6 +125,10 @@ pub struct SingleHostDeploy {
     /// `down_to(this)` instead of `up`, and its compensation goes back `up`.
     rollback_to: Option<Revision>,
     forward_compatible_lint: bool,
+    /// When set, the preflight step also rehearses a restore + migrate on a
+    /// throwaway DB (`[migration].preflight_mode = "restore_rehearsal"`).
+    restore_rehearsal: Option<Arc<dyn RehearsalDb>>,
+    backup_source: BackupSource,
     artifact: Arc<dyn ArtifactAdapter>,
     migration: Arc<dyn MigrationAdapter>,
     service: Arc<dyn ServiceAdapter>,
@@ -180,6 +211,8 @@ pub struct SingleHostDeployBuilder {
     target: Option<Revision>,
     rollback_to: Option<Revision>,
     forward_compatible_lint: bool,
+    restore_rehearsal: Option<Arc<dyn RehearsalDb>>,
+    backup_source: BackupSource,
     artifact: Option<Arc<dyn ArtifactAdapter>>,
     migration: Option<Arc<dyn MigrationAdapter>>,
     service: Option<Arc<dyn ServiceAdapter>>,
@@ -198,6 +231,8 @@ impl SingleHostDeployBuilder {
             // Default on: forward-compat preflight runs whenever the adapter
             // advertises it, unless the operator opts out (PRD G11 / Decision 4).
             forward_compatible_lint: true,
+            restore_rehearsal: None,
+            backup_source: BackupSource::FreshDump,
             artifact: None,
             migration: None,
             service: None,
@@ -237,6 +272,17 @@ impl SingleHostDeployBuilder {
     #[must_use]
     pub const fn forward_compatible_lint(mut self, enabled: bool) -> Self {
         self.forward_compatible_lint = enabled;
+        self
+    }
+
+    /// Enable the restore-rehearsal preflight (`[migration].preflight_mode =
+    /// "restore_rehearsal"`): before migrating the live DB, `db` provisions a
+    /// throwaway copy seeded from `backup` and the pending migrations are rehearsed
+    /// there. Complementary to [`Self::forward_compatible_lint`]; both can run.
+    #[must_use]
+    pub fn restore_rehearsal(mut self, db: Arc<dyn RehearsalDb>, backup: BackupSource) -> Self {
+        self.restore_rehearsal = Some(db);
+        self.backup_source = backup;
         self
     }
 
@@ -296,6 +342,8 @@ impl SingleHostDeployBuilder {
             target: self.target,
             rollback_to: self.rollback_to,
             forward_compatible_lint: self.forward_compatible_lint,
+            restore_rehearsal: self.restore_rehearsal,
+            backup_source: self.backup_source,
         })
     }
 }
@@ -319,6 +367,8 @@ struct DeployShared {
     target: Option<Revision>,
     rollback_to: Option<Revision>,
     forward_compatible_lint: bool,
+    restore_rehearsal: Option<Arc<dyn RehearsalDb>>,
+    backup_source: BackupSource,
     artifact: Arc<dyn ArtifactAdapter>,
     migration: Arc<dyn MigrationAdapter>,
     service: Arc<dyn ServiceAdapter>,
@@ -393,6 +443,8 @@ impl DeployShared {
             target: deploy.target.clone(),
             rollback_to: deploy.rollback_to.clone(),
             forward_compatible_lint: deploy.forward_compatible_lint,
+            restore_rehearsal: deploy.restore_rehearsal.clone(),
+            backup_source: deploy.backup_source.clone(),
             artifact: Arc::clone(&deploy.artifact),
             migration: Arc::clone(&deploy.migration),
             service: Arc::clone(&deploy.service),
@@ -416,19 +468,33 @@ impl DeployShared {
         }
     }
 
+    /// The preflight step, dispatched by mode (`[migration].preflight_mode`): the
+    /// forward-compatibility lint runs against the live DB (`live`/`restore_rehearsal`)
+    /// and the DR-grade restore rehearsal runs additionally (`restore_rehearsal`).
+    /// `off` sets both off, so the step is an inert no-op.
     async fn run_preflight(&self) -> Result<(), SagaError> {
-        // Operator opt-out (`[migration].forward_compatible_lint = false`): skip the
-        // forward-compat lint entirely — no describe, no preflight call.
-        if !self.forward_compatible_lint {
-            return Ok(());
+        if self.forward_compatible_lint {
+            self.run_forward_compat_lint().await?;
         }
+        // The restore rehearsal proves a *forward* migrate applies; it is irrelevant
+        // to a deliberate rollback (which migrates `down`), so skip it there.
+        if let Some(db) = &self.restore_rehearsal {
+            if self.rollback_to.is_none() {
+                self.run_restore_rehearsal_step(db.as_ref()).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run the migration adapter's forward-compatibility lint against the **live**
+    /// database. The adapter must advertise the `preflight` capability or the lint
+    /// is skipped (proceed at the operator's risk rather than fail — Decision 4).
+    async fn run_forward_compat_lint(&self) -> Result<(), SagaError> {
         let described = self
             .migration
             .describe()
             .await
             .map_err(|e| Self::failed("preflight", &e))?;
-        // Decision 4 gate: only call preflight if the adapter advertises it;
-        // otherwise proceed at the operator's risk rather than fail.
         if !described.capabilities.iter().any(|c| c == "preflight") {
             return Ok(());
         }
@@ -451,6 +517,23 @@ impl DeployShared {
             });
         }
         Ok(())
+    }
+
+    /// Rehearse a restore + migrate on a throwaway copy of the database before the
+    /// live deploy touches anything. A failure aborts the deploy (it is the first
+    /// step, so nothing has changed yet) with a message naming the escape hatch.
+    async fn run_restore_rehearsal_step(&self, db: &dyn RehearsalDb) -> Result<(), SagaError> {
+        run_restore_rehearsal(db, self.migration.as_ref(), &self.ctx, &self.backup_source)
+            .await
+            .map(|_report| ())
+            .map_err(|error| SagaError::StepFailed {
+                step: "preflight".to_owned(),
+                message: format!(
+                    "restore-rehearsal preflight failed: {error}. The pending migrations did not \
+                     apply cleanly on a fresh restore. Fix the migrations, or bypass this check \
+                     with `--skip-preflight` (or `[migration].preflight_mode = \"off\"`)."
+                ),
+            })
     }
 
     async fn run_fetch(&self, runtime: &mut DeployRuntime) -> Result<(), SagaError> {
@@ -656,6 +739,7 @@ mod tests {
         PreflightIssue, PreflightReport, Revision, ServiceAdapter, ServiceStatus, Severity,
         StagedArtifact, VerifyReport,
     };
+    use crate::restore_rehearsal::{BackupSource, RehearsalDb, RehearsalError, ThrowawayDb};
     use async_trait::async_trait;
     use fraisier_saga::saga::SagaOutcome;
     use fraisier_saga::state_store::{FilesystemStateStore, FraiseKey, StateStore};
@@ -1139,6 +1223,145 @@ mod tests {
         assert!(
             !trail.iter().any(|e| e == "describe" || e == "preflight"),
             "the preflight step made no adapter call: {trail:?}",
+        );
+    }
+
+    /// A fake throwaway-DB lifecycle for the restore-rehearsal saga tests.
+    struct FakeRehearsalDb {
+        trail: Trail,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl RehearsalDb for FakeRehearsalDb {
+        async fn provision(
+            &self,
+            live_dsn: &str,
+            _backup: &BackupSource,
+        ) -> Result<ThrowawayDb, RehearsalError> {
+            log(&self.trail, "rehearsal:provision");
+            if self.fail {
+                return Err(RehearsalError::Provision("seed restore failed".to_owned()));
+            }
+            Ok(ThrowawayDb {
+                dsn: format!("{live_dsn}_rehearsal"),
+                name: "throwaway".to_owned(),
+            })
+        }
+
+        async fn teardown(&self, _db: &ThrowawayDb) -> Result<(), String> {
+            log(&self.trail, "rehearsal:teardown");
+            Ok(())
+        }
+    }
+
+    /// A context whose `DATABASE_URL` resolves in-process (so the rehearsal can
+    /// clone it and redirect at the throwaway DB).
+    fn ctx_with_dsn() -> AdapterCtx {
+        AdapterCtx::new("checkout", "production")
+            .with_resolved_secret("DATABASE_URL", "postgres://u:pw@h/app")
+    }
+
+    #[tokio::test]
+    async fn restore_rehearsal_runs_before_migrate_on_the_live_db() {
+        // `preflight_mode = "restore_rehearsal"` provisions + migrates a throwaway
+        // copy *before* the live fetch/migrate, then tears it down — and the deploy
+        // still commits.
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let plan = SingleHostDeploy::builder("checkout", "production", HostId::new("localhost"))
+            .context(ctx_with_dsn())
+            .artifact(Arc::new(FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            }))
+            .migration(Arc::new(FakeMigration::healthy(&trail)))
+            .service(Arc::new(FakeService {
+                trail: trail.clone(),
+                fail_restarts: Arc::new(Mutex::new(0)),
+            }))
+            .health(Arc::new(FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            }))
+            .restore_rehearsal(
+                Arc::new(FakeRehearsalDb {
+                    trail: trail.clone(),
+                    fail: false,
+                }),
+                BackupSource::FreshDump,
+            )
+            .build()
+            .expect("all adapters provided");
+
+        let outcome = plan.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+
+        let trail = drain(&trail);
+        let provision = trail
+            .iter()
+            .position(|e| e == "rehearsal:provision")
+            .expect("rehearsal provisioned a throwaway db");
+        let stage = trail
+            .iter()
+            .position(|e| e == "stage")
+            .expect("the live fetch ran");
+        assert!(
+            provision < stage,
+            "the rehearsal must run before the live fetch/migrate: {trail:?}"
+        );
+        assert!(
+            trail.iter().any(|e| e == "rehearsal:teardown"),
+            "the throwaway db is torn down: {trail:?}"
+        );
+        // One rehearsal `up` (throwaway) + one live `up`.
+        assert_eq!(
+            trail.iter().filter(|e| *e == "up").count(),
+            2,
+            "the pending set is rehearsed and then applied live: {trail:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_rehearsal_failure_aborts_before_touching_the_live_db() {
+        // A failed rehearsal aborts the deploy at the preflight step — the live
+        // fetch/migrate never run.
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let plan = SingleHostDeploy::builder("checkout", "production", HostId::new("localhost"))
+            .context(ctx_with_dsn())
+            .artifact(Arc::new(FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            }))
+            .migration(Arc::new(FakeMigration::healthy(&trail)))
+            .service(Arc::new(FakeService {
+                trail: trail.clone(),
+                fail_restarts: Arc::new(Mutex::new(0)),
+            }))
+            .health(Arc::new(FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            }))
+            .restore_rehearsal(
+                Arc::new(FakeRehearsalDb {
+                    trail: trail.clone(),
+                    fail: true,
+                }),
+                BackupSource::FreshDump,
+            )
+            .build()
+            .expect("all adapters provided");
+
+        let outcome = plan.run(store).await.expect("run completes");
+        assert!(
+            !matches!(outcome, SagaOutcome::Committed),
+            "a failed rehearsal must not commit; got {outcome:?}"
+        );
+        let trail = drain(&trail);
+        assert!(
+            !trail.iter().any(|e| e == "stage"),
+            "the live deploy never started after a failed rehearsal: {trail:?}"
         );
     }
 

@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 
 use fraisier_core::adapter_axes::Severity;
+use fraisier_core::single_host::PreflightMode;
 use serde::{Deserialize, Serialize};
 
 use crate::schema::{STRATEGY_ALL_AT_ONCE, STRATEGY_ROLLING};
@@ -302,6 +303,17 @@ fn validate_migration(cfg: &DeployConfig, report: &mut ValidationReport) {
             "migration.forward_compatible_lint",
             "the command adapter does not implement preflight; \
              forward_compatible_lint will be skipped",
+        );
+    }
+    // The restore-rehearsal preflight composes generic-Postgres backup/restore, so
+    // it is only meaningful for the in-process confiture (Postgres) adapter.
+    if migration.effective_preflight_mode() == PreflightMode::RestoreRehearsal
+        && adapter != Some("confiture")
+    {
+        report.error(
+            "migration.preflight_mode",
+            "preflight_mode = \"restore_rehearsal\" requires the confiture adapter \
+             (it rehearses a real Postgres restore + migrate on a throwaway database)",
         );
     }
 }

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use fraisier_core::adapter_axes::{AdapterCtx, HostId};
 use fraisier_core::multi_host::{HostEntry, HostInventory, RolloutStrategy};
+use fraisier_core::single_host::PreflightMode;
 use serde::{Deserialize, Serialize};
 
 use crate::SpecqlPreset;
@@ -225,12 +226,44 @@ pub struct MigrationSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migrations_path: Option<PathBuf>,
     /// Whether to run the adapter's forward-compatibility `preflight` lint.
+    ///
+    /// Superseded by [`Self::preflight_mode`]; retained for back-compatibility and
+    /// folded into the effective mode by [`Self::effective_preflight_mode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forward_compatible_lint: Option<bool>,
+    /// Which preflight to run before migrating the live database: `"live"`
+    /// (default — the forward-compat lint), `"restore_rehearsal"` (DR-grade:
+    /// rehearse a real restore + migrate on a throwaway copy first), or `"off"`.
+    /// Additive and back-compatible: when unset, [`Self::forward_compatible_lint`]
+    /// selects `"live"`/`"off"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight_mode: Option<PreflightMode>,
+    /// `restore_rehearsal`: the backup archive to restore for the rehearsal. When
+    /// unset, a fresh dump of the live database is taken at deploy time. An
+    /// absolute path is recommended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight_backup_path: Option<PathBuf>,
     /// Adapter-specific settings (the `[migration.settings]` sub-table), passed
     /// through verbatim to `AdapterCtx.settings`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub settings: BTreeMap<String, serde_json::Value>,
+}
+
+impl MigrationSection {
+    /// The effective preflight mode, folding the legacy `forward_compatible_lint`
+    /// flag into [`PreflightMode`]: an explicit `preflight_mode` always wins;
+    /// otherwise `forward_compatible_lint = false` is [`PreflightMode::Off`] and
+    /// anything else is [`PreflightMode::Live`].
+    #[must_use]
+    pub const fn effective_preflight_mode(&self) -> PreflightMode {
+        if let Some(mode) = self.preflight_mode {
+            return mode;
+        }
+        match self.forward_compatible_lint {
+            Some(false) => PreflightMode::Off,
+            _ => PreflightMode::Live,
+        }
+    }
 }
 
 /// The `[service]` section.

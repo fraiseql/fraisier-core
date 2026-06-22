@@ -16,6 +16,7 @@ mod commands;
 #[cfg(test)]
 mod e2e;
 mod factory;
+mod pg_rehearsal;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -284,6 +285,12 @@ struct DeployArgs {
     /// Resolve and print the plan without executing anything.
     #[arg(long)]
     dry_run: bool,
+
+    /// Skip every migration preflight for this run — both the forward-compat lint
+    /// and the restore rehearsal (the emergency escape hatch from a preflight that
+    /// blocks a deploy you know is safe). Overrides `[migration].preflight_mode`.
+    #[arg(long)]
+    skip_preflight: bool,
 }
 
 #[derive(Debug, Args)]
@@ -632,6 +639,7 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
                 args.host.as_deref(),
                 args.app_version.as_deref(),
                 args.dry_run,
+                args.skip_preflight,
             )
             .await
         }

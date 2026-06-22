@@ -210,6 +210,7 @@ pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
         args.host,
         Some(&report.new_version),
         false,
+        false,
     )
     .await?;
     pretty.push_str(&deploy_out.pretty);
@@ -1217,6 +1218,7 @@ pub(crate) async fn deploy(
     host: Option<&str>,
     app_version: Option<&str>,
     dry_run: bool,
+    skip_preflight: bool,
 ) -> Result<CommandOutput> {
     let config = load(config_path)?;
     let report = config.validate();
@@ -1264,18 +1266,25 @@ pub(crate) async fn deploy(
     }
 
     let resolved = factory::build(&config, host, app_version)?;
-    let plan = SingleHostDeploy::builder(
+    // `--skip-preflight` is the per-run escape hatch: it forces every preflight off
+    // regardless of `[migration].preflight_mode`.
+    let mut builder = SingleHostDeploy::builder(
         resolved.fraise.clone(),
         resolved.environment.clone(),
         resolved.host.clone(),
     )
     .context(resolved.ctx)
-    .forward_compatible_lint(resolved.forward_compatible_lint)
+    .forward_compatible_lint(resolved.forward_compatible_lint && !skip_preflight)
     .artifact(resolved.artifact)
     .migration(resolved.migration)
     .service(resolved.service)
-    .health(resolved.health)
-    .build()?;
+    .health(resolved.health);
+    if !skip_preflight {
+        if let Some((db, backup)) = resolved.restore_rehearsal {
+            builder = builder.restore_rehearsal(db, backup);
+        }
+    }
+    let plan = builder.build()?;
 
     let outcome = plan.run(store).await?;
     notify_deploy_failure(&config, &resolved.fraise, &resolved.environment, &outcome).await;
@@ -1863,6 +1872,7 @@ impl fraisier_webhook::WebhookHandler for DeployHandler {
             &self.state_dir,
             None,
             version.as_deref(),
+            false,
             false,
         )
         .await
@@ -2800,9 +2810,16 @@ url = "http://127.0.0.1:8080/health"
         let dir = tempfile::tempdir().expect("tempdir");
         let config = write(dir.path(), "fraisier.toml", VALID);
         let state = dir.path().join("state");
-        let out = deploy(&config, &state, Some("127.0.0.1"), Some("1.2.3"), true)
-            .await
-            .expect("dry run");
+        let out = deploy(
+            &config,
+            &state,
+            Some("127.0.0.1"),
+            Some("1.2.3"),
+            true,
+            false,
+        )
+        .await
+        .expect("dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
         assert_eq!(
             out.json["migration"],
@@ -2828,7 +2845,7 @@ url = "http://127.0.0.1:8080/health"
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let state = dir.path().join("state");
         // Dry run: the strategy is recognized and routed; nothing is executed.
-        let out = deploy(&config, &state, None, Some("1.2.3"), true)
+        let out = deploy(&config, &state, None, Some("1.2.3"), true, false)
             .await
             .expect("dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
@@ -2842,7 +2859,7 @@ url = "http://127.0.0.1:8080/health"
         let bad = VALID.replace("database_url_env = \"CHECKOUT_DATABASE_URL\"\n", "");
         let config = write(dir.path(), "fraisier.toml", &bad);
         let state = dir.path().join("state");
-        let out = deploy(&config, &state, None, None, false)
+        let out = deploy(&config, &state, None, None, false, false)
             .await
             .expect("run");
         assert_eq!(out.exit_code, 1);
@@ -3041,7 +3058,7 @@ upstream = "checkout_upstream"
         let config = write(dir.path(), "fraisier.toml", MULTI_HOST);
         let state = dir.path().join("state");
         // No --host override: [hosts] selects the multi-host path.
-        let out = deploy(&config, &state, None, Some("1.2.3"), true)
+        let out = deploy(&config, &state, None, Some("1.2.3"), true, false)
             .await
             .expect("multi-host dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
@@ -3071,9 +3088,16 @@ upstream = "checkout_upstream"
         let dir = tempfile::tempdir().expect("tempdir");
         let config = write(dir.path(), "fraisier.toml", MULTI_HOST);
         let state = dir.path().join("state");
-        let out = deploy(&config, &state, Some("web1.internal"), Some("1.2.3"), true)
-            .await
-            .expect("single-host dry run");
+        let out = deploy(
+            &config,
+            &state,
+            Some("web1.internal"),
+            Some("1.2.3"),
+            true,
+            false,
+        )
+        .await
+        .expect("single-host dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
         assert_eq!(out.json["host"], serde_json::json!("web1.internal"));
     }
@@ -3086,7 +3110,7 @@ upstream = "checkout_upstream"
         let pull = MULTI_HOST.replace("source = \"release\"", "source = \"pull\"");
         let config = write(dir.path(), "fraisier.toml", &pull);
         let state = dir.path().join("state");
-        let out = deploy(&config, &state, None, Some("1.2.3"), true)
+        let out = deploy(&config, &state, None, Some("1.2.3"), true, false)
             .await
             .expect("multi-host pull dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);

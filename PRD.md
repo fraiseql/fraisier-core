@@ -308,6 +308,20 @@ forward_compatible_lint = true
 # the adapter resolves the value via `ctx.secret("DATABASE_URL")`. For IPC
 # adapters the core reads the source var and re-exposes the value under the
 # logical name `DATABASE_URL` on the spawned child (Phase 1 review Decision 5).
+#
+# preflight_mode selects the pre-migration safety check (additive; defaults to
+# "live", and the legacy `forward_compatible_lint = false` still maps to "off"):
+#   "live"              run the adapter's forward-compat lint against the live DB
+#                       (the default — equivalent to forward_compatible_lint = true)
+#   "restore_rehearsal" DR-grade: restore a backup into a throwaway database and
+#                       rehearse the pending migrations there before touching the
+#                       live DB (requires the confiture adapter). Complementary to
+#                       the live lint, which still runs.
+#   "off"              skip every preflight
+# preflight_mode = "restore_rehearsal"
+# preflight_backup_path = "/backups/fraiseql-latest.dump"  # else a fresh dump is taken
+# The rehearsal is opt-in because a full restore is heavy on a large primary;
+# `fraisier trigger-deploy --skip-preflight` bypasses every preflight for one run.
 
 [service]
 adapter = "systemd"
@@ -363,7 +377,7 @@ fraisier list [--flat]
 fraisier health [--json] [--host <name>]
 fraisier deployment-status <fraise> [--per-host]
 
-fraisier trigger-deploy <fraise> <env> [--dry-run] [--force] [--strategy <name>] [--hosts <list>]
+fraisier trigger-deploy <fraise> <env> [--dry-run] [--force] [--strategy <name>] [--hosts <list>] [--skip-preflight]
 fraisier rollback <fraise> <env> [--to <revision>] [--hosts <list>]
 
 fraisier ship patch|minor|major [--dry-run] [--no-deploy]

@@ -196,7 +196,9 @@ impl AdapterError {
 
 /// Everything an adapter needs to act, minus secret *values* (see the module docs).
 ///
-/// This is `params.ctx` on the JSON-RPC wire; its field set is frozen.
+/// This is `params.ctx` on the JSON-RPC wire; its **serialized** field set is
+/// frozen. [`resolved_secrets`](Self::resolved_secrets) is `#[serde(skip)]` and
+/// so never appears on the wire — it is an in-process-only escape hatch.
 ///
 /// # Example
 /// ```
@@ -205,8 +207,9 @@ impl AdapterError {
 /// assert_eq!(ctx.fraise, "checkout");
 /// ```
 // No `PartialEq`: `settings` holds `serde_json::Value`, which is not `Eq`, and
-// nothing compares whole contexts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// nothing compares whole contexts. `Debug` is hand-written so the in-process
+// resolved secret *values* are never rendered.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AdapterCtx {
     /// The fraise (deployable) name.
     pub fraise: String,
@@ -221,6 +224,15 @@ pub struct AdapterCtx {
     /// Logical secret name → name of the env var to read on this process.
     /// Never carries secret *values*. Resolve via [`AdapterCtx::secret`].
     pub env_secrets: BTreeMap<String, String>,
+    /// In-process resolved secret *values*, checked by [`AdapterCtx::secret`]
+    /// **before** the [`env_secrets`](Self::env_secrets) indirection.
+    ///
+    /// `#[serde(skip)]`, so values never cross the IPC boundary (only in-process
+    /// adapters such as confiture observe them) and the redacting [`fmt::Debug`]
+    /// impl never renders them. Set via [`AdapterCtx::with_resolved_secret`]; used
+    /// by the restore-rehearsal preflight to point an adapter at a throwaway DB.
+    #[serde(skip)]
+    pub resolved_secrets: BTreeMap<String, String>,
     /// The previously deployed revision, for rollback diagnostics.
     pub previous_revision: Option<Revision>,
     /// The artifact currently staged or active, when known.
@@ -241,30 +253,73 @@ impl AdapterCtx {
             workdir: PathBuf::from("."),
             migrations_path: None,
             env_secrets: BTreeMap::new(),
+            resolved_secrets: BTreeMap::new(),
             previous_revision: None,
             artifact_ref: None,
             settings: BTreeMap::new(),
         }
     }
 
+    /// Return a clone of this context with `logical` resolved directly to `value`
+    /// in-process (bypassing the env-var indirection).
+    ///
+    /// The value is stored only in [`resolved_secrets`](Self::resolved_secrets),
+    /// which is never serialized — so it stays in-process and is observed only by
+    /// in-process adapters. Used by the restore-rehearsal preflight to redirect a
+    /// migration adapter at a throwaway database.
+    #[must_use]
+    pub fn with_resolved_secret(
+        mut self,
+        logical: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.resolved_secrets.insert(logical.into(), value.into());
+        self
+    }
+
     /// Resolve a secret by its logical name.
     ///
-    /// Behaves identically in-process and over IPC: it looks up `logical` in
-    /// [`AdapterCtx::env_secrets`] to find the source env var name, then reads
-    /// that variable from the process environment. The value never travels in
-    /// JSON params or argv.
+    /// Checks the in-process [`resolved_secrets`](Self::resolved_secrets) override
+    /// first; otherwise behaves identically in-process and over IPC, looking up
+    /// `logical` in [`AdapterCtx::env_secrets`] to find the source env var name and
+    /// reading that variable from the process environment. The value never travels
+    /// in JSON params or argv.
     ///
     /// # Errors
     /// [`AdapterErrorKind::MissingSecret`] if `logical` is not declared, or
     /// [`AdapterErrorKind::SecretReadFailed`] if the mapped env var is unset or
     /// not valid UTF-8.
     pub fn secret(&self, logical: &str) -> Result<String, AdapterError> {
+        if let Some(value) = self.resolved_secrets.get(logical) {
+            return Ok(value.clone());
+        }
         let source = self
             .env_secrets
             .get(logical)
             .ok_or_else(|| AdapterError::missing_secret(logical))?;
         std::env::var(source)
             .map_err(|cause| AdapterError::secret_read_failed(logical, source, &cause))
+    }
+}
+
+impl fmt::Debug for AdapterCtx {
+    /// Renders every field except the in-process resolved secret *values*, which
+    /// are shown only as their logical key names so a debug print can never leak a
+    /// resolved DSN/password.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted: Vec<&String> = self.resolved_secrets.keys().collect();
+        f.debug_struct("AdapterCtx")
+            .field("fraise", &self.fraise)
+            .field("environment", &self.environment)
+            .field("host", &self.host)
+            .field("workdir", &self.workdir)
+            .field("migrations_path", &self.migrations_path)
+            .field("env_secrets", &self.env_secrets)
+            .field("resolved_secrets", &redacted)
+            .field("previous_revision", &self.previous_revision)
+            .field("artifact_ref", &self.artifact_ref)
+            .field("settings", &self.settings)
+            .finish()
     }
 }
 
@@ -952,10 +1007,32 @@ mod tests {
             workdir: ".".into(),
             migrations_path: None,
             env_secrets: BTreeMap::new(),
+            resolved_secrets: BTreeMap::new(),
             previous_revision: None,
             artifact_ref: None,
             settings: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn resolved_secret_override_wins_over_env_and_is_redacted_in_debug() {
+        // An in-process resolved value short-circuits the env-var indirection…
+        let ctx = AdapterCtx::new("checkout", "production")
+            .with_resolved_secret("DATABASE_URL", "postgres://u:pw@h/throwaway");
+        assert_eq!(
+            ctx.secret("DATABASE_URL").expect("resolved"),
+            "postgres://u:pw@h/throwaway"
+        );
+        // …and the value never appears in a debug print (only its logical key does).
+        let rendered = format!("{ctx:?}");
+        assert!(
+            !rendered.contains("throwaway") && !rendered.contains("pw"),
+            "resolved secret value leaked into Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("DATABASE_URL"),
+            "the logical key should still be visible: {rendered}"
+        );
     }
 
     #[tokio::test]

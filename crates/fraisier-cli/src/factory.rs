@@ -24,11 +24,19 @@ use fraisier_core::adapter_axes::{
     AdapterCtx, ArtifactAdapter, HealthAdapter, HostId, LbAdapter, MigrationAdapter, ServiceAdapter,
 };
 use fraisier_core::multi_host::{MultiHostPlan, RolloutStrategy};
+use fraisier_core::restore_rehearsal::{BackupSource, RehearsalDb};
+use fraisier_core::single_host::PreflightMode;
 use fraisier_ipc::{Launcher, SshLauncher};
 use serde_json::Value;
 
+use crate::pg_rehearsal::PgRehearsalDb;
+
 /// The logical secret name every migration adapter resolves the DSN under.
 const DATABASE_URL_LOGICAL: &str = "DATABASE_URL";
+
+/// A resolved restore-rehearsal plan: the throwaway-DB lifecycle plus where its
+/// seed data comes from.
+type RestoreRehearsalPlan = (Arc<dyn RehearsalDb>, BackupSource);
 
 /// A read-only summary of the adapters a deploy would use — what `--dry-run`
 /// prints. Building it resolves no secrets and constructs no adapters.
@@ -67,6 +75,10 @@ pub struct ResolvedDeploy {
     /// Whether to run the migration adapter's forward-compatibility `preflight`
     /// lint (`[migration].forward_compatible_lint`, default `true`).
     pub forward_compatible_lint: bool,
+    /// When set, the restore-rehearsal preflight provisions a throwaway DB (via
+    /// the given [`RehearsalDb`]) seeded from [`BackupSource`] and rehearses the
+    /// pending migrations there. Populated when `preflight_mode = "restore_rehearsal"`.
+    pub restore_rehearsal: Option<RestoreRehearsalPlan>,
     /// The artifact adapter.
     pub artifact: Arc<dyn ArtifactAdapter>,
     /// The migration adapter (in-process or IPC).
@@ -75,6 +87,26 @@ pub struct ResolvedDeploy {
     pub service: Arc<dyn ServiceAdapter>,
     /// The health adapter.
     pub health: Arc<dyn HealthAdapter>,
+}
+
+/// Resolve the preflight knobs from `[migration]`: the live forward-compat lint
+/// toggle and the optional restore-rehearsal `(db, backup)` pair.
+fn resolve_preflight(config: &DeployConfig) -> (bool, Option<RestoreRehearsalPlan>) {
+    let Some(migration) = config.migration.as_ref() else {
+        return (true, None);
+    };
+    match migration.effective_preflight_mode() {
+        PreflightMode::Off => (false, None),
+        PreflightMode::Live => (true, None),
+        PreflightMode::RestoreRehearsal => {
+            let backup = migration
+                .preflight_backup_path
+                .clone()
+                .map_or(BackupSource::FreshDump, BackupSource::Archive);
+            let db: Arc<dyn RehearsalDb> = Arc::new(PgRehearsalDb);
+            (true, Some((db, backup)))
+        }
+    }
 }
 
 /// Resolve the single host the **single-host** builders target.
@@ -332,13 +364,9 @@ pub fn build(
     let mut env_secrets = BTreeMap::new();
     let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
 
-    // Default on: the forward-compat lint runs whenever the adapter advertises it,
-    // unless the operator opts out in the config.
-    let forward_compatible_lint = config
-        .migration
-        .as_ref()
-        .and_then(|m| m.forward_compatible_lint)
-        .unwrap_or(true);
+    // The forward-compat lint and (opt-in) restore-rehearsal are selected by
+    // `[migration].preflight_mode` (default `live`, legacy flag honoured).
+    let (forward_compatible_lint, restore_rehearsal) = resolve_preflight(config);
 
     let mut ctx = AdapterCtx::new(fraise.clone(), environment.clone());
     ctx.host = Some(host.clone());
@@ -356,6 +384,7 @@ pub fn build(
         host,
         ctx,
         forward_compatible_lint,
+        restore_rehearsal,
         artifact,
         migration,
         service,
@@ -1179,6 +1208,61 @@ mod tests {
         build, build_health, build_health_probe, build_multi_host, summarize, summarize_multi_host,
     };
     use fraisier_config::DeployConfig;
+    use fraisier_core::restore_rehearsal::BackupSource;
+
+    /// A single-host confiture config with the given extra `[migration]` lines.
+    fn single_host_with_migration(extra_migration: &str) -> String {
+        format!(
+            "[deploy]\nname = \"app\"\nenvironment = \"prod\"\n\n\
+             [artifact]\nsource = \"local\"\npath = \"/builds/app\"\nactive_path = \"/srv/app/current\"\n\n\
+             [migration]\nadapter = \"confiture\"\ndatabase_url_env = \"APP_DATABASE_URL\"\n{extra_migration}\n\
+             [service]\nadapter = \"systemd\"\nunit = \"app.service\"\n\n\
+             [health]\nadapter = \"http\"\nurl = \"http://127.0.0.1/health\"\n"
+        )
+    }
+
+    #[test]
+    fn preflight_mode_restore_rehearsal_wires_a_rehearsal_db() {
+        // Default backup source is a fresh dump.
+        let config = DeployConfig::from_toml_str(&single_host_with_migration(
+            "preflight_mode = \"restore_rehearsal\"\n",
+        ))
+        .expect("parses");
+        let resolved = build(&config, None, None).expect("builds");
+        assert!(
+            resolved.forward_compatible_lint,
+            "rehearsal keeps the live lint"
+        );
+        match resolved.restore_rehearsal {
+            Some((_, BackupSource::FreshDump)) => {}
+            Some((_, other)) => panic!("expected a fresh-dump rehearsal, got {other:?}"),
+            None => panic!("expected a rehearsal to be configured"),
+        }
+
+        // An explicit backup path selects the archive source.
+        let config = DeployConfig::from_toml_str(&single_host_with_migration(
+            "preflight_mode = \"restore_rehearsal\"\npreflight_backup_path = \"/backups/app.dump\"\n",
+        ))
+        .expect("parses");
+        let resolved = build(&config, None, None).expect("builds");
+        match resolved.restore_rehearsal {
+            Some((_, BackupSource::Archive(path))) => {
+                assert_eq!(path, std::path::PathBuf::from("/backups/app.dump"));
+            }
+            Some((_, other)) => panic!("expected an archive rehearsal, got {other:?}"),
+            None => panic!("expected a rehearsal to be configured"),
+        }
+    }
+
+    #[test]
+    fn preflight_mode_off_disables_both_preflights() {
+        let config =
+            DeployConfig::from_toml_str(&single_host_with_migration("preflight_mode = \"off\"\n"))
+                .expect("parses");
+        let resolved = build(&config, None, None).expect("builds");
+        assert!(!resolved.forward_compatible_lint);
+        assert!(resolved.restore_rehearsal.is_none());
+    }
 
     /// A single-host config whose `[health]` block is command-driven, with the
     /// given extra health lines appended (e.g. `timeout_ms = …`).

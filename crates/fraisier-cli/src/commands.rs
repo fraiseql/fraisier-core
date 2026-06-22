@@ -686,7 +686,7 @@ pub(crate) fn scheduled_uninstall(
 }
 
 /// `validate-config`: parse, expand, and validate, reporting every located issue.
-pub(crate) fn validate_config(config_path: &Path) -> Result<CommandOutput> {
+pub(crate) fn validate_config(config_path: &Path, resolve_envvars: bool) -> Result<CommandOutput> {
     let toml = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading config {}", config_path.display()))?;
     match DeployConfig::from_toml_str(&toml) {
@@ -696,18 +696,41 @@ pub(crate) fn validate_config(config_path: &Path) -> Result<CommandOutput> {
             json: json!({ "ok": false, "parse_error": error.to_string() }),
         }),
         Ok(config) => {
+            let structurally_ok = config.validate().ok();
+            // Default: structure-only (no secrets resolved). `--resolve-envvars`
+            // additionally requires every referenced `*_env` source var to be set.
+            let unset_secrets: Vec<String> = if resolve_envvars {
+                crate::doctor::referenced_secrets(&config)
+                    .into_iter()
+                    .filter(|(_, source)| {
+                        !std::env::var(source).is_ok_and(|value| !value.is_empty())
+                    })
+                    .map(|(purpose, source)| format!("{purpose}: ${source}"))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let report = config.validate();
-            let ok = report.ok();
+            let ok = structurally_ok && unset_secrets.is_empty();
             let mut pretty = render_issues(&report);
-            pretty.push_str(match (ok, report.issues.is_empty()) {
-                (true, true) => "config is valid\n",
-                (true, false) => "config is valid (warnings only)\n",
-                (false, _) => "config is INVALID\n",
-            });
+            for unset in &unset_secrets {
+                let _ = writeln!(pretty, "  [error] unresolved secret: {unset}");
+            }
+            pretty.push_str(
+                match (ok, report.issues.is_empty() && unset_secrets.is_empty()) {
+                    (true, true) => "config is valid\n",
+                    (true, false) => "config is valid (warnings only)\n",
+                    (false, _) => "config is INVALID\n",
+                },
+            );
             Ok(CommandOutput {
                 exit_code: i32::from(!ok),
                 pretty,
-                json: json!({ "ok": ok, "issues": serde_json::to_value(&report.issues)? }),
+                json: json!({
+                    "ok": ok,
+                    "issues": serde_json::to_value(&report.issues)?,
+                    "unresolved_secrets": unset_secrets,
+                }),
             })
         }
     }
@@ -2436,7 +2459,8 @@ url = "http://127.0.0.1:8080/health"
     fn validate_config_accepts_a_valid_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write(dir.path(), "fraisier.toml", VALID);
-        let out = validate_config(&path).expect("run");
+        // Structure-only by default: no secrets need be set.
+        let out = validate_config(&path, false).expect("run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
         assert_eq!(out.json["ok"], serde_json::json!(true));
     }
@@ -2447,12 +2471,35 @@ url = "http://127.0.0.1:8080/health"
         // confiture without database_url_env.
         let bad = VALID.replace("database_url_env = \"CHECKOUT_DATABASE_URL\"\n", "");
         let path = write(dir.path(), "fraisier.toml", &bad);
-        let out = validate_config(&path).expect("run");
+        let out = validate_config(&path, false).expect("run");
         assert_eq!(out.exit_code, 1);
         let issues = out.json["issues"].as_array().expect("issues array");
         assert!(issues
             .iter()
             .any(|i| i["path"] == "migration.database_url_env"));
+    }
+
+    #[test]
+    fn validate_config_resolve_envvars_fails_on_an_unset_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Reference a uniquely-named env var that is never set in the test env.
+        let cfg = VALID.replace(
+            "database_url_env = \"CHECKOUT_DATABASE_URL\"",
+            "database_url_env = \"VALIDATE_RESOLVE_NEVER_SET\"",
+        );
+        let path = write(dir.path(), "fraisier.toml", &cfg);
+        // Structure-only still passes…
+        assert_eq!(validate_config(&path, false).expect("run").exit_code, 0);
+        // …but resolving secrets fails because the source var is unset.
+        let out = validate_config(&path, true).expect("run");
+        assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
+        assert!(
+            out.json["unresolved_secrets"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+            "json: {}",
+            out.json
+        );
     }
 
     #[test]

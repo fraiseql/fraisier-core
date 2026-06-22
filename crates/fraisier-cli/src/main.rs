@@ -13,6 +13,7 @@
 #![allow(clippy::redundant_pub_crate)]
 
 mod commands;
+mod doctor;
 #[cfg(test)]
 mod e2e;
 mod factory;
@@ -106,6 +107,33 @@ enum Command {
 
     /// Install the generated system files (and optionally prune stale ones).
     ScaffoldInstall(ScaffoldInstallArgs),
+
+    /// Diagnose the install: config loads/validates, secrets readable, toolchain.
+    Doctor(DoctorArgs),
+
+    /// Report which env vars a subcommand would read, and which are unset.
+    EnvCheck(EnvCheckArgs),
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Run only the named check(s) (repeatable). Empty = all checks.
+    #[arg(long = "check")]
+    checks: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct EnvCheckArgs {
+    /// The subcommand to inspect (e.g. `deploy`, `webhook-server`).
+    subcommand: String,
+
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -257,6 +285,12 @@ struct ConfigArgs {
     /// Path to the `fraisier.toml`.
     #[arg(long, default_value = "fraisier.toml")]
     config: PathBuf,
+
+    /// Also resolve secrets: fail if any referenced `*_env` source variable is
+    /// unset. Off by default (structure-only validation, no secrets required);
+    /// turn it on for a pre-deploy CI gate.
+    #[arg(long)]
+    resolve_envvars: bool,
 }
 
 #[derive(Debug, Args)]
@@ -634,10 +668,15 @@ async fn main() -> ExitCode {
     }
 }
 
+// Reason: a flat one-arm-per-subcommand dispatch; splitting it would scatter the
+// command table without reducing complexity.
+#[allow(clippy::too_many_lines)]
 async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
     match &cli.command {
         Command::Init(args) => commands::init(&args.config, args.force),
-        Command::ValidateConfig(args) => commands::validate_config(&args.config),
+        Command::ValidateConfig(args) => {
+            commands::validate_config(&args.config, args.resolve_envvars)
+        }
         Command::Deploy(args) => {
             commands::deploy(
                 &args.config,
@@ -734,6 +773,8 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::ScaffoldInstall(args) => {
             commands::scaffold_install(&args.config, &args.root, args.prune, args.yes, args.dry_run)
         }
+        Command::Doctor(args) => Ok(doctor::doctor(&args.config, &args.checks)),
+        Command::EnvCheck(args) => Ok(doctor::env_check(&args.config, &args.subcommand)),
     }
 }
 

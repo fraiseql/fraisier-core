@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-beta.4] - 2026-06-22
+
 ### Added
 
 - **Restore-rehearsal migration preflight** (`[migration].preflight_mode =

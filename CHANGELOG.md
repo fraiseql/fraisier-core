@@ -6,6 +6,58 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Restore-rehearsal migration preflight** (`[migration].preflight_mode =
+  "live" | "restore_rehearsal" | "off"`, default `"live"`). In
+  `restore_rehearsal` mode a deploy provisions a throwaway copy of the database
+  from a backup (`preflight_backup_path`, else a fresh dump), rehearses the
+  pending migrations there, and tears it down — *before* touching the live DB. A
+  **full** restore carries the migration-tracking rows, so the pending set
+  resolves from the throwaway's own tracking table; the rehearsal is
+  self-consistent by construction, avoiding the Python-0.34 backup-behind-tracking
+  bug rather than porting its fix. Opt-in (a full restore is heavy); the legacy
+  `forward_compatible_lint = false` still maps to `"off"`. Escape hatch:
+  `trigger-deploy --skip-preflight`. Confiture floor: ≥ 0.23 (window-safe verdict).
+- **`ship --no-bump`** re-ships the current version (no bump, no version-file
+  edit, no release commit — just (re)pushes `HEAD` to retrigger the deploy);
+  mutually exclusive with a bump level. **Version-race detection**: before
+  committing a bump, `ship` re-reads the version at `origin/<branch>` and, if it
+  advanced, rolls back the on-disk bump and returns a named error with a
+  copy-pasteable rebase recipe instead of a raw non-fast-forward git error.
+- **Smoke-test token providers** for the http health probe (`[health].token_provider`):
+  `exec`, `oauth2_client_credentials`, and `oauth2_refresh_token` acquire a
+  short-lived bearer at deploy time and inject it (default `Bearer {token}` into
+  `Authorization`), resolved at most once per deploy. Secrets resolve via
+  `AdapterCtx::secret` (never config values); tokens and secrets never appear in
+  logs or errors. `[health].headers` adds static probe headers. `validate-config`
+  rejects a bad `format`, a header collision, and a token provider on a non-http
+  adapter.
+- **Webhook self-upgrade drain**: while a coordinated restart is draining
+  (a `.draining` flag in the state dir), a verified deploy `POST` is refused with
+  `503` + `Retry-After` + a JSON body naming the refused fraises, instead of being
+  dropped. New defaulted `[webhook].self_upgrade_*` keys tune the drain
+  (`drain_timeout_s` 600, `drain_poll_s` 1, `drain_settle_s` 2, `retry_after_s`
+  60). See `docs/operations/self-upgrade.md`.
+- **`scheduled install` drift policy + `--prune`**: each unit is classified
+  Absent / Identical / Drifted; Identical is an idempotent no-op, Drifted fails
+  the install closed unless `--force`, and `--prune` removes marker-bearing
+  scheduled units no longer declared (reusing the existing prune marker
+  machinery).
+- **`fraisier doctor`** (host self-diagnosis: config loads/validates, referenced
+  secrets readable, confiture ≥ floor; exits 0/1/2 = pass/fail/warn) and
+  **`fraisier env-check <subcommand>`** (which env-var secrets a subcommand reads,
+  and which are unset; exits 0/1/2).
+- **Global `--verbose`/`-v`** (repeatable, mutually exclusive with `--json`).
+  Output stays compact by default and never auto-upgrades under
+  `CI`/`CLAUDECODE`/no-TTY.
+
+### Changed
+
+- **`validate-config` is structure-only by default** (no secrets resolved);
+  `--resolve-envvars` adds a pre-deploy CI gate that fails when any referenced
+  `*_env` source variable is unset.
+
 ## [1.0.0-beta.3] - 2026-06-11
 
 ### Added

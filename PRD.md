@@ -106,7 +106,7 @@ The honestly-disclosed trade: more architectural work in week 1, less adapter-po
 | Webhook server | socket-activated | ✅ Required + standalone HTTP fallback |
 | Bootstrap | SSH-based | ✅ Required (Python-subprocess fallback acceptable for beta) |
 | Scaffold | `scaffold`, `scaffold-install` | ✅ Required, with `--prune` |
-| Release workflow | `ship` | ✅ For `Cargo.toml` and `pyproject.toml`; runs `[[checks]]` as a pre-bump gate (`--no-check` to skip) |
+| Release workflow | `ship` | ✅ For `Cargo.toml` and `pyproject.toml`; runs `[[checks]]` as a pre-bump gate (`--no-check`); `--no-bump` re-ships the current version; version-race detection against `origin` (rolls back the bump + rebase recipe). GitHub-PR/auto-merge releases stay in CI / `gh` / release-plz (Decision 2026-06-22). |
 | Project checks | `check` | ✅ Declarative `[[checks]]`, cross-check parallelism (`-j`), single source of truth local + CI |
 | Versioning | `version show`, `version bump` | ✅ Required |
 | DB operations | `db migrate`, `db restore`, `db reset`, `backup` | ✅ Required |
@@ -115,8 +115,10 @@ The honestly-disclosed trade: more architectural work in week 1, less adapter-po
 | Sync (deploy-state ledger) | (Python `sync` is git source-branch promotion — a *different* feature) | ✅ Shares deploy state over `refs/fraisier/sync/<fraise>/<env>`. Git source-branch promotion + orphan reclaim is **out of scope** (CI / `gh`; Decision 2026-06-22). |
 | Providers | `providers`, `provider-test` | ✅ Required |
 | Init | `fraisier init` | ✅ Required |
-| Self-upgrade restart | v0.31 coordinated restart | ⏳ Graceful SIGTERM ships; the 503 + `Retry-After` drain handshake is being completed (gap-bridging Phase 04). |
-| Scheduled install | v0.30/v0.32 features | ⏳ install/list/uninstall ship; drift classification + scheduled `--prune` is being completed (gap-bridging Phase 05A). |
+| Self-upgrade restart | v0.31 coordinated restart | ✅ Graceful SIGTERM + a drain flag: a draining server refuses new deploys with `503` + `Retry-After`; the bounded drain coordinator clears in-flight deploys before restart (the restart-command probe wiring is a follow-up). |
+| Scheduled install | v0.30/v0.32 features | ✅ install/list/uninstall + drift classification (Absent/Identical/Drifted, fail-closed unless `--force`) + `--prune` orphan removal on the shared marker machinery. |
+| Restore-rehearsal preflight | (none — exceeds Python) | ✅ Opt-in DR preflight: restore a backup into a throwaway DB and rehearse the pending migrations there before touching live; self-consistent by construction. |
+| Smoke-test token providers | v0.22 `token_provider` | ✅ `exec` / `oauth2_client_credentials` / `oauth2_refresh_token` acquire a deploy-time bearer for the http health probe; resolved once per deploy; secrets via `AdapterCtx::secret`. |
 | Observability | logs only | ✅ OpenTelemetry traces + structured logs |
 | Forward-compat migration lint | (none) | ✅ Via the migration adapter's `preflight` capability (Confiture native; `command` declines) |
 

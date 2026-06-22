@@ -352,6 +352,12 @@ config_path = "/etc/nginx/sites-available/fraiseql"
 upstream = "fraiseql_upstream"
 ```
 
+A `[webhook]` server additionally accepts four defaulted self-upgrade-drain
+tunables — `self_upgrade_drain_timeout_s` (600), `self_upgrade_drain_poll_s` (1),
+`self_upgrade_drain_settle_s` (2), `self_upgrade_retry_after_s` (60) — that bound
+the coordinated-restart drain (a draining server answers new deploys `503` +
+`Retry-After`; see `docs/operations/self-upgrade.md`).
+
 ### 7.1a SpecQL-deployed app preset
 
 For applications deployed via SpecQL (the FraiseQL stack's umbrella product), a one-line preset replaces most of the explicit configuration. The preset fills in Confiture + fraiseql defaults automatically.

@@ -1938,6 +1938,18 @@ pub(crate) async fn webhook_server(
         tolerance_secs: webhook.tolerance_secs.unwrap_or(300),
         max_body_bytes: webhook.max_body_bytes.unwrap_or(1024 * 1024),
         read_timeout: std::time::Duration::from_secs(webhook.read_timeout_secs.unwrap_or(30)),
+        // A self-upgrade restart raises this flag (in the state dir) to drain
+        // in-flight deploys; while it exists, new deploys get a retriable 503.
+        drain: fraisier_webhook::Drain {
+            flag_path: Some(state_dir.join(".draining")),
+            retry_after_s: webhook.self_upgrade_retry_after_s.unwrap_or(60),
+            refused: config
+                .deploy
+                .as_ref()
+                .and_then(|d| d.name.clone())
+                .into_iter()
+                .collect(),
+        },
     };
     let (listener, source) = fraisier_webhook::acquire(&listen)
         .await

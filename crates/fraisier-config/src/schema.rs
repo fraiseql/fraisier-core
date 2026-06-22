@@ -373,6 +373,23 @@ pub struct WebhookSection {
     /// Defaults to `30`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_timeout_secs: Option<u64>,
+    /// Self-upgrade drain: how long (seconds) to wait for in-flight deploys to
+    /// finish before restarting. Default `600`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_upgrade_drain_timeout_s: Option<u64>,
+    /// Self-upgrade drain: how often (seconds) to poll for in-flight deploys.
+    /// Default `1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_upgrade_drain_poll_s: Option<u64>,
+    /// Self-upgrade drain: settle window (seconds) after setting the drain flag,
+    /// so dispatch-accepted deploys reach their lock before the wait begins.
+    /// Default `2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_upgrade_drain_settle_s: Option<u64>,
+    /// Self-upgrade drain: the `Retry-After` (seconds) returned on a 503 drain
+    /// refusal. Default `60`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_upgrade_retry_after_s: Option<u64>,
 }
 
 /// The `[sync]` section: how the deploy ledger is shared across operators

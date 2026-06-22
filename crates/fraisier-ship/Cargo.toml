@@ -17,7 +17,7 @@ workspace = true
 
 [dependencies]
 # Edit version fields in place, preserving the file's formatting and comments.
-toml_edit = "0.22.22"
+toml_edit = "0.25.12"
 # Parse and increment semantic versions.
 semver = "1.0.23"
 thiserror = "2.0.17"

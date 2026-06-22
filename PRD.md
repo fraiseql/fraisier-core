@@ -112,11 +112,11 @@ The honestly-disclosed trade: more architectural work in week 1, less adapter-po
 | DB operations | `db migrate`, `db restore`, `db reset`, `backup` | ✅ Required |
 | Status / introspection | `deployment-status`, `list`, `health` | ✅ Required |
 | Rollback (manual) | `rollback` | ✅ Required |
-| Sync | `fraisier/sync/*` namespace + orphan reclaim | ✅ Required |
+| Sync (deploy-state ledger) | (Python `sync` is git source-branch promotion — a *different* feature) | ✅ Shares deploy state over `refs/fraisier/sync/<fraise>/<env>`. Git source-branch promotion + orphan reclaim is **out of scope** (CI / `gh`; Decision 2026-06-22). |
 | Providers | `providers`, `provider-test` | ✅ Required |
 | Init | `fraisier init` | ✅ Required |
-| Self-upgrade restart | v0.31 coordinated restart | ✅ Required |
-| Scheduled install | v0.30/v0.32 features | ✅ Required |
+| Self-upgrade restart | v0.31 coordinated restart | ⏳ Graceful SIGTERM ships; the 503 + `Retry-After` drain handshake is being completed (gap-bridging Phase 04). |
+| Scheduled install | v0.30/v0.32 features | ⏳ install/list/uninstall ship; drift classification + scheduled `--prune` is being completed (gap-bridging Phase 05A). |
 | Observability | logs only | ✅ OpenTelemetry traces + structured logs |
 | Forward-compat migration lint | (none) | ✅ Via the migration adapter's `preflight` capability (Confiture native; `command` declines) |
 
@@ -561,3 +561,6 @@ If all five hold, rename + publish. If any fail, name the gap, defer the rename,
 | 2026-05-31 | Blue-green deferred to v1.0.0 GA, designed-in via the multi-host plan. | LB integration surface is real work; ship `rolling` first, prove it, then blue-green. |
 | 2026-05-31 | Postgres state backend deferred to v1.1. | Trait shape supports it; concrete implementation can wait. |
 | 2026-06-02 | **Drop `fraises.yaml` runtime compatibility (G6 / §7.2 / §10.1).** | The project has one Python fraisier user, who will hand-convert to `fraisier.toml`. A runtime parser plus a synthesized fixture corpus would prove only that it parses configs we invented — the real Python corpus is not in this repo. The native format is the single source of truth; the `framework → adapter` mapping survives as direct native config. Withdraws Cycles 2.8–2.11. |
+| 2026-06-22 | **Adopt `fraisier doctor` + `fraisier env-check` (gap-matrix Row 9).** | Host self-diagnosis (toolchain/config/secret-readability checks, exit 0/1/2) and per-subcommand env-var introspection are cheap, read-only, and high-leverage for operators; they compose with the lazy-secret introspection map. Built in the operational-parity phase; added to §8 CLI. |
+| 2026-06-22 | **`ship` stays direct-push; no GitHub-PR/auto-merge flow in core (gap-matrix Row 5 — WON'T).** | fraisier-core `ship` bumps + commits + pushes (+ optional deploy) and runs `[[checks]]` as a pre-bump gate. GitHub PR creation + `--auto`-merge releases already live in CI / `gh` / release-plz, which is the project's release model. Duplicating that flow in `ship` would contradict it. Version-race detection (model-agnostic) is still added to `ship`. |
+| 2026-06-22 | **`sync` stays the deploy-state ledger; no git source-branch `promote` in core (gap-matrix Row 12 — WON'T).** | Python `sync` promotes git source branches dev→staging via PR; fraisier-core `sync` is a *different feature* — it shares the deploy state ledger over `refs/fraisier/sync/<fraise>/<env>`. Overloading `sync` (or adding a `promote`) would graft a git/`gh` branch-promotion subsystem onto a deploy-coordination tool. Branch promotion stays in CI / `gh` / Python fraisier. |

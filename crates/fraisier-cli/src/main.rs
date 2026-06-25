@@ -375,6 +375,10 @@ struct HealthArgs {
     /// Probe only this host (inventory name or address).
     #[arg(long)]
     host: Option<String>,
+
+    /// Directory for the filesystem state store (read for the deployed version).
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -709,7 +713,9 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
             .await
         }
         Command::List(args) => commands::list(&args.state_dir, args.flat).await,
-        Command::Health(args) => commands::health(&args.config, args.host.as_deref()).await,
+        Command::Health(args) => {
+            commands::health(&args.config, args.host.as_deref(), &args.state_dir).await
+        }
         Command::Rollback(args) => {
             commands::rollback(
                 &args.config,

@@ -6,6 +6,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`fraisier health` reports the live deployed version.** Alongside each host's
+  health verdict, the command now surfaces the live deployed version and
+  migration revision (`version` / `revision` in `--json`; a `version:` line in
+  the pretty output), giving operators and CI a "what is actually live right
+  now?" signal — parity with the Python `fraisier` `/health`. The version is read
+  **only** from the committed release ledger (`DeployRecord`), which is written
+  post-commit, so a deploy that fails before commit (e.g. at `migrate`) keeps
+  reporting the *previous* version, never an in-flight one. The frozen
+  `HealthStatus` / `HealthAdapter` probe API is unchanged. (#21)
+
+### Changed
+
+- **`check` / `ship` cap a failing check's console output to the tail.** When a
+  failing check's combined stdout+stderr exceeds 30 lines, the report now prints
+  only the last 30 (where pytest/ruff/mypy put their verdict) prefixed with a
+  `... N earlier line(s) hidden` note, and writes the full output to a `0o600`
+  log under `$XDG_DATA_HOME/fraisier/logs/ship-check-<name>-<stamp>.log`
+  (falling back to `~/.local/share/...`), naming the path so nothing is lost.
+  Short failures still print whole. Log writing is best-effort — an I/O error
+  degrades to "tail only" rather than masking the failure. The `--json` report
+  is unchanged (it still carries the full stdout/stderr). Parity with Python
+  `fraisier` v0.36.0. (#20)
+
 ## [1.0.0-beta.4] - 2026-06-22
 
 ### Added

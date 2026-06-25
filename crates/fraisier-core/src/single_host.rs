@@ -1448,6 +1448,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_migrate_leaves_the_prior_version_in_the_ledger() {
+        // The release ledger is the only durable "what version is live" signal,
+        // and it is written *only* post-commit. A deploy that fails before commit
+        // (here at `migrate`) must therefore leave the ledger naming the prior
+        // version — never the in-flight one. This is the property #21's
+        // health-reported version relies on: it can never surface a version that
+        // was not actually deployed.
+        let (_dir, store) = store();
+        seed_prior(&store).await; // ledger starts at v-old / rev-old
+        let trail = Trail::default();
+        let mut migration = FakeMigration::healthy(&trail);
+        migration.fail_up = true; // the in-flight deploy would have been v-new
+        let plan = deploy(
+            &trail,
+            FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            },
+            migration,
+            FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            },
+        );
+
+        let outcome = plan.run(store.clone()).await.expect("run");
+        assert!(
+            matches!(&outcome, SagaOutcome::RolledBack { failed_step, .. } if failed_step == "migrate"),
+            "got {outcome:?}"
+        );
+
+        // The committed ledger still names v-old / rev-old — the in-flight v-new
+        // was never recorded because commit never happened.
+        let snapshot = store
+            .current_snapshot(&key())
+            .await
+            .expect("query")
+            .expect("prior ledger intact");
+        let record: DeployRecord = serde_json::from_value(snapshot).expect("decode");
+        assert_eq!(record.active.expect("active").artifact.id, "v-old");
+        assert_eq!(record.revision, Some(Revision::new("rev-old")));
+    }
+
+    #[tokio::test]
     async fn preflight_block_fails_before_any_mutation() {
         let (_dir, store) = store();
         let trail = Trail::default();

@@ -6,6 +6,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`check` / `ship` cap a failing check's console output to the tail.** When a
+  failing check's combined stdout+stderr exceeds 30 lines, the report now prints
+  only the last 30 (where pytest/ruff/mypy put their verdict) prefixed with a
+  `... N earlier line(s) hidden` note, and writes the full output to a `0o600`
+  log under `$XDG_DATA_HOME/fraisier/logs/ship-check-<name>-<stamp>.log`
+  (falling back to `~/.local/share/...`), naming the path so nothing is lost.
+  Short failures still print whole. Log writing is best-effort — an I/O error
+  degrades to "tail only" rather than masking the failure. The `--json` report
+  is unchanged (it still carries the full stdout/stderr). Parity with Python
+  `fraisier` v0.36.0. (#20)
+
 ## [1.0.0-beta.4] - 2026-06-22
 
 ### Added

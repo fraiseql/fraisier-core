@@ -215,6 +215,13 @@ name = "test"
 command = "cargo test --workspace"
 ```
 
+A failing check's captured output is shown inline. When it runs long (more than
+30 lines) only the **tail** — where pytest/ruff/mypy print their verdict — is
+printed, and the full stdout+stderr is written to a `0o600` log under
+`$XDG_DATA_HOME/fraisier/logs/` (falling back to `~/.local/share/...`) whose path
+is named in the report, so nothing is lost. Small failures print whole. The
+`--json` report always carries the full output regardless.
+
 ### Perf-regression rollback gate
 
 The `command` health adapter turns the saga's post-deploy `health` step into an

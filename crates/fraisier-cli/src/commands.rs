@@ -372,8 +372,16 @@ fn duration_ms(duration: std::time::Duration) -> u64 {
 
 /// The human-readable check report: one line per check (captured output shown
 /// for failures), then a pass/total summary.
+/// Max lines of a failing check's captured output shown inline before the
+/// report switches to "tail + full log on disk". Tools (pytest, ruff, mypy)
+/// print their verdict at the *end*, so the tail is the part worth keeping on
+/// screen; everything earlier is written to a `0o600` log and named by path so
+/// nothing is lost. Small failures (≤ this many lines) print whole.
+const CHECK_OUTPUT_TAIL_LINES: usize = 30;
+
 fn render_check_report(run: &fraisier_check::CheckRunReport) -> String {
     use fraisier_check::CheckStatus;
+    let log_dir = check_log_dir();
     let mut out = String::new();
     for outcome in &run.outcomes {
         let tag = match outcome.status {
@@ -384,15 +392,153 @@ fn render_check_report(run: &fraisier_check::CheckRunReport) -> String {
         let ms = duration_ms(outcome.duration);
         let _ = writeln!(out, "  [{tag}] {} ({ms} ms)", outcome.name);
         if !outcome.passed() {
-            for line in outcome.stdout.lines().chain(outcome.stderr.lines()) {
-                let _ = writeln!(out, "      {line}");
-            }
+            let lines: Vec<&str> = outcome
+                .stdout
+                .lines()
+                .chain(outcome.stderr.lines())
+                .collect();
+            // Only spend a log file (and an I/O round-trip) when the output
+            // actually overflows the window.
+            let log_path = if lines.len() > CHECK_OUTPUT_TAIL_LINES {
+                log_dir.as_deref().and_then(|dir| {
+                    write_check_log(dir, &outcome.name, &outcome.stdout, &outcome.stderr)
+                })
+            } else {
+                None
+            };
+            out.push_str(&render_failed_output(
+                &lines,
+                CHECK_OUTPUT_TAIL_LINES,
+                log_path.as_deref(),
+            ));
         }
     }
     let total = run.outcomes.len();
     let passed = total - run.failed_count();
     let _ = writeln!(out, "{passed}/{total} checks passed");
     out
+}
+
+/// Formats the captured-output block for one failing check. Output that fits
+/// within `window` lines is shown whole (the small-failure fast path — no note,
+/// no log). When it overflows, only the last `window` lines (the tail, where the
+/// verdict lives) are shown, prefixed with a note naming how many lines were
+/// hidden and — when the full log was written — its path.
+fn render_failed_output(lines: &[&str], window: usize, log_path: Option<&Path>) -> String {
+    let mut block = String::new();
+    if lines.len() > window {
+        let hidden = lines.len() - window;
+        match log_path {
+            Some(path) => {
+                let _ = writeln!(
+                    block,
+                    "      ... {hidden} earlier line(s) hidden; full output: {}",
+                    path.display()
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    block,
+                    "      ... {hidden} earlier line(s) hidden (full-log write failed)"
+                );
+            }
+        }
+        for line in &lines[lines.len() - window..] {
+            let _ = writeln!(block, "      {line}");
+        }
+    } else {
+        for line in lines {
+            let _ = writeln!(block, "      {line}");
+        }
+    }
+    block
+}
+
+/// The directory for full check-failure logs: `$XDG_DATA_HOME/fraisier/logs`,
+/// falling back to `$HOME/.local/share/fraisier/logs`. Returns `None` when
+/// neither is usable, so the caller degrades to "tail only".
+fn check_log_dir() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        let xdg = PathBuf::from(xdg);
+        // Per the XDG spec a relative `XDG_DATA_HOME` is invalid and ignored.
+        if xdg.is_absolute() {
+            return Some(xdg.join("fraisier").join("logs"));
+        }
+    }
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    if home.as_os_str().is_empty() {
+        return None;
+    }
+    Some(
+        home.join(".local")
+            .join("share")
+            .join("fraisier")
+            .join("logs"),
+    )
+}
+
+/// Best-effort: writes the full captured output of a failing check to
+/// `<dir>/ship-check-<slug>-<stamp>.log` (mode `0o600`) and returns its path.
+/// Any I/O error yields `None` so the report degrades to "tail only" rather than
+/// masking the check failure.
+fn write_check_log(dir: &Path, name: &str, stdout: &str, stderr: &str) -> Option<PathBuf> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::create_dir_all(dir).ok()?;
+    let path = dir.join(format!(
+        "ship-check-{}-{}.log",
+        slugify(name),
+        unix_millis()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .ok()?;
+    file.write_all(check_log_body(name, stdout, stderr).as_bytes())
+        .ok()?;
+    Some(path)
+}
+
+/// The on-disk log body: the check name then its full stdout and stderr under
+/// labeled sections, each newline-terminated so the two streams stay distinct.
+fn check_log_body(name: &str, stdout: &str, stderr: &str) -> String {
+    let mut body = format!("check: {name}\n\n=== stdout ===\n");
+    body.push_str(stdout);
+    if !stdout.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str("\n=== stderr ===\n");
+    body.push_str(stderr);
+    if !stderr.ends_with('\n') {
+        body.push('\n');
+    }
+    body
+}
+
+/// A filesystem-safe slug for a check name: ASCII alphanumerics, `-` and `_`
+/// pass through; every other character collapses to `-`.
+fn slugify(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Milliseconds since the Unix epoch, for log-file stamps; `0` if the clock
+/// reads before the epoch.
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
 }
 
 /// The machine-readable check report (the frozen `check` JSON shape).
@@ -2451,9 +2597,9 @@ mod tests {
     use super::{
         apply_exit, bootstrap, check, classify_source, db_backup, db_migrate, db_reset, db_restore,
         deploy, discover_adapters, health, init, list, notify_deploy_failure, provider_test,
-        providers, rollback, scaffold, scaffold_install, scheduled_install, scheduled_list,
-        scheduled_uninstall, ship, status, sync, validate_config, version_bump, version_show,
-        webhook_server, ShipArgs,
+        providers, render_check_report, render_failed_output, rollback, scaffold, scaffold_install,
+        scheduled_install, scheduled_list, scheduled_uninstall, ship, slugify, status, sync,
+        validate_config, version_bump, version_show, webhook_server, write_check_log, ShipArgs,
     };
     use fraisier_config::DeployConfig;
     use fraisier_core::single_host::DeployRecord;
@@ -2849,6 +2995,158 @@ url = "http://127.0.0.1:8080/health"
         let out = check(&config, dir.path(), 1).await.expect("check");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
         assert_eq!(out.json["checks"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn render_failed_output_shows_short_output_whole() {
+        let lines = ["alpha", "beta", "gamma"];
+        let block = render_failed_output(&lines, 30, None);
+        assert!(
+            block.contains("alpha") && block.contains("gamma"),
+            "{block}"
+        );
+        assert!(
+            !block.contains("hidden"),
+            "short output gets no note: {block}"
+        );
+    }
+
+    #[test]
+    fn render_failed_output_caps_to_tail_and_names_the_log() {
+        let owned: Vec<String> = (0..40).map(|i| format!("L{i}")).collect();
+        let lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let path = Path::new("/data/fraisier/logs/x.log");
+        let block = render_failed_output(&lines, 30, Some(path));
+        // 40 lines, window 30 → 10 hidden; tail is L10..L39.
+        assert!(block.contains("10 earlier line(s) hidden"), "{block}");
+        assert!(
+            block.contains("full output: /data/fraisier/logs/x.log"),
+            "{block}"
+        );
+        assert!(
+            !block.contains("L9"),
+            "an early line must be hidden: {block}"
+        );
+        assert!(block.contains("L10"), "the tail must start at L10: {block}");
+        assert!(
+            block.contains("L39"),
+            "the verdict tail must survive: {block}"
+        );
+    }
+
+    #[test]
+    fn render_failed_output_degrades_when_no_log_written() {
+        let owned: Vec<String> = (0..40).map(|i| format!("L{i}")).collect();
+        let lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let block = render_failed_output(&lines, 30, None);
+        assert!(block.contains("earlier line(s) hidden"), "{block}");
+        assert!(block.contains("full-log write failed"), "{block}");
+        assert!(
+            block.contains("L39"),
+            "tail still shown when the log failed: {block}"
+        );
+    }
+
+    #[test]
+    fn slugify_replaces_unsafe_chars() {
+        assert_eq!(slugify("a b/c:d"), "a-b-c-d");
+        assert_eq!(slugify("keep_-09AZ"), "keep_-09AZ");
+    }
+
+    #[test]
+    fn write_check_log_writes_full_output_as_0o600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let logs = dir.path().join("logs");
+        let path =
+            write_check_log(&logs, "pytest::suite/x", "OUT-LINE\n", "ERR-LINE\n").expect("log");
+        assert!(path.starts_with(&logs));
+        let name = path
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.starts_with("ship-check-pytest--suite-x-"),
+            "slugged, stamped name: {name}"
+        );
+        assert_eq!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("log"),
+            "{name}"
+        );
+        let body = std::fs::read_to_string(&path).expect("read log");
+        assert!(
+            body.contains("OUT-LINE") && body.contains("ERR-LINE"),
+            "{body}"
+        );
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "log must be owner-only");
+    }
+
+    #[test]
+    fn render_check_report_caps_long_failure_and_writes_a_full_log() {
+        use fraisier_check::{CheckOutcome, CheckRunReport, CheckStatus};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::Duration;
+
+        // Lock the env: `render_check_report` reads `XDG_DATA_HOME`. The whole
+        // function is synchronous, so the guard is never held across an `.await`.
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let data = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("XDG_DATA_HOME", data.path());
+
+        let stdout = (0..50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let report = CheckRunReport {
+            outcomes: vec![CheckOutcome {
+                name: "pytest".to_owned(),
+                status: CheckStatus::Failed,
+                code: Some(1),
+                stdout,
+                stderr: String::new(),
+                duration: Duration::from_millis(5),
+            }],
+            total_duration: Duration::from_millis(5),
+        };
+
+        let pretty = render_check_report(&report);
+        std::env::remove_var("XDG_DATA_HOME");
+
+        // 50 lines, window 30 → 20 hidden; only the tail prints inline.
+        assert!(pretty.contains("20 earlier line(s) hidden"), "{pretty}");
+        assert!(
+            pretty.contains("full output:"),
+            "the note names the log: {pretty}"
+        );
+        assert!(!pretty.contains("line 19"), "early lines hidden: {pretty}");
+        assert!(
+            pretty.contains("line 20"),
+            "tail starts at line 20: {pretty}"
+        );
+        assert!(
+            pretty.contains("line 49"),
+            "verdict tail survives: {pretty}"
+        );
+        assert!(pretty.contains("0/1 checks passed"), "{pretty}");
+
+        // The full output landed on disk as a single owner-only log.
+        let logs = data.path().join("fraisier").join("logs");
+        let files: Vec<_> = std::fs::read_dir(&logs)
+            .expect("logs dir")
+            .flatten()
+            .collect();
+        assert_eq!(files.len(), 1, "exactly one log file written");
+        let log = files[0].path();
+        let body = std::fs::read_to_string(&log).expect("read log");
+        assert!(
+            body.contains("line 0") && body.contains("line 49"),
+            "log keeps all lines"
+        );
+        let mode = std::fs::metadata(&log).expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "log must be owner-only");
     }
 
     #[test]

@@ -457,7 +457,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "anyhow",
  "async-trait",
@@ -494,7 +498,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-command"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -505,7 +513,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-confiture"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "fraisier-core",
@@ -515,7 +527,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-docker-compose"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -526,7 +542,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-http"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -538,7 +558,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-nginx"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -550,7 +574,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-rc"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -561,7 +589,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-release"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "fraisier-artifact-release",
  "fraisier-core",
@@ -575,7 +607,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-support"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "fraisier-core",
  "serde_json",
@@ -585,7 +621,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-systemd"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -596,7 +636,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-artifact-git"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -608,7 +652,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-artifact-local"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -620,7 +668,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-artifact-pull"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -633,7 +685,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-artifact-release"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -646,7 +702,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-bootstrap"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "fraisier-adapter-support",
  "fraisier-core",
@@ -656,7 +716,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-check"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "fraisier-adapter-support",
  "futures",
@@ -666,7 +730,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-config"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "fraisier-core",
  "serde",
@@ -677,7 +745,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-core"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "fraisier-saga",
@@ -692,7 +764,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-db"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "percent-encoding",
  "thiserror",
@@ -702,7 +778,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-ipc"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "fraisier-core",
@@ -714,7 +794,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-saga"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "chrono",
@@ -735,7 +819,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-scaffold"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "fraisier-config",
  "tempfile",
@@ -744,7 +832,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-self-upgrade"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "filetime",
@@ -761,7 +853,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-ship"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "semver",
  "tempfile",
@@ -771,7 +867,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-sync"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "tempfile",
  "thiserror",
@@ -779,7 +879,11 @@ dependencies = [
 
 [[package]]
 name = "fraisier-webhook"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 dependencies = [
  "async-trait",
  "hex",
@@ -2962,7 +3066,11 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 
 [[package]]
 name = "yoke"

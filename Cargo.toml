@@ -34,7 +34,11 @@ members = [
 exclude = ["examples/training-field"]
 
 [workspace.package]
+<<<<<<< Updated upstream
 version = "1.0.0-beta.2"
+=======
+version = "1.0.0-beta.5"
+>>>>>>> Stashed changes
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/fraiseql/fraisier-core"

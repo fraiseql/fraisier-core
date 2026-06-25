@@ -1219,9 +1219,53 @@ pub(crate) async fn rollback(
     })
 }
 
+/// The live deployed version, read from the committed [`DeployRecord`] in the
+/// state store — the only durable, post-commit release signal. Returns
+/// `(version, revision)` where `version` is the active artifact's id.
+///
+/// Best-effort: yields `(None, None)` when there is no `[deploy]` section, no
+/// recorded snapshot, or the store can't be read, so a missing ledger never
+/// fails the health probe. Sourcing strictly from the committed record (never a
+/// value stamped earlier in the saga) is the guardrail that keeps a deploy which
+/// failed before commit from ever reporting an in-flight version.
+async fn committed_version(
+    config: &DeployConfig,
+    state_dir: &Path,
+) -> (Option<String>, Option<String>) {
+    let Some(deploy) = config.deploy.as_ref() else {
+        return (None, None);
+    };
+    let (Some(fraise), Some(environment)) = (deploy.name.as_ref(), deploy.environment.as_ref())
+    else {
+        return (None, None);
+    };
+    let Ok(store) = FilesystemStateStore::new(state_dir) else {
+        return (None, None);
+    };
+    let record = match store
+        .current_snapshot(&FraiseKey::new(fraise, environment))
+        .await
+    {
+        Ok(Some(value)) => serde_json::from_value::<DeployRecord>(value).ok(),
+        _ => None,
+    };
+    record.map_or((None, None), |record| {
+        (
+            record.active.map(|a| a.artifact.id),
+            record.revision.map(|r| r.to_string()),
+        )
+    })
+}
+
 /// `health`: probe the configured health endpoint on every host (or just
-/// `host_filter`), reporting each result. Exit 0 iff every probed host is healthy.
-pub(crate) async fn health(config_path: &Path, host_filter: Option<&str>) -> Result<CommandOutput> {
+/// `host_filter`), reporting each result plus the live deployed version (from the
+/// committed release ledger). Exit 0 iff every probed host is healthy — the
+/// reported version never affects the exit code.
+pub(crate) async fn health(
+    config_path: &Path,
+    host_filter: Option<&str>,
+    state_dir: &Path,
+) -> Result<CommandOutput> {
     let config = load(config_path)?;
     let plan = factory::build_health_probe(&config)?;
 
@@ -1276,10 +1320,24 @@ pub(crate) async fn health(config_path: &Path, host_filter: Option<&str>) -> Res
         );
     }
 
+    // The live deployed version is independent of the probe — surface it from the
+    // committed ledger regardless of which (or whether any) hosts were probed.
+    let (version, revision) = committed_version(&config, state_dir).await;
+    let version_label = version.as_deref().unwrap_or("<unknown>");
+    let _ = match &revision {
+        Some(rev) => writeln!(pretty, "  version: {version_label} (revision {rev})"),
+        None => writeln!(pretty, "  version: {version_label}"),
+    };
+
     Ok(CommandOutput {
         exit_code: i32::from(!(all_healthy && probed > 0)),
         pretty,
-        json: json!({ "healthy": all_healthy && probed > 0, "hosts": results }),
+        json: json!({
+            "healthy": all_healthy && probed > 0,
+            "version": version,
+            "revision": revision,
+            "hosts": results,
+        }),
     })
 }
 
@@ -3358,7 +3416,9 @@ url = "http://127.0.0.1:8080/health"
         );
         let dir = tempfile::tempdir().expect("tempdir");
         let config = write(dir.path(), "fraisier.toml", &cfg);
-        let out = health(&config, None).await.expect("health");
+        let out = health(&config, None, &dir.path().join("state"))
+            .await
+            .expect("health");
         assert_eq!(out.exit_code, 1, "unreachable → non-zero: {}", out.pretty);
         assert_eq!(out.json["healthy"], serde_json::json!(false));
         assert_eq!(out.json["hosts"].as_array().expect("hosts").len(), 1);
@@ -3368,8 +3428,84 @@ url = "http://127.0.0.1:8080/health"
     async fn health_host_filter_selecting_nothing_is_reported() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = write(dir.path(), "fraisier.toml", VALID);
-        let out = health(&config, Some("no-such-host")).await.expect("health");
+        let out = health(&config, Some("no-such-host"), &dir.path().join("state"))
+            .await
+            .expect("health");
         assert!(out.pretty.contains("no host matching"), "{}", out.pretty);
+    }
+
+    /// Seed a committed release ledger for `checkout`/`staging` (the [`VALID`]
+    /// fraise/environment) at the given artifact id and revision.
+    async fn seed_ledger(state_dir: &Path, version: &str, revision: &str) {
+        use fraisier_core::adapter_axes::{ArtifactRef, Revision, StagedArtifact};
+        let store = FilesystemStateStore::new(state_dir).expect("store");
+        let record = DeployRecord {
+            active: Some(StagedArtifact {
+                artifact: ArtifactRef {
+                    id: version.to_owned(),
+                    checksum: None,
+                },
+                path: format!("/srv/checkout/{version}").into(),
+            }),
+            revision: Some(Revision::new(revision)),
+        };
+        store
+            .record_snapshot(
+                &FraiseKey::new("checkout", "staging"),
+                &serde_json::to_value(&record).expect("encode"),
+            )
+            .await
+            .expect("seed ledger");
+    }
+
+    #[tokio::test]
+    async fn health_reports_the_live_deployed_version_from_the_committed_ledger() {
+        // An unreachable probe (port 1) so the command runs without a live
+        // service — the version must still be reported, straight from the ledger.
+        let cfg = VALID.replace(
+            "url = \"http://127.0.0.1:8080/health\"",
+            "url = \"http://127.0.0.1:1/health\"",
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let state_dir = dir.path().join("state");
+        seed_ledger(&state_dir, "v1.2.3", "rev-42").await;
+
+        let out = health(&config, None, &state_dir).await.expect("health");
+        assert_eq!(out.json["version"], serde_json::json!("v1.2.3"));
+        assert_eq!(out.json["revision"], serde_json::json!("rev-42"));
+        assert!(out.pretty.contains("version: v1.2.3"), "{}", out.pretty);
+        assert!(out.pretty.contains("revision rev-42"), "{}", out.pretty);
+    }
+
+    #[tokio::test]
+    async fn health_reports_no_version_without_a_recorded_deploy() {
+        // No ledger recorded yet: the probe still runs and the version is null,
+        // never fabricated.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", VALID);
+        let out = health(&config, None, &dir.path().join("state"))
+            .await
+            .expect("health");
+        assert_eq!(out.json["version"], serde_json::Value::Null);
+        assert_eq!(out.json["revision"], serde_json::Value::Null);
+        assert!(out.pretty.contains("version: <unknown>"), "{}", out.pretty);
+    }
+
+    #[tokio::test]
+    async fn health_reports_the_prior_version_when_an_in_flight_deploy_never_committed() {
+        // The ledger only ever holds a post-commit version (see the core test
+        // `failed_migrate_leaves_the_prior_version_in_the_ledger`). When an
+        // in-flight deploy fails before commit, the ledger still names the prior
+        // version — and health surfaces exactly that, never the in-flight value.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", VALID);
+        let state_dir = dir.path().join("state");
+        seed_ledger(&state_dir, "v-old", "rev-old").await;
+
+        let out = health(&config, None, &state_dir).await.expect("health");
+        assert_eq!(out.json["version"], serde_json::json!("v-old"));
+        assert!(out.pretty.contains("version: v-old"), "{}", out.pretty);
     }
 
     #[tokio::test]

@@ -128,7 +128,13 @@ options = ["ConnectTimeout=10"]
 ```sh
 fraisier deploy --app-version 1.4.2     # rolls across the fleet
 fraisier status --per-host              # the live active release on each host
+fraisier health                         # health + the live deployed version
 ```
+
+`fraisier health` reports each host's health *and* the live deployed version,
+read from the committed release ledger (`version` / `revision` in `--json`). The
+version comes only from the post-commit ledger, so a deploy that fails before it
+commits keeps reporting the previous version — never an in-flight one.
 
 Hosts can be reached by shelling out to `ssh`/`scp` or by launching an IPC
 adapter over SSH (OpenSSH `ControlMaster` connection reuse) — the migration's DSN
@@ -181,7 +187,8 @@ validate-config   Parse, expand the SpecQL preset, and validate a fraisier.toml
 deploy            Run a deploy (single-host or fleet; --dry-run resolves the plan)
 list              List every deploy recorded in the state store
 status            Show the recorded saga state and release ledger (--per-host)
-health            Probe the configured health endpoint on every host
+health            Probe the configured health endpoint on every host; also
+                  reports the live deployed version from the release ledger
 rollback          Roll back to a prior revision (migrates the database down)
 bootstrap         Prepare each host's deploy directories over SSH (or locally)
 webhook-server    Run the signed-webhook deploy trigger (socket-activated/standalone)

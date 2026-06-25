@@ -6,6 +6,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`fraisier health` reports the live deployed version.** Alongside each host's
+  health verdict, the command now surfaces the live deployed version and
+  migration revision (`version` / `revision` in `--json`; a `version:` line in
+  the pretty output), giving operators and CI a "what is actually live right
+  now?" signal — parity with the Python `fraisier` `/health`. The version is read
+  **only** from the committed release ledger (`DeployRecord`), which is written
+  post-commit, so a deploy that fails before commit (e.g. at `migrate`) keeps
+  reporting the *previous* version, never an in-flight one. The frozen
+  `HealthStatus` / `HealthAdapter` probe API is unchanged. (#21)
+
 ### Changed
 
 - **`check` / `ship` cap a failing check's console output to the tail.** When a

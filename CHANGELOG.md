@@ -31,6 +31,33 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is unchanged (it still carries the full stdout/stderr). Parity with Python
   `fraisier` v0.36.0. (#20)
 
+### Fixed
+
+- **The Confiture `verify` gate no longer passes on error.** Confiture writes a
+  structured *error envelope* to the same `--output` file a report would go to,
+  on every error path — so the adapter's "we got JSON back, therefore we have a
+  report" shortcut parsed envelopes as reports. An envelope carries no
+  `failed_count`, which read as zero failures, so `verify` returned `ok = true`
+  for *every* confiture failure, including an unreachable database. The deploy
+  gate it feeds was unconditionally green on error. `verify` now recognises the
+  envelope and surfaces Confiture's own diagnosis as an adapter error. The
+  existing contract is unchanged: a report whose *checks* failed is still a
+  valid result (`ok ⇔ failed_count == 0`), never an adapter error — only a
+  non-report becomes one. This was pre-existing, not a Confiture 0.37.0
+  regression: the same silent pass reproduces on 0.36.0.
+- **`preflight` reports why it could not run.** It shares `verify`'s shape but
+  failed *closed* (an envelope carries `"ok": false`), so it never passed on
+  error — it reported a clean refusal instead: no issues, and no trace of the
+  connection failure or missing ledger behind it. It now surfaces the envelope.
+- **A database with no migration ledger is no longer called a config error.**
+  Confiture 0.37.0 exits `2` with `PRECON_1001` for a database built from schema
+  files rather than migrated. Exit `2` was mapped wholesale to `InvalidConfig`
+  (JSON-RPC `-32602`), sending operators to fix a config file that was perfectly
+  healthy. `PRECON_1001` is now classed as an execution failure, reusing the
+  error-code check `current_revision` already relied on — the discriminator is
+  the error code, never the bare exit integer, so an unrelated exit `2` still
+  reports as a configuration problem.
+
 ## [1.0.0-beta.4] - 2026-06-22
 
 ### Added

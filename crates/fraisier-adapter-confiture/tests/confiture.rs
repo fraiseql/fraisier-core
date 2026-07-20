@@ -6,7 +6,7 @@
 //! a usable, empty database.
 
 use fraisier_adapter_confiture::ConfitureMigration;
-use fraisier_core::adapter_axes::{AdapterCtx, MigrationAdapter, Revision};
+use fraisier_core::adapter_axes::{AdapterCtx, AdapterErrorKind, MigrationAdapter, Revision};
 use tokio::sync::Mutex;
 
 /// `set_var`/`var` are process-global; serialise the env-mutating tests. An
@@ -203,4 +203,297 @@ async fn roundtrip_against_postgres_covers_full_surface() {
 
     std::env::remove_var(source);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Error-envelope handling, driven by a stand-in `confiture`
+//
+// Confiture's `fail()` boundary writes a structured *error envelope* to the
+// `--output` file on **every** error path — the same file a successful run
+// writes its report to. So "the adapter got JSON back" proves nothing about
+// whether the command worked, and an envelope must never be read as a report.
+//
+// The payloads below were captured verbatim from confiture 0.37.0 (messages
+// abridged); they are the three states a deploy actually hits.
+// ---------------------------------------------------------------------------
+
+/// Unreachable database — `migrate verify` exits 3.
+#[cfg(unix)]
+const ENVELOPE_UNREACHABLE: &str = r#"{
+  "ok": false,
+  "error": {
+    "code": "CONFIG_006",
+    "message": "Failed to connect to database: connection refused",
+    "severity": "error",
+    "details": {}, "migration": null, "file": null, "line": null,
+    "actionable": "Check that the database server is running"
+  }
+}"#;
+
+/// No migration ledger (a database built from schema files rather than
+/// migrated) — `migrate verify` exits 2 under confiture 0.37.0.
+#[cfg(unix)]
+const ENVELOPE_NO_LEDGER: &str = r#"{
+  "ok": false,
+  "error": {
+    "code": "PRECON_1001",
+    "message": "No migration ledger found: `tb_confiture` is not present in this database",
+    "severity": "error",
+    "details": {}, "migration": null, "file": null, "line": null,
+    "actionable": "Run `confiture migrate up`, or pass --allow-uninitialized"
+  }
+}"#;
+
+/// The same ledger-less database under confiture 0.36.0, which exits 1. Kept so
+/// the suite proves this was never a 0.37.0 regression.
+#[cfg(unix)]
+const ENVELOPE_INTERNAL: &str = r#"{
+  "ok": false,
+  "error": { "code": "INTERNAL_ERROR", "message": "relation \"tb_confiture\" does not exist" }
+}"#;
+
+/// A configuration problem that really is one — no usable DSN, exit 2.
+#[cfg(unix)]
+const ENVELOPE_BAD_CONFIG: &str = r#"{
+  "ok": false,
+  "error": { "code": "CONFIG_010", "message": "no usable database URL" }
+}"#;
+
+/// A *genuine* verify report in which checks failed. Not an envelope: it carries
+/// the counts, so `ok ⇔ failed_count == 0` still applies.
+#[cfg(unix)]
+const REPORT_WITH_FAILURES: &str = r#"{
+  "verified_count": 1, "failed_count": 1, "skipped_count": 0, "total_applied": 2,
+  "results": [
+    { "version": "001", "name": "init", "status": "verified", "error": null },
+    { "version": "002", "name": "more", "status": "failed", "error": "checksum mismatch" }
+  ]
+}"#;
+
+/// Linux's `ETXTBSY` — "text file busy", raised when exec'ing a file that some
+/// process still holds open for writing.
+#[cfg(unix)]
+const ETXTBSY: i32 = 26;
+
+/// The one and only fake `confiture` executable, written once per test process.
+///
+/// It is deliberately *shared* and never rewritten. Writing an executable and
+/// immediately exec'ing it from a multi-threaded process races with any sibling
+/// test's `fork`: the child inherits the still-open write fd, and the exec fails
+/// with `ETXTBSY` — which the adapter reports as a spawn failure, silently
+/// turning an assertion about exit-code handling into an assertion about
+/// nothing. Writing the script exactly once and passing per-test data in files
+/// the script *reads* removes that race rather than papering over it.
+#[cfg(unix)]
+fn fake_confiture_program() -> &'static std::path::Path {
+    static PROGRAM: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    PROGRAM
+        .get_or_init(|| {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir =
+                std::env::temp_dir().join(format!("fraisier-fake-bin-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("mkdir fake bin dir");
+            let script = dir.join("confiture");
+            // Copies ./payload.json to the path following `--output` and exits with
+            // ./exit_code — both read from the per-call working directory the
+            // adapter sets, which is how each test supplies its own scenario.
+            std::fs::write(
+                &script,
+                "#!/bin/sh\n\
+                 out=\"\"\n\
+                 while [ $# -gt 0 ]; do\n\
+                 \x20   [ \"$1\" = \"--output\" ] && out=\"$2\"\n\
+                 \x20   shift\n\
+                 done\n\
+                 [ -n \"$out\" ] && cat payload.json > \"$out\"\n\
+                 exit \"$(cat exit_code)\"\n",
+            )
+            .expect("write fake confiture");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake confiture");
+
+            // Burn the ETXTBSY window left by any sibling fork that inherited the
+            // write fd. Those fds are O_CLOEXEC, so they clear as soon as the child
+            // execs; this converges immediately in practice.
+            for _ in 0..200 {
+                match std::process::Command::new(&script).output() {
+                    Ok(_) => return script,
+                    Err(err) if err.raw_os_error() == Some(ETXTBSY) => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("fake confiture is not executable: {err}"),
+                }
+            }
+            panic!("fake confiture stayed ETXTBSY");
+        })
+        .as_path()
+}
+
+/// A scenario for the shared fake: a working directory holding the payload it
+/// should emit and the exit code it should return, reproducing Confiture's
+/// failure boundary without needing a database (or Confiture itself).
+#[cfg(unix)]
+struct FakeConfiture {
+    dir: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl FakeConfiture {
+    fn new(tag: &str, payload: &str, code: i32) -> Self {
+        let dir = std::env::temp_dir().join(format!("fraisier-fake-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir fake workdir");
+        std::fs::write(dir.join("payload.json"), payload).expect("write payload");
+        std::fs::write(dir.join("exit_code"), format!("{code}\n")).expect("write exit code");
+        Self { dir }
+    }
+
+    /// An adapter pointed at the shared fake. The scenario travels in the
+    /// context's workdir, not in the program, which is why the program can be
+    /// written once and shared.
+    fn adapter() -> ConfitureMigration {
+        ConfitureMigration::with_program(fake_confiture_program())
+    }
+
+    /// A context whose DSN is resolved in-process, so these tests mutate no
+    /// environment and can run in parallel with the rest of the suite.
+    fn ctx(&self) -> AdapterCtx {
+        let mut ctx = AdapterCtx::new("checkout", "production");
+        ctx.workdir.clone_from(&self.dir);
+        ctx.migrations_path = Some(self.dir.clone());
+        ctx.resolved_secrets.insert(
+            "DATABASE_URL".to_owned(),
+            "postgresql://localhost/unused".to_owned(),
+        );
+        ctx
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FakeConfiture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The ship gate's load-bearing test: `verify` must never call an error a pass.
+///
+/// An envelope carries no `failed_count`, so reading it as a report yields zero
+/// failures — i.e. `ok = true` — and the deploy gate goes green on a database
+/// the adapter could not even reach.
+#[cfg(unix)]
+#[tokio::test]
+async fn verify_never_reports_green_for_an_error_envelope() {
+    for (tag, payload, code, state, detail) in [
+        (
+            "verify-unreachable",
+            ENVELOPE_UNREACHABLE,
+            3,
+            "an unreachable database",
+            "Failed to connect",
+        ),
+        (
+            "verify-no-ledger",
+            ENVELOPE_NO_LEDGER,
+            2,
+            "a ledger-less database on confiture 0.37.0",
+            "No migration ledger",
+        ),
+        (
+            "verify-internal",
+            ENVELOPE_INTERNAL,
+            1,
+            "a ledger-less database on confiture 0.36.0",
+            "does not exist",
+        ),
+    ] {
+        let fake = FakeConfiture::new(tag, payload, code);
+        match FakeConfiture::adapter().verify(&fake.ctx()).await {
+            Ok(report) => panic!(
+                "{state}: verify() read Confiture's error envelope as a report \
+                 (ok = {}) — a silently-green ship gate",
+                report.ok
+            ),
+            Err(err) => {
+                assert_eq!(err.operation.as_deref(), Some("verify"));
+                assert!(
+                    err.message.contains(detail),
+                    "{state}: the envelope's own message must reach the operator; got {}",
+                    err.message
+                );
+            }
+        }
+    }
+}
+
+/// The contract the fix must not break: a verify report whose *checks* failed is
+/// a valid result, not an adapter error — `ok ⇔ failed_count == 0`, whatever the
+/// exit code. Only a non-report may become an error.
+#[cfg(unix)]
+#[tokio::test]
+async fn verify_reports_genuine_check_failures_as_a_result() {
+    let fake = FakeConfiture::new("verify-failed-checks", REPORT_WITH_FAILURES, 1);
+    let report = FakeConfiture::adapter()
+        .verify(&fake.ctx())
+        .await
+        .expect("a verify report with failed checks is a result, not an adapter error");
+
+    assert!(!report.ok, "failed_count = 1 must mean ok = false");
+    assert_eq!(report.checks.len(), 2);
+    assert!(!report.checks[1].ok);
+}
+
+/// `preflight` shares `verify`'s return-JSON-before-checking-exit-code shape.
+/// It failed *closed* rather than open — an envelope carries `"ok": false` — but
+/// it reported a clean refusal: zero issues, and no trace of the unreachable
+/// database that actually caused it.
+#[cfg(unix)]
+#[tokio::test]
+async fn preflight_surfaces_the_envelope_instead_of_an_empty_refusal() {
+    let fake = FakeConfiture::new("preflight-unreachable", ENVELOPE_UNREACHABLE, 3);
+    let err = FakeConfiture::adapter()
+        .preflight(&fake.ctx())
+        .await
+        .expect_err("an unreachable database is not a preflight verdict");
+
+    assert!(
+        err.message.contains("Failed to connect"),
+        "the operator must be told why preflight could not run; got {}",
+        err.message
+    );
+}
+
+/// Exit 2 is not automatically "your config is broken". Under confiture 0.37.0 a
+/// ledger-less database exits 2 with `PRECON_1001`, which means "this database
+/// was never migrated" — reporting it as `invalid_config` (JSON-RPC `-32602`)
+/// sends the operator to edit a config file that is perfectly fine.
+#[cfg(unix)]
+#[tokio::test]
+async fn uninitialised_database_is_not_an_invalid_config_error() {
+    let fake = FakeConfiture::new("up-no-ledger", ENVELOPE_NO_LEDGER, 2);
+    let err = FakeConfiture::adapter()
+        .up(&fake.ctx(), None)
+        .await
+        .expect_err("up must fail against a ledger-less database");
+
+    assert_eq!(
+        err.kind,
+        AdapterErrorKind::Execution,
+        "PRECON_1001 is an unmet precondition, not a configuration error"
+    );
+    assert_ne!(err.code, -32602);
+}
+
+/// ...but an exit 2 that Confiture attributes to the configuration still is one.
+/// The discriminator is the error code, never the bare integer.
+#[cfg(unix)]
+#[tokio::test]
+async fn unrelated_exit_two_stays_an_invalid_config_error() {
+    let fake = FakeConfiture::new("up-bad-config", ENVELOPE_BAD_CONFIG, 2);
+    let err = FakeConfiture::adapter()
+        .up(&fake.ctx(), None)
+        .await
+        .expect_err("up must fail when Confiture has no usable DSN");
+
+    assert_eq!(err.kind, AdapterErrorKind::InvalidConfig);
 }

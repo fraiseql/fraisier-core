@@ -46,7 +46,7 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: release-plz — maintain the release PR
-        uses: release-plz/action@064f4d1e36c843611ddf013be726beaa4ad804db # v0.5
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5
         with:
           command: release-pr
         env:
@@ -73,7 +73,7 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: release-plz — publish unreleased crates
-        uses: release-plz/action@064f4d1e36c843611ddf013be726beaa4ad804db # v0.5
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5
         with:
           command: release
         env:

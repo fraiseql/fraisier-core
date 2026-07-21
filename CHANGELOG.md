@@ -8,6 +8,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`AdapterErrorKind` now carries confiture's full failure taxonomy.** Seven
+  kinds were added so the confiture adapter maps each exit class 1:1 onto the wire
+  instead of flattening most of them to `Execution`: `PreconditionFailed`
+  (`-32004`, no migration ledger / `PRECON_1001`), `DbUnreachable` (`-32005`),
+  `SchemaError` (`-32006`), `LockContention` (`-32007`, retriable), `GitError`
+  (`-32008`), `IrreversibleRollback` (`-32009`), and `InternalError` (`-32010`).
+  Each has a stable snake_case wire string matching confiture's semantic-class
+  name. All are additive to the `#[non_exhaustive]` v1.0 enum (every downstream
+  match already carries a wildcard arm), so the frozen contract is not broken.
 - **`fraisier health` reports the live deployed version.** Alongside each host's
   health verdict, the command now surfaces the live deployed version and
   migration revision (`version` / `revision` in `--json`; a `version:` line in
@@ -20,6 +29,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Confiture's exit-code classification now derives from a confiture-owned
+  table.** The adapter previously encoded confiture's exit-code contract ad hoc
+  inside `kind_for_code`, and the Python `fraisier` adapter encoded it *again,
+  differently* — the two had drifted. Confiture is now the single source of truth:
+  it emits the whole `(exit_code → semantic class)` table as JSON via
+  `confiture --exit-codes-json`. This crate **vendors** that output
+  (`src/exit_codes.vendored.json`) and the new `exit_codes` module projects it —
+  `classify()` → `ExitClass` → `AdapterErrorKind`, a faithful 1:1 mapping. A
+  contract test diffs the Rust table against the vendored file (always) and against
+  the live `confiture --exit-codes-json` (when a new-enough confiture is on `PATH`;
+  it skips otherwise), so a drift fails CI here and in confiture. The nine classes
+  are `ok`, `internal_error`, `precondition_failed`, `db_unreachable`,
+  `schema_error`, `invalid_config`, `lock_contention`, `git_error`,
+  `irreversible_rollback`. A present exit code is authoritative and is never
+  laundered by a stray error code — a config error (exit 5) is never downgraded to
+  a benign precondition — and lock contention keeps its retriable message note on
+  top of the distinct `LockContention` kind.
 - **`check` / `ship` cap a failing check's console output to the tail.** When a
   failing check's combined stdout+stderr exceeds 30 lines, the report now prints
   only the last 30 (where pytest/ruff/mypy put their verdict) prefixed with a
@@ -30,6 +56,34 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   degrades to "tail only" rather than masking the failure. The `--json` report
   is unchanged (it still carries the full stdout/stderr). Parity with Python
   `fraisier` v0.36.0. (#20)
+
+### Fixed
+
+- **The Confiture `verify` gate no longer passes on error.** Confiture writes a
+  structured *error envelope* to the same `--output` file a report would go to,
+  on every error path — so the adapter's "we got JSON back, therefore we have a
+  report" shortcut parsed envelopes as reports. An envelope carries no
+  `failed_count`, which read as zero failures, so `verify` returned `ok = true`
+  for *every* confiture failure, including an unreachable database. The deploy
+  gate it feeds was unconditionally green on error. `verify` now recognises the
+  envelope and surfaces Confiture's own diagnosis as an adapter error. The
+  existing contract is unchanged: a report whose *checks* failed is still a
+  valid result (`ok ⇔ failed_count == 0`), never an adapter error — only a
+  non-report becomes one. This was pre-existing, not a Confiture 0.37.0
+  regression: the same silent pass reproduces on 0.36.0.
+- **`preflight` reports why it could not run.** It shares `verify`'s shape but
+  failed *closed* (an envelope carries `"ok": false`), so it never passed on
+  error — it reported a clean refusal instead: no issues, and no trace of the
+  connection failure or missing ledger behind it. It now surfaces the envelope.
+- **A database with no migration ledger is no longer called a config error.**
+  Confiture 0.37.0 exits `2` with `PRECON_1001` for a database built from schema
+  files rather than migrated. Exit `2` was mapped wholesale to `InvalidConfig`
+  (JSON-RPC `-32602`), sending operators to fix a config file that was perfectly
+  healthy. `PRECON_1001` now maps to its own `PreconditionFailed` kind (see
+  *Added*) via the canonical exit-code table (see *Changed*): the operator is
+  told to migrate, not to edit a healthy config. Exit `2` means "no ledger"
+  under confiture's frozen contract, while a genuine configuration problem
+  (exit `5`, e.g. `CONFIG_010`) still reports as `InvalidConfig`.
 
 ## [1.0.0-beta.4] - 2026-06-22
 

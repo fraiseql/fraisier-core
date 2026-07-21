@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-beta.5] - 2026-07-21
+
 ### Added
 
 - **`AdapterErrorKind` now carries confiture's full failure taxonomy.** Seven

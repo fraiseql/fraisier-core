@@ -252,7 +252,9 @@ const ENVELOPE_INTERNAL: &str = r#"{
   "error": { "code": "INTERNAL_ERROR", "message": "relation \"tb_confiture\" does not exist" }
 }"#;
 
-/// A configuration problem that really is one — no usable DSN, exit 2.
+/// A configuration problem that really is one — no usable DSN (`CONFIG_010`),
+/// which confiture exits **5** for (the #146 renumbering moved config errors off
+/// exit 2; exit 2 is now exclusively "no ledger").
 #[cfg(unix)]
 const ENVELOPE_BAD_CONFIG: &str = r#"{
   "ok": false,
@@ -463,13 +465,14 @@ async fn preflight_surfaces_the_envelope_instead_of_an_empty_refusal() {
     );
 }
 
-/// Exit 2 is not automatically "your config is broken". Under confiture 0.37.0 a
-/// ledger-less database exits 2 with `PRECON_1001`, which means "this database
-/// was never migrated" — reporting it as `invalid_config` (JSON-RPC `-32602`)
-/// sends the operator to edit a config file that is perfectly fine.
+/// Exit 2 is not "your config is broken". Under confiture 0.37.0 a ledger-less
+/// database exits 2 with `PRECON_1001`, which means "this database was never
+/// migrated" — now its own `PreconditionFailed` kind. Reporting it as
+/// `invalid_config` (JSON-RPC `-32602`) would send the operator to edit a config
+/// file that is perfectly fine.
 #[cfg(unix)]
 #[tokio::test]
-async fn uninitialised_database_is_not_an_invalid_config_error() {
+async fn uninitialised_database_is_a_precondition_not_an_invalid_config_error() {
     let fake = FakeConfiture::new("up-no-ledger", ENVELOPE_NO_LEDGER, 2);
     let err = FakeConfiture::adapter()
         .up(&fake.ctx(), None)
@@ -478,18 +481,19 @@ async fn uninitialised_database_is_not_an_invalid_config_error() {
 
     assert_eq!(
         err.kind,
-        AdapterErrorKind::Execution,
-        "PRECON_1001 is an unmet precondition, not a configuration error"
+        AdapterErrorKind::PreconditionFailed,
+        "PRECON_1001 is an unmet precondition, its own kind — not Execution, not InvalidConfig"
     );
     assert_ne!(err.code, -32602);
 }
 
-/// ...but an exit 2 that Confiture attributes to the configuration still is one.
-/// The discriminator is the error code, never the bare integer.
+/// ...but a *genuine* configuration problem — no usable DSN (`CONFIG_010`) —
+/// exits 5 and stays `InvalidConfig`. A present, severe exit code is never
+/// laundered into a benign precondition by a stray error code.
 #[cfg(unix)]
 #[tokio::test]
-async fn unrelated_exit_two_stays_an_invalid_config_error() {
-    let fake = FakeConfiture::new("up-bad-config", ENVELOPE_BAD_CONFIG, 2);
+async fn a_genuine_config_error_stays_an_invalid_config_error() {
+    let fake = FakeConfiture::new("up-bad-config", ENVELOPE_BAD_CONFIG, 5);
     let err = FakeConfiture::adapter()
         .up(&fake.ctx(), None)
         .await

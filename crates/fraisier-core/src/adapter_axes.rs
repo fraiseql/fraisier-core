@@ -45,6 +45,30 @@ pub enum AdapterErrorKind {
     SecretReadFailed,
     /// The adapter's configuration is invalid.
     InvalidConfig,
+    /// A required precondition was not met — e.g. the target database has no
+    /// migration ledger yet (confiture `PRECON_1001`, exit 2). Distinct from
+    /// [`InvalidConfig`](Self::InvalidConfig): the configuration is fine, the
+    /// database is simply uninitialised, so the operator's fix is to migrate,
+    /// not to edit config. Added additively to this `#[non_exhaustive]` enum.
+    PreconditionFailed,
+    /// The target database could not be reached — host/auth/network failure
+    /// (confiture exit 3). Distinct from a config error: the DSN may be perfect
+    /// and the server simply down.
+    DbUnreachable,
+    /// A schema / DDL / build operation failed (confiture exit 4).
+    SchemaError,
+    /// A migration lock or connection-pool is held by another writer (confiture
+    /// exit 6). **Retriable** — waiting and retrying unchanged may succeed.
+    LockContention,
+    /// A git / pgGit / grant-accompaniment step failed (confiture exit 7).
+    GitError,
+    /// A rollback was irreversible, or left inconsistent state (confiture exit
+    /// 8) — the most dangerous class; manual intervention is usually required.
+    IrreversibleRollback,
+    /// An unexpected internal failure with no more specific class (confiture
+    /// exit 1 / `INTERNAL_ERROR`). Distinct from [`Execution`](Self::Execution),
+    /// which is the *generic* underlying-operation failure other adapters raise.
+    InternalError,
     /// The adapter ran but the underlying operation failed.
     Execution,
     /// The IPC framing or JSON-RPC envelope was malformed.
@@ -62,6 +86,13 @@ impl AdapterErrorKind {
             Self::MissingSecret => "missing_secret",
             Self::SecretReadFailed => "secret_read_failed",
             Self::InvalidConfig => "invalid_config",
+            Self::PreconditionFailed => "precondition_failed",
+            Self::DbUnreachable => "db_unreachable",
+            Self::SchemaError => "schema_error",
+            Self::LockContention => "lock_contention",
+            Self::GitError => "git_error",
+            Self::IrreversibleRollback => "irreversible_rollback",
+            Self::InternalError => "internal_error",
             Self::Execution => "execution",
             Self::Protocol => "protocol",
             Self::Remote => "remote",
@@ -79,6 +110,15 @@ impl AdapterErrorKind {
             Self::SecretReadFailed => -32002,
             Self::Execution => -32000,
             Self::Remote => -32003,
+            // fraisier server-error space (-320xx): the confiture exit-code
+            // taxonomy, one code per class (see `fraisier-adapter-confiture`).
+            Self::PreconditionFailed => -32004,
+            Self::DbUnreachable => -32005,
+            Self::SchemaError => -32006,
+            Self::LockContention => -32007,
+            Self::GitError => -32008,
+            Self::IrreversibleRollback => -32009,
+            Self::InternalError => -32010,
         }
     }
 }
@@ -1082,6 +1122,56 @@ mod tests {
         let json = serde_json::to_string(&err).expect("serialize");
         let back: AdapterError = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.kind, AdapterErrorKind::MethodNotSupported);
+    }
+
+    #[test]
+    fn confiture_failure_kinds_have_stable_wire_strings_and_distinct_codes() {
+        // The confiture exit-code taxonomy projected 1:1 onto the wire enum. Each
+        // wire string is the cross-repo contract vocabulary shared with confiture
+        // and the Python adapter; each code must be distinct (a collision would,
+        // e.g., send a no-ledger precondition to InvalidConfig's -32602 and tell
+        // the operator to fix a healthy config file).
+        let taxonomy = [
+            (
+                AdapterErrorKind::PreconditionFailed,
+                "precondition_failed",
+                -32004,
+            ),
+            (AdapterErrorKind::DbUnreachable, "db_unreachable", -32005),
+            (AdapterErrorKind::SchemaError, "schema_error", -32006),
+            (AdapterErrorKind::LockContention, "lock_contention", -32007),
+            (AdapterErrorKind::GitError, "git_error", -32008),
+            (
+                AdapterErrorKind::IrreversibleRollback,
+                "irreversible_rollback",
+                -32009,
+            ),
+            (AdapterErrorKind::InternalError, "internal_error", -32010),
+        ];
+        let mut seen_codes = std::collections::BTreeSet::new();
+        for (kind, wire, code) in taxonomy {
+            assert_eq!(kind.as_str(), wire);
+            assert_eq!(kind.code(), code);
+            assert!(seen_codes.insert(code), "duplicate JSON-RPC code {code}");
+            // Serde uses the snake_case variant name — it must equal `as_str`.
+            let json = serde_json::to_string(&kind).expect("serialize");
+            assert_eq!(json, format!("\"{wire}\""));
+            let back: AdapterErrorKind = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, kind);
+        }
+        // The taxonomy must not collide with the pre-existing generic kinds.
+        for generic in [
+            AdapterErrorKind::InvalidConfig,
+            AdapterErrorKind::Execution,
+            AdapterErrorKind::Protocol,
+            AdapterErrorKind::Remote,
+        ] {
+            assert!(
+                !seen_codes.contains(&generic.code()),
+                "{} collides with a taxonomy code",
+                generic.as_str()
+            );
+        }
     }
 
     #[test]

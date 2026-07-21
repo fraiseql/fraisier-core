@@ -59,6 +59,9 @@ use fraisier_core::adapter_axes::{
 };
 use serde_json::Value;
 
+mod exit_codes;
+use exit_codes::{classify, NO_LEDGER_ERROR_CODE};
+
 /// The adapter's discovery/identity name.
 const ADAPTER_NAME: &str = "confiture";
 
@@ -89,11 +92,6 @@ const CAPABILITIES: &[&str] = &[
     "preflight",
     "window_safe",
 ];
-
-/// Confiture's error code for a reachable-but-uninitialised database (tracking
-/// table absent). `migrate current` reports it with exit code 2; the adapter
-/// maps it to "no current revision" rather than an error.
-const UNINITIALISED_ERROR_CODE: &str = "PRECON_1001";
 
 /// Process-wide counter making each `--output` temp file path unique.
 static OUTPUT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -275,7 +273,7 @@ impl RunOutput {
 
     /// Build an [`AdapterError`] for a non-success exit of `operation`.
     fn into_error(self, operation: &str) -> AdapterError {
-        let kind = kind_for_code(self.code, self.json.as_ref());
+        let class = classify(self.code, self.json.as_ref().and_then(error_code_of));
         let detail = self
             .json
             .as_ref()
@@ -289,45 +287,18 @@ impl RunOutput {
             message.push_str(": ");
             message.push_str(&detail);
         }
-        if self.code == Some(LOCK_EXIT_CODE) {
+        // Lock contention is the one retriable class; the nuance rides in the
+        // message (the wire kind stays a generic Execution — see
+        // `ExitClass::to_adapter_kind`).
+        if class.is_retriable() {
             message.push_str(" (migration lock held by another process — retriable)");
         }
         AdapterError {
             adapter: Some(ADAPTER_NAME.to_owned()),
             operation: Some(operation.to_owned()),
             stderr: (!self.stderr.trim().is_empty()).then(|| self.stderr.clone()),
-            ..AdapterError::new(kind, message)
+            ..AdapterError::new(class.to_adapter_kind(), message)
         }
-    }
-}
-
-/// Confiture's retriable lock-contention exit code (`LOCK_1300`).
-const LOCK_EXIT_CODE: i32 = 6;
-
-/// Map a Confiture process exit code (and its report, when there is one) to an
-/// [`AdapterErrorKind`].
-///
-/// Follows Confiture's frozen exit-code contract (codes `0..8`; see the Confiture
-/// repo's `docs/reference/exit-codes.md` and `fraisier-adapter-contract.md`):
-/// exit `5` (configuration invalid / validation / lint) and exit `2`
-/// (precondition failed) are classed as configuration problems. Everything else
-/// (`1` generic, `3` DB-connection, `4` schema/DDL, `6` lock, `7` git, `8`
-/// irreversible rollback, signals) is an execution failure.
-///
-/// Exit `2` carries one deliberate exception. `PRECON_1001` — no migration
-/// ledger — means the database was never migrated (typically built from schema
-/// files), which is an unmet *precondition*, not a broken configuration. Calling
-/// it [`InvalidConfig`] would surface as JSON-RPC `-32602` and send the operator
-/// to fix a config file that is perfectly healthy. The discriminator is the
-/// error code, never the bare integer: an unrelated exit `2` (a usage error, or
-/// `CONFIG_010`'s no-usable-DSN) genuinely *is* a configuration problem.
-///
-/// [`InvalidConfig`]: AdapterErrorKind::InvalidConfig
-fn kind_for_code(code: Option<i32>, json: Option<&Value>) -> AdapterErrorKind {
-    match code {
-        Some(2) if reports_uninitialised(json) => AdapterErrorKind::Execution,
-        Some(2 | 5) => AdapterErrorKind::InvalidConfig,
-        _ => AdapterErrorKind::Execution,
     }
 }
 
@@ -373,13 +344,17 @@ fn is_error_envelope(json: &Value) -> bool {
     json.get("error").is_some_and(Value::is_object)
 }
 
+/// The symbolic error code from a Confiture error envelope (`error.code`), when
+/// the payload carries one. Both the classifier ([`kind_for_code`]) and the
+/// no-ledger check ([`reports_uninitialised`]) read the code through here.
+fn error_code_of(json: &Value) -> Option<&str> {
+    json.get("error")?.get("code")?.as_str()
+}
+
 /// Whether a Confiture JSON report is the structured "tracking table absent"
 /// (uninitialised database) error, which the adapter treats as "no revision".
 fn reports_uninitialised(json: Option<&Value>) -> bool {
-    json.and_then(|report| report.get("error"))
-        .and_then(|error| error.get("code"))
-        .and_then(Value::as_str)
-        == Some(UNINITIALISED_ERROR_CODE)
+    json.and_then(error_code_of) == Some(NO_LEDGER_ERROR_CODE)
 }
 
 /// The first non-blank line of `text`, trimmed (used for error messages).
@@ -692,14 +667,22 @@ fn args_contain(args: &[OsString], needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        args_contain, is_error_envelope, kind_for_code, parse_current_revision,
+        args_contain, classify, error_code_of, is_error_envelope, parse_current_revision,
         parse_down_to_outcome, parse_preflight_report, parse_up_outcome, parse_verify_report,
         parse_version, plan, reports_uninitialised, subcommand_takes_migrations_dir,
         ConfitureMigration, CONFITURE_DSN_ENV,
     };
     use fraisier_core::adapter_axes::{AdapterCtx, AdapterErrorKind, Revision, Severity};
+    use serde_json::Value;
     use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
+
+    /// The composed `envelope -> AdapterErrorKind` projection `into_error` applies:
+    /// read `error.code` from the JSON, classify, project. Exercises `error_code_of`
+    /// + `classify` + `to_adapter_kind` together, the way the adapter really does.
+    fn kind_of(code: Option<i32>, json: Option<&Value>) -> AdapterErrorKind {
+        classify(code, json.and_then(error_code_of)).to_adapter_kind()
+    }
 
     /// Serialises env-mutating tests so `set_var`/`var` don't race.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -823,49 +806,55 @@ mod tests {
 
     #[test]
     fn exit_codes_map_to_kinds() {
-        assert_eq!(
-            kind_for_code(Some(2), None),
-            AdapterErrorKind::InvalidConfig
-        );
-        assert_eq!(
-            kind_for_code(Some(5), None),
-            AdapterErrorKind::InvalidConfig
-        );
-        assert_eq!(kind_for_code(Some(3), None), AdapterErrorKind::Execution);
-        assert_eq!(kind_for_code(Some(6), None), AdapterErrorKind::Execution);
-        assert_eq!(kind_for_code(Some(8), None), AdapterErrorKind::Execution);
-        assert_eq!(kind_for_code(Some(1), None), AdapterErrorKind::Execution);
-        assert_eq!(kind_for_code(None, None), AdapterErrorKind::Execution);
+        // A faithful 1:1 projection of the canonical table (see `exit_codes`):
+        // every confiture exit integer has its own wire kind.
+        for (code, kind) in [
+            (1, AdapterErrorKind::InternalError),
+            (2, AdapterErrorKind::PreconditionFailed),
+            (3, AdapterErrorKind::DbUnreachable),
+            (4, AdapterErrorKind::SchemaError),
+            (5, AdapterErrorKind::InvalidConfig),
+            (6, AdapterErrorKind::LockContention),
+            (7, AdapterErrorKind::GitError),
+            (8, AdapterErrorKind::IrreversibleRollback),
+        ] {
+            assert_eq!(kind_of(Some(code), None), kind, "exit {code}");
+        }
+        // No exit code (killed by signal) is unclassifiable → internal.
+        assert_eq!(kind_of(None, None), AdapterErrorKind::InternalError);
     }
 
     #[test]
     fn uninitialised_exit_two_is_a_precondition_not_a_config_error() {
-        // Confiture 0.37.0 exits 2 with PRECON_1001 for a database that has no
-        // migration ledger. That is "never migrated", not "your config is
-        // broken" — classing it InvalidConfig would surface as JSON-RPC -32602.
+        // Confiture exits 2 with PRECON_1001 for a database that has no migration
+        // ledger. That is "never migrated" — its own PreconditionFailed kind, not
+        // "your config is broken" (which would surface as JSON-RPC -32602 and send
+        // the operator to edit a healthy config file).
         let no_ledger = serde_json::json!({
             "ok": false,
             "error": { "code": "PRECON_1001", "message": "No migration ledger found" }
         });
         assert_eq!(
-            kind_for_code(Some(2), Some(&no_ledger)),
-            AdapterErrorKind::Execution
+            kind_of(Some(2), Some(&no_ledger)),
+            AdapterErrorKind::PreconditionFailed
         );
+        // Exit 2 always means "no ledger" under confiture's frozen contract, even
+        // when the envelope is absent.
+        assert_eq!(kind_of(Some(2), None), AdapterErrorKind::PreconditionFailed);
 
-        // The discriminator is the error code, never the bare integer: an
-        // unrelated exit 2 really is a configuration problem.
+        // A genuine configuration problem (no usable DSN, CONFIG_010) exits 5 and
+        // stays InvalidConfig — and a present exit code is never laundered by a
+        // stray error code, so a severe exit 5 is not downgraded to a precondition.
         let bad_config = serde_json::json!({
             "ok": false,
             "error": { "code": "CONFIG_010", "message": "no usable database URL" }
         });
         assert_eq!(
-            kind_for_code(Some(2), Some(&bad_config)),
+            kind_of(Some(5), Some(&bad_config)),
             AdapterErrorKind::InvalidConfig
         );
-
-        // PRECON_1001 does not launder an exit code that means something else.
         assert_eq!(
-            kind_for_code(Some(5), Some(&no_ledger)),
+            kind_of(Some(5), Some(&no_ledger)),
             AdapterErrorKind::InvalidConfig
         );
     }

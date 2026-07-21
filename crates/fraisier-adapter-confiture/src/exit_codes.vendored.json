@@ -1,0 +1,144 @@
+{
+  "classes": [
+    "ok",
+    "internal_error",
+    "precondition_failed",
+    "db_unreachable",
+    "schema_error",
+    "invalid_config",
+    "lock_contention",
+    "git_error",
+    "irreversible_rollback"
+  ],
+  "exit_codes": {
+    "0": {
+      "class": "ok",
+      "meaning": "Success (including success-with-signal: already applied, nothing pending, advisories)",
+      "symbolic_codes": [
+        "LINT_1501",
+        "MIGR_101",
+        "MIGR_105"
+      ]
+    },
+    "1": {
+      "class": "internal_error",
+      "meaning": "Generic failure (SQL/hook execution, ambiguous-change advisory, status: pending)",
+      "symbolic_codes": [
+        "DIFFER_402",
+        "HOOK_1100",
+        "HOOK_1101",
+        "SQL_001",
+        "SQL_700",
+        "SQL_701",
+        "SQL_702",
+        "SQL_703"
+      ]
+    },
+    "2": {
+      "class": "precondition_failed",
+      "meaning": "Tracking table absent \u2014 confiture not initialized on this database yet",
+      "symbolic_codes": [
+        "PRECON_1001"
+      ]
+    },
+    "3": {
+      "class": "db_unreachable",
+      "meaning": "Database connection failed \u2014 host/auth/network unreachable",
+      "symbolic_codes": [
+        "CONFIG_006",
+        "GEN_001",
+        "MIGR_001",
+        "MIGR_004",
+        "MIGR_010",
+        "MIGR_011",
+        "MIGR_100",
+        "MIGR_102",
+        "MIGR_103",
+        "MIGR_104",
+        "MIGR_106",
+        "MIGR_107"
+      ]
+    },
+    "4": {
+      "class": "schema_error",
+      "meaning": "Schema / DDL / build error",
+      "symbolic_codes": [
+        "REBUILD_001",
+        "SCHEMA_001",
+        "SCHEMA_200",
+        "SCHEMA_201",
+        "SCHEMA_202",
+        "SCHEMA_203",
+        "SCHEMA_204"
+      ]
+    },
+    "5": {
+      "class": "invalid_config",
+      "meaning": "Configuration invalid, or validation / sync / lint / precondition failure",
+      "symbolic_codes": [
+        "ANON_1400",
+        "ANON_1401",
+        "CONFIG_001",
+        "CONFIG_002",
+        "CONFIG_003",
+        "CONFIG_004",
+        "CONFIG_005",
+        "CONFIG_007",
+        "CONFIG_010",
+        "DIFFER_400",
+        "DIFFER_401",
+        "DIFF_001",
+        "LINT_1500",
+        "PRECON_1000",
+        "RESTORE_001",
+        "SEED_001",
+        "SYNC_001",
+        "SYNC_300",
+        "SYNC_301",
+        "SYNC_302",
+        "SYNC_303",
+        "VALID_001",
+        "VALID_500",
+        "VALID_501",
+        "VALID_502",
+        "VERIFY_001"
+      ]
+    },
+    "6": {
+      "class": "lock_contention",
+      "meaning": "Lock or connection-pool contention \u2014 another writer holds the lock",
+      "symbolic_codes": [
+        "LOCK_1300",
+        "LOCK_1301",
+        "POOL_1200",
+        "POOL_1201"
+      ]
+    },
+    "7": {
+      "class": "git_error",
+      "meaning": "Git / pgGit / grant-accompaniment error",
+      "symbolic_codes": [
+        "GIT_001",
+        "GIT_002",
+        "GIT_003",
+        "GIT_800",
+        "GIT_801",
+        "GIT_802",
+        "GRANT_001",
+        "PGGIT_900",
+        "PGGIT_901"
+      ]
+    },
+    "8": {
+      "class": "irreversible_rollback",
+      "meaning": "Irreversible rollback, or inconsistent state after rollback",
+      "symbolic_codes": [
+        "ROLLBACK_001",
+        "ROLLBACK_600",
+        "ROLLBACK_601",
+        "ROLLBACK_602"
+      ]
+    }
+  },
+  "no_ledger_error_code": "PRECON_1001"
+}

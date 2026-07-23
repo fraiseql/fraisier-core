@@ -1,0 +1,116 @@
+name: release-binaries
+
+# release-plz publishes `fraisier` to crates.io and cuts the GitHub release, but it
+# builds NO binaries — so the only way to get a `fraisier` binary was
+# `cargo install fraisier`, which bakes in the build host's glibc floor. Built on a
+# modern host that is `GLIBC_2.38`+, which is why the beta.4 binary failed to load on
+# Debian 12 (glibc 2.36).
+#
+# This workflow attaches portable, prebuilt `fraisier` binaries to each `fraisier-v*`
+# release: the Linux `-gnu` builds are glibc-floored to 2.28 with cargo-zigbuild (run
+# on Debian 10+/Ubuntu 18.04+/RHEL 8+), plus a fully-static musl build for
+# Alpine/distroless/scratch. A release-time objdump gate fails the build if any Linux
+# `-gnu` binary would need newer than GLIBC_2.34.
+#
+# Triggered on `release: published` (not the tag push) so the release always exists
+# when we upload — release-plz creates it via a GitHub App token, so the event does
+# fire this workflow. Only the `fraisier` bin crate's tags qualify (fraisier-webhook-v*
+# and other workspace crates are filtered out).
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write   # upload assets to the release
+
+concurrency:
+  group: release-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_STRIP: symbols   # strip at link time (host-arch-independent)
+
+jobs:
+  binaries:
+    name: ${{ matrix.target }}
+    if: >-
+      github.repository == 'fraiseql/fraisier-core' &&
+      startsWith(github.event.release.tag_name, 'fraisier-v')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            zig_target: x86_64-unknown-linux-gnu.2.28
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            zig_target: aarch64-unknown-linux-gnu.2.28
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            zig_target: x86_64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Install the pinned Rust toolchain
+        run: rustup show
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      # cargo-zigbuild pins the glibc floor (`.2.28`) via zig as the linker and
+      # produces static musl binaries. Only the Linux `zig_target` rows use it; the
+      # macOS rows build natively.
+      - name: Install zig + cargo-zigbuild
+        if: matrix.zig_target
+        shell: bash
+        run: |
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
+          echo "$PWD/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --version 0.23.0 --locked
+
+      - name: Build fraisier
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.zig_target }}" ]; then
+            cargo zigbuild --release --target "${{ matrix.zig_target }}" --bin fraisier
+          else
+            cargo build --release --target "${{ matrix.target }}" --bin fraisier
+          fi
+
+      - name: Verify glibc ceiling (Linux gnu)
+        if: contains(matrix.target, 'unknown-linux-gnu')
+        shell: bash
+        run: |
+          ceiling="2.34"
+          p="target/${{ matrix.target }}/release/fraisier"
+          max=$(objdump -T "$p" 2>/dev/null | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -V | tail -1)
+          echo "fraisier needs up to GLIBC_${max:-none}"
+          if [ -n "$max" ] && [ "$(printf '%s\n%s\n' "$ceiling" "$max" | sort -V | tail -1)" != "$ceiling" ]; then
+            echo "::error::fraisier requires GLIBC_$max > $ceiling — would not load on Debian 12 (glibc 2.36)"
+            exit 1
+          fi
+
+      - name: Package
+        shell: bash
+        run: tar czf "fraisier-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" fraisier
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "fraisier-${{ matrix.target }}.tar.gz" --clobber

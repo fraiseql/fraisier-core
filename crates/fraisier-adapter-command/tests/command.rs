@@ -90,6 +90,50 @@ async fn verify_pass_fail_and_unconfigured() {
 }
 
 #[tokio::test]
+async fn up_exposes_release_context_env() {
+    // A source-run prepare script reads these to reference the release portably:
+    // FRAISIER_RELEASE_DIR mirrors the command's working directory; ACTIVE_PATH
+    // and APP_VERSION come from the [artifact] settings.
+    let a = adapter(json!({
+        "up": "printf '%s|%s|%s' \
+               \"$FRAISIER_RELEASE_DIR\" \"$FRAISIER_ACTIVE_PATH\" \"$FRAISIER_APP_VERSION\""
+    }));
+    let mut c = ctx();
+    // An existing directory, so `sh` can spawn from it; FRAISIER_RELEASE_DIR
+    // mirrors this working directory (the staged release in a real deploy).
+    c.workdir = std::path::PathBuf::from("/");
+    c.settings
+        .insert("active_path".to_owned(), json!("/srv/app/current"));
+    c.settings.insert("version".to_owned(), json!("dev"));
+
+    let outcome = a.up(&c, None).await.expect("up");
+    assert_eq!(outcome.log, "/|/srv/app/current|dev");
+}
+
+#[tokio::test]
+async fn release_context_env_omits_unset_optional_settings() {
+    // With no active_path/version configured, those vars are unset (empty), while
+    // FRAISIER_RELEASE_DIR always reflects the working directory.
+    let a = adapter(json!({
+        "up": "printf '[%s][%s]' \"$FRAISIER_ACTIVE_PATH\" \"$FRAISIER_APP_VERSION\""
+    }));
+    let outcome = a.up(&ctx(), None).await.expect("up");
+    assert_eq!(outcome.log, "[][]");
+}
+
+#[tokio::test]
+async fn command_runs_from_the_ctx_workdir() {
+    // The command's cwd is ctx.workdir, not the caller's directory: a `pwd` from
+    // "/" (always present) reports "/". This is what makes a relative
+    // `up = "bash scripts/deploy/prepare.sh"` resolve against the release.
+    let a = adapter(json!({ "up": "pwd" }));
+    let mut c = ctx();
+    c.workdir = std::path::PathBuf::from("/");
+    let outcome = a.up(&c, None).await.expect("up");
+    assert_eq!(outcome.log.trim(), "/");
+}
+
+#[tokio::test]
 async fn secret_reaches_command_via_env_not_argv() {
     let _guard = ENV_LOCK.lock().await;
     let source = "FRAISIER_CMD_IT_SECRET";

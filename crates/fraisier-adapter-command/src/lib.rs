@@ -32,6 +32,16 @@
 //! Because [`describe`](MigrationAdapter::describe) advertises only configured
 //! commands and takes no context, the command set is fixed at construction.
 //!
+//! ## Working directory and the release context
+//!
+//! The deploy runs these commands with their working directory set to the staged
+//! release (see [`AdapterCtx::workdir`]), so a relative `up = "bash
+//! scripts/deploy/prepare.sh"` resolves against the release it was cut from. Each
+//! command also receives the release context in its environment —
+//! `FRAISIER_RELEASE_DIR` (the working directory), and, when configured,
+//! `FRAISIER_ACTIVE_PATH` and `FRAISIER_APP_VERSION` — so a source-run prepare
+//! script can reference the deploy's paths without coupling to a fixed version.
+//!
 //! ## Secrets and the target revision (never in argv)
 //!
 //! Every declared secret in [`AdapterCtx::env_secrets`] is resolved via
@@ -60,6 +70,16 @@ const PROTOCOL_VERSION: u32 = 1;
 
 /// The env var the target revision is exported under for `up`/`down_to`.
 const TARGET_ENV: &str = "FRAISIER_TARGET";
+
+/// The env var carrying the migration command's working directory — the staged
+/// release for a release-based deploy.
+const RELEASE_DIR_ENV: &str = "FRAISIER_RELEASE_DIR";
+
+/// The env var carrying the `active_path` symlink target, when configured.
+const ACTIVE_PATH_ENV: &str = "FRAISIER_ACTIVE_PATH";
+
+/// The env var carrying the app version being deployed, when known.
+const APP_VERSION_ENV: &str = "FRAISIER_APP_VERSION";
 
 /// Method keys recognised under `settings.commands`, in capability order.
 const METHOD_KEYS: &[&str] = &["current_revision", "up", "down_to", "verify"];
@@ -189,6 +209,7 @@ impl CommandMigration {
         })?;
 
         let mut envs = resolve_secret_env(ctx, &self.name)?;
+        envs.extend(release_env(ctx));
         envs.extend(extra_env);
         let (program, args) = spec.program_and_args();
         run_command(
@@ -231,6 +252,33 @@ fn resolve_secret_env(
             Ok((OsString::from(logical), OsString::from(value)))
         })
         .collect()
+}
+
+/// The release-context env vars exported to every migration command, so a
+/// source-run prepare script can reference the deploy's paths **portably** —
+/// without hard-coding an absolute release path coupled to `--app-version`:
+///
+/// - `FRAISIER_RELEASE_DIR` — the command's working directory, which the deploy
+///   sets to the staged release for a release-based deploy (so relative paths and
+///   this var both point at the freshly-cut release).
+/// - `FRAISIER_ACTIVE_PATH` — the `active_path` symlink swapped in on activate,
+///   when configured.
+/// - `FRAISIER_APP_VERSION` — the app version being deployed, when known.
+///
+/// The last two are omitted when their `[artifact]` settings are absent, so a
+/// script can distinguish "not configured" from an empty value.
+fn release_env(ctx: &AdapterCtx) -> Vec<(OsString, OsString)> {
+    let mut envs = vec![(
+        OsString::from(RELEASE_DIR_ENV),
+        ctx.workdir.clone().into_os_string(),
+    )];
+    if let Some(active_path) = ctx.settings.get("active_path").and_then(Value::as_str) {
+        envs.push((OsString::from(ACTIVE_PATH_ENV), OsString::from(active_path)));
+    }
+    if let Some(version) = ctx.settings.get("version").and_then(Value::as_str) {
+        envs.push((OsString::from(APP_VERSION_ENV), OsString::from(version)));
+    }
+    envs
 }
 
 #[async_trait]

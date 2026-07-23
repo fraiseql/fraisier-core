@@ -546,12 +546,36 @@ impl DeployShared {
         Ok(())
     }
 
+    /// The migration context for this run, with `workdir` pointed at the staged
+    /// release directory when the artifact was staged **locally**.
+    ///
+    /// This is what lets a source-run migration run *from the release it was cut
+    /// from* rather than the operator's invocation directory: a `command`-adapter
+    /// `up = "bash scripts/deploy/prepare.sh"` resolves the script against the
+    /// release, and a confiture `--migrations-dir` given relatively resolves the
+    /// same way. Scoped to the migrate step (Preflight, which runs before `fetch`,
+    /// keeps the base workdir), so the release is always present when it applies.
+    ///
+    /// The override is gated on the staged path existing as a local directory, so
+    /// a deploy with no artifact axis — or a single-host stage whose path lives on
+    /// a remote host — keeps the base `workdir` unchanged.
+    fn migration_ctx(&self, runtime: &DeployRuntime) -> AdapterCtx {
+        let mut ctx = self.ctx.clone();
+        if let Some(staged) = &runtime.staged {
+            if staged.path.is_dir() {
+                ctx.workdir.clone_from(&staged.path);
+            }
+        }
+        ctx
+    }
+
     async fn run_migrate(&self, runtime: &mut DeployRuntime) -> Result<(), SagaError> {
+        let ctx = self.migration_ctx(runtime);
         // Capture the live pre-migration revision first, so compensation has an
         // exact target even if the durable ledger has drifted.
         let previous = self
             .migration
-            .current_revision(&self.ctx)
+            .current_revision(&ctx)
             .await
             .map_err(|e| Self::failed("migrate", &e))?;
         runtime.previous_revision = previous;
@@ -559,14 +583,14 @@ impl DeployShared {
         if let Some(target) = &self.rollback_to {
             // Deliberate rollback: take the database *down* to the target revision.
             self.migration
-                .down_to(&self.ctx, target.clone())
+                .down_to(&ctx, target.clone())
                 .await
                 .map_err(|e| Self::failed("migrate", &e))?;
             runtime.new_revision = Some(target.clone());
         } else {
             let outcome = self
                 .migration
-                .up(&self.ctx, self.target.clone())
+                .up(&ctx, self.target.clone())
                 .await
                 .map_err(|e| Self::failed("migrate", &e))?;
             runtime.new_revision = outcome.to.or_else(|| runtime.previous_revision.clone());
@@ -586,17 +610,13 @@ impl DeployShared {
         };
         // Compensation undoes whatever `run_migrate` did: a forward deploy went
         // `up`, so it comes back `down_to(previous)`; a rollback went `down_to`, so
-        // it goes back `up` to the pre-rollback revision.
+        // it goes back `up` to the pre-rollback revision. Runs from the same
+        // release-relative workdir the forward migration used.
+        let ctx = self.migration_ctx(runtime);
         let result = if self.rollback_to.is_some() {
-            self.migration
-                .up(&self.ctx, Some(previous))
-                .await
-                .map(|_| ())
+            self.migration.up(&ctx, Some(previous)).await.map(|_| ())
         } else {
-            self.migration
-                .down_to(&self.ctx, previous)
-                .await
-                .map(|_| ())
+            self.migration.down_to(&ctx, previous).await.map(|_| ())
         };
         result.map_err(|e| Self::failed("migrate", &e))
     }
@@ -743,6 +763,7 @@ mod tests {
     use async_trait::async_trait;
     use fraisier_saga::saga::SagaOutcome;
     use fraisier_saga::state_store::{FilesystemStateStore, FraiseKey, StateStore};
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     /// An ordered log of every adapter call, shared across the fakes.
@@ -802,6 +823,49 @@ mod tests {
         }
     }
 
+    /// An artifact fake whose `stage` reports a caller-provided (real) path, so a
+    /// test can assert the migrate step runs from that staged release directory.
+    struct StagedPathArtifact {
+        trail: Trail,
+        path: PathBuf,
+    }
+
+    #[async_trait]
+    impl ArtifactAdapter for StagedPathArtifact {
+        async fn stage(
+            &self,
+            _ctx: &AdapterCtx,
+            _host: &HostId,
+        ) -> Result<StagedArtifact, AdapterError> {
+            log(&self.trail, "stage");
+            Ok(StagedArtifact {
+                artifact: ArtifactRef {
+                    id: "v-new".to_owned(),
+                    checksum: None,
+                },
+                path: self.path.clone(),
+            })
+        }
+
+        async fn activate(
+            &self,
+            _ctx: &AdapterCtx,
+            _host: &HostId,
+            staged: &StagedArtifact,
+        ) -> Result<(), AdapterError> {
+            log(&self.trail, format!("activate:{}", staged.artifact.id));
+            Ok(())
+        }
+
+        async fn current(
+            &self,
+            _ctx: &AdapterCtx,
+            _host: &HostId,
+        ) -> Result<Option<ArtifactRef>, AdapterError> {
+            Ok(None)
+        }
+    }
+
     // Reason: each bool is an independent failure-injection toggle for a distinct
     // test scenario; a two-variant enum per flag (the lint's suggestion) would be
     // more ceremony than signal for a test fake.
@@ -818,6 +882,9 @@ mod tests {
         /// `run_to`). Guards the [`run_migrate`] contract that `self.target` is
         /// `None` unless an operator explicitly pinned one.
         decline_targeted_up: bool,
+        /// The `ctx.workdir` seen by each migration call, for asserting the
+        /// migrate step runs from the staged release directory.
+        seen_workdirs: Arc<Mutex<Vec<PathBuf>>>,
     }
 
     impl FakeMigration {
@@ -830,7 +897,15 @@ mod tests {
                 fail_up: false,
                 verify_ok: true,
                 decline_targeted_up: false,
+                seen_workdirs: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn record_workdir(&self, ctx: &AdapterCtx) {
+            self.seen_workdirs
+                .lock()
+                .expect("workdirs")
+                .push(ctx.workdir.clone());
         }
     }
 
@@ -848,17 +923,19 @@ mod tests {
 
         async fn current_revision(
             &self,
-            _ctx: &AdapterCtx,
+            ctx: &AdapterCtx,
         ) -> Result<Option<Revision>, AdapterError> {
+            self.record_workdir(ctx);
             log(&self.trail, "current_revision");
             Ok(self.current.clone())
         }
 
         async fn up(
             &self,
-            _ctx: &AdapterCtx,
+            ctx: &AdapterCtx,
             target: Option<Revision>,
         ) -> Result<MigrationOutcome, AdapterError> {
+            self.record_workdir(ctx);
             log(&self.trail, "up");
             if self.decline_targeted_up && target.is_some() {
                 return Err(exec_error(
@@ -878,9 +955,10 @@ mod tests {
 
         async fn down_to(
             &self,
-            _ctx: &AdapterCtx,
+            ctx: &AdapterCtx,
             target: Revision,
         ) -> Result<MigrationOutcome, AdapterError> {
+            self.record_workdir(ctx);
             log(&self.trail, format!("down_to:{target}"));
             Ok(MigrationOutcome::default())
         }
@@ -1065,6 +1143,80 @@ mod tests {
         let record: DeployRecord = serde_json::from_value(snapshot).expect("decode");
         assert_eq!(record.active.expect("active").artifact.id, "v-new");
         assert_eq!(record.revision, Some(Revision::new("rev-new")));
+    }
+
+    #[tokio::test]
+    async fn migrate_runs_from_the_staged_release_directory() {
+        // A source-run deploy stages the release, then its command/confiture
+        // migration must run *from* that release (not the operator's invocation
+        // cwd). The migrate ctx.workdir must be the staged path, captured after
+        // fetch — proving the fix for the escape-hatch adapter's release coupling.
+        let (_dir, store) = store();
+        let release = tempfile::tempdir().expect("release dir");
+        let trail = Trail::default();
+        let migration = FakeMigration::healthy(&trail);
+        let seen = migration.seen_workdirs.clone();
+
+        let plan = SingleHostDeploy::builder("checkout", "production", HostId::new("localhost"))
+            .artifact(Arc::new(StagedPathArtifact {
+                trail: trail.clone(),
+                path: release.path().to_path_buf(),
+            }))
+            .migration(Arc::new(migration))
+            .service(Arc::new(FakeService {
+                trail: trail.clone(),
+                fail_restarts: Arc::new(Mutex::new(0)),
+            }))
+            .health(Arc::new(FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            }))
+            .build()
+            .expect("build");
+
+        let outcome = plan.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+
+        let seen = seen.lock().expect("workdirs").clone();
+        assert!(!seen.is_empty(), "the migration axis ran");
+        assert!(
+            seen.iter().all(|dir| dir == release.path()),
+            "every migration call ran from the staged release {:?}, saw {seen:?}",
+            release.path()
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_keeps_base_workdir_when_no_local_release_is_staged() {
+        // With the default staged path (`/staging/v-new`, absent on this host —
+        // as for a remote single-host stage), the override must not apply: the
+        // migration keeps the base workdir rather than cd-ing into a missing dir.
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let migration = FakeMigration::healthy(&trail);
+        let seen = migration.seen_workdirs.clone();
+
+        let plan = deploy(
+            &trail,
+            FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            },
+            migration,
+            FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            },
+        );
+
+        let outcome = plan.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+
+        let seen = seen.lock().expect("workdirs").clone();
+        assert!(
+            seen.iter().all(|dir| dir == &PathBuf::from(".")),
+            "a non-local stage keeps the base workdir, saw {seen:?}"
+        );
     }
 
     #[tokio::test]

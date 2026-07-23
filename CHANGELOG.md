@@ -6,6 +6,34 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Migrations now run from the staged release directory.** On a single-host
+  deploy, the migrate step runs the migration axis with its working directory set
+  to the release just staged by `fetch` (`StagedArtifact.path`) instead of the
+  operator's invocation directory. This unblocks the idiomatic **source-run /
+  build-on-deploy** pattern: a `command`-adapter migration can now use the natural
+  `up = "bash scripts/deploy/prepare.sh"` and have the script resolve against the
+  release it was cut from — no more hard-coding an absolute release path coupled
+  to `--app-version`. A confiture `--migrations-dir` given as a relative path
+  resolves the same way, so the two adapters behave consistently. The override is
+  gated on the staged path existing as a local directory, so a deploy with no
+  artifact axis — or a remote single-host stage whose release lives on another
+  host — keeps the previous base working directory. Preflight (which runs before
+  `fetch`) is unaffected. Multi-host deploys are unchanged: they migrate once on
+  the orchestrator, where the per-host release is not present.
+
+### Added
+
+- **The `command` migration adapter exposes the release context to its
+  commands.** Every migration command now receives `FRAISIER_RELEASE_DIR` (the
+  command's working directory — the staged release), and, when configured,
+  `FRAISIER_ACTIVE_PATH` (the `active_path` symlink target) and
+  `FRAISIER_APP_VERSION` (the version being deployed). A prepare script can
+  reference the deploy's paths portably instead of coupling to a fixed
+  `--app-version`. The two optional vars are omitted when their `[artifact]`
+  settings are absent, so a script can tell "not configured" from an empty value.
+
 ## [1.0.0-beta.5] - 2026-07-21
 
 ### Added

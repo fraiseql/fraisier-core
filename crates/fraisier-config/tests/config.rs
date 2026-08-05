@@ -1143,6 +1143,30 @@ fn with_policy(body: &str) -> DeployConfig {
 }
 
 #[test]
+fn a_policy_with_preflight_off_warns_that_every_deploy_will_be_refused() {
+    // The combination is not a contradiction the operator can be assumed to
+    // have meant: `preflight_mode = "off"` means nothing inspects the pending
+    // schema changes, and a policy cannot approve what nobody has looked at, so
+    // *every* deploy is refused at the gate. Correct, and baffling to debug from
+    // the refusal alone — say it at config time, where the fix is.
+    let off = PRD_7_1.replace("forward_compatible_lint = true", "preflight_mode = \"off\"");
+    let report =
+        DeployConfig::from_toml_str(&format!("{off}\n[policy]\nauto_apply = [\"additive\"]\n"))
+            .expect("parses")
+            .validate();
+    assert!(has_warning(&report, "policy"), "{report}");
+    // A warning, not an error: the operator may be mid-migration between the two
+    // settings, and refusing to load the config would be worse than saying so.
+    assert!(report.ok(), "{report}");
+}
+
+#[test]
+fn a_policy_with_preflight_on_does_not_warn() {
+    let report = with_policy("auto_apply = [\"additive\"]\n").validate();
+    assert!(!has_warning(&report, "policy"), "{report}");
+}
+
+#[test]
 fn an_unknown_policy_key_is_rejected() {
     let toml = format!("{PRD_7_1}\n[policy]\nauto_aply = [\"additive\"]\n");
     assert!(

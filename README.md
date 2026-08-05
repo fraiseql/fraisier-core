@@ -145,7 +145,9 @@ never crosses the wire.
 Set the strategy to `blue-green` and give fraisier an `lb` adapter. fraisier
 brings up a green fleet alongside blue, **refuses to proceed unless the pending
 migration is certified forward-compatible for a two-version window** (it consumes
-confiture's first-class `window_safe` verdict — confiture ≥ 0.23.0), checks the
+confiture's first-class `window_safe` verdict — confiture ≥ 0.23.0 — as the
+always-on half of the [schema risk policy gate](docs/schema-risk-policy.md)),
+checks the
 connection budget against the shared database, swaps traffic at the load
 balancer, holds, and — if green degrades during the hold — swaps **back** to the
 still-hot blue fleet. Rollback is a traffic swap-back, not a database rollback.
@@ -239,6 +241,28 @@ that makes a database mutation slower rolls back automatically, naming the
 regressed operation (`perf regression: order/UPDATE p50 +42% (12ms→17ms)`) in the
 rollback reason and the `[schedule].notify` webhook. The DSN reaches the scan by
 environment, never argv. See [`docs/perf-regression-gate.md`](docs/perf-regression-gate.md).
+
+### Schema risk policy gate
+
+`[policy]` turns the migration adapter's per-change **risk tier** into a deploy
+decision: auto-apply the tiers you trust, send the rest to an approval hook, and
+**refuse anything nobody classified**.
+
+```toml
+[policy]
+auto_apply       = ["additive", "reversible"]
+require_approval = ["lock_risky", "destructive", "irreversible"]
+unclassified     = "deny"                          # never "auto_apply"
+approval_command = "scripts/deploy/approve.sh"     # exit 0 approves
+```
+
+A deploy that drops a column stops at `preflight`, names the object, and waits
+for the hook to say yes — before anything is staged, migrated or restarted.
+Configuring the section is the opt-in: with no `[policy]`, deploys behave exactly
+as they did. There is no `--force`; approval arrives only through the hook, and a
+hook that fails, times out, or cannot be spawned is a **refusal**. Blue-green's
+window-safety rule applies with or without the section. See
+[`docs/schema-risk-policy.md`](docs/schema-risk-policy.md).
 
 ## Observability
 

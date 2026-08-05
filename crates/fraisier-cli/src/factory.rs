@@ -1291,10 +1291,59 @@ pub fn build_blue_green(
 #[cfg(test)]
 mod tests {
     use super::{
-        build, build_health, build_health_probe, build_multi_host, summarize, summarize_multi_host,
+        build, build_health, build_health_probe, build_multi_host, build_policy_gate, summarize,
+        summarize_multi_host,
     };
     use fraisier_config::DeployConfig;
+    use fraisier_core::adapter_axes::RiskTier;
+    use fraisier_core::policy::{PolicyAction, UnclassifiedAction};
     use fraisier_core::restore_rehearsal::BackupSource;
+
+    #[test]
+    fn an_absent_policy_section_builds_no_gate() {
+        // The D6 opt-out, at the wiring layer: nothing to configure means
+        // nothing to decide, and no approval hook to spawn.
+        let config = DeployConfig::from_toml_str(&single_host_with_migration("")).expect("parses");
+        let gate = build_policy_gate(&config);
+        assert!(gate.policy().is_none());
+        assert!(!gate.has_hook());
+    }
+
+    #[test]
+    fn the_factory_builds_a_policy_and_its_hook_from_config() {
+        let toml = format!(
+            "{}\n[policy]\nauto_apply = [\"additive\"]\n\
+             require_approval = [\"irreversible\"]\n\
+             unclassified = \"require_approval\"\n\
+             approval_command = \"scripts/deploy/approve.sh\"\n",
+            single_host_with_migration("")
+        );
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+        let gate = build_policy_gate(&config);
+        let policy = gate.policy().expect("a configured section builds a policy");
+        assert_eq!(policy.actions[&RiskTier::Additive], PolicyAction::AutoApply);
+        assert_eq!(
+            policy.actions[&RiskTier::Irreversible],
+            PolicyAction::RequireApproval
+        );
+        // A tier in neither list is denied, not defaulted back in.
+        assert!(!policy.actions.contains_key(&RiskTier::Destructive));
+        assert_eq!(policy.unclassified, UnclassifiedAction::RequireApproval);
+        assert!(gate.has_hook());
+    }
+
+    #[test]
+    fn a_blank_approval_command_wires_no_hook() {
+        // Whitespace is not a hook. The policy still claims one would be needed,
+        // so the gate refuses rather than running `sh -c ""` and reading its
+        // exit 0 as a sign-off.
+        let toml = format!(
+            "{}\n[policy]\napproval_command = \"   \"\n",
+            single_host_with_migration("")
+        );
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+        assert!(!build_policy_gate(&config).has_hook());
+    }
 
     /// A single-host confiture config with the given extra `[migration]` lines.
     fn single_host_with_migration(extra_migration: &str) -> String {

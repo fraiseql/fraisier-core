@@ -237,6 +237,24 @@ fn validate_policy(cfg: &DeployConfig, report: &mut ValidationReport) {
             ),
         ),
     }
+    // Correct, and baffling to debug from the refusal alone: with no preflight
+    // there is no report, so nothing inspected the pending schema changes, and a
+    // policy cannot approve what nobody has looked at. Every deploy is refused at
+    // the gate. Say so here, where the fix is — a warning rather than an error,
+    // because an operator may legitimately be mid-move between the two settings.
+    if cfg
+        .migration
+        .as_ref()
+        .is_some_and(|migration| migration.effective_preflight_mode() == PreflightMode::Off)
+    {
+        report.warn(
+            "policy",
+            "[policy] is configured but [migration].preflight_mode is \"off\" (or \
+             forward_compatible_lint = false), so nothing inspects the pending schema changes \
+             and every deploy will be refused at the policy gate; turn preflight on, or remove \
+             [policy]",
+        );
+    }
     if policy.approval_timeout_secs == Some(0) {
         report.error(
             "policy.approval_timeout_secs",

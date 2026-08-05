@@ -121,6 +121,7 @@ The honestly-disclosed trade: more architectural work in week 1, less adapter-po
 | Smoke-test token providers | v0.22 `token_provider` | ✅ `exec` / `oauth2_client_credentials` / `oauth2_refresh_token` acquire a deploy-time bearer for the http health probe; resolved once per deploy; secrets via `AdapterCtx::secret`. |
 | Observability | logs only | ✅ OpenTelemetry traces + structured logs |
 | Forward-compat migration lint | (none) | ✅ Via the migration adapter's `preflight` capability (Confiture native; `command` declines) |
+| Schema risk policy gate | (none) | ✅ Opt-in `[policy]`: per-change risk tiers (`additive` … `irreversible`) map to auto-apply / require-approval / deny, with an exec approval hook (JSON on stdin, exit 0 approves, any failure or timeout refuses). Deny-by-default on anything unclassified. One decision function gates all three strategies; blue-green's window-safety rule is its always-on baseline. |
 
 Rows marked ✅ ship in v1.0.0-beta.1. ⏳ indicates designed-in but deferred. Anything not in this matrix is out of scope.
 

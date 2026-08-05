@@ -2626,6 +2626,11 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
 /// deploy of a sick build rolls back **and** emits a notification, reusing the
 /// self-upgrade notify primitive. A committed deploy, or a config with no notify
 /// sink, fires nothing.
+///
+/// A deploy the **schema policy** blocked is reported as its own event: it is
+/// not "the deploy broke", it is "a pending migration needs a human", and an
+/// operator triaging the alert should not have to parse a reason string to tell
+/// those apart.
 async fn notify_deploy_failure(
     config: &DeployConfig,
     fraise: &str,
@@ -2641,7 +2646,11 @@ async fn notify_deploy_failure(
     };
     let (_, label, detail) = outcome_result(outcome);
     let payload = fraisier_self_upgrade::FailurePayload {
-        event: "scheduled-deploy-failed".to_owned(),
+        event: if detail.contains(fraisier_core::policy::REFUSED) {
+            "policy-blocked".to_owned()
+        } else {
+            "scheduled-deploy-failed".to_owned()
+        },
         failed: Some(format!("{fraise}/{environment}")),
         restored: None,
         reason: format!("{label}{detail}").trim().to_owned(),
@@ -4302,6 +4311,91 @@ current_revision = "true"
         std::fs::remove_file(&out).expect("rm");
         notify_deploy_failure(&config, "checkout", "production", &SagaOutcome::Committed).await;
         assert!(!out.exists(), "no notify on a committed deploy");
+    }
+
+    #[tokio::test]
+    async fn a_policy_block_exits_nonzero_and_names_the_cause() {
+        // End-to-end through the real wiring: config → factory → builder → saga
+        // → exit code. The `command` migration adapter advertises only the
+        // methods it is configured with, so it cannot classify — and a policy
+        // that cannot see the pending changes refuses rather than assuming they
+        // are safe.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let toml = format!(
+            "{}\n[policy]\nauto_apply = [\"additive\"]\n",
+            VALID.replace(
+                "adapter = \"confiture\"\ndatabase_url_env = \"CHECKOUT_DATABASE_URL\"",
+                "adapter = \"command\"\n\n[migration.settings.commands]\n\
+                 up = \"true\"\ncurrent_revision = \"true\"",
+            )
+        );
+        let config = write(dir.path(), "fraisier.toml", &toml);
+        let state = dir.path().join("state");
+
+        let out = deploy(&config, &state, None, Some("1.2.3"), false, false)
+            .await
+            .expect("the deploy runs and is refused");
+        assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
+        assert!(out.pretty.contains("policy refused"), "{}", out.pretty);
+        assert!(
+            out.pretty.contains("no preflight report"),
+            "the refusal names its cause: {}",
+            out.pretty
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_block_notifies_as_its_own_event() {
+        // A scheduled deploy blocked by the schema policy is not "the deploy
+        // broke" — it is "someone has to look at this migration". The operator
+        // reading the alert needs to tell the two apart without parsing a
+        // reason string, so the block gets its own event name.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("captured");
+        let command = format!("echo \"$FRAISIER_NOTIFY_EVENT\" > {}", out.display());
+        let toml = format!("[schedule]\nnotify = '{command}'\n");
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+
+        notify_deploy_failure(
+            &config,
+            "checkout",
+            "production",
+            &SagaOutcome::RolledBack {
+                failed_step: "preflight".to_owned(),
+                reason: format!(
+                    "step 'preflight' failed: {} approval is required for \
+                     public.tb_user.legacy_flag",
+                    fraisier_core::policy::REFUSED
+                ),
+            },
+        )
+        .await;
+        let captured = std::fs::read_to_string(&out).expect("hook ran");
+        assert_eq!(captured.trim(), "policy-blocked", "{captured}");
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_failure_keeps_the_scheduled_deploy_event() {
+        // The discrimination is on the policy's own refusal marker, not on the
+        // step name: plenty of preflight failures are not policy blocks.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("captured");
+        let command = format!("echo \"$FRAISIER_NOTIFY_EVENT\" > {}", out.display());
+        let toml = format!("[schedule]\nnotify = '{command}'\n");
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+
+        notify_deploy_failure(
+            &config,
+            "checkout",
+            "production",
+            &SagaOutcome::RolledBack {
+                failed_step: "preflight".to_owned(),
+                reason: "step 'preflight' failed: 2 host(s) unreachable".to_owned(),
+            },
+        )
+        .await;
+        let captured = std::fs::read_to_string(&out).expect("hook ran");
+        assert_eq!(captured.trim(), "scheduled-deploy-failed", "{captured}");
     }
 
     #[tokio::test]

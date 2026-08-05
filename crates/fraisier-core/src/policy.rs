@@ -752,6 +752,22 @@ impl PolicyGate {
         self
     }
 
+    /// The resolved `[policy]` section, or `None` when none was configured.
+    ///
+    /// For rendering what the gate would decide — a plan preview, a status line
+    /// — without running it.
+    #[must_use]
+    pub const fn policy(&self) -> Option<&Policy> {
+        self.policy.as_ref()
+    }
+
+    /// Whether an approval hook is wired, i.e. whether anything could unblock a
+    /// decision that needs sign-off.
+    #[must_use]
+    pub const fn has_hook(&self) -> bool {
+        self.hook.is_some()
+    }
+
     /// Decide whether this deploy may proceed, resolving approval and auditing
     /// the outcome.
     ///

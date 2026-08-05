@@ -65,6 +65,50 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `fetch`) is unaffected. Multi-host deploys are unchanged: they migrate once on
   the orchestrator, where the per-host release is not present.
 
+### Added
+
+- **The policy gate runs, and an approval hook can unblock it.** `[policy]` now
+  stops a deploy: the gate applies at the `preflight` step of all three
+  strategies, ahead of the forward-compat lint, so a refused deploy stages
+  nothing, migrates nothing and restarts nothing. A refusal names the objects
+  responsible and opens with `policy refused:`.
+
+  `approval_command` is the one way to unblock a change that needs sign-off —
+  there is deliberately no `--force` or `--approve` flag, so "an agent with
+  authority" means configuring a hook that can authenticate that agent. The hook
+  runs via `sh -c` with the request as **JSON on stdin** (never argv) and the
+  deploy's identity in `FRAISIER_APPROVAL_FRAISE` / `_ENVIRONMENT` /
+  `_WORST_TIER` / `_CHANGE_COUNT`. Exit 0 approves, and the first non-empty line
+  of stdout is recorded as the approver. **Every other outcome refuses** — a
+  non-zero exit, a command that cannot be executed, a spawn failure, or a hook
+  still running at `approval_timeout_secs` (now read; default 300s). The hook
+  receives the identity and the triggering changes and no `AdapterCtx`, so no
+  DSN or secret can reach it by construction.
+
+  Which deploys are gated: single-host, multi-host and blue-green, opt-in by the
+  section's presence (D6). `fraisier rollback` is **not** gated — it migrates
+  `down`, while the preflight report describes the pending *forward* changes, so
+  gating it would rule on a change-set the run will not apply and would put an
+  approver between an operator and an emergency rollback.
+
+  Every decision is audited: a `schema policy` tracing event with the deploy's
+  identity (and the approver, on an approval), and a blocked deploy fires
+  `[schedule].notify` with the event **`policy-blocked`** rather than
+  `scheduled-deploy-failed`, so an unattended deploy held for sign-off is
+  distinguishable from one that broke.
+
+  `validate-config` now warns when `[policy]` is configured together with
+  `[migration].preflight_mode = "off"`: nothing then inspects the pending schema
+  changes, so every deploy is refused at the gate — correct, and baffling to
+  debug from the refusal alone.
+
+  Operator guide: [`docs/schema-risk-policy.md`](docs/schema-risk-policy.md).
+
+- **One `describe` + `preflight` per deploy.** The lint, the blue-green window
+  rule and the tier policy read one report instead of asking the adapter each —
+  previously up to two confiture subprocesses and two database round-trips per
+  deploy for answers that cannot differ within a run.
+
 ### Removed
 
 - **BREAKING (embedders): the `fraisier_core::window_safety` module is gone**,

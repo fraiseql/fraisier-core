@@ -1462,6 +1462,18 @@ fn render_summary(summary: &factory::PlanSummary) -> String {
     out
 }
 
+/// Fold `extra`'s keys into `target`.
+///
+/// The blue-green payload is hand-built rather than serialized from a summary
+/// struct, so this is how it carries the same flattened schema keys the other
+/// two strategies' plans do — one shape across all three, not three that drift.
+fn merge(target: &mut Value, extra: Value) {
+    let (Some(target), Value::Object(extra)) = (target.as_object_mut(), extra) else {
+        return;
+    };
+    target.extend(extra);
+}
+
 /// Append the schema preview to a plan, set off by blank lines.
 ///
 /// A silent preview appends nothing at all — not even the blank lines — which
@@ -1606,7 +1618,7 @@ pub(crate) async fn deploy(
 
     // `[deploy].strategy = "blue-green"` selects the HTTP-tier traffic-swap flow.
     if config.deploy.as_ref().and_then(|d| d.strategy.as_deref()) == Some("blue-green") {
-        return run_blue_green(&config, app_version, state_dir, dry_run).await;
+        return run_blue_green(&config, app_version, state_dir, dry_run, fail_on_block).await;
     }
 
     // A config with [hosts] runs the multi-host rollout — unless an explicit
@@ -1730,22 +1742,32 @@ async fn run_blue_green(
     app_version: Option<&str>,
     state_dir: &Path,
     dry_run: bool,
+    fail_on_block: bool,
 ) -> Result<CommandOutput> {
     let resolved = factory::build_blue_green(config, app_version)?;
     if dry_run {
-        let pretty = format!(
-            "blue-green deploy plan for {}/{} (dry run — nothing executed)\n",
+        // Blue-green holds N-1 and N against one database for the swap window,
+        // so its plan answers the question no other strategy has to ask — and
+        // `--skip-preflight` is deliberately not honoured here, because the live
+        // blue-green preflight does not honour it either.
+        let schema = preview_schema(config, None, app_version, Baseline::WindowSafety, false).await;
+        let mut lines = vec![format!(
+            "blue-green deploy plan for {}/{}:",
             resolved.fraise, resolved.environment
-        );
+        )];
+        push_schema(&mut lines, &schema);
+        lines.push("(dry run — nothing was executed)".to_owned());
+        let mut json = json!({
+            "strategy": "blue-green",
+            "fraise": resolved.fraise,
+            "environment": resolved.environment,
+            "dry_run": true,
+        });
+        merge(&mut json, serde_json::to_value(&schema)?);
         return Ok(CommandOutput {
-            exit_code: 0,
-            pretty,
-            json: json!({
-                "strategy": "blue-green",
-                "fraise": resolved.fraise,
-                "environment": resolved.environment,
-                "dry_run": true,
-            }),
+            exit_code: i32::from(fail_on_block && preview::would_block(&schema)),
+            pretty: format!("{}\n", lines.join("\n")),
+            json,
         });
     }
 
@@ -3577,6 +3599,109 @@ url = "http://127.0.0.1:8080/health"
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
         assert_eq!(out.json["strategy"], serde_json::json!("blue-green"));
         assert_eq!(out.json["dry_run"], serde_json::json!(true));
+    }
+
+    /// A blue-green config over `body`'s `[deploy]`/axes.
+    fn blue_green_config(dir: &Path, body: &str) -> std::path::PathBuf {
+        let cfg = format!(
+            "{}\n[lb]\nadapter = \"nginx\"\nupstream = \"checkout_upstream\"\n\
+             include_dir = \"{}\"\n\n[blue_green]\ngreen_unit = \"checkout-green.service\"\n\
+             green_health_url = \"http://127.0.0.1:8081/healthz\"\n\
+             green_servers = [\"127.0.0.1:8081\"]\nblue_servers = [\"127.0.0.1:8080\"]\n",
+            body.replace(
+                "environment = \"staging\"",
+                "environment = \"staging\"\nstrategy = \"blue-green\""
+            ),
+            dir.join("nginx").display(),
+        );
+        write(dir, "fraisier.toml", &cfg)
+    }
+
+    #[tokio::test]
+    async fn blue_green_dry_run_shows_the_change_set() {
+        // The strategy with the highest schema stakes had the thinnest preview:
+        // four JSON fields and one line of prose. It reaches parity here.
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A `command` adapter with no preflight command configured: it builds,
+        // it describes itself, and it advertises no `preflight` — a degradation
+        // that needs no database, no subprocess, and no installed confiture.
+        let lints_nothing = VALID.replace(
+            "adapter = \"confiture\"\ndatabase_url_env = \"CHECKOUT_DATABASE_URL\"\n",
+            "adapter = \"command\"\ndatabase_url_env = \"CHECKOUT_DATABASE_URL\"\n\n             [migration.settings]\nup = \"true\"\n",
+        );
+        let config = blue_green_config(dir.path(), &lints_nothing);
+        let out = deploy(
+            &config,
+            &dir.path().join("state"),
+            None,
+            Some("1.2.3"),
+            true,
+            false,
+            false,
+        )
+        .await
+        .expect("dry run");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        // The existing four fields keep their names and types.
+        assert_eq!(out.json["strategy"], serde_json::json!("blue-green"));
+        assert_eq!(out.json["dry_run"], serde_json::json!(true));
+        // ...and the schema preview is beside them, in the same shape the
+        // single-host plan carries.
+        assert_eq!(
+            out.json["change_set_unavailable"]["code"],
+            serde_json::json!("no_preflight_capability")
+        );
+        assert!(out.pretty.contains("UNAVAILABLE"), "{}", out.pretty);
+        assert!(
+            out.pretty.contains("Risk is unknown, not zero."),
+            "{}",
+            out.pretty
+        );
+    }
+
+    #[tokio::test]
+    async fn blue_green_dry_run_shows_the_window_safety_verdict() {
+        // The baseline is not opt-in (the D3 carve-out), so blue-green always
+        // has a verdict to report — with no `[policy]` section anywhere.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = blue_green_config(dir.path(), VALID);
+        let out = deploy(
+            &config,
+            &dir.path().join("state"),
+            None,
+            Some("1.2.3"),
+            true,
+            false,
+            false,
+        )
+        .await
+        .expect("dry run");
+        assert!(
+            out.pretty.contains("window safety:"),
+            "no window-safety line: {}",
+            out.pretty
+        );
+        assert!(out.pretty.contains("WOULD BLOCK"), "{}", out.pretty);
+        assert_eq!(out.json["policy"]["decision"], serde_json::json!("deny"));
+        assert_eq!(out.json["window_safe"], serde_json::json!("unknown"));
+    }
+
+    #[tokio::test]
+    async fn blue_green_dry_run_honours_fail_on_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = blue_green_config(dir.path(), VALID);
+        let out = deploy(
+            &config,
+            &dir.path().join("state"),
+            None,
+            Some("1.2.3"),
+            true,
+            false,
+            true,
+        )
+        .await
+        .expect("dry run");
+        assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
     }
 
     #[tokio::test]

@@ -218,6 +218,7 @@ pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
         Some(&report.new_version),
         false,
         false,
+        false,
     )
     .await?;
     pretty.push_str(&deploy_out.pretty);
@@ -1589,6 +1590,7 @@ pub(crate) async fn deploy(
     app_version: Option<&str>,
     dry_run: bool,
     skip_preflight: bool,
+    fail_on_block: bool,
 ) -> Result<CommandOutput> {
     let config = load(config_path)?;
     let report = config.validate();
@@ -1616,11 +1618,14 @@ pub(crate) async fn deploy(
         // database, so neither has a shared hold window to certify.
         let schema =
             preview_schema(&config, host, app_version, Baseline::None, skip_preflight).await;
+        // A plan *was* produced, so the command succeeds — terraform semantics.
+        // `--fail-on-block` is the pipeline's opt-in to the stricter reading.
+        let exit_code = i32::from(fail_on_block && preview::would_block(&schema));
         if multi_host {
             let mut summary = factory::summarize_multi_host(&config, app_version)?;
             summary.schema = schema;
             return Ok(CommandOutput {
-                exit_code: 0,
+                exit_code,
                 pretty: render_multi_host_summary(&summary, &report),
                 json: serde_json::to_value(&summary)?,
             });
@@ -1628,7 +1633,7 @@ pub(crate) async fn deploy(
         let mut summary = factory::summarize(&config, host, app_version)?;
         summary.schema = schema;
         return Ok(CommandOutput {
-            exit_code: 0,
+            exit_code,
             pretty: render_summary(&summary),
             json: serde_json::to_value(&summary)?,
         });
@@ -2250,6 +2255,7 @@ impl fraisier_webhook::WebhookHandler for DeployHandler {
             &self.state_dir,
             None,
             version.as_deref(),
+            false,
             false,
             false,
         )
@@ -3382,6 +3388,7 @@ url = "http://127.0.0.1:8080/health"
             Some("1.2.3"),
             true,
             false,
+            false,
         )
         .await
         .expect("dry run");
@@ -3413,6 +3420,7 @@ url = "http://127.0.0.1:8080/health"
             Some("1.2.3"),
             true,
             true,
+            false,
         )
         .await
         .expect("dry run");
@@ -3425,6 +3433,87 @@ url = "http://127.0.0.1:8080/health"
             out.json["change_set_unavailable"]["code"],
             serde_json::json!("preflight_skipped")
         );
+    }
+
+    /// A config with `[policy]` configured and a migration adapter that cannot
+    /// be built here (the DSN env var is deliberately unset), so the gate decides
+    /// on *"nothing looked at the pending changes"* — a refusal, and one that
+    /// needs no subprocess, no database, and no installed confiture to reproduce.
+    fn policy_config() -> String {
+        let unbuildable = VALID.replace(
+            "adapter = \"confiture\"\ndatabase_url_env = \"CHECKOUT_DATABASE_URL\"",
+            "adapter = \"sqlx\"\ndatabase_url_env = \"FRAISIER_TEST_DSN_DELIBERATELY_UNSET\"",
+        );
+        format!(
+            "{unbuildable}\n[policy]\nauto_apply = [\"additive\"]\n\
+             require_approval = [\"irreversible\"]\nunclassified = \"deny\"\n\
+             approval_command = \"scripts/deploy/approve.sh\"\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_would_block_without_blocking() {
+        // Terraform semantics: a plan *was* produced, so the command succeeds.
+        // The block is reported, not enforced.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", &policy_config());
+        let out = deploy(
+            &config,
+            &dir.path().join("state"),
+            Some("127.0.0.1"),
+            Some("1.2.3"),
+            true,
+            false,
+            false,
+        )
+        .await
+        .expect("dry run");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert!(out.pretty.contains("WOULD BLOCK"), "{}", out.pretty);
+        assert_eq!(out.json["policy"]["decision"], serde_json::json!("deny"));
+    }
+
+    #[tokio::test]
+    async fn fail_on_block_turns_a_would_block_into_a_nonzero_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", &policy_config());
+        let out = deploy(
+            &config,
+            &dir.path().join("state"),
+            Some("127.0.0.1"),
+            Some("1.2.3"),
+            true,
+            false,
+            true,
+        )
+        .await
+        .expect("dry run");
+        assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
+        // The plan is still printed — a pipeline needs to see *why* it failed.
+        assert!(out.pretty.contains("deploy plan for"), "{}", out.pretty);
+    }
+
+    #[tokio::test]
+    async fn no_policy_section_renders_no_policy_line() {
+        // D6 again, at the CLI: an operator who has not opted in sees the
+        // change-set (or why there is none) and nothing else.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", VALID);
+        let out = deploy(
+            &config,
+            &dir.path().join("state"),
+            Some("127.0.0.1"),
+            Some("1.2.3"),
+            true,
+            false,
+            true,
+        )
+        .await
+        .expect("dry run");
+        assert!(!out.pretty.contains("policy:"), "{}", out.pretty);
+        assert_eq!(out.json["policy"], serde_json::Value::Null);
+        // ...and `--fail-on-block` has nothing to gate on, so it does not fire.
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
     }
 
     #[tokio::test]
@@ -3445,6 +3534,7 @@ url = "http://127.0.0.1:8080/health"
             Some("127.0.0.1"),
             Some("1.2.3"),
             true,
+            false,
             false,
         )
         .await
@@ -3481,7 +3571,7 @@ url = "http://127.0.0.1:8080/health"
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let state = dir.path().join("state");
         // Dry run: the strategy is recognized and routed; nothing is executed.
-        let out = deploy(&config, &state, None, Some("1.2.3"), true, false)
+        let out = deploy(&config, &state, None, Some("1.2.3"), true, false, false)
             .await
             .expect("dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
@@ -3495,7 +3585,7 @@ url = "http://127.0.0.1:8080/health"
         let bad = VALID.replace("database_url_env = \"CHECKOUT_DATABASE_URL\"\n", "");
         let config = write(dir.path(), "fraisier.toml", &bad);
         let state = dir.path().join("state");
-        let out = deploy(&config, &state, None, None, false, false)
+        let out = deploy(&config, &state, None, None, false, false, false)
             .await
             .expect("run");
         assert_eq!(out.exit_code, 1);
@@ -3772,7 +3862,7 @@ upstream = "checkout_upstream"
         let config = write(dir.path(), "fraisier.toml", MULTI_HOST);
         let state = dir.path().join("state");
         // No --host override: [hosts] selects the multi-host path.
-        let out = deploy(&config, &state, None, Some("1.2.3"), true, false)
+        let out = deploy(&config, &state, None, Some("1.2.3"), true, false, false)
             .await
             .expect("multi-host dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
@@ -3809,6 +3899,7 @@ upstream = "checkout_upstream"
             Some("1.2.3"),
             true,
             false,
+            false,
         )
         .await
         .expect("single-host dry run");
@@ -3824,7 +3915,7 @@ upstream = "checkout_upstream"
         let pull = MULTI_HOST.replace("source = \"release\"", "source = \"pull\"");
         let config = write(dir.path(), "fraisier.toml", &pull);
         let state = dir.path().join("state");
-        let out = deploy(&config, &state, None, Some("1.2.3"), true, false)
+        let out = deploy(&config, &state, None, Some("1.2.3"), true, false, false)
             .await
             .expect("multi-host pull dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
@@ -4472,7 +4563,7 @@ current_revision = "true"
         let config = write(dir.path(), "fraisier.toml", &toml);
         let state = dir.path().join("state");
 
-        let out = deploy(&config, &state, None, Some("1.2.3"), false, false)
+        let out = deploy(&config, &state, None, Some("1.2.3"), false, false, false)
             .await
             .expect("the deploy runs and is refused");
         assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);

@@ -382,6 +382,24 @@ impl PolicyPreview {
     }
 }
 
+/// Whether `--fail-on-block` should fail this plan.
+///
+/// A plan was produced either way, so a dry-run exits 0 by default — terraform
+/// semantics. `--fail-on-block` is for the pipeline that wants the plan *and* a
+/// nonzero exit when the deploy it previews would not go through: both a refusal
+/// and a decision waiting on a human qualify, because neither one deploys
+/// unattended.
+///
+/// A plan with no verdict at all (D6: no `[policy]`, no baseline) never blocks —
+/// a pipeline must not start failing on a gate its config never opted in to.
+#[must_use]
+pub fn would_block(preview: &SchemaPreview) -> bool {
+    matches!(
+        preview.policy.as_ref().map(|policy| policy.decision),
+        Some(Verdict::Deny | Verdict::NeedsApproval)
+    )
+}
+
 /// The phrase every degraded line ends on.
 ///
 /// A plan is read fast, and a missing change-set at a glance looks exactly like
@@ -421,9 +439,7 @@ pub fn render(preview: &SchemaPreview) -> String {
             lines.push(String::new());
         }
         lines.extend(wrap(match window {
-            WindowSafety::Safe => {
-                "window safety: certified forward-compatible for the two-version blue-green window"
-            }
+            WindowSafety::Safe => "window safety: certified for the two-version blue-green window",
             WindowSafety::Unsafe => {
                 "window safety: NOT CERTIFIED — the migration is not forward-compatible for a \
                  two-version window, and blue-green runs N-1 and N against one database"
@@ -967,6 +983,49 @@ mod tests {
         .await;
         assert!(preview.change_set.is_some(), "{preview:?}");
         assert!(preview.policy.is_none(), "{preview:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // `--fail-on-block`
+    // -----------------------------------------------------------------------
+
+    /// A preview whose gate reached `decision`.
+    fn decided(decision: Verdict) -> SchemaPreview {
+        SchemaPreview {
+            policy: Some(PolicyPreview {
+                decision,
+                worst_tier: None,
+                reason: Some("because".to_owned()),
+                reasons: Vec::new(),
+                approval_command: None,
+            }),
+            ..SchemaPreview::default()
+        }
+    }
+
+    #[test]
+    fn fail_on_block_exits_nonzero_on_deny() {
+        assert!(super::would_block(&decided(Verdict::Deny)));
+    }
+
+    #[test]
+    fn fail_on_block_exits_nonzero_on_needs_approval() {
+        // A decision waiting on a human does not deploy unattended either, so a
+        // pipeline gating on `--fail-on-block` has to see it.
+        assert!(super::would_block(&decided(Verdict::NeedsApproval)));
+    }
+
+    #[test]
+    fn fail_on_block_exits_zero_on_allow() {
+        assert!(!super::would_block(&decided(Verdict::Allow)));
+    }
+
+    #[test]
+    fn fail_on_block_exits_zero_when_nothing_decided() {
+        // D6: no `[policy]` section and no baseline means no verdict, and a
+        // pipeline must not start failing on a gate its config never opted in
+        // to.
+        assert!(!super::would_block(&SchemaPreview::default()));
     }
 
     // -----------------------------------------------------------------------

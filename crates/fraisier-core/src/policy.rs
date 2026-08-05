@@ -90,8 +90,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::adapter_axes::{
-    AdapterCtx, AdapterError, ChangeSetUnavailable, MigrationAdapter, PreflightReport, RiskTier,
-    SchemaChange,
+    AdapterCtx, AdapterDescription, AdapterError, ChangeSetUnavailable, MigrationAdapter,
+    PreflightReport, RiskTier, SchemaChange,
 };
 
 /// The tiers a policy auto-applies when its config does not say otherwise.
@@ -674,6 +674,14 @@ pub fn evaluate(
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct Inspection {
+    /// How the adapter described itself, or `None` when it was never asked
+    /// (the operator turned preflight off).
+    ///
+    /// [`capabilities`](Self::capabilities) is the decision-shaped reading of
+    /// the same `describe`; this field keeps the identity beside it, because a
+    /// report that says *"this adapter does not classify"* is only actionable
+    /// when it can also say **which** adapter, at **which** version.
+    pub adapter: Option<AdapterDescription>,
     /// What the adapter advertises.
     pub capabilities: Capabilities,
     /// Its preflight report, or `None` when no preflight ran — because the
@@ -702,6 +710,7 @@ pub async fn inspect(
         None
     };
     Ok(Inspection {
+        adapter: Some(described),
         capabilities,
         report,
     })

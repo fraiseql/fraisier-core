@@ -10,12 +10,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use fraisier_config::{DeployConfig, Severity, ValidationReport};
 use fraisier_core::multi_host::MultiHostDeploy;
+use fraisier_core::policy::Baseline;
 use fraisier_core::single_host::{DeployRecord, SingleHostDeploy};
 use fraisier_saga::saga::SagaOutcome;
 use fraisier_saga::state_store::{FilesystemStateStore, FraiseKey, StateStore};
 use serde_json::{json, Value};
 
 use crate::factory;
+use crate::preview::{self, SchemaPreview, Unavailable};
 
 /// The result of a command: an exit code and both renderings of its output.
 pub(crate) struct CommandOutput {
@@ -1452,10 +1454,25 @@ fn render_summary(summary: &factory::PlanSummary) -> String {
         lines.push(format!("  database_url_env: {source}"));
     }
     lines.push(format!("  settings:  {}", summary.settings_keys.join(", ")));
+    push_schema(&mut lines, &summary.schema);
     lines.push("(dry run — nothing was executed)".to_owned());
     let mut out = lines.join("\n");
     out.push('\n');
     out
+}
+
+/// Append the schema preview to a plan, set off by blank lines.
+///
+/// A silent preview appends nothing at all — not even the blank lines — which
+/// is how `--dry-run --skip-preflight` keeps printing the plan byte-for-byte.
+fn push_schema(lines: &mut Vec<String>, schema: &SchemaPreview) {
+    let rendered = preview::render(schema);
+    if rendered.is_empty() {
+        return;
+    }
+    lines.push(String::new());
+    lines.push(rendered);
+    lines.push(String::new());
 }
 
 /// Render only a report's non-blocking issues (warnings/info), in the same shape
@@ -1485,7 +1502,7 @@ fn render_multi_host_summary(
     report: &ValidationReport,
 ) -> String {
     let mut out = render_warnings(report);
-    let lines = vec![
+    let mut lines = vec![
         format!(
             "multi-host deploy plan for {}/{}:",
             summary.fraise, summary.environment
@@ -1498,11 +1515,69 @@ fn render_multi_host_summary(
         format!("  service:   {}", summary.service),
         format!("  health:    {}", summary.health),
         format!("  lb:        {}", summary.lb),
-        "(dry run — nothing was executed)".to_owned(),
     ];
+    push_schema(&mut lines, &summary.schema);
+    lines.push("(dry run — nothing was executed)".to_owned());
     out.push_str(&lines.join("\n"));
     out.push('\n');
     out
+}
+
+/// Inspect the migration adapter for a `--dry-run`, degrading rather than
+/// aborting.
+///
+/// Every way of failing to see the schema — the operator turned preflight off,
+/// the config did, the adapter cannot be built, the database is unreachable —
+/// yields a plan carrying an explicit unavailability instead of an error exit
+/// (rule 2, D8). The one thing it never does is produce a plan that reads as
+/// clean.
+async fn preview_schema(
+    config: &DeployConfig,
+    host: Option<&str>,
+    app_version: Option<&str>,
+    baseline: Baseline,
+    skip_preflight: bool,
+) -> SchemaPreview {
+    let (gate, approval_command) = factory::preview_gate(config);
+    let approval_command = approval_command.as_deref();
+    let uninspected =
+        |reason: Unavailable| preview::not_inspected(reason, &gate, approval_command, baseline);
+    if skip_preflight {
+        return uninspected(Unavailable::new(
+            Unavailable::SKIPPED,
+            "preflight was skipped for this run (`--skip-preflight`), so nothing inspected the \
+             pending schema changes",
+        ));
+    }
+    let target = match factory::build_preview(config, host, app_version) {
+        Ok(target) => target,
+        // An unset DSN env var is the common one. Today's dry-run never resolves
+        // secrets, so this is a failure mode the plan did not have before D8 —
+        // and it must not turn a plan into an error exit.
+        Err(error) => {
+            return uninspected(Unavailable::new(
+                Unavailable::ADAPTER_UNAVAILABLE,
+                preview::redact_credentials(&format!(
+                    "the migration adapter could not be built: {error:#}"
+                )),
+            ))
+        }
+    };
+    if !target.forward_compatible_lint {
+        return uninspected(Unavailable::new(
+            Unavailable::PREFLIGHT_OFF,
+            "`[migration].preflight_mode = \"off\"` turns every preflight off, so the deploy \
+             itself will not inspect the pending schema changes either",
+        ));
+    }
+    preview::gather(
+        target.migration.as_ref(),
+        &target.ctx,
+        &gate,
+        approval_command,
+        baseline,
+    )
+    .await
 }
 
 /// `deploy`: validate, then either summarize the plan (`--dry-run`) or run the
@@ -1537,15 +1612,21 @@ pub(crate) async fn deploy(
     let multi_host = config.hosts.is_some() && host.is_none();
 
     if dry_run {
+        // Single-host and multi-host run one version at a time against the
+        // database, so neither has a shared hold window to certify.
+        let schema =
+            preview_schema(&config, host, app_version, Baseline::None, skip_preflight).await;
         if multi_host {
-            let summary = factory::summarize_multi_host(&config, app_version)?;
+            let mut summary = factory::summarize_multi_host(&config, app_version)?;
+            summary.schema = schema;
             return Ok(CommandOutput {
                 exit_code: 0,
                 pretty: render_multi_host_summary(&summary, &report),
                 json: serde_json::to_value(&summary)?,
             });
         }
-        let summary = factory::summarize(&config, host, app_version)?;
+        let mut summary = factory::summarize(&config, host, app_version)?;
+        summary.schema = schema;
         return Ok(CommandOutput {
             exit_code: 0,
             pretty: render_summary(&summary),
@@ -2680,19 +2761,7 @@ mod tests {
     };
     use std::path::Path;
 
-    /// Serializes the env-mutating db-op tests so `set_var`/`var` don't race the
-    /// process environment across threads.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Drive an async command to completion on a fresh current-thread runtime.
-    /// Kept synchronous so the [`ENV_LOCK`] guard is never held across an `.await`.
-    fn block_on<F: std::future::Future>(future: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime")
-            .block_on(future)
-    }
+    use crate::test_env::{block_on, ENV_LOCK};
 
     /// A db-ops config naming `dsn_env` as the DSN source (no-op command adapter).
     fn db_ops_config(dsn_env: &str) -> String {
@@ -3322,6 +3391,77 @@ url = "http://127.0.0.1:8080/health"
             serde_json::json!("confiture (in-process)")
         );
         assert_eq!(out.json["host"], serde_json::json!("127.0.0.1"));
+    }
+
+    /// Today's dry-run plan, byte for byte. Rule 1: `--skip-preflight` is the
+    /// documented way back to the pure offline check, so a CI job that used
+    /// `--dry-run` as a cheap config gate keeps its exact output.
+    const OFFLINE_PLAN: &str = "deploy plan for checkout/staging → host 127.0.0.1\n  \
+        artifact:  release\n  migration: confiture (in-process)\n  service:   systemd\n  \
+        health:    http\n  database_url_env: CHECKOUT_DATABASE_URL\n  \
+        settings:  checksum_url, expected_status, release_url, unit, url, version\n\
+        (dry run — nothing was executed)\n";
+
+    #[tokio::test]
+    async fn skip_preflight_produces_the_pre_change_set_plan_verbatim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", VALID);
+        let out = deploy(
+            &config,
+            &dir.path().join("state"),
+            Some("127.0.0.1"),
+            Some("1.2.3"),
+            true,
+            true,
+        )
+        .await
+        .expect("dry run");
+        assert_eq!(out.pretty, OFFLINE_PLAN);
+        assert_eq!(out.exit_code, 0);
+        // The machine form is still honest about what it did not look at: an
+        // agent must not read the silence as "no changes".
+        assert_eq!(out.json["change_set"], serde_json::Value::Null);
+        assert_eq!(
+            out.json["change_set_unavailable"]["code"],
+            serde_json::json!("preflight_skipped")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_dsn_degrades_rather_than_aborting() {
+        // The IPC path resolves the DSN env var when it builds the adapter, so
+        // an unset one fails the build. Today's dry-run never resolved secrets;
+        // under D8 it does, and that new failure mode must not turn a plan into
+        // an error exit.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = VALID.replace(
+            "adapter = \"confiture\"\ndatabase_url_env = \"CHECKOUT_DATABASE_URL\"",
+            "adapter = \"sqlx\"\ndatabase_url_env = \"FRAISIER_TEST_DSN_DELIBERATELY_UNSET\"",
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let out = deploy(
+            &config,
+            &dir.path().join("state"),
+            Some("127.0.0.1"),
+            Some("1.2.3"),
+            true,
+            false,
+        )
+        .await
+        .expect("a plan was produced");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert!(out.pretty.contains("deploy plan for"), "{}", out.pretty);
+        assert_eq!(
+            out.json["change_set_unavailable"]["code"],
+            serde_json::json!("adapter_unavailable")
+        );
+        assert!(
+            out.json["change_set_unavailable"]["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("FRAISIER_TEST_DSN_DELIBERATELY_UNSET")),
+            "{}",
+            out.json
+        );
     }
 
     #[tokio::test]

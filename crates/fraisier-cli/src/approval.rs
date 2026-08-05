@@ -327,19 +327,24 @@ mod tests {
         assert_eq!(verdict, ApprovalVerdict::approved("exec:exit 0"));
     }
 
-    #[tokio::test]
-    async fn the_hook_is_told_the_identity_and_nothing_else() {
+    #[test]
+    fn the_hook_is_told_the_identity_and_nothing_else() {
         // The hook receives the deploy's identity and the tiers — never the
         // `AdapterCtx`, so no DSN, secret name, or adapter setting can reach it.
         // Asserting the exported set is *exactly* these four is what keeps a
         // later "just pass the context through" from being a silent leak. (The
         // hook still inherits the operator's own environment, as every fraisier
         // hook does; what fraisier itself adds is this and only this.)
+        //
+        // Synchronous, under the shared lock: the child inherits the *process*
+        // environment, so a db-op test mid-`set_var` on another thread would
+        // otherwise show up here as a variable fraisier never exported.
+        let _guard = crate::test_env::ENV_LOCK.lock().expect("env lock");
         let dir = tempfile::tempdir().expect("tempdir");
         let seen = dir.path().join("env");
-        let _ = hook(&format!("env > {}; exit 1", seen.display()))
-            .request(&request())
-            .await;
+        let _ = crate::test_env::block_on(
+            hook(&format!("env > {}; exit 1", seen.display())).request(&request()),
+        );
         let env = std::fs::read_to_string(&seen).expect("the hook ran");
         let mut exported: Vec<&str> = env
             .lines()

@@ -19,6 +19,9 @@ mod doctor;
 mod e2e;
 mod factory;
 mod pg_rehearsal;
+mod preview;
+#[cfg(test)]
+mod test_env;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

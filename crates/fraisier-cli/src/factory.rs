@@ -32,6 +32,7 @@ use serde_json::Value;
 
 use crate::approval::ExecApproval;
 use crate::pg_rehearsal::PgRehearsalDb;
+use crate::preview::SchemaPreview;
 
 /// The logical secret name every migration adapter resolves the DSN under.
 const DATABASE_URL_LOGICAL: &str = "DATABASE_URL";
@@ -62,6 +63,13 @@ pub struct PlanSummary {
     pub settings_keys: Vec<String>,
     /// The source env var the DSN is read from, if configured.
     pub database_url_env: Option<String>,
+    /// Always `true`: this payload exists only on the `--dry-run` path, and the
+    /// blue-green plan already carries the same marker.
+    pub dry_run: bool,
+    /// What would change in the schema, and what the policy would decide about
+    /// it. Empty until the dry-run inspects the migration adapter.
+    #[serde(flatten)]
+    pub schema: SchemaPreview,
 }
 
 /// Resolve the `[policy]` section into the gate a deploy runs at preflight.
@@ -90,6 +98,87 @@ fn build_policy_gate(config: &DeployConfig) -> PolicyGate {
             )) as Arc<dyn ApprovalHook>
         });
     PolicyGate::new(section.resolve()).with_hook(hook)
+}
+
+/// The gate a `--dry-run` renders, and the command that could unblock what it
+/// holds.
+///
+/// Resolved apart from the adapter because a preview whose migration adapter
+/// cannot even be built — an unset DSN env var is the common one — still owes
+/// the operator the verdict that failure implies. The gate itself carries no
+/// command string (nothing at deploy time needs one), so the render reads it off
+/// the config here.
+#[must_use]
+pub fn preview_gate(config: &DeployConfig) -> (PolicyGate, Option<String>) {
+    let approval_command = config
+        .policy
+        .as_ref()
+        .and_then(|section| section.approval_command.clone())
+        .map(|command| command.trim().to_owned())
+        .filter(|command| !command.is_empty());
+    (build_policy_gate(config), approval_command)
+}
+
+/// The migration adapter a `--dry-run` inspects, and the context it inspects
+/// under.
+pub struct PreviewTarget {
+    /// The migration adapter (in-process or IPC).
+    pub migration: Arc<dyn MigrationAdapter>,
+    /// The context the preview inspects under — the same one the deploy would
+    /// use, so the two cannot decide on different facts.
+    pub ctx: AdapterCtx,
+    /// Whether any preflight runs at all (`[migration].preflight_mode`). When
+    /// this is false the deploy inspects nothing, and neither does its preview.
+    pub forward_compatible_lint: bool,
+}
+
+/// Build just what a `--dry-run` needs to inspect the pending schema change.
+///
+/// The single site all three strategies' previews resolve through. The host is
+/// resolved when the config names one and left unset otherwise: a multi-host
+/// rollout migrates one database for the whole fleet, so it previews one
+/// change-set, not one per host.
+///
+/// # Errors
+/// Fails if `[deploy]`/`[migration]` is missing or incomplete, the adapter name
+/// is unsupported in this build, or (IPC path) the configured DSN env var is
+/// unset. Every one of those degrades the plan rather than failing the command —
+/// see `preview::gather`'s callers.
+pub fn build_preview(
+    config: &DeployConfig,
+    host_override: Option<&str>,
+    app_version: Option<&str>,
+) -> Result<PreviewTarget> {
+    let deploy = config.deploy.as_ref().context("missing [deploy] section")?;
+    let fraise = deploy.name.clone().context("[deploy].name is required")?;
+    let environment = deploy
+        .environment
+        .clone()
+        .context("[deploy].environment is required")?;
+
+    let database_url_env = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.database_url_env.clone());
+    let mut env_secrets = BTreeMap::new();
+    let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
+    add_token_provider_secrets(config, &mut env_secrets);
+
+    let mut ctx = AdapterCtx::new(fraise, environment);
+    ctx.host = resolve_host(config, host_override).ok();
+    ctx.workdir = PathBuf::from(".");
+    ctx.migrations_path = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.migrations_path.clone());
+    ctx.env_secrets = env_secrets;
+    ctx.settings = settings_map(config, app_version);
+
+    Ok(PreviewTarget {
+        migration,
+        ctx,
+        forward_compatible_lint: resolve_preflight(config).0,
+    })
 }
 
 /// The fully-built adapters and context, ready to hand to a `SingleHostDeploy`.
@@ -404,6 +493,8 @@ pub fn summarize(
             .migration
             .as_ref()
             .and_then(|m| m.database_url_env.clone()),
+        dry_run: true,
+        schema: SchemaPreview::default(),
     })
 }
 
@@ -597,6 +688,12 @@ pub struct MultiHostSummary {
     pub health: String,
     /// The selected load-balancer adapter.
     pub lb: String,
+    /// Always `true`: this payload exists only on the `--dry-run` path.
+    pub dry_run: bool,
+    /// What would change in the schema, and what the policy would decide about
+    /// it — the same shape the single-host plan carries.
+    #[serde(flatten)]
+    pub schema: SchemaPreview,
 }
 
 /// Build the read-only multi-host plan summary (no secrets, no adapters built).
@@ -651,6 +748,8 @@ pub fn summarize_multi_host(
         service: axis_name(config.service.as_ref().and_then(|s| s.adapter.as_deref())),
         health: axis_name(config.health.as_ref().and_then(|h| h.adapter.as_deref())),
         lb: axis_name(config.lb.as_ref().and_then(|l| l.adapter.as_deref())),
+        dry_run: true,
+        schema: SchemaPreview::default(),
     })
 }
 

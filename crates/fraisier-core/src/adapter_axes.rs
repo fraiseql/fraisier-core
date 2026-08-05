@@ -773,6 +773,30 @@ impl ChangeSet {
         }
     }
 
+    /// Stamp the change-set with the contract version a **producer** wrote.
+    ///
+    /// [`new`](Self::new) stamps *this build's* [`RISK_CONTRACT_VERSION`],
+    /// which is correct for a change-set produced in Rust and wrong for one
+    /// reconstructed from the wire: a payload written to a later contract has
+    /// to keep its own version, or [`PreflightReport::usable_change_set`]
+    /// cannot refuse it *by name* — and a refusal that cannot say which side to
+    /// upgrade is not actionable. Restamping a payload we cannot read with a
+    /// version we can is the best-effort parse the contract forbids.
+    ///
+    /// # Example
+    /// ```
+    /// # use fraisier_core::adapter_axes::{ChangeSet, PreflightReport};
+    /// // An adapter parsing a report from a producer newer than this build.
+    /// let from_the_wire = ChangeSet::new(Vec::new()).with_contract_version(2);
+    /// let report = PreflightReport::new(true).with_change_set(from_the_wire);
+    /// assert!(report.usable_change_set().is_err());
+    /// ```
+    #[must_use]
+    pub const fn with_contract_version(mut self, contract_version: u32) -> Self {
+        self.contract_version = contract_version;
+        self
+    }
+
     /// The most severe tier present, or `None` when no change carries one.
     ///
     /// Unclassified changes are **not** folded in — they are not "tier zero".
@@ -1925,6 +1949,25 @@ mod tests {
             ChangeSet::default().contract_version,
             0,
             "majors start at 1; a zero would sail past the version check unstamped"
+        );
+    }
+
+    /// The counterpart, for an adapter that *parses* a change-set rather than
+    /// producing one: the producer's version has to survive reconstruction, or
+    /// the too-new refusal cannot name it — and a payload from a contract we
+    /// cannot read would present as one we can.
+    #[test]
+    fn a_reconstructed_change_set_keeps_the_producers_contract_version() {
+        let from_the_wire = ChangeSet::new(Vec::new()).with_contract_version(2);
+        assert_eq!(from_the_wire.contract_version, 2);
+        assert_eq!(
+            PreflightReport::new(true)
+                .with_change_set(from_the_wire)
+                .usable_change_set(),
+            Err(ChangeSetUnavailable::VersionTooNew {
+                found: 2,
+                understood: RISK_CONTRACT_VERSION,
+            })
         );
     }
 

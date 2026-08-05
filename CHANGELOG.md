@@ -67,6 +67,42 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The Confiture adapter reads the schema change-set, and advertises
+  `risk_tier` only when the installed binary can produce one.** `preflight` now
+  parses the `change_set` object out of `confiture migrate preflight --format
+  json` into the typed `ChangeSet` the policy gate will read, and `describe`
+  appends the **`risk_tier`** capability only when the detected confiture
+  version is at or above the release that implements the contract
+  (provisionally 0.40.0 — 0.39.0 emits no change-set). Claiming the capability
+  against a confiture that cannot classify would make the gate expect a
+  change-set and deny every deploy: safe, and useless. Withholding it is the
+  honest *"I do not classify"*, so a deploy with no risk policy configured
+  behaves exactly as it does today, and a version string this adapter cannot
+  parse degrades to *no capability*, never to *capability*.
+
+  Every way of failing resolves to **unclassified**, which is never *safe*:
+  a missing `change_set` key, an envelope that is not an object, a missing or
+  non-integer `contract_version`, a `changes` key that is not a list, and an
+  error envelope from a crashed confiture all yield no change-set at all. A
+  `contract_version` from the future is *preserved* rather than swallowed, so
+  `usable_change_set()` can name both versions in the refusal, and
+  `ChangeSet::with_contract_version` (new, additive) is what lets an adapter
+  reconstruct a wire payload without restamping it with this build's version.
+
+  One asymmetry is deliberate: a broken **envelope** voids the whole
+  change-set, while a broken **entry** becomes an unclassified placeholder that
+  holds its position in the plan. Dropping the entry would shrink the set
+  silently, and a shorter list of fully-classified changes reads as a *cleaner*
+  plan than the truth. Warnings name the JSON *shape* that arrived and never
+  quote its content: a payload that is off the contract has also left the
+  contract's promise that `detail` carries no credential.
+
+  The eight golden fixtures at
+  `crates/fraisier-adapter-confiture/tests/fixtures/preflight/` are now a
+  committed pact test — confiture asserts it emits those bytes, this adapter
+  asserts it parses them — and a further test pins that this hand-rolled parser
+  and `fraisier-core`'s `serde` path classify the same bytes identically.
+
 - **The `command` migration adapter exposes the release context to its
   commands.** Every migration command now receives `FRAISIER_RELEASE_DIR` (the
   command's working directory — the staged release), and, when configured,

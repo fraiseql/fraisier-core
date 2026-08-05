@@ -39,6 +39,17 @@
 //! for online-safe ops including `CREATE INDEX CONCURRENTLY`. An older confiture
 //! omits the field; fraisier's blue-green gate then refuses (fail-safe).
 //!
+//! The **`risk_tier`** capability (a per-change risk-tiered change-set, parsed
+//! from the `preflight` report's `change_set` object) requires a confiture that
+//! implements the migration risk contract — provisionally **≥ 0.40.0**, the
+//! `RISK_TIER_MIN_CONFITURE` floor.
+//! Unlike the capabilities above it is **advertised conditionally**, on the
+//! version the installed binary reports: claiming it against a confiture that
+//! cannot classify would make fraisier's policy gate expect a change-set and
+//! deny every deploy. Withholding it says *"I do not classify"*, and a deploy
+//! with no risk policy configured then behaves exactly as it does today. The
+//! contract is specified in `docs/proposals/migration-risk-contract.md`.
+//!
 //! ## Double locking (intentional)
 //!
 //! Confiture takes its own DB-level migration lock; the saga takes a deploy-level
@@ -53,9 +64,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use fraisier_core::adapter_axes::{
-    AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, MigrationAdapter,
-    MigrationOutcome, PreflightIssue, PreflightReport, Revision, Severity, VerifyCheck,
-    VerifyReport,
+    AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, ChangeSet, MigrationAdapter,
+    MigrationOutcome, PreflightIssue, PreflightReport, Revision, SchemaChange, Severity,
+    VerifyCheck, VerifyReport,
 };
 use serde_json::Value;
 
@@ -92,6 +103,35 @@ const CAPABILITIES: &[&str] = &[
     "preflight",
     "window_safe",
 ];
+
+/// The capability advertised when the installed confiture classifies the
+/// pending schema changes into a risk-tiered change-set.
+///
+/// One string, not two: a change-set without tiers gives the policy gate
+/// nothing to decide on, and tiers without a change-set have nothing to attach
+/// to, so there is no useful intermediate state to advertise.
+const RISK_TIER_CAPABILITY: &str = "risk_tier";
+
+/// The first confiture release that emits a change-set (fraiseql/confiture#197).
+///
+/// Gating on the **installed** version is what keeps the capability honest.
+/// Advertising `risk_tier` against a confiture that cannot classify would make
+/// the policy gate expect a change-set and deny every deploy — safe, but
+/// useless. Withholding it is the honest *"I do not classify"*, which callers
+/// handle deliberately, and which keeps a deploy with no risk policy working
+/// exactly as it does today.
+///
+/// The floor is **provisional**: confiture 0.39.0 emits no change-set, so the
+/// producer half of the contract lands no earlier than 0.40.0. It is confirmed
+/// against the real binary when the two repositories land together.
+const RISK_TIER_MIN_CONFITURE: (u32, u32, u32) = (0, 40, 0);
+
+/// The `kind` given to a change entry this build could not read.
+///
+/// It is fraisier's own marker, never a confiture code: the adapter is saying
+/// *"something is here and I could not classify it"*, which is a denial, not a
+/// classification.
+const UNPARSEABLE_KIND: &str = "unparseable";
 
 /// Process-wide counter making each `--output` temp file path unique.
 static OUTPUT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -502,7 +542,148 @@ fn parse_preflight_report(json: &Value) -> PreflightReport {
     if let Some(window_safe) = window_safe {
         report = report.with_window_safe(window_safe);
     }
+    if let Some(change_set) = parse_change_set(json) {
+        report = report.with_change_set(change_set);
+    }
     report
+}
+
+/// Parse the classified change-set out of a `migrate preflight` JSON report.
+///
+/// `None` means *nobody classified this*, which is never *safe* — it is the
+/// state a pre-contract confiture, a producer bug, and an unreadable payload
+/// all land in, and the policy gate denies on all three.
+///
+/// The two failure granularities are deliberately different, and the asymmetry
+/// is load-bearing (contract §6):
+///
+/// - a broken **envelope** voids the whole change-set. If the wrapper is
+///   untrustworthy, the entries inside it cannot be trusted either.
+/// - a broken **entry** becomes an unclassified placeholder, never a hole.
+///   Dropping it would shrink the set silently, and a shorter list of
+///   fully-classified changes reads as a *cleaner* plan than the truth — the
+///   one failure direction this contract exists to prevent.
+///
+/// Both resolve to *denied*. Only one of them could be mistaken for a clean
+/// bill of health, and it is the one that is refused outright.
+fn parse_change_set(json: &Value) -> Option<ChangeSet> {
+    // Confiture writes its error envelope to the same `--output` file a report
+    // goes to, on every failure path — so a crash could otherwise present as a
+    // classification. See [`is_error_envelope`].
+    if is_error_envelope(json) {
+        return None;
+    }
+    // No key at all: a confiture older than this contract. Expected, and not an
+    // event worth warning about — the capability handshake already says so.
+    let raw = json.get("change_set")?;
+    let Some(envelope) = raw.as_object() else {
+        warn_unusable("change_set", "an object", raw);
+        return None;
+    };
+    let Some(raw_version) = envelope.get("contract_version") else {
+        tracing::warn!(
+            "confiture preflight: the change-set carries no `contract_version`, so it cannot be \
+             read; the pending schema changes count as unclassified"
+        );
+        return None;
+    };
+    // A `0` is an *unstamped* payload rather than one from an older contract
+    // (majors start at 1), and it would sail past the `usable_change_set`
+    // version check as though a producer had stamped it.
+    let Some(contract_version) = raw_version
+        .as_u64()
+        .and_then(|version| u32::try_from(version).ok())
+        .filter(|version| *version != 0)
+    else {
+        warn_unusable("contract_version", "a contract revision", raw_version);
+        return None;
+    };
+    let changes = match envelope.get("changes") {
+        // Absent is equivalent to empty: the producer classified and found
+        // nothing (contract §4). Anything that is not a list, `null` included,
+        // leaves us unable to enumerate the changes at all — which is an
+        // envelope-level break, not an empty plan.
+        None => Vec::new(),
+        Some(Value::Array(entries)) => entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| schema_change_from(index, entry))
+            .collect(),
+        Some(other) => {
+            warn_unusable("changes", "a list of changes", other);
+            return None;
+        }
+    };
+    Some(ChangeSet::new(changes).with_contract_version(contract_version))
+}
+
+/// Convert one Confiture preflight `changes[]` entry to a [`SchemaChange`].
+///
+/// The entry is handed to [`SchemaChange`]'s own deserializer rather than read
+/// field by field, so the rule that an unrecognised tier is *unclassified* and
+/// never a nearest match lives in exactly one place — `fraisier-core`, where
+/// the taxonomy is defined and where every other adapter's report is parsed.
+/// A second copy of that rule here is a second place for it to drift.
+///
+/// An entry that will not deserialize at all becomes an
+/// [`unclassified_placeholder`] rather than an error: one unreadable change
+/// does not invalidate the ones beside it.
+fn schema_change_from(index: usize, change: &Value) -> SchemaChange {
+    serde_json::from_value::<SchemaChange>(change.clone())
+        .unwrap_or_else(|_| unclassified_placeholder(index, change))
+}
+
+/// A stand-in for a change entry this build could not read, holding its place
+/// in the plan.
+///
+/// Dropping the entry would shrink the set silently, and a shorter list of
+/// fully-classified changes reads as a *cleaner* plan than the truth — the one
+/// failure direction the contract exists to prevent (§6). The placeholder
+/// carries no tier, so it is unclassified, so the policy gate denies on it and
+/// can name it. A hole is denied by nothing.
+///
+/// It names the entry's **position** and the **shape** that arrived, and
+/// quotes nothing from inside it: a payload that is off the contract has also
+/// left the contract's promise that `detail` carries no DSN and no credential.
+fn unclassified_placeholder(index: usize, change: &Value) -> SchemaChange {
+    let shape = json_shape(change);
+    tracing::warn!(
+        "confiture preflight: the change entry at index {index} is {shape}, not a schema change; \
+         recording it as an unclassified change rather than dropping it from the plan"
+    );
+    SchemaChange::new(
+        UNPARSEABLE_KIND,
+        format!("<unreadable entry at index {index}>"),
+    )
+    .with_detail(format!(
+        "the migration adapter emitted {shape} where a change entry was expected"
+    ))
+}
+
+/// Warn that a change-set payload could not be read, naming the **shape** that
+/// arrived and never its content.
+///
+/// A payload that is off the contract has also left the contract's promise that
+/// `detail` carries no DSN and no credential, so nothing from inside it is
+/// quotable into a log line.
+fn warn_unusable(field: &str, expected: &str, value: &Value) {
+    tracing::warn!(
+        "confiture preflight: `{field}` is {}, not {expected}; the change-set is unusable and \
+         the pending schema changes count as unclassified",
+        json_shape(value)
+    );
+}
+
+/// The JSON type name of `value` — its shape, never its content.
+const fn json_shape(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// Convert one Confiture preflight `issues[]` entry to a [`PreflightIssue`].
@@ -540,6 +721,47 @@ fn parse_version(output: &str) -> String {
         .to_owned()
 }
 
+/// The capabilities to advertise for an installed confiture at `version`.
+///
+/// [`CAPABILITIES`] is the static base — every method this adapter implements
+/// against every confiture it supports at all. `risk_tier` is the one that
+/// depends on which binary is actually installed.
+fn capabilities_for(version: &str) -> Vec<String> {
+    let mut capabilities: Vec<String> = CAPABILITIES
+        .iter()
+        .map(|capability| (*capability).to_owned())
+        .collect();
+    if supports_risk_tier(version) {
+        capabilities.push(RISK_TIER_CAPABILITY.to_owned());
+    }
+    capabilities
+}
+
+/// Whether the confiture at `version` can emit a risk-tiered change-set.
+///
+/// A version string this build cannot read degrades to `false` — *"I do not
+/// classify"* — and never to `true`. Guessing upward would advertise a
+/// capability the installed binary cannot fulfil, which is the one failure this
+/// gate exists to prevent.
+fn supports_risk_tier(version: &str) -> bool {
+    version_triple(version).is_some_and(|triple| triple >= RISK_TIER_MIN_CONFITURE)
+}
+
+/// The `(major, minor, patch)` of a plain numeric version string, comparable as
+/// a tuple — `"0.100.0"` outranks `"0.40.0"`, which as strings it does not.
+///
+/// Deliberately strict: one to three dot-separated decimal components and
+/// nothing else. A pre-release or dev build (`0.40.0rc1`, `0.40.0.dev0`) is not
+/// a release whose behaviour this adapter can vouch for, so it reads as no
+/// version at all — which withholds the capability rather than granting it.
+fn version_triple(version: &str) -> Option<(u32, u32, u32)> {
+    let mut components = version.split('.');
+    let major: u32 = components.next()?.parse().ok()?;
+    let minor: u32 = components.next().map_or(Ok(0), str::parse).ok()?;
+    let patch: u32 = components.next().map_or(Ok(0), str::parse).ok()?;
+    components.next().is_none().then_some((major, minor, patch))
+}
+
 #[async_trait]
 impl MigrationAdapter for ConfitureMigration {
     async fn describe(&self) -> Result<AdapterDescription, AdapterError> {
@@ -558,11 +780,14 @@ impl MigrationAdapter for ConfitureMigration {
             .into_error("describe"));
         }
         let version = parse_version(&String::from_utf8_lossy(&output.stdout));
+        // The capability list describes the binary that just answered, not this
+        // crate: `risk_tier` is withheld unless that binary can classify.
+        let capabilities = capabilities_for(&version);
         Ok(AdapterDescription {
             name: ADAPTER_NAME.to_owned(),
             version,
             protocol_version: PROTOCOL_VERSION,
-            capabilities: CAPABILITIES.iter().map(|cap| (*cap).to_owned()).collect(),
+            capabilities,
         })
     }
 
@@ -671,15 +896,463 @@ fn args_contain(args: &[OsString], needle: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        args_contain, classify, error_code_of, is_error_envelope, parse_current_revision,
-        parse_down_to_outcome, parse_preflight_report, parse_up_outcome, parse_verify_report,
-        parse_version, plan, reports_uninitialised, subcommand_takes_migrations_dir,
-        ConfitureMigration, CONFITURE_DSN_ENV,
+        args_contain, capabilities_for, classify, error_code_of, is_error_envelope,
+        parse_change_set, parse_current_revision, parse_down_to_outcome, parse_preflight_report,
+        parse_up_outcome, parse_verify_report, parse_version, plan, reports_uninitialised,
+        subcommand_takes_migrations_dir, supports_risk_tier, version_triple, ConfitureMigration,
+        CONFITURE_DSN_ENV,
     };
-    use fraisier_core::adapter_axes::{AdapterCtx, AdapterErrorKind, Revision, Severity};
+    use fraisier_core::adapter_axes::{
+        AdapterCtx, AdapterErrorKind, ChangeSetUnavailable, PreflightReport, Revision, RiskTier,
+        Severity, RISK_CONTRACT_VERSION,
+    };
     use serde_json::Value;
     use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
+
+    /// The golden fixtures of the cross-repo pact (`tests/fixtures/preflight/`),
+    /// embedded rather than read at runtime: deleting one breaks the *build*,
+    /// which is what their `_README.md` promises. Confiture asserts it emits
+    /// these bytes; the tests below assert this adapter parses them.
+    const FIXTURES: &[(&str, &str)] = &[
+        (
+            "v0-no-change-set",
+            include_str!("../tests/fixtures/preflight/v0-no-change-set.json"),
+        ),
+        (
+            "v1-empty",
+            include_str!("../tests/fixtures/preflight/v1-empty.json"),
+        ),
+        (
+            "v1-additive",
+            include_str!("../tests/fixtures/preflight/v1-additive.json"),
+        ),
+        (
+            "v1-mixed",
+            include_str!("../tests/fixtures/preflight/v1-mixed.json"),
+        ),
+        (
+            "v1-unknown-tier",
+            include_str!("../tests/fixtures/preflight/v1-unknown-tier.json"),
+        ),
+        (
+            "v1-missing-tier",
+            include_str!("../tests/fixtures/preflight/v1-missing-tier.json"),
+        ),
+        (
+            "v2-future",
+            include_str!("../tests/fixtures/preflight/v2-future.json"),
+        ),
+        (
+            "malformed",
+            include_str!("../tests/fixtures/preflight/malformed.json"),
+        ),
+    ];
+
+    /// One golden fixture, by name (without the `.json`).
+    fn fixture(name: &str) -> Value {
+        let (_, bytes) = FIXTURES
+            .iter()
+            .find(|(fixture, _)| *fixture == name)
+            .unwrap_or_else(|| panic!("no golden fixture named {name}"));
+        serde_json::from_str(bytes)
+            .unwrap_or_else(|err| panic!("golden fixture {name} is not valid JSON: {err}"))
+    }
+
+    #[test]
+    fn every_fixture_parses_without_panicking() {
+        for (name, _) in FIXTURES {
+            let json = fixture(name);
+            // Whichever way a fixture breaks the change-set, it never breaks the
+            // report: `ok`, `issues` and `window_safe` predate this contract and
+            // the deploy already blocks on them.
+            let report = parse_preflight_report(&json);
+            assert!(report.ok, "{name}: every fixture is a clean lint result");
+            assert_eq!(
+                report.window_safe,
+                Some(true),
+                "{name}: window_safe still crosses the seam untouched"
+            );
+            // And reaching the classification never panics, however it is missing.
+            let _ = parse_change_set(&json);
+            let _ = report.usable_change_set();
+        }
+    }
+
+    /// A preflight report carrying `change_set` verbatim.
+    ///
+    /// The consumer-robustness cases below are deliberately *not* golden
+    /// fixtures: asking confiture to emit a corrupted envelope as a contract
+    /// obligation would be nonsense (see the pact's `_README.md`). They test
+    /// this parser, not the pact.
+    fn report_with_change_set(change_set: &Value) -> Value {
+        serde_json::json!({
+            "ok": true,
+            "window_safe": true,
+            "issues": [],
+            "change_set": change_set,
+        })
+    }
+
+    /// The distinction the whole design rests on, read off the wire: *nobody
+    /// classified this* and *the adapter classified and found nothing* are
+    /// different states, and only one of them is safe.
+    #[test]
+    fn an_absent_change_set_and_an_empty_one_are_different_states() {
+        // A pre-contract confiture: no key at all. Unknown, and unknown is never
+        // safety — the policy gate must be able to tell this apart from "clean".
+        assert_eq!(parse_change_set(&fixture("v0-no-change-set")), None);
+
+        // A confiture that implements the contract and found nothing to change.
+        let classified = parse_change_set(&fixture("v1-empty")).expect("v1-empty is classified");
+        assert!(classified.changes.is_empty());
+        assert_eq!(classified.contract_version, 1);
+    }
+
+    #[test]
+    fn a_string_change_set_yields_none() {
+        // `"change_set": "additive"` — a producer bug the consumer must survive.
+        assert_eq!(parse_change_set(&fixture("malformed")), None);
+        // ...and the report around it still parses, so a typo in a purely
+        // additive field never fails a deploy that never asked for risk tiers.
+        let report = parse_preflight_report(&fixture("malformed"));
+        assert!(report.ok);
+        assert_eq!(report.window_safe, Some(true));
+    }
+
+    #[test]
+    fn a_missing_contract_version_yields_none() {
+        // An unversioned payload is unreadable, not empty: without the version
+        // there is no way to know what the entries even mean.
+        assert_eq!(
+            parse_change_set(&report_with_change_set(
+                &serde_json::json!({ "changes": [] })
+            )),
+            None
+        );
+        // Control: the same envelope, stamped.
+        assert!(parse_change_set(&report_with_change_set(
+            &serde_json::json!({ "contract_version": 1, "changes": [] })
+        ))
+        .is_some());
+    }
+
+    #[test]
+    fn a_non_integer_contract_version_yields_none() {
+        for version in [
+            serde_json::json!("1"),
+            serde_json::json!(1.5),
+            serde_json::json!(-1),
+            serde_json::json!(true),
+            serde_json::json!(null),
+            // Larger than the contract's `u32` can express.
+            serde_json::json!(u64::from(u32::MAX) + 1),
+        ] {
+            assert_eq!(
+                parse_change_set(&report_with_change_set(&serde_json::json!({
+                    "contract_version": version,
+                    "changes": [],
+                }))),
+                None,
+                "contract_version {version} is not a contract revision"
+            );
+        }
+    }
+
+    /// Majors start at 1, so a `0` is an *unstamped* payload rather than one
+    /// from an older contract — and `0 <= RISK_CONTRACT_VERSION` would sail
+    /// straight through `usable_change_set`'s version check. `fraisier-core`'s
+    /// own lenient deserializer rejects it for the same reason; the two paths
+    /// must not disagree about what a valid envelope is.
+    #[test]
+    fn a_zero_contract_version_yields_none() {
+        assert_eq!(
+            parse_change_set(&report_with_change_set(&serde_json::json!({
+                "contract_version": 0,
+                "changes": [],
+            }))),
+            None
+        );
+    }
+
+    /// Confiture writes its error envelope to the same `--output` file a report
+    /// would go to, on every failure path. A crash must not be able to present
+    /// as a clean, empty plan — the same class of bug the `verify`/`preflight`
+    /// envelope guards already close.
+    #[test]
+    fn an_error_envelope_never_yields_a_change_set() {
+        let mut envelope = report_with_change_set(&serde_json::json!({
+            "contract_version": 1,
+            "changes": [],
+        }));
+        // Control: without the error object this payload classifies.
+        assert!(parse_change_set(&envelope).is_some());
+
+        envelope["ok"] = serde_json::json!(false);
+        envelope["error"] = serde_json::json!({
+            "code": "CONFIG_006",
+            "message": "Failed to connect to database: connection refused",
+        });
+        assert!(is_error_envelope(&envelope));
+        assert_eq!(
+            parse_change_set(&envelope),
+            None,
+            "an error envelope carries no classification, however well-formed its payload looks"
+        );
+    }
+
+    /// `changes` of the wrong type is an envelope-level break: we cannot
+    /// enumerate the changes at all, so we cannot claim to have classified
+    /// them. Reading it as `[]` would turn garbage into a clean, empty plan.
+    #[test]
+    fn a_changes_key_that_is_not_an_array_voids_the_envelope() {
+        for changes in [
+            serde_json::json!({}),
+            serde_json::json!("add_column"),
+            serde_json::json!(null),
+            serde_json::json!(3),
+        ] {
+            assert_eq!(
+                parse_change_set(&report_with_change_set(&serde_json::json!({
+                    "contract_version": 1,
+                    "changes": changes,
+                }))),
+                None,
+                "changes: {changes} is not an enumerable change list"
+            );
+        }
+        // Absent, though, *is* equivalent to empty: the producer classified and
+        // found nothing (contract §4).
+        let absent = parse_change_set(&report_with_change_set(
+            &serde_json::json!({ "contract_version": 1 }),
+        ))
+        .expect("an absent `changes` is an empty one");
+        assert!(absent.changes.is_empty());
+    }
+
+    /// A version from the future is *not* swallowed here. The adapter's job is
+    /// to hand the consumer what the producer actually said; refusing it is
+    /// `usable_change_set`'s job, and it can only name the version in the
+    /// refusal if the version survives the parse. Restamping it with this
+    /// build's version — which is what `ChangeSet::new` alone would do — would
+    /// turn a payload we cannot read into one we silently approve.
+    #[test]
+    fn a_future_contract_version_is_preserved_for_the_consumer() {
+        let set = parse_change_set(&fixture("v2-future")).expect("the envelope itself is readable");
+        assert_eq!(set.contract_version, 2);
+
+        let report = parse_preflight_report(&fixture("v2-future"));
+        let refusal = report
+            .usable_change_set()
+            .expect_err("a change-set from a later contract is unusable");
+        assert_eq!(
+            refusal,
+            ChangeSetUnavailable::VersionTooNew {
+                found: 2,
+                understood: RISK_CONTRACT_VERSION,
+            }
+        );
+        assert!(
+            refusal.to_string().contains('2'),
+            "the refusal must name the version that arrived: {refusal}"
+        );
+    }
+
+    #[test]
+    fn v1_additive_parses_one_tiered_change() {
+        let set = parse_change_set(&fixture("v1-additive")).expect("classified");
+        assert_eq!(set.contract_version, RISK_CONTRACT_VERSION);
+        assert_eq!(set.changes.len(), 1);
+
+        let change = &set.changes[0];
+        assert_eq!(change.kind, "add_column");
+        assert_eq!(change.object, "public.tb_user.nickname");
+        // The version prefix, not the filename — it is what `issues[].migration`
+        // already carries, and what keeps the plan render's column bounded.
+        assert_eq!(change.migration.as_deref(), Some("20260804120000"));
+        assert_eq!(change.tier, Some(RiskTier::Additive));
+        assert_eq!(
+            change.detail.as_deref(),
+            Some("ADD COLUMN nickname text NULL")
+        );
+        assert_eq!(set.worst_tier(), Some(RiskTier::Additive));
+        assert_eq!(set.unclassified().count(), 0);
+    }
+
+    #[test]
+    fn v1_mixed_preserves_order_and_tiers() {
+        let set = parse_change_set(&fixture("v1-mixed")).expect("classified");
+
+        // Migration order, exactly as the producer listed it. The contract does
+        // not sort; the render does, and it cannot sort what it never received.
+        let listed: Vec<(&str, Option<RiskTier>)> = set
+            .changes
+            .iter()
+            .map(|change| (change.object.as_str(), change.tier))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("public.tb_user.nickname", Some(RiskTier::Additive)),
+                ("public.tb_order.idx_placed_at", Some(RiskTier::LockRisky)),
+                ("public.tb_user.legacy_flag", Some(RiskTier::Irreversible)),
+            ]
+        );
+        // The worst tier is computed, never taken from the last entry or the
+        // producer's ordering.
+        assert_eq!(set.worst_tier(), Some(RiskTier::Irreversible));
+    }
+
+    /// Two parsers read this same wire shape: this hand-rolled one, and
+    /// `fraisier-core`'s `serde` path (which any IPC adapter's report arrives
+    /// through). They must not drift — the same bytes have to classify the same
+    /// way whichever adapter carried them.
+    ///
+    /// They diverge in exactly one deliberate place, which no golden fixture
+    /// exercises: a *malformed entry* voids the whole set for `serde`'s
+    /// all-or-nothing `Vec<SchemaChange>`, while this parser reads entries one
+    /// at a time and can keep the rest beside an unclassified placeholder. Both
+    /// deny; this one can say more about why.
+    #[test]
+    fn the_manual_parser_agrees_with_the_typed_deserializer() {
+        for (name, bytes) in FIXTURES {
+            let typed: PreflightReport =
+                serde_json::from_str(bytes).unwrap_or_else(|err| panic!("{name}: {err}"));
+            let manual = parse_preflight_report(&fixture(name));
+            assert_eq!(
+                manual.change_set, typed.change_set,
+                "{name}: the adapter's parse and the typed contract disagree"
+            );
+        }
+    }
+
+    /// A future confiture tier — `"quantum"` — must not round down to the
+    /// nearest string-similar one. One unclassified change is a denial the
+    /// operator can act on; a misclassification is a wrong verdict nobody sees.
+    #[test]
+    fn an_unknown_tier_survives_as_unclassified() {
+        let set = parse_change_set(&fixture("v1-unknown-tier")).expect("classified");
+        assert_eq!(set.changes.len(), 2, "the entry beside it must survive");
+        assert_eq!(set.changes[0].tier, Some(RiskTier::Additive));
+
+        let unknown = &set.changes[1];
+        assert_eq!(unknown.tier, None);
+        // The entry itself is intact — an unreadable *tier* is not an
+        // unreadable *change*, and the refusal has to be able to name it.
+        assert_eq!(unknown.kind, "entangle_column");
+        assert_eq!(unknown.object, "public.tb_user.spin_state");
+        assert_eq!(
+            set.unclassified()
+                .map(|c| c.object.as_str())
+                .collect::<Vec<_>>(),
+            ["public.tb_user.spin_state"]
+        );
+        // Not folded into the worst tier: an unclassified change is not "tier
+        // zero", and a set whose worst *known* tier is `additive` would
+        // otherwise read as approvable.
+        assert_eq!(set.worst_tier(), Some(RiskTier::Additive));
+    }
+
+    #[test]
+    fn a_missing_tier_survives_as_unclassified() {
+        let set = parse_change_set(&fixture("v1-missing-tier")).expect("classified");
+        assert_eq!(set.changes.len(), 2);
+
+        let untiered = &set.changes[1];
+        assert_eq!(untiered.tier, None);
+        assert_eq!(untiered.kind, "alter_column_type");
+        assert_eq!(
+            untiered.detail.as_deref(),
+            Some("ALTER COLUMN total_cents TYPE bigint")
+        );
+        assert_eq!(set.unclassified().count(), 1);
+    }
+
+    /// The load-bearing asymmetry, from the dangerous side.
+    ///
+    /// A broken envelope voids everything; a broken *entry* must not simply
+    /// vanish. A four-change plan silently rendered as three fully-classified
+    /// changes reads *cleaner* than the truth, and that is the one failure
+    /// direction this contract exists to prevent.
+    #[test]
+    fn a_malformed_entry_leaves_an_unclassified_placeholder_not_a_hole() {
+        for (label, broken) in [
+            ("an entry that is not an object", serde_json::json!(42)),
+            (
+                "an entry with no `kind`",
+                serde_json::json!({ "object": "public.tb_user.email" }),
+            ),
+            (
+                "an entry whose `object` is not a string",
+                serde_json::json!({ "kind": "drop_column", "object": 42 }),
+            ),
+        ] {
+            let set = parse_change_set(&report_with_change_set(&serde_json::json!({
+                "contract_version": 1,
+                "changes": [
+                    { "kind": "add_column", "object": "public.tb_user.nickname", "tier": "additive" },
+                    broken,
+                    { "kind": "drop_column", "object": "public.tb_user.legacy_flag", "tier": "irreversible" },
+                ],
+            })))
+            .expect("one bad entry does not void the envelope");
+
+            assert_eq!(set.changes.len(), 3, "{label}: the plan must not shrink");
+            // Position is preserved, so the surviving entries still line up
+            // with what the producer listed.
+            assert_eq!(set.changes[0].tier, Some(RiskTier::Additive));
+            assert_eq!(set.changes[2].tier, Some(RiskTier::Irreversible));
+
+            let placeholder = &set.changes[1];
+            assert_eq!(placeholder.tier, None, "{label}: never classified");
+            assert_eq!(placeholder.kind, "unparseable", "{label}");
+            assert!(
+                placeholder.object.contains('1'),
+                "{label}: the placeholder must name its position; got {}",
+                placeholder.object
+            );
+            let detail = placeholder
+                .detail
+                .as_deref()
+                .unwrap_or_else(|| panic!("{label}: the placeholder must say what arrived"));
+            // The shape, and only the shape: an entry that is off the contract
+            // has also left the contract's promise that `detail` carries no
+            // credential, so nothing from inside it is quotable.
+            assert!(
+                !detail.contains("42") && !detail.contains("tb_user"),
+                "{label}: the placeholder quoted the payload: {detail}"
+            );
+
+            // And the gate can both see it and name it.
+            assert_eq!(set.unclassified().count(), 1, "{label}");
+            assert_eq!(set.worst_tier(), Some(RiskTier::Irreversible), "{label}");
+        }
+    }
+
+    /// The pact is the *directory*, not this file's table: a state confiture
+    /// starts emitting must not be silently unexercised here.
+    #[test]
+    fn the_fixture_table_covers_the_whole_pact_directory() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/preflight");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .expect("the pact directory exists")
+            .filter_map(|entry| {
+                let path = entry.expect("readable dir entry").path();
+                (path.extension()? == "json")
+                    .then(|| path.file_stem()?.to_str().map(ToOwned::to_owned))?
+            })
+            .collect();
+        on_disk.sort();
+        let mut tabled: Vec<String> = FIXTURES
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        tabled.sort();
+        assert_eq!(
+            on_disk, tabled,
+            "every fixture in the pact directory must be exercised by name"
+        );
+    }
 
     /// The composed `envelope -> AdapterErrorKind` projection `into_error` applies:
     /// read `error.code` from the JSON, classify, project. Exercises `error_code_of`
@@ -1001,6 +1674,79 @@ mod tests {
             &serde_json::json!({ "ok": true, "window_safe": false, "issues": [] }),
         );
         assert_eq!(unsafe_.window_safe, Some(false));
+    }
+
+    /// The capability must describe the **installed** confiture, not this
+    /// crate's ambitions. Advertising `risk_tier` against a binary that cannot
+    /// classify makes the policy gate expect a change-set and deny every
+    /// deploy — safe, and useless.
+    #[test]
+    fn describe_omits_risk_tier_on_an_old_confiture() {
+        for version in ["0.22.0", "0.23.0", "0.38.1", "0.39.0"] {
+            assert!(
+                !supports_risk_tier(version),
+                "confiture {version} emits no change-set"
+            );
+            let capabilities = capabilities_for(version);
+            assert!(
+                !capabilities.iter().any(|cap| cap == "risk_tier"),
+                "confiture {version}: {capabilities:?}"
+            );
+            // The base handshake is untouched — an old confiture keeps every
+            // capability it had.
+            assert!(capabilities.iter().any(|cap| cap == "preflight"));
+            assert!(capabilities.iter().any(|cap| cap == "window_safe"));
+        }
+    }
+
+    #[test]
+    fn describe_advertises_risk_tier_on_a_new_confiture() {
+        for version in ["0.40.0", "0.40.1", "0.41.0", "1.0.0"] {
+            assert!(
+                supports_risk_tier(version),
+                "confiture {version} classifies"
+            );
+            assert!(capabilities_for(version)
+                .iter()
+                .any(|cap| cap == "risk_tier"));
+        }
+    }
+
+    /// A confiture that changes its `--version` format must degrade to *"I do
+    /// not classify"*, never to *"I classify"*. Absence is the honest answer to
+    /// a question we could not read.
+    #[test]
+    fn an_unparseable_version_omits_risk_tier() {
+        for version in [
+            // What `parse_version` yields for empty or unexpected output.
+            "unknown",
+            "",
+            // Python-shaped pre-release and dev builds: not a release this
+            // adapter can vouch for.
+            "0.40.0rc1",
+            "0.40.0.dev0",
+            "0.40.0+local",
+            "v0.40.0",
+            "0..0",
+            "0.40.0-beta.1",
+        ] {
+            assert!(
+                !supports_risk_tier(version),
+                "an unreadable version ({version:?}) must not advertise a capability"
+            );
+        }
+    }
+
+    /// The floor is a numeric comparison, not a lexicographic one: as strings,
+    /// `"0.100.0" < "0.40.0"`, which would silently withdraw the capability the
+    /// first time confiture's minor reaches three digits.
+    #[test]
+    fn the_capability_floor_is_a_numeric_comparison() {
+        assert!(supports_risk_tier("0.100.0"));
+        assert!(supports_risk_tier("0.40"), "a missing patch reads as .0");
+        assert!(!supports_risk_tier("0.9.0"));
+        assert_eq!(version_triple("0.40.1"), Some((0, 40, 1)));
+        assert_eq!(version_triple("1"), Some((1, 0, 0)));
     }
 
     #[test]

@@ -571,6 +571,82 @@ pub enum RiskTier {
     Irreversible,
 }
 
+impl RiskTier {
+    /// Every tier, least → most severe.
+    ///
+    /// For rendering the taxonomy to an operator (a config error listing what
+    /// was expected, a plan legend). Adding a tier means adding it here;
+    /// [`as_str`](Self::as_str)'s exhaustive match is the compiler-enforced half
+    /// of that pair, and `snake_case_wire_names_are_pinned` is the test half.
+    pub const ALL: [Self; 5] = [
+        Self::Additive,
+        Self::Reversible,
+        Self::LockRisky,
+        Self::Destructive,
+        Self::Irreversible,
+    ];
+
+    /// The tier's name on the wire — the cross-repo pact with confiture.
+    ///
+    /// Kept in step with the `snake_case` serde representation by
+    /// `snake_case_wire_names_are_pinned`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Additive => "additive",
+            Self::Reversible => "reversible",
+            Self::LockRisky => "lock_risky",
+            Self::Destructive => "destructive",
+            Self::Irreversible => "irreversible",
+        }
+    }
+}
+
+impl std::fmt::Display for RiskTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for RiskTier {
+    type Err = UnknownRiskTier;
+
+    /// Parse a wire name. **Never a nearest match** — an unrecognised string is
+    /// no tier at all, which the policy gate denies (contract §5).
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|tier| tier.as_str() == name)
+            .ok_or_else(|| UnknownRiskTier {
+                name: name.to_owned(),
+            })
+    }
+}
+
+/// A tier name that is not in the taxonomy.
+///
+/// Its message lists the valid names, so a config typo is one line away from
+/// being fixed rather than one grep through the docs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownRiskTier {
+    /// The name that did not parse.
+    pub name: String,
+}
+
+impl std::fmt::Display for UnknownRiskTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let expected: Vec<&str> = RiskTier::ALL.iter().map(|tier| tier.as_str()).collect();
+        write!(
+            f,
+            "unknown risk tier '{}'; expected one of: {}",
+            self.name,
+            expected.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnknownRiskTier {}
+
 /// Deserialize a [`SchemaChange::tier`] leniently: a tier string this build does
 /// not recognise — or a `null`, or any other shape — becomes `None`
 /// (*unclassified*) instead of failing the enclosing entry.
@@ -1793,6 +1869,25 @@ mod tests {
             assert_eq!(json, format!("\"{wire}\""));
             let back: RiskTier = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(back, tier);
+            // `as_str` / `FromStr` are the same pact spelled for config files
+            // and messages; a drift between them and serde would classify one
+            // side of the seam differently from the other.
+            assert_eq!(tier.as_str(), wire);
+            assert_eq!(wire.parse::<RiskTier>().expect("parses"), tier);
+        }
+        assert_eq!(pact.map(|(tier, _)| tier), RiskTier::ALL, "ALL is complete");
+    }
+
+    #[test]
+    fn an_unknown_tier_name_does_not_parse_to_a_nearest_match() {
+        let error = "destructve"
+            .parse::<RiskTier>()
+            .expect_err("a typo must not resolve to a tier");
+        let message = error.to_string();
+        assert!(message.contains("destructve"), "{message}");
+        // The message lists the taxonomy, so the fix does not need a doc lookup.
+        for tier in RiskTier::ALL {
+            assert!(message.contains(tier.as_str()), "{message}");
         }
     }
 

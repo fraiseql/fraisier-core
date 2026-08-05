@@ -67,6 +67,55 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A risk-keyed policy engine, and the `[policy]` section that drives it.**
+  `fraisier_core::policy::evaluate` is one pure decision function over one
+  preflight report: it auto-applies the tiers a policy trusts, sends the rest to
+  an approval hook, and **denies anything it cannot classify**. The `[policy]`
+  section configures it:
+
+  ```toml
+  [policy]
+  auto_apply = ["additive", "reversible"]
+  require_approval = ["lock_risky", "destructive", "irreversible"]
+  unclassified = "deny"              # or "require_approval"
+  approval_command = "scripts/deploy/approve.sh"
+  approval_timeout_secs = 300
+  ```
+
+  The section is flat because fraisier's config is already one file per
+  environment, so per-environment thresholds are satisfied by construction. Its
+  *presence* is the opt-in: with no `[policy]` section the tier gate does not run
+  at all and every existing deploy behaves byte-for-byte as before. Nothing calls
+  the engine yet — wiring it into the deploy flow, running the approval hook, and
+  auditing the decision ship separately — so this release adds the decision and
+  its configuration, not a behaviour change.
+
+  Deny-by-default is the law, and it is spelled out in the types rather than left
+  to a validation rule: a tier listed in **neither** list is denied (a tier added
+  to the taxonomy later cannot silently auto-apply on a config written today), a
+  policy that requires approval with no `approval_command` configured **denies**
+  rather than passing silently, a change-set written to a newer contract version
+  is never approvable, and `unclassified` accepts only `deny` or
+  `require_approval` — auto-applying what nobody classified is not expressible.
+  A refusal names which rule fired and which objects are responsible.
+
+  `[policy]` validation reports a mistyped tier name (`"destructve"`) as a
+  located error rather than letting it become an unlisted-and-therefore-denied
+  tier, refuses a tier claimed by both lists instead of picking a winner, and
+  warns when the approval hook and the tiers that need it disagree in either
+  direction.
+
+- **The blue-green window-safety rule now lives in `policy` as the always-on
+  baseline.** `policy::evaluate` applies it *before* the tier policy and with or
+  without a `[policy]` section: the tier policy is opt-in, the window-safety
+  baseline is not, so folding the two gates into one decision function does not
+  quietly delete today's blue-green block for anyone. `window_safety::evaluate`
+  is now a thin delegation to that single implementation and keeps behaving
+  exactly as before; the module is removed once the blue-green flow calls the
+  policy gate directly. `window_safe` stays on the wire as an *input* to the
+  decision — it carries "confiture could not read this migration", which no risk
+  tier expresses.
+
 - **The Confiture adapter reads the schema change-set, and advertises
   `risk_tier` only when the installed binary can produce one.** `preflight` now
   parses the `change_set` object out of `confiture migrate preflight --format

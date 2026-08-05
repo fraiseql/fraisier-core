@@ -9,11 +9,12 @@
 
 use std::collections::BTreeSet;
 
-use fraisier_core::adapter_axes::Severity;
+use fraisier_core::adapter_axes::{RiskTier, Severity};
+use fraisier_core::policy::{PolicyAction, UnclassifiedAction};
 use fraisier_core::single_host::PreflightMode;
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{STRATEGY_ALL_AT_ONCE, STRATEGY_ROLLING};
+use crate::schema::{STRATEGY_ALL_AT_ONCE, STRATEGY_ROLLING, UNCLASSIFIED_ACTIONS};
 use crate::DeployConfig;
 
 /// The lowest and highest meaningful HTTP status codes.
@@ -134,6 +135,7 @@ impl DeployConfig {
         validate_sync(self, &mut report);
         validate_blue_green(self, &mut report);
         validate_checks(self, &mut report);
+        validate_policy(self, &mut report);
         report
     }
 
@@ -166,7 +168,10 @@ impl DeployConfig {
 }
 
 /// Whether an optional string field is present and non-blank.
-fn is_set(field: Option<&String>) -> bool {
+///
+/// `pub` only in the sense that this module is private: it is a crate-internal
+/// helper shared with [`crate::schema`].
+pub fn is_set(field: Option<&String>) -> bool {
     field.is_some_and(|s| !s.trim().is_empty())
 }
 
@@ -193,6 +198,97 @@ fn validate_checks(cfg: &DeployConfig, report: &mut ValidationReport) {
             }
         }
     }
+}
+
+/// Validate the `[policy]` section: the tier lists name real tiers, no tier is
+/// claimed by both, and the approval hook matches what the policy asks for.
+///
+/// An absent section is not an error — it is the D6 opt-out, and the tier gate
+/// simply does not run.
+fn validate_policy(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(policy) = &cfg.policy else {
+        return;
+    };
+    let auto_apply = tiers(policy.auto_apply.as_ref(), "policy.auto_apply", report);
+    let require_approval = tiers(
+        policy.require_approval.as_ref(),
+        "policy.require_approval",
+        report,
+    );
+    // Ambiguous rather than merely redundant: refuse to pick a winner.
+    for tier in auto_apply.intersection(&require_approval) {
+        report.error(
+            "policy.auto_apply",
+            format!(
+                "the tier '{tier}' is listed in both auto_apply and require_approval; \
+                 a tier maps to exactly one action"
+            ),
+        );
+    }
+    match policy.unclassified.as_deref() {
+        None => {}
+        Some(value) if UNCLASSIFIED_ACTIONS.contains(&value) => {}
+        Some(other) => report.error(
+            "policy.unclassified",
+            format!(
+                "unknown value '{other}' (expected one of: {}); a change nobody classified \
+                 may never auto-apply",
+                UNCLASSIFIED_ACTIONS.join(", ")
+            ),
+        ),
+    }
+    if policy.approval_timeout_secs == Some(0) {
+        report.error(
+            "policy.approval_timeout_secs",
+            "an approval timeout of 0 would refuse every approval before the hook could answer; \
+             omit the key or give it a positive number of seconds",
+        );
+    }
+    // Asked of the *resolved* policy, so an omitted list is judged by the
+    // default it takes rather than by being absent.
+    let resolved = policy.resolve();
+    let wants_approval = resolved
+        .actions
+        .values()
+        .any(|action| *action == PolicyAction::RequireApproval)
+        || resolved.unclassified == UnclassifiedAction::RequireApproval;
+    if wants_approval && !resolved.has_approval_hook {
+        report.warn(
+            "policy.approval_command",
+            "the policy requires approval for at least one tier but no approval_command is \
+             configured; those changes will be refused at the gate, not approved",
+        );
+    }
+    if !wants_approval && resolved.has_approval_hook {
+        report.warn(
+            "policy.approval_command",
+            "an approval_command is configured but no tier requires approval; the hook will \
+             never run",
+        );
+    }
+}
+
+/// Parse one tier list, reporting every name that is not in the taxonomy.
+///
+/// An omitted list takes its documented default, which is by construction valid,
+/// so it contributes no issues.
+fn tiers(
+    names: Option<&Vec<String>>,
+    path: &str,
+    report: &mut ValidationReport,
+) -> BTreeSet<RiskTier> {
+    let mut parsed = BTreeSet::new();
+    for name in names.into_iter().flatten() {
+        match name.parse::<RiskTier>() {
+            Ok(tier) => {
+                parsed.insert(tier);
+            }
+            // A typo must not quietly become an unlisted — and therefore denied
+            // — tier: that fails safe and is baffling to debug.
+            Err(error) => report.error(path, error.to_string()),
+        }
+    }
+    parsed
 }
 
 fn validate_deploy(cfg: &DeployConfig, report: &mut ValidationReport) {

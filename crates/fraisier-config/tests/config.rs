@@ -3,7 +3,9 @@
 //! separate validation pass.
 
 use fraisier_config::{DeployConfig, Severity};
+use fraisier_core::adapter_axes::RiskTier;
 use fraisier_core::multi_host::RolloutStrategy;
+use fraisier_core::policy::{PolicyAction, UnclassifiedAction};
 use fraisier_core::single_host::PreflightMode;
 
 /// The canonical PRD §7.1 `fraisier.toml` example.
@@ -1112,4 +1114,145 @@ fn http_health_still_requires_url() {
         .expect("parses")
         .validate();
     assert!(has_error(&report, "health.url"), "{report}");
+}
+
+// ---------------------------------------------------------------------------
+// The [policy] section — the risk-keyed policy gate (issue #45)
+// ---------------------------------------------------------------------------
+
+/// A `[policy]` section stating every key.
+const FULL_POLICY: &str = r#"
+[policy]
+auto_apply = ["additive"]
+require_approval = ["lock_risky", "destructive", "irreversible"]
+unclassified = "require_approval"
+approval_command = "scripts/deploy/approve.sh"
+approval_timeout_secs = 300
+"#;
+
+fn has_warning(report: &fraisier_config::ValidationReport, path: &str) -> bool {
+    report
+        .issues
+        .iter()
+        .any(|i| i.path == path && i.severity == Severity::Warning)
+}
+
+/// `PRD_7_1` plus the given `[policy]` body.
+fn with_policy(body: &str) -> DeployConfig {
+    DeployConfig::from_toml_str(&format!("{PRD_7_1}\n[policy]\n{body}")).expect("parses")
+}
+
+#[test]
+fn an_unknown_policy_key_is_rejected() {
+    let toml = format!("{PRD_7_1}\n[policy]\nauto_aply = [\"additive\"]\n");
+    assert!(
+        DeployConfig::from_toml_str(&toml).is_err(),
+        "deny_unknown_fields must reject an unknown policy key"
+    );
+}
+
+#[test]
+fn an_unknown_tier_name_is_a_validation_error() {
+    // A typo must not silently become an unlisted-and-therefore-denied tier:
+    // that fails safe, and is baffling to debug.
+    let report = with_policy("require_approval = [\"destructve\"]\n").validate();
+    assert!(has_error(&report, "policy.require_approval"), "{report}");
+    assert!(
+        report
+            .errors()
+            .any(|i| i.message.contains("destructve") && i.message.contains("irreversible")),
+        "the error must name the typo and the valid tiers: {report}"
+    );
+}
+
+#[test]
+fn a_tier_in_both_lists_is_a_validation_error() {
+    // Ambiguous: refuse rather than pick.
+    let report =
+        with_policy("auto_apply = [\"lock_risky\"]\nrequire_approval = [\"lock_risky\"]\n")
+            .validate();
+    assert!(has_error(&report, "policy.auto_apply"), "{report}");
+}
+
+#[test]
+fn unclassified_only_accepts_deny_or_require_approval() {
+    let report = with_policy("unclassified = \"auto_apply\"\n").validate();
+    assert!(has_error(&report, "policy.unclassified"), "{report}");
+    // And the two legitimate values validate clean.
+    for value in ["deny", "require_approval"] {
+        let cfg = with_policy(&format!(
+            "unclassified = \"{value}\"\napproval_command = \"a.sh\"\n"
+        ));
+        assert!(
+            !has_error(&cfg.validate(), "policy.unclassified"),
+            "{value} must be accepted"
+        );
+    }
+}
+
+#[test]
+fn a_zero_approval_timeout_is_a_validation_error() {
+    let report = with_policy("approval_timeout_secs = 0\napproval_command = \"a.sh\"\n").validate();
+    assert!(
+        has_error(&report, "policy.approval_timeout_secs"),
+        "{report}"
+    );
+}
+
+#[test]
+fn an_approval_command_without_require_approval_tiers_warns() {
+    // The hook would never run; say so rather than leaving it looking wired up.
+    let report = with_policy(
+        "auto_apply = [\"additive\"]\nrequire_approval = []\napproval_command = \"a.sh\"\n",
+    )
+    .validate();
+    assert!(has_warning(&report, "policy.approval_command"), "{report}");
+}
+
+#[test]
+fn require_approval_tiers_without_a_hook_warns() {
+    // The other half: the policy asks for sign-off with nothing able to give
+    // it, so every risky deploy will be refused at the gate. Fail-safe, but the
+    // operator should learn it at config time, not mid-deploy.
+    let report = with_policy("require_approval = [\"irreversible\"]\n").validate();
+    assert!(has_warning(&report, "policy.approval_command"), "{report}");
+}
+
+#[test]
+fn the_policy_section_parses_and_resolves() {
+    let cfg = DeployConfig::from_toml_str(&format!("{PRD_7_1}{FULL_POLICY}")).expect("parses");
+    let report = cfg.validate();
+    assert!(report.ok(), "{report}");
+
+    let policy = cfg.policy.as_ref().expect("policy").resolve();
+    assert_eq!(policy.actions[&RiskTier::Additive], PolicyAction::AutoApply);
+    assert_eq!(
+        policy.actions[&RiskTier::Irreversible],
+        PolicyAction::RequireApproval
+    );
+    // Listed in neither list, so it is denied by omission.
+    assert!(!policy.actions.contains_key(&RiskTier::Reversible));
+    assert_eq!(policy.unclassified, UnclassifiedAction::RequireApproval);
+    assert!(policy.has_approval_hook);
+}
+
+#[test]
+fn an_omitted_policy_key_takes_its_documented_default() {
+    let cfg = with_policy("approval_command = \"a.sh\"\n");
+    assert!(cfg.validate().ok(), "{}", cfg.validate());
+
+    let policy = cfg.policy.as_ref().expect("policy").resolve();
+    assert_eq!(
+        policy,
+        fraisier_core::policy::Policy::default().with_approval_hook(true)
+    );
+}
+
+#[test]
+fn no_policy_section_means_no_policy_at_all() {
+    // D6: configuring the section is the opt-in. Absent stays absent — there is
+    // no implicit default policy for a config that never asked for one.
+    let cfg = DeployConfig::from_toml_str(PRD_7_1).expect("parses");
+    assert!(cfg.policy.is_none());
+    assert!(cfg.validate().ok(), "{}", cfg.validate());
 }

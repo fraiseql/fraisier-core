@@ -119,6 +119,9 @@ impl SpecqlPreset {
             blue_green: None,
             // The preset emits no checks; an author-supplied [[checks]] wins.
             checks: Vec::new(),
+            // The preset states no policy: the tier gate stays opt-in, so a
+            // preset must not switch it on behind the author's back.
+            policy: None,
             specql: None,
         }
     }
@@ -328,6 +331,8 @@ impl DeployConfig {
             } else {
                 self.checks
             },
+            // The preset never emits [policy]; an author-supplied one wins.
+            policy: prefer(base.policy, self.policy),
             specql: None,
         }
     }

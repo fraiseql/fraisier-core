@@ -1,66 +1,14 @@
-//! Blue-green **window-safety** gate — the headline failure path of phase-07.
+//! Blue-green **window-safety** gate — superseded by [`crate::policy`].
 //!
-//! A blue-green swap runs version N-1 and N against **one shared Postgres** for
-//! the hold window, so the swap is only allowed when the pending migration is
-//! certified *forward-compatible for a two-version window*. fraisier **consumes
-//! confiture's verdict** — it never authors, validates, or reinvents
-//! expand/contract logic, and it knows nothing of confiture's classifier
-//! internals (DDL codes, SQL-vs-`.py`).
-//!
-//! ## The contract: one typed verdict
-//!
-//! The migration adapter returns a first-class
-//! [`PreflightReport::window_safe`](crate::adapter_axes::PreflightReport::window_safe):
-//! `Some(true)` iff **every** pending migration is forward-compatible for a
-//! two-version window — confiture folds the relevant concerns into it
-//! (replica-unsafe ops + migrations it cannot classify). It is purely about
-//! forward-compatibility: transactionality / reversibility are **not** consulted,
-//! because blue-green does no DB rollback (rollback is a traffic swap-back to
-//! still-hot blue), so a non-transactional-but-forward-compatible op like
-//! `CREATE INDEX CONCURRENTLY` is window-safe. The gate is a single boolean read:
-//!
-//! - `Some(true)` ⇒ **Safe**;
-//! - `Some(false)` ⇒ **Refused** (hard block before any instance or traffic change);
-//! - `None` ⇒ **Refused** — the adapter offers no window-safety verdict, so
-//!   nothing can certify the window (mirrors the `MethodNotSupported`-never-a-pass
-//!   design). An adapter without the `preflight` capability is likewise refused.
-//!
-//! There is **no force-equivalent** (a silent override would re-introduce the
-//! exact shared-DB-corruption footgun this gate exists to prevent) and **no
-//! fallback to pattern-matching issue codes** — the typed verdict is the contract.
-//!
-//! ## Relationship to the risk-tier contract
-//!
-//! `window_safe` is one signal on the preflight report; the *risk tier* of each
-//! planned change is another, carried by
-//! [`PreflightReport::change_set`](crate::adapter_axes::PreflightReport::change_set)
-//! and read through
-//! [`usable_change_set`](crate::adapter_axes::PreflightReport::usable_change_set).
-//! They answer different questions and neither substitutes for the other:
-//! window-safety is *"can N-1 and N share this database?"*, and it is the only
-//! question this module has ever answered. A tier says how destructive a change
-//! is, which the window-safety question does not ask — a `DROP TABLE` on an
-//! unread table is window-safe and irreversible at the same time. Notably,
-//! *"confiture could not read this migration"* folds into `window_safe == false`
-//! and has no tier at all, so dropping the boolean would discard a signal the
-//! taxonomy cannot express.
-//!
-//! A single `policy` module is planned to fold both into one decision function,
-//! so that a refusal has exactly one origin and names which rule fired. Until it
-//! lands, this module is that gate.
-//!
-//! ## Cross-repo contract (tracked in fraiseql/confiture#154)
-//!
-//! confiture emits `window_safe` on the `migrate preflight` JSON report and pins
-//! it in its contract test. `window_safe == false` for **any** migration confiture
-//! cannot certify — including ones its replica classifier cannot read (non-SQL /
-//! `.py`) — so "can't see" can never masquerade as "safe". fraisier requires a
-//! confiture release that emits the field; an older one returns `None` and is
-//! refused (fail safe).
-//!
-//! [fraiseql/confiture#154]: https://github.com/fraiseql/confiture/issues/154
+//! The rule itself now lives in `policy`, as the
+//! [`Baseline::WindowSafety`](crate::policy::Baseline::WindowSafety) verdict of
+//! the one decision function; the *why* — the shared-DB hold window, the typed
+//! verdict, the confiture#154 contract — is documented there. This module is a
+//! thin adapter over that rule, kept only until the blue-green flow calls the
+//! policy gate directly, and it delegates rather than keeping a second copy.
 
 use crate::adapter_axes::{AdapterCtx, MigrationAdapter, PreflightReport};
+use crate::policy::{baseline_verdict, Baseline, Capabilities};
 
 /// The verdict of the window-safety gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,46 +38,21 @@ impl WindowSafety {
     }
 }
 
-/// Apply the window-safety policy to already-gathered inputs (pure — the heart of
-/// the gate).
+/// Apply the window-safety policy to already-gathered inputs (pure).
 ///
 /// `has_preflight` is whether the adapter advertises the capability; `report` is
-/// the preflight result (`None` when preflight wasn't run). The decision is the
-/// adapter's first-class `window_safe` verdict; there is no fallback.
+/// the preflight result (`None` when preflight wasn't run).
+///
+/// Delegates to [`policy::baseline_verdict`](crate::policy::baseline_verdict) —
+/// the rule has exactly one implementation, and it is the one the policy gate
+/// applies.
 #[must_use]
 pub fn evaluate(has_preflight: bool, report: Option<&PreflightReport>) -> WindowSafety {
-    if !has_preflight {
-        return WindowSafety::Refused(
-            "the migration adapter does not advertise `preflight`; nothing can certify the \
-             migration window-safe for a two-version blue-green window"
-                .to_owned(),
-        );
-    }
-    let Some(report) = report else {
-        return WindowSafety::Refused(
-            "no preflight report was produced; cannot certify the window".to_owned(),
-        );
-    };
-    // `window_safe` is the SOLE window-safety verdict — purely forward-compatibility
-    // for the two-version window. Transactionality / reversibility are deliberately
-    // NOT consulted: blue-green does no DB rollback (rollback is a traffic swap-back
-    // to still-hot blue on the expanded schema), so a non-transactional but
-    // forward-compatible op like `CREATE INDEX CONCURRENTLY` is window-safe. A
-    // genuinely broken migration still fails at the `migrate` step (before any
-    // traffic moves), not here.
-    match report.window_safe {
-        Some(true) => WindowSafety::Safe,
-        Some(false) => WindowSafety::Refused(
-            "the migration is NOT forward-compatible for a two-version window \
-             (confiture window_safe = false)"
-                .to_owned(),
-        ),
-        None => WindowSafety::Refused(
-            "the migration adapter returned no window-safety verdict (window_safe); blue-green \
-             needs a confiture release that emits it — see fraiseql/confiture#154"
-                .to_owned(),
-        ),
-    }
+    // The window rule reads only `preflight`; `risk_tier` is the tier policy's
+    // input and has no bearing on certifying the window.
+    let capabilities = Capabilities::new(has_preflight, false);
+    baseline_verdict(Baseline::WindowSafety, capabilities, report)
+        .map_or(WindowSafety::Safe, WindowSafety::Refused)
 }
 
 /// Run the adapter's `preflight` (if advertised) and apply the [`evaluate`] policy.

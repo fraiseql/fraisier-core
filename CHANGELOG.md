@@ -50,6 +50,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   change-set, a version from the future, an entry with no recognised tier)
   resolves to *unclassified*, and unclassified is never *safe*.
 
+- **BREAKING (CI pipelines): `deploy --dry-run` now reads the database.** A
+  change-set can only come from `MigrationAdapter::preflight`, which for
+  confiture means running `confiture migrate preflight` against the target
+  database — so a dry-run needs a DSN where it previously needed nothing, spawned
+  no process, and touched no database. **A CI job that runs `deploy --dry-run`
+  as a cheap offline config check now needs either database credentials or
+  `--skip-preflight`.**
+
+  ```sh
+  # before — offline, no credentials
+  fraisier deploy --dry-run
+
+  # after, unchanged output and still offline
+  fraisier deploy --dry-run --skip-preflight
+  ```
+
+  `--dry-run --skip-preflight` restores the previous plan **byte-for-byte** (the
+  machine form still records `change_set_unavailable.code =
+  "preflight_skipped"`, so an agent cannot mistake the silence for *"no
+  changes"*). Without the flag the dry-run degrades rather than failing: an
+  unreachable database or an unset DSN yields the plan plus an explicit
+  unavailability line, at exit 0. Blue-green's dry-run does **not** honour
+  `--skip-preflight`, because its live preflight does not either — the
+  window-safety rule is not something a flag can switch off.
+
 - **Migrations now run from the staged release directory.** On a single-host
   deploy, the migrate step runs the migration axis with its working directory set
   to the release just staged by `fetch` (`StagedArtifact.path`) instead of the
@@ -66,6 +91,40 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the orchestrator, where the per-host release is not present.
 
 ### Added
+
+- **`deploy --dry-run` shows the schema change-set and the policy verdict** —
+  terraform-plan for schema change, in both human and JSON form. The plan lists
+  every classified change (`tier`, `kind`, `object`, `migration`) **worst-first**
+  — unclassified, then most severe down to least, stable within a tier so equal
+  changes keep the order they will apply in — and states what the gate *would*
+  decide, computed with the same `policy::evaluate` the live gate calls. A
+  dry-run **never calls the approval hook**: it reports that sign-off would be
+  needed rather than going to ask for it, which is structural — only
+  `PolicyGate::admit` runs a hook. Blue-green's plan, previously four JSON
+  fields and one line of prose, reaches the same parity and adds the
+  window-safety verdict its baseline already reads.
+
+  **Unknown is never rendered as zero.** *"The adapter looked and there is
+  nothing to change"* is `change_set: { "changes": [], … }`; *"nobody looked, or
+  nobody could classify"* is `change_set: null` with a
+  `change_set_unavailable: { code, detail }` beside it — a stable machine code
+  (`preflight_skipped`, `preflight_off`, `adapter_unavailable`,
+  `no_preflight_capability`, `preflight_failed`, `no_risk_tier_capability`,
+  `no_change_set`, `unreadable_change_set`), so a pipeline tells the two apart
+  without parsing prose. The human render ends every such line with *"Risk is
+  unknown, not zero."* Existing dry-run JSON keys keep their names and types;
+  the additions are strictly additive.
+
+  Every way of failing to see the schema **degrades rather than aborting**: an
+  unreachable database, an unset DSN, an adapter with no `preflight`, a
+  change-set from a contract this build cannot read. The plan still prints and
+  still exits 0, because a plan *was* produced. Degradation reasons are stripped
+  of URL credentials before they are printed or logged.
+
+  **`--fail-on-block`** (new, on `deploy`) turns a would-be block into a nonzero
+  exit for CI — both a refusal and a decision waiting on a human, because
+  neither deploys unattended. Without a `[policy]` section there is no verdict,
+  so it has nothing to gate on and never fires.
 
 - **The policy gate runs, and an approval hook can unblock it.** `[policy]` now
   stops a deploy: the gate applies at the `preflight` step of all three

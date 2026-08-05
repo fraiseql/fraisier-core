@@ -49,6 +49,7 @@ Every way of not knowing is a refusal, and the refusal says which one it was:
 | Situation | Result |
 |---|---|
 | Preflight did not run (`preflight_mode = "off"`, `--skip-preflight`) | refused — nothing inspected the changes |
+| The migration adapter could not be built (an unset DSN env var) | refused — same reason, one step earlier |
 | The adapter does not advertise `risk_tier` | refused (or sent to the hook, with `unclassified = "require_approval"`) |
 | It advertises `risk_tier` and emits no change-set | refused — that is an adapter bug, and the message says so |
 | The change-set is stamped with a contract version this build cannot read | refused, naming both versions. Never approvable: an approver would be signing off on a payload nobody can read |
@@ -127,6 +128,103 @@ fi
 echo "no acknowledgement within 4 minutes" >&2
 exit 1
 ```
+
+## Previewing a change
+
+`fraisier deploy --dry-run` shows the classified change-set and the verdict the
+gate **would** reach — terraform-plan for schema change. It runs the same
+`preflight` and the same decision function the deploy does, and it never calls
+the approval hook: a dry-run reports that sign-off would be needed, it does not
+go and ask for it.
+
+```
+deploy plan for checkout/production → host web-1
+  artifact:  release
+  migration: confiture (in-process)
+  service:   systemd
+  health:    http
+  database_url_env: CHECKOUT_DATABASE_URL
+  settings:  migrations_path
+
+  schema change-set (confiture 0.40.0, contract v1) — 3 changes:
+    [irreversible]  drop_column   public.tb_user.legacy_flag     20260804120100
+    [lock_risky]    create_index  public.tb_order.idx_placed_at  20260804120050
+    [additive]      add_column    public.tb_user.nickname        20260804120000
+
+  policy: WOULD BLOCK — 2 change(s) require approval (worst tier: irreversible)
+    · create_index public.tb_order.idx_placed_at (20260804120050)
+    · drop_column public.tb_user.legacy_flag (20260804120100)
+    approval hook: scripts/deploy/approve.sh
+
+(dry run — nothing was executed)
+```
+
+Changes are listed **worst-first** — unclassified, then most severe down to
+least — because an operator scans the top of a list. Within one tier they keep
+the order they will apply in.
+
+A blue-green plan adds the window-safety verdict, which its baseline reads from
+the same report:
+
+```
+  window safety: certified for the two-version blue-green window
+```
+
+### It reads the database now
+
+A change-set can only come from `MigrationAdapter::preflight`, which for
+confiture means running `confiture migrate preflight` against the target
+database. **A dry-run therefore needs a DSN where it previously needed
+nothing.** If you run `deploy --dry-run` in CI as a cheap config check, either
+give that job database credentials or add `--skip-preflight`.
+
+`--dry-run --skip-preflight` prints the plan exactly as it did before this
+feature existed — no change-set, no verdict, no new lines.
+
+### When it cannot see
+
+A plan that cannot reach the schema still prints, still exits 0, and never reads
+as clean:
+
+```
+  schema change-set: UNAVAILABLE — confiture 0.38.1 does not advertise
+    `risk_tier`, so no pending schema change was classified.
+    Risk is unknown, not zero.
+```
+
+Every such line ends on that phrase — **Risk is unknown, not zero.** — because a
+plan is read fast, and a missing change-set at a glance looks exactly like an
+empty one.
+
+The machine form keeps the two apart without parsing that prose — which is the
+whole point, because *"nothing to change"* and *"nobody looked"* are one careless
+`if` apart:
+
+| State | `change_set` | `change_set_unavailable` |
+|---|---|---|
+| The adapter looked, nothing changes | `{ "changes": [], … }` | `null` |
+| Nobody looked, or nobody could classify | `null` | `{ "code": …, "detail": … }` |
+
+The codes are stable: `preflight_skipped`, `preflight_off`,
+`adapter_unavailable`, `no_preflight_capability`, `preflight_failed`,
+`no_risk_tier_capability`, `no_change_set`, `unreadable_change_set`.
+
+Degradation reasons are stripped of URL credentials before they are printed or
+logged — a failed connection names the host, never the password.
+
+### Gating a pipeline on the plan
+
+`--dry-run` exits 0 whenever a plan was produced, including one that reports a
+block: the plan is the deliverable. Add `--fail-on-block` to exit nonzero when
+the deploy it previews would not go through — both a refusal and a decision
+waiting on a human, because neither one deploys unattended.
+
+```sh
+fraisier deploy --dry-run --fail-on-block --json   # the plan, and a CI gate
+```
+
+With no `[policy]` section there is no verdict, so `--fail-on-block` has nothing
+to gate on and never fires.
 
 ## How to unblock a refused deploy
 

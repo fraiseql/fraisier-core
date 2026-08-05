@@ -96,8 +96,12 @@ adapter = "http"
 url = "http://127.0.0.1:8080/healthz"
 ```
 
-`fraisier deploy --dry-run` resolves and prints the plan without touching
-anything. Every deploy is recorded in a pluggable state store (filesystem by
+`fraisier deploy --dry-run` resolves and prints the plan — including the
+classified schema change-set and what the [risk
+policy](docs/schema-risk-policy.md) would decide about it — without executing
+anything. It reads the database to do that, so a CI job using it as an offline
+config check wants `--skip-preflight`, which restores the pure plan. Every
+deploy is recorded in a pluggable state store (filesystem by
 default; sqlite and in-memory backends ship too), and `fraisier status` /
 `fraisier list` / `fraisier rollback` operate on that ledger.
 
@@ -261,7 +265,13 @@ for the hook to say yes — before anything is staged, migrated or restarted.
 Configuring the section is the opt-in: with no `[policy]`, deploys behave exactly
 as they did. There is no `--force`; approval arrives only through the hook, and a
 hook that fails, times out, or cannot be spawned is a **refusal**. Blue-green's
-window-safety rule applies with or without the section. See
+window-safety rule applies with or without the section.
+
+`fraisier deploy --dry-run` previews all of it — the change-set, worst-first,
+and the verdict the gate would reach — without ever calling the hook. Add
+`--fail-on-block` to turn a would-be block into a nonzero exit for CI. A plan
+that cannot see the schema says so (*"Risk is unknown, not zero"*) instead of
+printing as though it were clean. See
 [`docs/schema-risk-policy.md`](docs/schema-risk-policy.md).
 
 ## Observability

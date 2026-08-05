@@ -985,6 +985,33 @@ mod tests {
         assert!(preview.policy.is_none(), "{preview:?}");
     }
 
+    #[test]
+    fn every_unavailability_code_is_documented() {
+        // The codes are published as a stable contract a pipeline branches on,
+        // so a new one that never reaches the guide is a contract an operator
+        // cannot discover. `docs/schema-risk-policy.md` is the list.
+        let guide = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(2)
+                .expect("workspace root")
+                .join("docs/schema-risk-policy.md"),
+        )
+        .expect("read the operator guide");
+        for code in [
+            Unavailable::SKIPPED,
+            Unavailable::PREFLIGHT_OFF,
+            Unavailable::ADAPTER_UNAVAILABLE,
+            Unavailable::NO_PREFLIGHT_CAPABILITY,
+            Unavailable::PREFLIGHT_FAILED,
+            Unavailable::NO_RISK_TIER_CAPABILITY,
+            Unavailable::NO_CHANGE_SET,
+            Unavailable::UNREADABLE_CHANGE_SET,
+        ] {
+            assert!(guide.contains(code), "undocumented unavailability: {code}");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // `--fail-on-block`
     // -----------------------------------------------------------------------

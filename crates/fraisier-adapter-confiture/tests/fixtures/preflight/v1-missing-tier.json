@@ -1,0 +1,29 @@
+{
+  "ok": true,
+  "window_safe": true,
+  "summary": {
+    "errors": 0,
+    "warnings": 0,
+    "info": 0,
+    "migrations_checked": 2
+  },
+  "issues": [],
+  "change_set": {
+    "contract_version": 1,
+    "changes": [
+      {
+        "kind": "add_column",
+        "object": "public.tb_user.nickname",
+        "migration": "20260804120000",
+        "tier": "additive",
+        "detail": "ADD COLUMN nickname text NULL"
+      },
+      {
+        "kind": "alter_column_type",
+        "object": "public.tb_order.total_cents",
+        "migration": "20260804120300",
+        "detail": "ALTER COLUMN total_cents TYPE bigint"
+      }
+    ]
+  }
+}

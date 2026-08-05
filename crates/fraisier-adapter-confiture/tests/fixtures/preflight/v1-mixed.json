@@ -1,0 +1,48 @@
+{
+  "ok": true,
+  "window_safe": true,
+  "summary": {
+    "errors": 0,
+    "warnings": 1,
+    "info": 0,
+    "migrations_checked": 3
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_NON_TRANSACTIONAL",
+      "message": "Migration 20260804120050 contains a non-transactional statement (CREATE INDEX).",
+      "migration": "20260804120050",
+      "file": "migrations/20260804120050_index_placed_at.sql",
+      "line": 1,
+      "actionable": "Run with --allow-non-transactional to apply it in autocommit, or split the statement out of the transactional migration.",
+      "details": {}
+    }
+  ],
+  "change_set": {
+    "contract_version": 1,
+    "changes": [
+      {
+        "kind": "add_column",
+        "object": "public.tb_user.nickname",
+        "migration": "20260804120000",
+        "tier": "additive",
+        "detail": "ADD COLUMN nickname text NULL"
+      },
+      {
+        "kind": "create_index",
+        "object": "public.tb_order.idx_placed_at",
+        "migration": "20260804120050",
+        "tier": "lock_risky",
+        "detail": "CREATE INDEX idx_placed_at ON tb_order (placed_at)"
+      },
+      {
+        "kind": "drop_column",
+        "object": "public.tb_user.legacy_flag",
+        "migration": "20260804120100",
+        "tier": "irreversible",
+        "detail": "DROP COLUMN legacy_flag"
+      }
+    ]
+  }
+}

@@ -48,6 +48,7 @@ use crate::adapter_axes::{
     AdapterCtx, AdapterError, ArtifactAdapter, HealthAdapter, HostId, MigrationAdapter, Revision,
     ServiceAdapter, Severity, StagedArtifact,
 };
+use crate::policy::{self, Baseline, Inspection, PolicyGate};
 use crate::restore_rehearsal::{run_restore_rehearsal, BackupSource, RehearsalDb};
 
 /// Which preflight a deploy runs before touching the live database.
@@ -125,6 +126,9 @@ pub struct SingleHostDeploy {
     /// `down_to(this)` instead of `up`, and its compensation goes back `up`.
     rollback_to: Option<Revision>,
     forward_compatible_lint: bool,
+    /// The schema policy gate. Default (no `[policy]` section) leaves the tier
+    /// gate switched off — single-host has no always-on baseline rule.
+    policy: PolicyGate,
     /// When set, the preflight step also rehearses a restore + migrate on a
     /// throwaway DB (`[migration].preflight_mode = "restore_rehearsal"`).
     restore_rehearsal: Option<Arc<dyn RehearsalDb>>,
@@ -211,6 +215,7 @@ pub struct SingleHostDeployBuilder {
     target: Option<Revision>,
     rollback_to: Option<Revision>,
     forward_compatible_lint: bool,
+    policy: PolicyGate,
     restore_rehearsal: Option<Arc<dyn RehearsalDb>>,
     backup_source: BackupSource,
     artifact: Option<Arc<dyn ArtifactAdapter>>,
@@ -231,6 +236,7 @@ impl SingleHostDeployBuilder {
             // Default on: forward-compat preflight runs whenever the adapter
             // advertises it, unless the operator opts out (PRD G11 / Decision 4).
             forward_compatible_lint: true,
+            policy: PolicyGate::default(),
             restore_rehearsal: None,
             backup_source: BackupSource::FreshDump,
             artifact: None,
@@ -272,6 +278,19 @@ impl SingleHostDeployBuilder {
     #[must_use]
     pub const fn forward_compatible_lint(mut self, enabled: bool) -> Self {
         self.forward_compatible_lint = enabled;
+        self
+    }
+
+    /// Apply `gate` — the resolved `[policy]` section and its approval hook — to
+    /// this deploy's preflight step.
+    ///
+    /// Absent, the tier gate does not run at all (D6: configuring the section is
+    /// the opt-in), and a single-host deploy behaves exactly as it does without a
+    /// policy: single-host runs one version at a time, so it has no always-on
+    /// baseline rule either.
+    #[must_use]
+    pub fn policy(mut self, gate: PolicyGate) -> Self {
+        self.policy = gate;
         self
     }
 
@@ -342,6 +361,7 @@ impl SingleHostDeployBuilder {
             target: self.target,
             rollback_to: self.rollback_to,
             forward_compatible_lint: self.forward_compatible_lint,
+            policy: self.policy,
             restore_rehearsal: self.restore_rehearsal,
             backup_source: self.backup_source,
         })
@@ -367,6 +387,7 @@ struct DeployShared {
     target: Option<Revision>,
     rollback_to: Option<Revision>,
     forward_compatible_lint: bool,
+    policy: PolicyGate,
     restore_rehearsal: Option<Arc<dyn RehearsalDb>>,
     backup_source: BackupSource,
     artifact: Arc<dyn ArtifactAdapter>,
@@ -443,6 +464,7 @@ impl DeployShared {
             target: deploy.target.clone(),
             rollback_to: deploy.rollback_to.clone(),
             forward_compatible_lint: deploy.forward_compatible_lint,
+            policy: deploy.policy.clone(),
             restore_rehearsal: deploy.restore_rehearsal.clone(),
             backup_source: deploy.backup_source.clone(),
             artifact: Arc::clone(&deploy.artifact),
@@ -472,7 +494,12 @@ impl DeployShared {
     /// forward-compatibility lint runs against the live DB (`live`/`restore_rehearsal`)
     /// and the DR-grade restore rehearsal runs additionally (`restore_rehearsal`).
     /// `off` sets both off, so the step is an inert no-op.
+    ///
+    /// The schema policy gate runs **first**: a deploy the policy will not allow
+    /// should not first be told about lint findings in a change the operator is
+    /// not permitted to make anyway.
     async fn run_preflight(&self) -> Result<(), SagaError> {
+        self.run_policy_gate().await?;
         if self.forward_compatible_lint {
             self.run_forward_compat_lint().await?;
         }
@@ -484,6 +511,41 @@ impl DeployShared {
             }
         }
         Ok(())
+    }
+
+    /// Apply the schema policy gate to this deploy.
+    ///
+    /// Single-host runs one version at a time against the database, so there is
+    /// no shared hold window to certify: the baseline is [`Baseline::None`] and
+    /// the gate is entirely opt-in through `[policy]` (D6). With no section
+    /// configured this is a no-op that touches no adapter.
+    ///
+    /// When the operator turned preflight off, nothing inspected the pending
+    /// changes and a configured policy refuses on that basis — which is why
+    /// `[policy]` with `preflight_mode = "off"` is a config-time warning.
+    async fn run_policy_gate(&self) -> Result<(), SagaError> {
+        if !self.policy.needs_inspection(Baseline::None) {
+            return Ok(());
+        }
+        let inspection = if self.forward_compatible_lint {
+            policy::inspect(self.migration.as_ref(), &self.ctx)
+                .await
+                .map_err(|e| Self::failed("preflight", &e))?
+        } else {
+            Inspection::default()
+        };
+        self.policy
+            .admit(
+                Baseline::None,
+                inspection.capabilities,
+                inspection.report.as_ref(),
+                &self.ctx,
+            )
+            .await
+            .map_err(|reason| SagaError::StepFailed {
+                step: "preflight".to_owned(),
+                message: reason,
+            })
     }
 
     /// Run the migration adapter's forward-compatibility lint against the **live**
@@ -755,10 +817,11 @@ mod tests {
     use super::{DeployBuildError, DeployRecord, SingleHostDeploy};
     use crate::adapter_axes::{
         AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, ArtifactAdapter,
-        ArtifactRef, HealthAdapter, HealthStatus, HostId, MigrationAdapter, MigrationOutcome,
-        PreflightIssue, PreflightReport, Revision, ServiceAdapter, ServiceStatus, Severity,
-        StagedArtifact, VerifyReport,
+        ArtifactRef, ChangeSet, HealthAdapter, HealthStatus, HostId, MigrationAdapter,
+        MigrationOutcome, PreflightIssue, PreflightReport, Revision, RiskTier, SchemaChange,
+        ServiceAdapter, ServiceStatus, Severity, StagedArtifact, VerifyReport,
     };
+    use crate::policy::{testing::FixedApproval, Policy, PolicyGate, REFUSED};
     use crate::restore_rehearsal::{BackupSource, RehearsalDb, RehearsalError, ThrowawayDb};
     use async_trait::async_trait;
     use fraisier_saga::saga::SagaOutcome;
@@ -882,6 +945,10 @@ mod tests {
         /// `run_to`). Guards the [`run_migrate`] contract that `self.target` is
         /// `None` unless an operator explicitly pinned one.
         decline_targeted_up: bool,
+        /// The classified change-set the preflight report carries. `Some` also
+        /// makes the adapter advertise `risk_tier` — an adapter that claims to
+        /// classify and emits nothing is its own (tested) failure mode.
+        change_set: Option<ChangeSet>,
         /// The `ctx.workdir` seen by each migration call, for asserting the
         /// migrate step runs from the staged release directory.
         seen_workdirs: Arc<Mutex<Vec<PathBuf>>>,
@@ -897,7 +964,21 @@ mod tests {
                 fail_up: false,
                 verify_ok: true,
                 decline_targeted_up: false,
+                change_set: None,
                 seen_workdirs: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// A healthy adapter that classifies its pending changes.
+        fn classifying(trail: &Trail, changes: Vec<SchemaChange>) -> Self {
+            Self {
+                capabilities: vec![
+                    "preflight".to_owned(),
+                    "up".to_owned(),
+                    "risk_tier".to_owned(),
+                ],
+                change_set: Some(ChangeSet::new(changes)),
+                ..Self::healthy(trail)
             }
         }
 
@@ -983,11 +1064,15 @@ mod tests {
             } else {
                 Vec::new()
             };
-            Ok(PreflightReport {
+            let mut report = PreflightReport {
                 ok: !self.preflight_blocking,
                 issues,
                 ..Default::default()
-            })
+            };
+            if let Some(changes) = self.change_set.clone() {
+                report = report.with_change_set(changes);
+            }
+            Ok(report)
         }
     }
 
@@ -1064,6 +1149,34 @@ mod tests {
             .health(Arc::new(health))
             .build()
             .expect("all adapters provided")
+    }
+
+    /// The same deploy as [`deploy`], with a schema policy gate applied.
+    fn policed(trail: &Trail, migration: FakeMigration, gate: PolicyGate) -> SingleHostDeploy {
+        SingleHostDeploy::builder("checkout", "production", HostId::new("localhost"))
+            .policy(gate)
+            .artifact(Arc::new(FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            }))
+            .migration(Arc::new(migration))
+            .service(Arc::new(FakeService {
+                trail: trail.clone(),
+                fail_restarts: Arc::new(Mutex::new(0)),
+            }))
+            .health(Arc::new(FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            }))
+            .build()
+            .expect("all adapters provided")
+    }
+
+    /// One irreversible change: dropping a column, data and all.
+    fn drop_legacy_flag() -> SchemaChange {
+        SchemaChange::new("drop_column", "public.tb_user.legacy_flag")
+            .with_migration("20260804120100_drop_legacy")
+            .with_tier(RiskTier::Irreversible)
     }
 
     fn store() -> (tempfile::TempDir, FilesystemStateStore) {
@@ -1761,5 +1874,111 @@ mod tests {
             .build()
             .expect_err("missing migration/service/health");
         assert!(matches!(err, DeployBuildError::MissingAdapter("migration")));
+    }
+
+    // -----------------------------------------------------------------------
+    // The schema policy gate (#45). Single-host has no shared-DB hold window,
+    // so the gate here is entirely opt-in: `[policy]` present or nothing runs.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_policy_denial_fails_the_preflight_step_naming_the_object() {
+        // The default policy sends an irreversible change to the hook, and no
+        // hook is configured — a refusal, never a silent pass. It must land as a
+        // step failure that names *what* was refused: "policy denied" alone is
+        // useless to the operator reading it at 3am.
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let plan = policed(
+            &trail,
+            FakeMigration::classifying(&trail, vec![drop_legacy_flag()]),
+            PolicyGate::new(Policy::default()),
+        );
+
+        let outcome = plan.run(store).await.expect("run");
+        let SagaOutcome::RolledBack {
+            failed_step,
+            reason,
+        } = &outcome
+        else {
+            panic!("expected a rollback at preflight, got {outcome:?}");
+        };
+        assert_eq!(failed_step, "preflight");
+        assert!(reason.contains(REFUSED), "{reason}");
+        assert!(reason.contains("public.tb_user.legacy_flag"), "{reason}");
+        assert!(reason.contains("no approval hook"), "{reason}");
+        // Refused before anything was staged, migrated, or restarted.
+        assert_eq!(drain(&trail), vec!["describe", "preflight"]);
+    }
+
+    #[tokio::test]
+    async fn no_policy_section_leaves_behaviour_unchanged() {
+        // The D6 guarantee, and the regression test that protects every existing
+        // user: the same irreversible change, with no `[policy]` section, still
+        // deploys exactly as it does today.
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let plan = deploy(
+            &trail,
+            FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            },
+            FakeMigration::classifying(&trail, vec![drop_legacy_flag()]),
+            FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            },
+        );
+
+        let outcome = plan.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn an_approved_deploy_proceeds_past_preflight() {
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let plan = policed(
+            &trail,
+            FakeMigration::classifying(&trail, vec![drop_legacy_flag()]),
+            PolicyGate::new(Policy::default().with_approval_hook(true)).with_hook(Some(Arc::new(
+                FixedApproval::approving("oncall@example.com"),
+            ))),
+        );
+
+        let outcome = plan.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_denied_hook_verdict_rolls_back_before_the_fetch_step() {
+        // The approver said no: nothing is staged, no service is touched, and
+        // the refusal carries the approver's own words.
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let plan = policed(
+            &trail,
+            FakeMigration::classifying(&trail, vec![drop_legacy_flag()]),
+            PolicyGate::new(Policy::default().with_approval_hook(true)).with_hook(Some(Arc::new(
+                FixedApproval::refusing("not during the change freeze"),
+            ))),
+        );
+
+        let outcome = plan.run(store).await.expect("run");
+        let SagaOutcome::RolledBack {
+            failed_step,
+            reason,
+        } = &outcome
+        else {
+            panic!("expected a rollback at preflight, got {outcome:?}");
+        };
+        assert_eq!(failed_step, "preflight");
+        assert!(reason.contains("not during the change freeze"), "{reason}");
+        let trail = drain(&trail);
+        assert!(
+            !trail.iter().any(|entry| entry == "stage" || entry == "up"),
+            "nothing was staged or migrated: {trail:?}"
+        );
     }
 }

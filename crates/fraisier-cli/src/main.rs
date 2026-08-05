@@ -12,6 +12,7 @@
 // a public API that a binary crate does not actually expose.
 #![allow(clippy::redundant_pub_crate)]
 
+mod approval;
 mod commands;
 mod doctor;
 #[cfg(test)]

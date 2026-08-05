@@ -24,11 +24,13 @@ use fraisier_core::adapter_axes::{
     AdapterCtx, ArtifactAdapter, HealthAdapter, HostId, LbAdapter, MigrationAdapter, ServiceAdapter,
 };
 use fraisier_core::multi_host::{MultiHostPlan, RolloutStrategy};
+use fraisier_core::policy::{ApprovalHook, PolicyGate};
 use fraisier_core::restore_rehearsal::{BackupSource, RehearsalDb};
 use fraisier_core::single_host::PreflightMode;
 use fraisier_ipc::{Launcher, SshLauncher};
 use serde_json::Value;
 
+use crate::approval::ExecApproval;
 use crate::pg_rehearsal::PgRehearsalDb;
 
 /// The logical secret name every migration adapter resolves the DSN under.
@@ -62,6 +64,34 @@ pub struct PlanSummary {
     pub database_url_env: Option<String>,
 }
 
+/// Resolve the `[policy]` section into the gate a deploy runs at preflight.
+///
+/// An absent section is the D6 opt-out and yields the default gate: no tier
+/// policy at all, and whatever always-on baseline the strategy itself applies.
+/// An `approval_command` becomes the one [`ApprovalHook`] implementation; without
+/// one, anything the policy sends for sign-off is refused rather than passed.
+fn build_policy_gate(config: &DeployConfig) -> PolicyGate {
+    let Some(section) = config.policy.as_ref() else {
+        return PolicyGate::default();
+    };
+    let hook: Option<Arc<dyn ApprovalHook>> = section
+        .approval_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(|command| {
+            Arc::new(ExecApproval::new(
+                command,
+                Duration::from_secs(
+                    section
+                        .approval_timeout_secs
+                        .unwrap_or(fraisier_config::DEFAULT_APPROVAL_TIMEOUT_SECS),
+                ),
+            )) as Arc<dyn ApprovalHook>
+        });
+    PolicyGate::new(section.resolve()).with_hook(hook)
+}
+
 /// The fully-built adapters and context, ready to hand to a `SingleHostDeploy`.
 pub struct ResolvedDeploy {
     /// The fraise (deployable) name.
@@ -75,6 +105,8 @@ pub struct ResolvedDeploy {
     /// Whether to run the migration adapter's forward-compatibility `preflight`
     /// lint (`[migration].forward_compatible_lint`, default `true`).
     pub forward_compatible_lint: bool,
+    /// The schema policy gate resolved from `[policy]` (default: no tier gate).
+    pub policy: PolicyGate,
     /// When set, the restore-rehearsal preflight provisions a throwaway DB (via
     /// the given [`RehearsalDb`]) seeded from [`BackupSource`] and rehearses the
     /// pending migrations there. Populated when `preflight_mode = "restore_rehearsal"`.
@@ -430,6 +462,7 @@ pub fn build(
         host,
         ctx,
         forward_compatible_lint,
+        policy: build_policy_gate(config),
         restore_rehearsal,
         artifact,
         migration,

@@ -2,10 +2,15 @@
 //!
 //! [`evaluate`] is where a preflight report becomes a verdict. It is pure: it
 //! takes the facts already gathered (what the adapter says it can do, what its
-//! preflight reported) and returns a [`PolicyDecision`]. All I/O — running
-//! preflight, running an approval hook — belongs above it, which is what lets the
+//! preflight reported) and returns a [`PolicyDecision`], which is what lets the
 //! whole decision table be covered by unit tests with no fixtures and no
 //! database.
+//!
+//! The I/O sits strictly above it, in two thin wrappers: [`inspect`] gathers the
+//! facts from the adapter once per deploy, and [`PolicyGate::admit`] turns the
+//! decision into a verdict — running the approval hook when the decision asks for
+//! one, auditing either way. A saga calls those two; nothing calls an adapter
+//! from inside a decision.
 //!
 //! Two orthogonal questions are answered in one pass, so that a refusal has
 //! exactly one origin and names which rule fired:
@@ -81,9 +86,13 @@
 
 use std::collections::BTreeMap;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::adapter_axes::{ChangeSetUnavailable, PreflightReport, RiskTier, SchemaChange};
+use crate::adapter_axes::{
+    AdapterCtx, AdapterError, ChangeSetUnavailable, MigrationAdapter, PreflightReport, RiskTier,
+    SchemaChange,
+};
 
 /// The tiers a policy auto-applies when its config does not say otherwise.
 pub const DEFAULT_AUTO_APPLY: [RiskTier; 2] = [RiskTier::Additive, RiskTier::Reversible];
@@ -254,6 +263,26 @@ pub struct PolicyReason {
 }
 
 impl PolicyReason {
+    /// A reason about one change, stated directly.
+    ///
+    /// The engine builds its own reasons from the change-set; this is for the
+    /// layers above it — an approval hook's payload, a plan render, a test —
+    /// which the `#[non_exhaustive]` marker keeps out of a struct literal.
+    #[must_use]
+    pub fn new(
+        tier: Option<RiskTier>,
+        object: impl Into<String>,
+        kind: impl Into<String>,
+        migration: Option<String>,
+    ) -> Self {
+        Self {
+            tier,
+            object: object.into(),
+            kind: kind.into(),
+            migration,
+        }
+    }
+
     /// The reason attached to one classified-or-not change.
     fn for_change(change: &SchemaChange) -> Self {
         Self {
@@ -299,6 +328,96 @@ pub enum PolicyDecision {
         /// them. Empty when the refusal is not about any particular change.
         reasons: Vec<PolicyReason>,
     },
+}
+
+/// What an [`ApprovalHook`] is asked to sign off on.
+///
+/// Carries the deploy's identity and every change that needs sign-off — and
+/// nothing else. In particular it carries no [`AdapterCtx`](crate::adapter_axes::AdapterCtx),
+/// so no secret, DSN, or adapter setting can reach a hook by construction rather
+/// than by a filtering rule someone has to remember.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct ApprovalRequest {
+    /// The fraise (deployable) being deployed.
+    pub fraise: String,
+    /// The environment being deployed to.
+    pub environment: String,
+    /// Every change that is not auto-apply, in the order the adapter listed them.
+    pub reasons: Vec<PolicyReason>,
+    /// The most severe tier among the reasons, or `None` when nothing that needs
+    /// sign-off was classified.
+    pub worst_tier: Option<RiskTier>,
+}
+
+impl ApprovalRequest {
+    /// The request for a decision that needs sign-off, with `worst_tier` derived
+    /// from `reasons`.
+    #[must_use]
+    pub fn new(
+        fraise: impl Into<String>,
+        environment: impl Into<String>,
+        reasons: Vec<PolicyReason>,
+    ) -> Self {
+        Self {
+            fraise: fraise.into(),
+            environment: environment.into(),
+            worst_tier: reasons.iter().filter_map(|reason| reason.tier).max(),
+            reasons,
+        }
+    }
+}
+
+/// What an [`ApprovalHook`] answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ApprovalVerdict {
+    /// Signed off. `approver` identifies who or what said yes, for the audit
+    /// record.
+    Approved {
+        /// Who approved, as the hook reported itself.
+        approver: String,
+    },
+    /// Refused — including every way of failing to answer.
+    Denied {
+        /// Why, in one line an operator can act on.
+        reason: String,
+    },
+}
+
+impl ApprovalVerdict {
+    /// A refusal with `reason`.
+    #[must_use]
+    pub fn denied(reason: impl Into<String>) -> Self {
+        Self::Denied {
+            reason: reason.into(),
+        }
+    }
+
+    /// A sign-off from `approver`.
+    #[must_use]
+    pub fn approved(approver: impl Into<String>) -> Self {
+        Self::Approved {
+            approver: approver.into(),
+        }
+    }
+}
+
+/// Where a [`PolicyDecision::NeedsApproval`] goes to be answered.
+///
+/// The method returns an [`ApprovalVerdict`] rather than a `Result`, and that is
+/// the whole point: a `Result` invites a caller to write `.unwrap_or(Approved)`
+/// or to propagate an error some outer layer treats as "inconclusive, proceed".
+/// Making refusal the only failure representation removes the footgun at the type
+/// level — the same reasoning as `MethodNotSupported` never being a passing
+/// preflight report.
+///
+/// **Any** failure — spawn error, timeout, non-zero exit, unreadable output —
+/// must answer [`ApprovalVerdict::Denied`].
+#[async_trait]
+pub trait ApprovalHook: Send + Sync {
+    /// Ask for sign-off on `request`.
+    async fn request(&self, request: &ApprovalRequest) -> ApprovalVerdict;
 }
 
 /// The worst of a set of actions — the outcome a whole change-set takes.
@@ -544,6 +663,186 @@ pub fn evaluate(
     assemble(policy, triggers, change_set.changes.len())
 }
 
+/// What the preflight step learned about the migration adapter: what it says it
+/// can do, and the report it produced.
+///
+/// Gathered **once** per deploy and read by everything that needs it — the
+/// forward-compatibility lint, the baseline, and the tier policy. Each of those
+/// asking the adapter itself would mean two or three confiture subprocesses and
+/// as many database round-trips per deploy, for answers that cannot legitimately
+/// differ within one run.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct Inspection {
+    /// What the adapter advertises.
+    pub capabilities: Capabilities,
+    /// Its preflight report, or `None` when no preflight ran — because the
+    /// adapter does not advertise one, or because the operator turned it off.
+    pub report: Option<PreflightReport>,
+}
+
+/// Describe the migration adapter and, when it advertises `preflight`, run it.
+///
+/// This is the gate's only I/O. Everything below it is pure.
+///
+/// # Errors
+/// The adapter's own [`AdapterError`], unchanged: a `describe` or `preflight`
+/// that fails is an infrastructure failure the caller reports against its step,
+/// never a verdict — "the check could not run" must never resolve to "the check
+/// passed".
+pub async fn inspect(
+    migration: &dyn MigrationAdapter,
+    ctx: &AdapterCtx,
+) -> Result<Inspection, AdapterError> {
+    let described = migration.describe().await?;
+    let capabilities = Capabilities::from_advertised(&described.capabilities);
+    let report = if capabilities.preflight {
+        Some(migration.preflight(ctx).await?)
+    } else {
+        None
+    };
+    Ok(Inspection {
+        capabilities,
+        report,
+    })
+}
+
+/// How every refusal from this gate opens, so an operator — and the notify sink
+/// — can tell a policy block from any other preflight failure.
+pub const REFUSED: &str = "policy refused:";
+
+/// The policy gate as wired into a deploy: what `[policy]` configured, plus the
+/// hook that can unblock what it holds.
+///
+/// The default gate — no policy, no hook — is not an inert one: it still applies
+/// the [`Baseline`] its strategy passes, which is what keeps blue-green's
+/// window-safety rule on for the deploys that never configure `[policy]` (D6's
+/// carve-out).
+#[derive(Clone, Default)]
+pub struct PolicyGate {
+    policy: Option<Policy>,
+    hook: Option<std::sync::Arc<dyn ApprovalHook>>,
+}
+
+impl std::fmt::Debug for PolicyGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The hook is a trait object (not `Debug`); show whether one is wired.
+        f.debug_struct("PolicyGate")
+            .field("policy", &self.policy)
+            .field("hook", &self.hook.is_some())
+            .finish()
+    }
+}
+
+impl PolicyGate {
+    /// The gate a configured `[policy]` section builds, with no approval hook.
+    #[must_use]
+    pub const fn new(policy: Policy) -> Self {
+        Self {
+            policy: Some(policy),
+            hook: None,
+        }
+    }
+
+    /// Wire the approval hook (or `None`, which leaves anything needing sign-off
+    /// refused).
+    #[must_use]
+    pub fn with_hook(mut self, hook: Option<std::sync::Arc<dyn ApprovalHook>>) -> Self {
+        self.hook = hook;
+        self
+    }
+
+    /// Whether a preflight report is worth gathering for this gate.
+    ///
+    /// False only when the tier gate is unconfigured *and* the strategy has no
+    /// always-on rule — today's ungated single- and multi-host deploy, which must
+    /// not start spawning a preflight subprocess for a gate that is switched off.
+    #[must_use]
+    pub const fn needs_inspection(&self, baseline: Baseline) -> bool {
+        self.policy.is_some() || !matches!(baseline, Baseline::None)
+    }
+
+    /// Decide whether this deploy may proceed, resolving approval and auditing
+    /// the outcome.
+    ///
+    /// `baseline` is fixed by the deploy strategy, not by config; `capabilities`
+    /// and `report` come from one [`inspect`] per run; `ctx` supplies the
+    /// deploy's identity (and nothing else) for the audit record and the hook.
+    ///
+    /// # Errors
+    /// The refusal message, ready to fail the preflight step with. It always
+    /// opens with [`REFUSED`].
+    pub async fn admit(
+        &self,
+        baseline: Baseline,
+        capabilities: Capabilities,
+        report: Option<&PreflightReport>,
+        ctx: &AdapterCtx,
+    ) -> Result<(), String> {
+        match evaluate(self.policy.as_ref(), baseline, capabilities, report) {
+            PolicyDecision::Allow { changes } => {
+                tracing::info!(
+                    deploy.fraise = %ctx.fraise,
+                    deploy.environment = %ctx.environment,
+                    policy.changes = changes,
+                    "schema policy: allowed"
+                );
+                Ok(())
+            }
+            PolicyDecision::Deny { reason, .. } => Err(refuse(ctx, &reason)),
+            PolicyDecision::NeedsApproval { reasons } => {
+                let Some(hook) = self.hook.as_ref() else {
+                    // Unreachable through `PolicySection::resolve`, which sets
+                    // `has_approval_hook` from the same config that supplies the
+                    // hook — so `evaluate` would already have refused. Reachable
+                    // by an embedder that says it has a hook and wires none, and
+                    // the answer there is the same as everywhere else: absence
+                    // is not approval.
+                    return Err(refuse(
+                        ctx,
+                        "approval is required, and the policy declares an approval hook that was \
+                         never wired into the deploy",
+                    ));
+                };
+                let request = ApprovalRequest::new(&ctx.fraise, &ctx.environment, reasons);
+                match hook.request(&request).await {
+                    ApprovalVerdict::Approved { approver } => {
+                        tracing::info!(
+                            deploy.fraise = %ctx.fraise,
+                            deploy.environment = %ctx.environment,
+                            policy.approver = %approver,
+                            policy.changes = request.reasons.len(),
+                            "schema policy: approved"
+                        );
+                        Ok(())
+                    }
+                    ApprovalVerdict::Denied { reason } => Err(refuse(
+                        ctx,
+                        &format!(
+                            "approval was refused for {}: {reason}",
+                            summarise(&request.reasons.iter().collect::<Vec<_>>())
+                        ),
+                    )),
+                }
+            }
+        }
+    }
+}
+
+/// Audit a refusal and render it for the saga step that will carry it.
+///
+/// Every refusal from the gate goes through here, so the audit record and the
+/// operator-facing message can never disagree about what was refused.
+fn refuse(ctx: &AdapterCtx, reason: &str) -> String {
+    tracing::warn!(
+        deploy.fraise = %ctx.fraise,
+        deploy.environment = %ctx.environment,
+        policy.reason = reason,
+        "schema policy: refused"
+    );
+    format!("{REFUSED} {reason}")
+}
+
 /// The decision when the change-set as a whole is unclassified — nobody is at
 /// fault change-by-change, so the reason is about the set.
 fn unclassified_change_set(policy: &Policy, cause: &str, kind: &str) -> PolicyDecision {
@@ -625,6 +924,39 @@ fn summarise(reasons: &[&PolicyReason]) -> String {
         rendered.push(format!("and {rest} more"));
     }
     rendered.join(", ")
+}
+
+/// Test doubles for the approval seam, shared by the deploy compositions' tests.
+///
+/// One implementation, so a saga test that wires an approving hook and one that
+/// wires a refusing hook cannot drift into disagreeing about what the trait
+/// promises.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::{ApprovalHook, ApprovalRequest, ApprovalVerdict};
+    use async_trait::async_trait;
+
+    /// An approval hook that always answers the same way.
+    pub struct FixedApproval(ApprovalVerdict);
+
+    impl FixedApproval {
+        /// A hook that signs everything off as `approver`.
+        pub fn approving(approver: &str) -> Self {
+            Self(ApprovalVerdict::approved(approver))
+        }
+
+        /// A hook that refuses everything, for `reason`.
+        pub fn refusing(reason: &str) -> Self {
+            Self(ApprovalVerdict::denied(reason))
+        }
+    }
+
+    #[async_trait]
+    impl ApprovalHook for FixedApproval {
+        async fn request(&self, _request: &ApprovalRequest) -> ApprovalVerdict {
+            self.0.clone()
+        }
+    }
 }
 
 #[cfg(test)]

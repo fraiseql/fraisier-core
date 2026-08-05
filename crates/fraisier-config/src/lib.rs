@@ -75,7 +75,7 @@ pub use preset::SpecqlPreset;
 pub use schema::{
     ArtifactSection, BlueGreenSection, CheckSection, DeployConfig, DeploySection, HealthSection,
     HostSpec, HostsSection, LbSection, MigrationSection, PolicySection, ScheduleSection,
-    ServiceSection, SshSection, UNCLASSIFIED_ACTIONS,
+    ServiceSection, SshSection, DEFAULT_APPROVAL_TIMEOUT_SECS, UNCLASSIFIED_ACTIONS,
 };
 pub use validate::{ValidationIssue, ValidationReport};
 

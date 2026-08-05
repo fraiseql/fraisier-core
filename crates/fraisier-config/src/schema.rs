@@ -221,6 +221,8 @@ pub struct PolicySection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_command: Option<String>,
     /// How long the approval hook may take before it counts as a refusal.
+    /// Omitted ⇒ [`DEFAULT_APPROVAL_TIMEOUT_SECS`]. A hook that has not answered
+    /// by then is a refusal, never a pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_timeout_secs: Option<u64>,
 }
@@ -228,6 +230,13 @@ pub struct PolicySection {
 /// The accepted `[policy].unclassified` values, in the order they are offered to
 /// an operator who typed something else.
 pub const UNCLASSIFIED_ACTIONS: [&str; 2] = ["deny", "require_approval"];
+
+/// How long an approval hook may take when `approval_timeout_secs` is omitted.
+///
+/// Five minutes: long enough for a human paged out of hours to answer, short
+/// enough that an unattended deploy is not pinned open by a hook nobody will
+/// ever answer.
+pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 300;
 
 impl PolicySection {
     /// Resolve the section into the engine's [`Policy`] — the single

@@ -1569,6 +1569,7 @@ pub(crate) async fn deploy(
     )
     .context(resolved.ctx)
     .forward_compatible_lint(resolved.forward_compatible_lint && !skip_preflight)
+    .policy(resolved.policy)
     .artifact(resolved.artifact)
     .migration(resolved.migration)
     .service(resolved.service)

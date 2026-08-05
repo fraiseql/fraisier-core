@@ -29,6 +29,26 @@
 //! exact shared-DB-corruption footgun this gate exists to prevent) and **no
 //! fallback to pattern-matching issue codes** — the typed verdict is the contract.
 //!
+//! ## Relationship to the risk-tier contract
+//!
+//! `window_safe` is one signal on the preflight report; the *risk tier* of each
+//! planned change is another, carried by
+//! [`PreflightReport::change_set`](crate::adapter_axes::PreflightReport::change_set)
+//! and read through
+//! [`usable_change_set`](crate::adapter_axes::PreflightReport::usable_change_set).
+//! They answer different questions and neither substitutes for the other:
+//! window-safety is *"can N-1 and N share this database?"*, and it is the only
+//! question this module has ever answered. A tier says how destructive a change
+//! is, which the window-safety question does not ask — a `DROP TABLE` on an
+//! unread table is window-safe and irreversible at the same time. Notably,
+//! *"confiture could not read this migration"* folds into `window_safe == false`
+//! and has no tier at all, so dropping the boolean would discard a signal the
+//! taxonomy cannot express.
+//!
+//! A single `policy` module is planned to fold both into one decision function,
+//! so that a refusal has exactly one origin and names which rule fired. Until it
+//! lands, this module is that gate.
+//!
 //! ## Cross-repo contract (tracked in fraiseql/confiture#154)
 //!
 //! confiture emits `window_safe` on the `migrate preflight` JSON report and pins
@@ -219,8 +239,8 @@ mod tests {
     fn report(window_safe: Option<bool>, ok: bool) -> PreflightReport {
         PreflightReport {
             ok,
-            issues: Vec::new(),
             window_safe,
+            ..Default::default()
         }
     }
 

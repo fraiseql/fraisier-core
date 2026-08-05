@@ -394,8 +394,8 @@ mod tests {
             Arc::new(Self {
                 report: PreflightReport {
                     ok: true,
-                    issues: Vec::new(),
                     window_safe: Some(true),
+                    ..Default::default()
                 },
             })
         }
@@ -404,8 +404,8 @@ mod tests {
             Arc::new(Self {
                 report: PreflightReport {
                     ok: true,
-                    issues: Vec::new(),
                     window_safe: Some(false),
+                    ..Default::default()
                 },
             })
         }

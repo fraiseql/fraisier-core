@@ -494,11 +494,15 @@ fn parse_preflight_report(json: &Value) -> PreflightReport {
     // (top-level `window_safe` boolean). Absent on older confiture → `None`, so the
     // consumer falls back to the `PFLIGHT_REPLICA_*` issue codes.
     let window_safe = json.get("window_safe").and_then(Value::as_bool);
-    PreflightReport {
-        ok,
-        issues,
-        window_safe,
+    // `PreflightReport` is `#[non_exhaustive]`, so a struct literal — including
+    // `..Default::default()` — is not available outside `fraisier-core`; the
+    // builder is the supported construction path, and it is what makes the next
+    // field on that struct additive here instead of breaking.
+    let mut report = PreflightReport::new(ok).with_issues(issues);
+    if let Some(window_safe) = window_safe {
+        report = report.with_window_safe(window_safe);
     }
+    report
 }
 
 /// Convert one Confiture preflight `issues[]` entry to a [`PreflightIssue`].

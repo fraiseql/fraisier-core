@@ -1322,7 +1322,7 @@ mod tests {
             Ok(PreflightReport {
                 ok: !self.faults.preflight_blocking,
                 issues,
-                window_safe: None,
+                ..Default::default()
             })
         }
     }

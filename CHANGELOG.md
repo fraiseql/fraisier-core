@@ -8,6 +8,48 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **BREAKING (adapter authors): `PreflightReport` is now `#[non_exhaustive]`,
+  and carries a `change_set`.** The migration adapter contract can now carry a
+  per-change **risk tier** across the seam as typed data, instead of inferring it
+  from `issues[].code` strings. `PreflightReport` gains
+  `change_set: Option<ChangeSet>`, and the new
+  `RiskTier` / `SchemaChange` / `ChangeSet` / `RISK_CONTRACT_VERSION` vocabulary
+  lands in `fraisier_core::adapter_axes`. Nothing reads the change-set yet — the
+  policy gate that consumes it ships separately — so this release is a contract
+  change with no behaviour change. `window_safe` is untouched and stays. The wire
+  contract is specified in `docs/proposals/migration-risk-contract.md`, with
+  golden fixtures at
+  `crates/fraisier-adapter-confiture/tests/fixtures/preflight/`.
+
+  The `#[non_exhaustive]` marker is the one deliberate break, taken now, pre-GA,
+  so that every future field on this struct is additive. It forbids **all**
+  struct-expression construction from outside `fraisier-core` — including
+  `..Default::default()`, which is rejected just as a full literal is (E0639).
+  Downstream adapters (e.g. the reference `fraisier-adapter-sqlx`) move to the
+  builder:
+
+  ```rust
+  // before
+  PreflightReport { ok, issues, window_safe: Some(true) }
+
+  // after
+  PreflightReport::new(ok).with_issues(issues).with_window_safe(true)
+  ```
+
+  Reading a report is unchanged; only construction moves. `SchemaChange` and
+  `ChangeSet` are `#[non_exhaustive]` for the same reason and ship with the same
+  shape of builder (`SchemaChange::new(kind, object).with_tier(…)`,
+  `ChangeSet::new(changes)`).
+
+  An adapter that classifies advertises the **`risk_tier`** capability, and only
+  when the installed producer can actually emit a change-set. Consumers read the
+  set through `PreflightReport::usable_change_set()`, which centralises the
+  contract-version check: a change-set stamped with a version newer than this
+  build understands is reported as unavailable — naming both versions — rather
+  than best-effort parsed. Every way of being missing (no capability, no
+  change-set, a version from the future, an entry with no recognised tier)
+  resolves to *unclassified*, and unclassified is never *safe*.
+
 - **Migrations now run from the staged release directory.** On a single-host
   deploy, the migrate step runs the migration axis with its working directory set
   to the release just staged by `fetch` (`StagedArtifact.path`) instead of the

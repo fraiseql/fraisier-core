@@ -986,7 +986,7 @@ mod tests {
             Ok(PreflightReport {
                 ok: !self.preflight_blocking,
                 issues,
-                window_safe: None,
+                ..Default::default()
             })
         }
     }

@@ -496,15 +496,351 @@ pub struct PreflightIssue {
     pub migration: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// The migration risk contract
+// ---------------------------------------------------------------------------
+
+/// The revision of the migration risk contract this build of fraisier
+/// understands.
+///
+/// It is a **major**, carried inside the change-set payload as
+/// [`ChangeSet::contract_version`] — deliberately *not* the IPC
+/// [`AdapterDescription::protocol_version`], which a purely additive payload
+/// field must not invalidate for every external adapter. Adding a field to a
+/// change entry does not bump it; removing or renaming one, or changing what a
+/// tier *means*, does.
+///
+/// A change-set stamped with a **greater** version is treated as absent, not
+/// best-effort parsed — see [`PreflightReport::usable_change_set`].
+///
+/// The contract is specified in `docs/proposals/migration-risk-contract.md`.
+pub const RISK_CONTRACT_VERSION: u32 = 1;
+
+/// How risky one planned schema change is, as classified by the migration
+/// adapter.
+///
+/// The variants are ordered least → most severe, and that order exists for
+/// exactly two purposes: computing the worst tier in a [`ChangeSet`], and
+/// sorting a plan render worst-first. **It is not how policy decisions are
+/// made** — policy maps each tier to an action independently, so an operator who
+/// considers a lock-risky index build more dangerous than a `DROP INDEX` on
+/// their workload expresses that in configuration, not by arguing about this
+/// ordering.
+///
+/// A change qualifying for two tiers takes the **more severe** one.
+///
+/// # Example
+/// ```
+/// # use fraisier_core::adapter_axes::RiskTier;
+/// assert!(RiskTier::Additive < RiskTier::Irreversible);
+/// // The wire name is the cross-repo pact with confiture.
+/// assert_eq!(serde_json::to_string(&RiskTier::LockRisky).unwrap(), "\"lock_risky\"");
+/// // A tier this build does not know is never a nearest match — it is no tier.
+/// assert!(serde_json::from_str::<RiskTier>("\"quantum\"").is_err());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RiskTier {
+    /// Adds a new object. No existing reader or writer can break.
+    ///
+    /// `CREATE TABLE`, `ADD COLUMN … NULL`, `CREATE INDEX CONCURRENTLY`.
+    Additive,
+    /// Changes existing state, with a proven `down` path that restores it.
+    ///
+    /// `ALTER … SET DEFAULT`, widening a `varchar(n)`.
+    Reversible,
+    /// Semantically safe, but takes a lock that can stall a hot table.
+    ///
+    /// `ADD COLUMN … NOT NULL DEFAULT` on older PostgreSQL, a non-concurrent
+    /// `CREATE INDEX`, a table rewrite.
+    LockRisky,
+    /// Destroys data or an object, but the loss is bounded and recoverable from
+    /// backup.
+    ///
+    /// `DELETE`, `TRUNCATE`, and — the ruling that is not re-litigated per pull
+    /// request — **`DROP INDEX`**: the index is rebuildable from the data it
+    /// indexes, so the cost is time and load, not information.
+    Destructive,
+    /// Destroys data with no `down` path that can restore it.
+    ///
+    /// `DROP TABLE`, narrowing a type, and **`DROP COLUMN` even when a
+    /// `down.sql` exists** — the down path restores the *schema*, not the
+    /// *data*. Reversibility here means the state is recoverable, not that a
+    /// script exists.
+    Irreversible,
+}
+
+/// Deserialize a [`SchemaChange::tier`] leniently: a tier string this build does
+/// not recognise — or a `null`, or any other shape — becomes `None`
+/// (*unclassified*) instead of failing the enclosing entry.
+///
+/// The failure mode this exists to prevent: confiture adds a sixth tier, every
+/// `SchemaChange` carrying it fails to parse, the whole `change_set` envelope
+/// goes with it, and a deploy that should have been **denied for one
+/// unclassified change** instead reports "no change-set at all" — a state the
+/// gate cannot distinguish from an adapter that never classified. One producer
+/// release would become a fleet-wide outage or, worse, a wrong verdict.
+///
+/// The leniency is scoped to this one field. `kind` and `object` stay required,
+/// and [`RiskTier`] itself stays strict (an unknown tier is never rounded to a
+/// nearest match) — see `docs/proposals/migration-risk-contract.md` §6.
+fn deserialize_lenient_tier<'de, D>(deserializer: D) -> Result<Option<RiskTier>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    /// Matches a known tier first; anything else is swallowed as unclassified.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        Known(RiskTier),
+        Unrecognised(serde::de::IgnoredAny),
+    }
+
+    Ok(match Option::<Lenient>::deserialize(deserializer)? {
+        Some(Lenient::Known(tier)) => Some(tier),
+        Some(Lenient::Unrecognised(_)) | None => None,
+    })
+}
+
+/// One planned schema change, as classified by the migration adapter.
+///
+/// fraisier **consumes** this classification; it never re-derives one. In
+/// particular [`tier`](Self::tier) is never inferred from [`kind`](Self::kind):
+/// inference from string codes is how a producer-side rename becomes a silent
+/// consumer-side misclassification, which is the whole reason the tier travels
+/// as typed data.
+///
+/// This struct is `#[non_exhaustive]`, so adapters in other crates build it
+/// through [`SchemaChange::new`] and the `with_*` methods rather than a struct
+/// literal — that is what keeps a later field addition additive for them.
+///
+/// # Example
+/// ```
+/// # use fraisier_core::adapter_axes::{RiskTier, SchemaChange};
+/// let change = SchemaChange::new("drop_column", "public.tb_user.legacy_flag")
+///     .with_migration("20260804120100")
+///     .with_tier(RiskTier::Irreversible)
+///     .with_detail("DROP COLUMN legacy_flag");
+/// assert_eq!(change.tier, Some(RiskTier::Irreversible));
+///
+/// // A tier this build does not know is unclassified, and the entry survives.
+/// let unknown: SchemaChange = serde_json::from_str(
+///     r#"{"kind": "entangle_column", "object": "public.tb_user.spin", "tier": "quantum"}"#,
+/// ).unwrap();
+/// assert_eq!(unknown.tier, None);
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SchemaChange {
+    /// A stable machine code for the operation, e.g. `"drop_column"`.
+    ///
+    /// Rendered verbatim to the operator; never parsed for meaning.
+    pub kind: String,
+    /// The object touched, fully qualified: `schema.table`,
+    /// `schema.table.column`, `schema.index`.
+    ///
+    /// It is shown to the operator, so it must identify the object
+    /// unambiguously without a further lookup.
+    pub object: String,
+    /// The migration this change belongs to, when the adapter attributes it —
+    /// the **version prefix** (`"20260804120100"`), not the filename, matching
+    /// [`PreflightIssue::migration`].
+    #[serde(default)]
+    pub migration: Option<String>,
+    /// The adapter's classification.
+    ///
+    /// `None` ⇒ *unclassified* ⇒ the policy gate denies. Absent, `null`, and
+    /// unrecognised all arrive here as `None`; none of them mean "safe".
+    #[serde(default, deserialize_with = "deserialize_lenient_tier")]
+    pub tier: Option<RiskTier>,
+    /// One human-readable line for the plan render. Never parsed.
+    ///
+    /// Must not contain a DSN or any other credential — it is printed and
+    /// logged.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+impl SchemaChange {
+    /// An **unclassified** change to `object` of kind `kind`.
+    ///
+    /// The tier starts absent deliberately: an adapter states a classification
+    /// by calling [`with_tier`](Self::with_tier), and saying nothing is never
+    /// mistaken for saying "safe".
+    #[must_use]
+    pub fn new(kind: impl Into<String>, object: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            object: object.into(),
+            migration: None,
+            tier: None,
+            detail: None,
+        }
+    }
+
+    /// Attribute the change to a migration, by version prefix.
+    #[must_use]
+    pub fn with_migration(mut self, migration: impl Into<String>) -> Self {
+        self.migration = Some(migration.into());
+        self
+    }
+
+    /// Classify the change.
+    #[must_use]
+    pub const fn with_tier(mut self, tier: RiskTier) -> Self {
+        self.tier = Some(tier);
+        self
+    }
+
+    /// Attach the one-line description shown in the plan render.
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+}
+
+/// The migration adapter's classified plan — every change it intends to apply,
+/// each with the tier it assigned.
+///
+/// **Its presence is the signal.** `Some(ChangeSet)` with an empty
+/// [`changes`](Self::changes) means *the adapter looked and there is nothing to
+/// change*; a `None` [`PreflightReport::change_set`] means *nobody classified
+/// this*, which is not safe. That is why the wire form is an object and never a
+/// bare array: an array conflates the two states, and the conflation resolves in
+/// the dangerous direction — an unclassified migration presenting as a clean,
+/// empty plan and applying itself.
+///
+/// This struct is `#[non_exhaustive]`; build it with [`ChangeSet::new`], which
+/// stamps [`RISK_CONTRACT_VERSION`].
+///
+/// # Example
+/// ```
+/// # use fraisier_core::adapter_axes::{ChangeSet, RiskTier, SchemaChange};
+/// let set = ChangeSet::new(vec![
+///     SchemaChange::new("add_column", "public.tb_user.nickname").with_tier(RiskTier::Additive),
+///     SchemaChange::new("drop_table", "public.tb_legacy").with_tier(RiskTier::Irreversible),
+///     SchemaChange::new("entangle_column", "public.tb_user.spin"), // unclassified
+/// ]);
+/// assert_eq!(set.worst_tier(), Some(RiskTier::Irreversible));
+/// assert_eq!(set.unclassified().count(), 1);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ChangeSet {
+    /// The revision of the risk contract this payload was written to.
+    ///
+    /// Required: an unversioned payload is an unreadable one, not an empty one.
+    /// A version **greater** than [`RISK_CONTRACT_VERSION`] makes the whole set
+    /// unusable — see [`PreflightReport::usable_change_set`].
+    pub contract_version: u32,
+    /// The planned changes, in the order the adapter listed them (migration
+    /// order, which is deliberately *not* severity order — the render sorts, the
+    /// contract does not).
+    ///
+    /// Absent on the wire is equivalent to empty: the producer classified and
+    /// found nothing.
+    #[serde(default)]
+    pub changes: Vec<SchemaChange>,
+}
+
+impl Default for ChangeSet {
+    /// An empty change-set stamped with **this build's** contract version.
+    ///
+    /// Not `#[derive(Default)]`: a derived `contract_version` of `0` is outside
+    /// the contract's domain (majors start at 1) and would sail through the
+    /// version check as though a producer had stamped it.
+    fn default() -> Self {
+        Self {
+            contract_version: RISK_CONTRACT_VERSION,
+            changes: Vec::new(),
+        }
+    }
+}
+
+impl ChangeSet {
+    /// A change-set of `changes`, stamped with [`RISK_CONTRACT_VERSION`].
+    ///
+    /// This is the constructor for an adapter *producing* a classification in
+    /// Rust; a change-set arriving over the wire carries the producer's own
+    /// version instead.
+    #[must_use]
+    pub fn new(changes: Vec<SchemaChange>) -> Self {
+        Self {
+            changes,
+            ..Self::default()
+        }
+    }
+
+    /// The most severe tier present, or `None` when no change carries one.
+    ///
+    /// Unclassified changes are **not** folded in — they are not "tier zero".
+    /// A set whose worst *known* tier is `additive` reads as approvable, so the
+    /// unclassified ones are surfaced separately by
+    /// [`unclassified`](Self::unclassified) and denied by the policy gate.
+    #[must_use]
+    pub fn worst_tier(&self) -> Option<RiskTier> {
+        self.changes.iter().filter_map(|change| change.tier).max()
+    }
+
+    /// The changes the adapter did not classify, in the order it listed them.
+    ///
+    /// Each one is a reason to refuse; naming them is what makes the refusal
+    /// actionable.
+    pub fn unclassified(&self) -> impl Iterator<Item = &SchemaChange> {
+        self.changes.iter().filter(|change| change.tier.is_none())
+    }
+}
+
+/// Deserialize [`PreflightReport::change_set`] leniently: an envelope this build
+/// cannot read becomes `None` (*not classified*) instead of failing the whole
+/// report.
+///
+/// A broken envelope invalidates the **change-set**, not the report. The report
+/// also carries `ok`, `issues` and `window_safe`, all of which predate this
+/// contract and all of which the deploy blocks on today; a hard parse error here
+/// would turn a producer's typo in a purely additive field into a failed deploy
+/// for operators who never asked for risk tiers. The change-set is still
+/// unusable — which is the part that has to fail safe — and the policy gate
+/// refuses on it.
+///
+/// A `contract_version` of `0` is rejected here too: majors start at `1`, so a
+/// zero is an unstamped payload rather than a payload from an older contract,
+/// and it must not slip past the version check in
+/// [`PreflightReport::usable_change_set`].
+fn deserialize_lenient_change_set<'de, D>(deserializer: D) -> Result<Option<ChangeSet>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    /// Matches a well-formed envelope first; anything else is not a change-set.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        Envelope(ChangeSet),
+        Broken(serde::de::IgnoredAny),
+    }
+
+    Ok(match Option::<Lenient>::deserialize(deserializer)? {
+        Some(Lenient::Envelope(change_set)) if change_set.contract_version != 0 => Some(change_set),
+        Some(Lenient::Envelope(_) | Lenient::Broken(_)) | None => None,
+    })
+}
+
 /// The result of a `preflight` forward-compatibility lint (PRD review Decision 4).
+///
+/// This struct is `#[non_exhaustive]`, so adapters in other crates build it
+/// through [`PreflightReport::new`] and the `with_*` methods; every future field
+/// is then additive for them.
 ///
 /// # Example
 /// ```
 /// # use fraisier_core::adapter_axes::PreflightReport;
-/// let report = PreflightReport { ok: true, ..Default::default() };
+/// let report = PreflightReport::new(true).with_window_safe(true);
 /// assert!(report.ok);
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PreflightReport {
     /// Whether the migrations are safe to deploy (no `Error`-severity issues).
     pub ok: bool,
@@ -519,6 +855,119 @@ pub struct PreflightReport {
     /// adapter that doesn't emit it stays compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_safe: Option<bool>,
+    /// The adapter's classified change-set, when it advertises the `risk_tier`
+    /// capability.
+    ///
+    /// `None` ⇒ *nobody classified this*, which is not safe. Read it through
+    /// [`usable_change_set`](Self::usable_change_set) rather than directly, so
+    /// the contract-version check cannot be skipped.
+    ///
+    /// `skip_serializing_if` keeps the serialized form byte-identical for an
+    /// adapter that does not classify, so no downstream consumer sees a new
+    /// `null` key appear.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_change_set"
+    )]
+    pub change_set: Option<ChangeSet>,
+}
+
+impl PreflightReport {
+    /// A report carrying `ok`, with no issues, no window-safety verdict and no
+    /// change-set.
+    ///
+    /// Every optional verdict starts absent: an adapter states what it knows,
+    /// and silence is never read as a pass.
+    #[must_use]
+    pub fn new(ok: bool) -> Self {
+        Self {
+            ok,
+            ..Self::default()
+        }
+    }
+
+    /// Attach the lint findings.
+    #[must_use]
+    pub fn with_issues(mut self, issues: Vec<PreflightIssue>) -> Self {
+        self.issues = issues;
+        self
+    }
+
+    /// State the two-version window-safety verdict (see [`crate::window_safety`]).
+    #[must_use]
+    pub const fn with_window_safe(mut self, window_safe: bool) -> Self {
+        self.window_safe = Some(window_safe);
+        self
+    }
+
+    /// Attach the classified change-set — only for an adapter that advertises
+    /// the `risk_tier` capability.
+    #[must_use]
+    pub fn with_change_set(mut self, change_set: ChangeSet) -> Self {
+        self.change_set = Some(change_set);
+        self
+    }
+
+    /// The change-set, if there is one **and** this build can read it.
+    ///
+    /// This is the only supported way to reach [`Self::change_set`]: it
+    /// centralises the [`RISK_CONTRACT_VERSION`] check so no call site can
+    /// forget it, and every way of failing resolves to *unclassified*, which the
+    /// policy gate denies. Absence is never safety.
+    ///
+    /// # Errors
+    /// [`ChangeSetUnavailable::NotEmitted`] when the adapter emitted no readable
+    /// change-set, or [`ChangeSetUnavailable::VersionTooNew`] when it emitted one
+    /// written to a later contract — named, not best-effort parsed.
+    pub const fn usable_change_set(&self) -> Result<&ChangeSet, ChangeSetUnavailable> {
+        let Some(change_set) = &self.change_set else {
+            return Err(ChangeSetUnavailable::NotEmitted);
+        };
+        if change_set.contract_version > RISK_CONTRACT_VERSION {
+            return Err(ChangeSetUnavailable::VersionTooNew {
+                found: change_set.contract_version,
+                understood: RISK_CONTRACT_VERSION,
+            });
+        }
+        Ok(change_set)
+    }
+}
+
+/// Why a [`PreflightReport`] yielded no usable change-set.
+///
+/// Both variants mean the same thing to a policy decision — *unclassified*,
+/// therefore denied. They differ only in what the operator is told to do about
+/// it, which is the whole reason they are distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ChangeSetUnavailable {
+    /// No readable change-set was emitted.
+    ///
+    /// Either the adapter does not classify at all — it should not be
+    /// advertising `risk_tier` — or it advertised the capability and then sent
+    /// nothing usable, which is a producer bug worth naming out loud.
+    #[error(
+        "the migration adapter emitted no usable change-set; nothing classified the pending \
+         schema changes"
+    )]
+    NotEmitted,
+    /// The change-set was written to a later revision of the risk contract.
+    ///
+    /// Naming both versions is the actionable part: it says which side to
+    /// upgrade. No best-effort parse is attempted — a payload written to a
+    /// contract we cannot read is not one we may approve on the operator's
+    /// behalf.
+    #[error(
+        "the migration adapter emitted a change-set at risk-contract version {found}, but this \
+         build of fraisier understands version {understood}; upgrade fraisier or pin the adapter"
+    )]
+    VersionTooNew {
+        /// The version the adapter stamped on the payload.
+        found: u32,
+        /// The version this build understands ([`RISK_CONTRACT_VERSION`]).
+        understood: u32,
+    },
 }
 
 /// An adapter's self-description, returned by `describe` — the capability and
@@ -543,8 +992,25 @@ pub struct AdapterDescription {
     pub version: String,
     /// The IPC protocol major version the adapter speaks.
     pub protocol_version: u32,
-    /// The methods the adapter actually implements (gates optional calls like
-    /// `preflight`).
+    /// The methods and optional behaviours the adapter actually implements —
+    /// this is fraisier's feature-negotiation idiom, in preference to bumping
+    /// [`protocol_version`](Self::protocol_version) for additive work.
+    ///
+    /// Gates optional calls (`preflight`, `traffic_swap`) and optional *payload*
+    /// content:
+    ///
+    /// | Capability | Means |
+    /// |---|---|
+    /// | `preflight` | The adapter implements the forward-compatibility lint. |
+    /// | `window_safe` | Its [`PreflightReport`] carries a typed window-safety verdict. |
+    /// | `risk_tier` | Its [`PreflightReport`] carries a classified [`ChangeSet`]. |
+    ///
+    /// An adapter advertises a capability only when the **installed** producer
+    /// can actually fulfil it — for a CLI-backed adapter that means gating on the
+    /// detected tool version, not hard-coding the string. Advertising one that
+    /// cannot be fulfilled turns every deploy into a denial: safe, but useless.
+    /// Not advertising it is the honest signal *"I do not do this"*, which
+    /// callers handle deliberately.
     pub capabilities: Vec<String>,
 }
 
@@ -698,6 +1164,16 @@ pub struct LbMembership {
 ///
 /// `preflight` and `post_migrate` have defaults; everything else is required.
 ///
+/// # The risk contract
+///
+/// An adapter that can classify the schema changes it is about to apply
+/// advertises the **`risk_tier`** capability and attaches a [`ChangeSet`] to its
+/// [`PreflightReport`]. No extra trait method: the change-set rides on the
+/// existing `preflight` return, which is why a purely additive payload field
+/// needs no IPC protocol bump. The wire shape, the tier taxonomy and the
+/// boundary rulings are specified in
+/// `docs/proposals/migration-risk-contract.md`.
+///
 /// # Example
 /// ```no_run
 /// # use fraisier_core::adapter_axes::{MigrationAdapter, AdapterCtx, AdapterError};
@@ -751,11 +1227,51 @@ pub trait MigrationAdapter: Send + Sync {
     /// [`AdapterError`] if verification cannot run.
     async fn verify(&self, ctx: &AdapterCtx) -> Result<VerifyReport, AdapterError>;
 
-    /// Forward-compatibility lint (PRD review Decision 4).
+    /// Forward-compatibility lint (PRD review Decision 4), and — for an adapter
+    /// advertising `risk_tier` — the classified [`ChangeSet`].
     ///
     /// Defaults to [`AdapterErrorKind::MethodNotSupported`] — never a passing
     /// report — so that "I can't lint" can never masquerade as "lint passed".
     /// The deploy layer gates this call on [`AdapterDescription::capabilities`].
+    ///
+    /// The same fail-safe rule governs the change-set: a report with no usable
+    /// change-set is *unclassified*, and unclassified is a refusal, not a pass.
+    /// A consumer gates on the capability and then reads through
+    /// [`PreflightReport::usable_change_set`], never the field directly:
+    ///
+    /// ```
+    /// # use fraisier_core::adapter_axes::{AdapterDescription, PreflightReport, RiskTier};
+    /// /// The worst tier in the plan, or why there is no answer.
+    /// fn worst_risk(
+    ///     desc: &AdapterDescription,
+    ///     report: &PreflightReport,
+    /// ) -> Result<Option<RiskTier>, String> {
+    ///     // 1. The capability gates the read. Not advertising it is the honest
+    ///     //    signal "I do not classify" — which denies, it does not proceed.
+    ///     if !desc.capabilities.iter().any(|c| c == "risk_tier") {
+    ///         return Err("the migration adapter does not classify schema changes".to_owned());
+    ///     }
+    ///     // 2. The accessor carries the contract-version check, so no call site
+    ///     //    can forget it; its error already names what to do about it.
+    ///     let change_set = report.usable_change_set().map_err(|e| e.to_string())?;
+    ///     // 3. An unclassified change is a refusal even beside classified ones.
+    ///     let unclassified: Vec<&str> =
+    ///         change_set.unclassified().map(|c| c.object.as_str()).collect();
+    ///     if !unclassified.is_empty() {
+    ///         return Err(format!("unclassified schema changes: {}", unclassified.join(", ")));
+    ///     }
+    ///     Ok(change_set.worst_tier())
+    /// }
+    ///
+    /// // An adapter that lints but does not classify: no capability, no answer.
+    /// let desc = AdapterDescription {
+    ///     name: "confiture".into(),
+    ///     version: "0.38.1".into(),
+    ///     protocol_version: 1,
+    ///     capabilities: vec!["preflight".into(), "window_safe".into()],
+    /// };
+    /// assert!(worst_risk(&desc, &PreflightReport::new(true)).is_err());
+    /// ```
     ///
     /// # Errors
     /// [`AdapterError`] of kind [`AdapterErrorKind::MethodNotSupported`] by
@@ -989,8 +1505,9 @@ pub trait TrafficDirector: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, MigrationAdapter,
-        MigrationOutcome, Revision, VerifyReport,
+        AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, ChangeSet,
+        ChangeSetUnavailable, MigrationAdapter, MigrationOutcome, PreflightIssue, PreflightReport,
+        Revision, RiskTier, SchemaChange, Severity, VerifyReport, RISK_CONTRACT_VERSION,
     };
     use std::collections::BTreeMap;
 
@@ -1181,5 +1698,397 @@ mod tests {
         let back: AdapterCtx = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.fraise, "checkout");
         assert_eq!(back.environment, "production");
+    }
+
+    // -----------------------------------------------------------------------
+    // The migration risk contract (docs/proposals/migration-risk-contract.md)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unknown_tier_strings_do_not_deserialize() {
+        // A tier this build does not know must never round down to a nearest
+        // match: `"quantum"` is not `destructive` because the words rhyme, and
+        // `"DESTRUCTIVE"` is not `destructive` because serde is case-sensitive
+        // by design here. Both are *unclassified*, which the gate denies.
+        for wire in ["\"quantum\"", "\"DESTRUCTIVE\"", "\"lockRisky\"", "\"\""] {
+            serde_json::from_str::<RiskTier>(wire)
+                .expect_err(&format!("{wire} must not parse as a tier"));
+        }
+    }
+
+    #[test]
+    fn a_non_string_tier_does_not_deserialize() {
+        // The enum itself is strict about shape as well as spelling; the one
+        // deliberate leniency lives on `SchemaChange::tier`, nowhere else.
+        for wire in ["1", "null", "{}", "[]", "true"] {
+            serde_json::from_str::<RiskTier>(wire)
+                .expect_err(&format!("{wire} must not parse as a tier"));
+        }
+    }
+
+    #[test]
+    fn severity_ordering_is_additive_to_irreversible() {
+        // The full chain, asserted as a chain rather than pairwise, so a
+        // reordered variant cannot hide behind a passing neighbour comparison.
+        let ascending = [
+            RiskTier::Additive,
+            RiskTier::Reversible,
+            RiskTier::LockRisky,
+            RiskTier::Destructive,
+            RiskTier::Irreversible,
+        ];
+        for pair in ascending.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "{:?} must rank below {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert_eq!(
+            ascending.iter().copied().max(),
+            Some(RiskTier::Irreversible),
+            "the derived Ord is what `worst_tier` relies on"
+        );
+    }
+
+    #[test]
+    fn snake_case_wire_names_are_pinned() {
+        // These strings are the cross-repo pact with confiture. A serde rename
+        // slip here does not fail loudly — it silently reclassifies every change
+        // of that tier as unclassified on one side of the seam.
+        let pact = [
+            (RiskTier::Additive, "additive"),
+            (RiskTier::Reversible, "reversible"),
+            (RiskTier::LockRisky, "lock_risky"),
+            (RiskTier::Destructive, "destructive"),
+            (RiskTier::Irreversible, "irreversible"),
+        ];
+        for (tier, wire) in pact {
+            let json = serde_json::to_string(&tier).expect("serialize");
+            assert_eq!(json, format!("\"{wire}\""));
+            let back: RiskTier = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, tier);
+        }
+    }
+
+    #[test]
+    fn a_change_without_a_tier_is_unclassified() {
+        // No `tier` key at all. The absent tier must surface as `None` — never
+        // as a default tier, which would be fraisier inventing a classification
+        // the adapter declined to make.
+        let change: SchemaChange = serde_json::from_str(
+            r#"{"kind": "alter_column_type", "object": "public.tb_order.total_cents"}"#,
+        )
+        .expect("an entry with no tier is still a well-formed change");
+        assert_eq!(change.tier, None);
+        assert_eq!(change.kind, "alter_column_type");
+        assert_eq!(change.migration, None);
+        assert_eq!(change.detail, None);
+    }
+
+    #[test]
+    fn an_unknown_tier_is_unclassified_not_nearest_match() {
+        // A tier from a future confiture. The entry must survive with
+        // `tier: None`: rejecting it would let one producer-side addition
+        // discard the whole change-set, turning a confiture release into a
+        // fraisier outage.
+        let change: SchemaChange = serde_json::from_str(
+            r#"{"kind": "entangle_column", "object": "public.tb_user.spin_state",
+                "tier": "quantum", "detail": "a tier this build does not recognise"}"#,
+        )
+        .expect("an unrecognised tier must not fail the entry");
+        assert_eq!(change.tier, None);
+        assert_eq!(change.object, "public.tb_user.spin_state");
+        assert_eq!(
+            change.detail.as_deref(),
+            Some("a tier this build does not recognise"),
+            "the rest of the entry is still rendered to the operator"
+        );
+    }
+
+    #[test]
+    fn a_null_or_non_string_tier_is_unclassified_not_a_parse_failure() {
+        // Every shape confusion resolves the same way: unclassified. `null` is
+        // the documented "adapter looked and could not say"; the others are
+        // producer bugs that must still leave the change visible in the plan.
+        for raw in ["null", "3", "{}", "[]", "true", "\"DESTRUCTIVE\""] {
+            let json = format!(
+                r#"{{"kind": "drop_column", "object": "public.tb_user.x", "tier": {raw}}}"#
+            );
+            let change: SchemaChange = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("tier {raw} must not fail the entry: {e}"));
+            assert_eq!(change.tier, None, "tier {raw} must be unclassified");
+        }
+    }
+
+    #[test]
+    fn a_newly_built_change_is_unclassified_until_a_tier_is_stated() {
+        // The constructor must not seed a tier. An adapter that builds a change
+        // and forgets to classify it produces an unclassified change — which the
+        // gate denies — not an accidentally `additive` one.
+        let change = SchemaChange::new("drop_column", "public.tb_user.legacy_flag");
+        assert_eq!(change.tier, None);
+        assert_eq!(
+            change.with_tier(RiskTier::Irreversible).tier,
+            Some(RiskTier::Irreversible),
+            "stating a tier is an explicit act"
+        );
+    }
+
+    #[test]
+    fn a_change_missing_kind_or_object_does_not_parse() {
+        // `kind` and `object` are what the plan render and the audit trail are
+        // written from; an entry without them identifies nothing. Leniency is
+        // scoped to `tier` alone.
+        for json in [
+            r#"{"object": "public.tb_user.x", "tier": "additive"}"#,
+            r#"{"kind": "drop_column", "tier": "additive"}"#,
+        ] {
+            serde_json::from_str::<SchemaChange>(json)
+                .expect_err("kind and object are required by the contract");
+        }
+    }
+
+    #[test]
+    fn an_empty_change_set_is_not_the_same_as_no_change_set() {
+        // The distinction the whole design rests on, asserted at the type level:
+        // `Some(empty)` is "the adapter looked and there is nothing to change";
+        // `None` is "nobody looked". A bare `changes: []` would conflate them,
+        // and the conflation resolves in the dangerous direction — an
+        // unclassified migration presenting as a clean, empty plan.
+        let empty = ChangeSet::new(Vec::new());
+        let looked: Option<ChangeSet> = Some(empty.clone());
+        let nobody_looked: Option<ChangeSet> = None;
+        assert_ne!(looked, nobody_looked);
+        assert!(empty.changes.is_empty());
+        assert_eq!(empty.worst_tier(), None);
+    }
+
+    #[test]
+    fn worst_tier_picks_the_most_severe() {
+        // Independently of the order the adapter listed them in: the set below is
+        // in migration order, which is not severity order.
+        let set = ChangeSet::new(vec![
+            SchemaChange::new("add_column", "public.tb_user.nickname")
+                .with_tier(RiskTier::Additive),
+            SchemaChange::new("create_index", "public.tb_order.idx_placed_at")
+                .with_tier(RiskTier::LockRisky),
+            SchemaChange::new("drop_column", "public.tb_user.legacy_flag")
+                .with_tier(RiskTier::Irreversible),
+        ]);
+        assert_eq!(set.worst_tier(), Some(RiskTier::Irreversible));
+        assert_eq!(
+            set.changes.first().expect("first").kind,
+            "add_column",
+            "the adapter's order is preserved for the plan render"
+        );
+    }
+
+    #[test]
+    fn worst_tier_is_none_when_empty() {
+        assert_eq!(ChangeSet::new(Vec::new()).worst_tier(), None);
+    }
+
+    #[test]
+    fn worst_tier_ignores_unclassified_changes_which_unclassified_reports() {
+        // `worst_tier` answers "how bad is the worst *known* change" — it must
+        // not silently absorb an unclassified one, because a set whose worst
+        // known tier is `additive` reads as approvable. The unclassified changes
+        // are surfaced separately, and the gate is what refuses on them.
+        let set = ChangeSet::new(vec![
+            SchemaChange::new("add_column", "public.tb_user.nickname")
+                .with_tier(RiskTier::Additive),
+            SchemaChange::new("alter_column_type", "public.tb_order.total_cents"),
+            SchemaChange::new("entangle_column", "public.tb_user.spin_state"),
+        ]);
+        assert_eq!(set.worst_tier(), Some(RiskTier::Additive));
+        let unclassified: Vec<&str> = set.unclassified().map(|c| c.object.as_str()).collect();
+        assert_eq!(
+            unclassified,
+            ["public.tb_order.total_cents", "public.tb_user.spin_state"],
+            "every untiered change must be nameable in the refusal reason"
+        );
+    }
+
+    #[test]
+    fn a_change_set_built_here_carries_this_builds_contract_version() {
+        // An in-process adapter that emits a change-set is emitting *this*
+        // contract; a zero-valued default version would sail past the version
+        // check as if it had been stamped.
+        assert_eq!(
+            ChangeSet::new(Vec::new()).contract_version,
+            RISK_CONTRACT_VERSION
+        );
+        assert_eq!(ChangeSet::default().contract_version, RISK_CONTRACT_VERSION);
+        assert_ne!(
+            ChangeSet::default().contract_version,
+            0,
+            "majors start at 1; a zero would sail past the version check unstamped"
+        );
+    }
+
+    #[test]
+    fn absent_changes_is_an_empty_change_set_but_absent_version_is_not_a_change_set() {
+        // `changes` absent means the producer classified and found nothing…
+        let classified: ChangeSet =
+            serde_json::from_str(r#"{"contract_version": 1}"#).expect("changes defaults to empty");
+        assert!(classified.changes.is_empty());
+        // …while `contract_version` is what makes the envelope an envelope. An
+        // unversioned payload is unreadable, not empty.
+        serde_json::from_str::<ChangeSet>(r#"{"changes": []}"#)
+            .expect_err("an unversioned change-set is not a change-set");
+    }
+
+    #[test]
+    fn a_report_without_a_change_set_round_trips() {
+        // A payload shaped like confiture 0.38's — the back-compat baseline. An
+        // adapter that predates this contract must keep working unchanged, and
+        // must land in the "did not classify" state, not a default one.
+        let report: PreflightReport =
+            serde_json::from_str(r#"{"ok": true, "issues": [], "window_safe": true}"#)
+                .expect("a pre-contract report still deserializes");
+        assert!(report.ok);
+        assert_eq!(report.window_safe, Some(true));
+        assert_eq!(report.change_set, None);
+        assert_eq!(
+            report.usable_change_set(),
+            Err(ChangeSetUnavailable::NotEmitted),
+            "absent is unclassified, never safe"
+        );
+    }
+
+    #[test]
+    fn change_set_is_omitted_when_absent() {
+        // Serialization stays byte-identical for adapters that do not classify,
+        // so no existing downstream consumer sees a new `null` key appear.
+        let report = PreflightReport {
+            ok: true,
+            window_safe: Some(true),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        assert!(
+            !json.contains("change_set"),
+            "an unclassified report must not grow a key: {json}"
+        );
+    }
+
+    #[test]
+    fn a_future_contract_version_is_treated_as_absent() {
+        // We cannot read a payload written to a contract we do not know, so we
+        // do not guess at it. Naming both versions is the actionable part of the
+        // refusal — it tells the operator which side to upgrade.
+        let report: PreflightReport = serde_json::from_str(
+            r#"{"ok": true, "issues": [],
+                "change_set": {"contract_version": 2, "changes": [
+                    {"kind": "drop_column", "object": "public.tb_user.legacy_flag",
+                     "tier": "irreversible"}
+                ]}}"#,
+        )
+        .expect("a future change-set still deserializes; it is the *use* that is refused");
+        assert!(
+            report.change_set.is_some(),
+            "the payload is retained for diagnostics"
+        );
+        assert_eq!(
+            report.usable_change_set(),
+            Err(ChangeSetUnavailable::VersionTooNew {
+                found: 2,
+                understood: RISK_CONTRACT_VERSION,
+            })
+        );
+        let reason = report.usable_change_set().expect_err("too new").to_string();
+        assert!(
+            reason.contains('2') && reason.contains(&RISK_CONTRACT_VERSION.to_string()),
+            "both versions must be named: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_change_set_envelope_does_not_break_the_report() {
+        // A broken *envelope* invalidates the change-set, not the whole report:
+        // preflight's lint and `window_safe` predate this contract and must keep
+        // working. A hard parse error here would turn a producer's typo into a
+        // failed deploy for operators who never asked for risk tiers — while
+        // still leaving the change-set unusable, which is the safe part.
+        for broken in [
+            r#""additive""#,                // a string where the object belongs
+            "[]",                           // a bare array — the shape the ADR forbids
+            r#"{"changes": []}"#,           // no contract_version
+            r#"{"contract_version": "1"}"#, // a version that is not an integer
+            r#"{"contract_version": 0}"#,   // a version outside the contract's domain
+        ] {
+            let json = format!(r#"{{"ok": true, "issues": [], "change_set": {broken}}}"#);
+            let report: PreflightReport = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("a broken envelope must not fail the report: {e}"));
+            assert!(report.ok);
+            assert_eq!(
+                report.usable_change_set(),
+                Err(ChangeSetUnavailable::NotEmitted),
+                "broken envelope {broken} must be unusable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_current_version_change_set_is_usable_and_round_trips() {
+        let report = PreflightReport {
+            ok: true,
+            issues: vec![PreflightIssue {
+                severity: Severity::Warning,
+                code: "PFLIGHT_NON_TRANSACTIONAL".to_owned(),
+                message: "non-transactional statement".to_owned(),
+                migration: Some("20260804120050".to_owned()),
+            }],
+            window_safe: Some(true),
+            change_set: Some(ChangeSet::new(vec![SchemaChange::new(
+                "drop_column",
+                "public.tb_user.legacy_flag",
+            )
+            .with_tier(RiskTier::Irreversible)])),
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        let back: PreflightReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back, report,
+            "the change-set survives the JSON-RPC boundary"
+        );
+        let set = back.usable_change_set().expect("current version is usable");
+        assert_eq!(set.worst_tier(), Some(RiskTier::Irreversible));
+    }
+
+    #[test]
+    fn a_passing_report_still_carries_no_classification() {
+        // `ok: true` answers the lint's question, not the risk question. An
+        // adapter that lints clean and does not classify must not read as
+        // "classified, and nothing risky" — that is the exact conflation the
+        // change-set's presence semantics exist to prevent.
+        for report in [PreflightReport::default(), PreflightReport::new(true)] {
+            assert_eq!(
+                report.usable_change_set(),
+                Err(ChangeSetUnavailable::NotEmitted)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_adapter_that_does_not_advertise_risk_tier_has_no_change_set() {
+        // The capability is the honest signal "I do not classify". An adapter
+        // that lints but does not classify advertises `preflight` and not
+        // `risk_tier`, and its report carries no change-set — consistently, so a
+        // consumer that checks either one reaches the same verdict.
+        let described = MinimalMigration
+            .describe()
+            .await
+            .expect("describe succeeds");
+        assert!(!described.capabilities.iter().any(|c| c == "risk_tier"));
+
+        let report = PreflightReport::new(true).with_window_safe(true);
+        assert_eq!(
+            report.usable_change_set(),
+            Err(ChangeSetUnavailable::NotEmitted),
+            "a window-safe migration is still an unclassified one"
+        );
     }
 }

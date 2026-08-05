@@ -509,9 +509,9 @@ pub enum Baseline {
 /// The always-on rule's verdict: `Some(reason)` refuses, `None` falls through to
 /// the tier policy.
 ///
-/// The single implementation of the window-safety rule. [`crate::window_safety`]
-/// delegates here rather than keeping a second copy.
-pub(crate) fn baseline_verdict(
+/// The single implementation of the window-safety rule — the gate it replaced
+/// kept no second copy, and left none behind.
+fn baseline_verdict(
     baseline: Baseline,
     capabilities: Capabilities,
     report: Option<&PreflightReport>,
@@ -750,16 +750,6 @@ impl PolicyGate {
     pub fn with_hook(mut self, hook: Option<std::sync::Arc<dyn ApprovalHook>>) -> Self {
         self.hook = hook;
         self
-    }
-
-    /// Whether a preflight report is worth gathering for this gate.
-    ///
-    /// False only when the tier gate is unconfigured *and* the strategy has no
-    /// always-on rule — today's ungated single- and multi-host deploy, which must
-    /// not start spawning a preflight subprocess for a gate that is switched off.
-    #[must_use]
-    pub const fn needs_inspection(&self, baseline: Baseline) -> bool {
-        self.policy.is_some() || !matches!(baseline, Baseline::None)
     }
 
     /// Decide whether this deploy may proceed, resolving approval and auditing
@@ -1291,8 +1281,8 @@ mod tests {
 
     // ---------------------------------------------------------------------
     // The baseline: the window-safety rule, folded in here from the gate it
-    // replaces. These five rows must reproduce `window_safety::evaluate`'s
-    // verdict in meaning, or the replacement has quietly lost coverage.
+    // replaced. These five rows reproduce the retired `window_safety` gate's
+    // verdict in meaning, so the replacement lost no coverage.
     // ---------------------------------------------------------------------
 
     /// A blue-green deploy whose adapter lints but does not classify.

@@ -43,4 +43,3 @@ pub mod policy;
 pub mod restore_rehearsal;
 pub mod single_host;
 pub mod token_provider;
-pub mod window_safety;

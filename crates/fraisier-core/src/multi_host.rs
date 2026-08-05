@@ -63,6 +63,8 @@ use fraisier_saga::saga::{Saga, SagaError, SagaOutcome, Step, StepContext};
 use fraisier_saga::state_store::{FraiseKey, StateStore, StateStoreError};
 use serde_json::Value;
 
+use crate::policy::{self, Baseline, Inspection, PolicyGate};
+
 use crate::adapter_axes::{
     AdapterCtx, AdapterError, ArtifactAdapter, HealthAdapter, HostId, LbAdapter, LbMembership,
     MigrationAdapter, Revision, ServiceAdapter, Severity, StagedArtifact,
@@ -270,6 +272,10 @@ pub struct MultiHostDeploy {
     ctx: AdapterCtx,
     target: Option<Revision>,
     forward_compatible_lint: bool,
+    /// The schema policy gate. Default (no `[policy]` section) leaves the tier
+    /// gate switched off — multi-host rolls one version at a time against the
+    /// database, so it has no always-on baseline rule either.
+    policy: PolicyGate,
     artifact: Arc<dyn ArtifactAdapter>,
     migration: Arc<dyn MigrationAdapter>,
     service: Arc<dyn ServiceAdapter>,
@@ -376,6 +382,7 @@ pub struct MultiHostDeployBuilder {
     ctx: Option<AdapterCtx>,
     target: Option<Revision>,
     forward_compatible_lint: bool,
+    policy: PolicyGate,
     artifact: Option<Arc<dyn ArtifactAdapter>>,
     migration: Option<Arc<dyn MigrationAdapter>>,
     service: Option<Arc<dyn ServiceAdapter>>,
@@ -394,6 +401,7 @@ impl MultiHostDeployBuilder {
             // Default on: the forward-compat preflight runs whenever the adapter
             // advertises it, unless the operator opts out (PRD G11 / Decision 4).
             forward_compatible_lint: true,
+            policy: PolicyGate::default(),
             artifact: None,
             migration: None,
             service: None,
@@ -423,6 +431,17 @@ impl MultiHostDeployBuilder {
     #[must_use]
     pub const fn forward_compatible_lint(mut self, enabled: bool) -> Self {
         self.forward_compatible_lint = enabled;
+        self
+    }
+
+    /// Apply `gate` — the resolved `[policy]` section and its approval hook — to
+    /// this rollout's preflight step.
+    ///
+    /// Absent, the tier gate does not run at all (D6), and the rollout behaves
+    /// exactly as it does without a policy.
+    #[must_use]
+    pub fn policy(mut self, gate: PolicyGate) -> Self {
+        self.policy = gate;
         self
     }
 
@@ -493,6 +512,7 @@ impl MultiHostDeployBuilder {
             ctx,
             target: self.target,
             forward_compatible_lint: self.forward_compatible_lint,
+            policy: self.policy,
         })
     }
 }
@@ -506,6 +526,7 @@ struct RolloutShared {
     inventory: Vec<HostEntry>,
     target: Option<Revision>,
     forward_compatible_lint: bool,
+    policy: PolicyGate,
     artifact: Arc<dyn ArtifactAdapter>,
     migration: Arc<dyn MigrationAdapter>,
     service: Arc<dyn ServiceAdapter>,
@@ -613,6 +634,7 @@ impl RolloutShared {
             inventory: deploy.plan.inventory().hosts().to_vec(),
             target: deploy.target.clone(),
             forward_compatible_lint: deploy.forward_compatible_lint,
+            policy: deploy.policy.clone(),
             artifact: Arc::clone(&deploy.artifact),
             migration: Arc::clone(&deploy.migration),
             service: Arc::clone(&deploy.service),
@@ -668,26 +690,46 @@ impl RolloutShared {
         ctx
     }
 
-    /// The migration forward-compatibility lint, gated exactly like the single-host
-    /// composition: skipped when opted out, and only invoked when the adapter
-    /// advertises the `preflight` capability.
-    async fn run_forward_compat_lint(&self) -> Result<(), SagaError> {
+    /// Ask the migration adapter what it can do and, when it lints, run its
+    /// preflight — **once** for the whole step, feeding both the policy gate and
+    /// the lint. Gated exactly like the single-host composition: opting out means
+    /// no adapter call, so nothing inspected the pending changes and a configured
+    /// policy refuses on that basis.
+    async fn inspect(&self) -> Result<Inspection, SagaError> {
         if !self.forward_compatible_lint {
-            return Ok(());
+            return Ok(Inspection::default());
         }
-        let described = self
-            .migration
-            .describe()
+        policy::inspect(self.migration.as_ref(), &self.ctx)
             .await
-            .map_err(|e| Self::failed("preflight", &e))?;
-        if !described.capabilities.iter().any(|c| c == "preflight") {
+            .map_err(|e| Self::failed("preflight", &e))
+    }
+
+    /// Apply the schema policy gate to this rollout. Multi-host rolls one
+    /// version at a time against the database, so there is no shared hold window
+    /// to certify: the baseline is [`Baseline::None`] and the gate is entirely
+    /// opt-in through `[policy]` (D6).
+    async fn run_policy_gate(&self, inspection: &Inspection) -> Result<(), SagaError> {
+        self.policy
+            .admit(
+                Baseline::None,
+                inspection.capabilities,
+                inspection.report.as_ref(),
+                &self.ctx,
+            )
+            .await
+            .map_err(|reason| SagaError::StepFailed {
+                step: "preflight".to_owned(),
+                message: reason,
+            })
+    }
+
+    /// Apply the forward-compatibility lint to the report [`inspect`](Self::inspect)
+    /// gathered. No report — the adapter does not advertise `preflight`, or the
+    /// operator opted out — means no lint (Decision 4).
+    fn run_forward_compat_lint(inspection: &Inspection) -> Result<(), SagaError> {
+        let Some(report) = inspection.report.as_ref() else {
             return Ok(());
-        }
-        let report = self
-            .migration
-            .preflight(&self.ctx)
-            .await
-            .map_err(|e| Self::failed("preflight", &e))?;
+        };
         let blocking = report
             .issues
             .iter()
@@ -704,10 +746,17 @@ impl RolloutShared {
         Ok(())
     }
 
-    /// Preflight: the shared forward-compat lint, then a reachability probe of
-    /// **every** host in parallel. Reports all unreachable hosts at once.
+    /// Preflight: the schema policy gate, the shared forward-compat lint, then a
+    /// reachability probe of **every** host in parallel. Reports all unreachable
+    /// hosts at once.
+    ///
+    /// The gate runs first, for the same reason it does on single-host: a deploy
+    /// the policy will not allow should not first be told about lint findings, or
+    /// about unreachable hosts, for a change the operator may not make anyway.
     async fn run_preflight(&self) -> Result<(), SagaError> {
-        self.run_forward_compat_lint().await?;
+        let inspection = self.inspect().await?;
+        self.run_policy_gate(&inspection).await?;
+        Self::run_forward_compat_lint(&inspection)?;
 
         let probes = self.inventory.iter().map(|entry| {
             let ctx = self.host_ctx(entry);
@@ -1111,14 +1160,16 @@ impl Step<RolloutRuntime> for RolloutStep {
 mod tests {
     use super::{
         plan_batches, HostEntry, HostInventory, MultiHostBuildError, MultiHostDeploy,
-        MultiHostPlan, MultiHostRecord, RolloutStrategy,
+        MultiHostDeployBuilder, MultiHostPlan, MultiHostRecord, RolloutStrategy,
     };
     use crate::adapter_axes::{
         AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, ArtifactAdapter,
-        ArtifactRef, HealthAdapter, HealthStatus, HostId, LbAdapter, LbMembership, LbState,
-        MigrationAdapter, MigrationOutcome, PreflightIssue, PreflightReport, Revision,
-        ServiceAdapter, ServiceStatus, Severity, StagedArtifact, VerifyCheck, VerifyReport,
+        ArtifactRef, ChangeSet, HealthAdapter, HealthStatus, HostId, LbAdapter, LbMembership,
+        LbState, MigrationAdapter, MigrationOutcome, PreflightIssue, PreflightReport, Revision,
+        RiskTier, SchemaChange, ServiceAdapter, ServiceStatus, Severity, StagedArtifact,
+        VerifyCheck, VerifyReport,
     };
+    use crate::policy::{testing::FixedApproval, Policy, PolicyGate, REFUSED};
     use async_trait::async_trait;
     use fraisier_saga::saga::SagaOutcome;
     use fraisier_saga::state_store::{FilesystemStateStore, FraiseKey, StateStore};
@@ -1170,6 +1221,9 @@ mod tests {
         restart_fail: BTreeMap<String, usize>,
         /// Whether the post-migration `verify` reports a failing check.
         verify_fail: bool,
+        /// The classified change-set the preflight report carries. `Some` also
+        /// makes the adapter advertise `risk_tier`.
+        change_set: Option<ChangeSet>,
     }
 
     impl Faults {
@@ -1240,11 +1294,15 @@ mod tests {
     impl MigrationAdapter for FakeMigration {
         async fn describe(&self) -> Result<AdapterDescription, AdapterError> {
             log(&self.trail, "describe");
+            let mut capabilities = vec!["preflight".to_owned(), "up".to_owned()];
+            if self.faults.change_set.is_some() {
+                capabilities.push("risk_tier".to_owned());
+            }
             Ok(AdapterDescription {
                 name: "fake".to_owned(),
                 version: "0".to_owned(),
                 protocol_version: 1,
-                capabilities: vec!["preflight".to_owned(), "up".to_owned()],
+                capabilities,
             })
         }
 
@@ -1319,11 +1377,15 @@ mod tests {
             } else {
                 Vec::new()
             };
-            Ok(PreflightReport {
+            let mut report = PreflightReport {
                 ok: !self.faults.preflight_blocking,
                 issues,
                 ..Default::default()
-            })
+            };
+            if let Some(changes) = self.faults.change_set.clone() {
+                report = report.with_change_set(changes);
+            }
+            Ok(report)
         }
     }
 
@@ -1430,6 +1492,27 @@ mod tests {
 
     /// Assemble a multi-host deploy from the fakes, sharing one `Faults`/`Trail`.
     fn deploy(trail: &Trail, faults: &Arc<Faults>, strategy: RolloutStrategy) -> MultiHostDeploy {
+        gated(trail, faults, strategy, PolicyGate::default())
+    }
+
+    /// The same rollout with a schema policy gate applied.
+    fn gated(
+        trail: &Trail,
+        faults: &Arc<Faults>,
+        strategy: RolloutStrategy,
+        policy: PolicyGate,
+    ) -> MultiHostDeploy {
+        builder(trail, faults, strategy)
+            .policy(policy)
+            .build()
+            .expect("all adapters provided")
+    }
+
+    fn builder(
+        trail: &Trail,
+        faults: &Arc<Faults>,
+        strategy: RolloutStrategy,
+    ) -> MultiHostDeployBuilder {
         MultiHostDeploy::builder(
             "checkout",
             "production",
@@ -1456,8 +1539,6 @@ mod tests {
             trail: trail.clone(),
             faults: Arc::clone(faults),
         }))
-        .build()
-        .expect("all adapters provided")
     }
 
     fn store() -> (tempfile::TempDir, FilesystemStateStore) {
@@ -2007,5 +2088,95 @@ mod tests {
         // Reverse host order (the last-advanced host restores first), DB last.
         assert!(pos(&trail, "activate:web-3:v-old") < pos(&trail, "activate:web-1:v-old"));
         assert!(pos(&trail, "activate:web-1:v-old") < pos(&trail, "down_to:rev-prev"));
+    }
+
+    // -----------------------------------------------------------------------
+    // The schema policy gate (#45). Multi-host rolls one version at a time
+    // against the shared database, so — like single-host and unlike blue-green —
+    // it carries no always-on baseline rule: the gate is opt-in entirely.
+    // -----------------------------------------------------------------------
+
+    /// A fault set whose migration adapter classifies `changes`.
+    fn classifying(changes: Vec<SchemaChange>) -> Arc<Faults> {
+        Arc::new(Faults {
+            change_set: Some(ChangeSet::new(changes)),
+            ..Faults::default()
+        })
+    }
+
+    /// One irreversible change: dropping a column, data and all.
+    fn drop_legacy_flag() -> SchemaChange {
+        SchemaChange::new("drop_column", "public.tb_user.legacy_flag")
+            .with_tier(RiskTier::Irreversible)
+    }
+
+    #[tokio::test]
+    async fn a_policy_denial_fails_the_rollout_before_any_host_is_probed() {
+        // The gate runs ahead of the lint *and* the reachability probe: an
+        // operator who may not make this change should not first be handed a
+        // list of unreachable hosts to fix.
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let deploy = gated(
+            &trail,
+            &classifying(vec![drop_legacy_flag()]),
+            RolloutStrategy::Rolling(1),
+            PolicyGate::new(Policy::default()),
+        );
+
+        let outcome = deploy.run(store).await.expect("run");
+        let SagaOutcome::RolledBack {
+            failed_step,
+            reason,
+        } = &outcome
+        else {
+            panic!("expected a rollback at preflight, got {outcome:?}");
+        };
+        assert_eq!(failed_step, "preflight");
+        assert!(reason.contains(REFUSED), "{reason}");
+        assert!(reason.contains("public.tb_user.legacy_flag"), "{reason}");
+        assert_eq!(drain_trail(&trail), vec!["describe", "preflight"]);
+    }
+
+    #[tokio::test]
+    async fn a_multi_host_rollout_with_no_policy_section_is_unchanged() {
+        // The D6 guarantee for the fleet path: the same irreversible change,
+        // with no `[policy]` section, still rolls out exactly as it does today.
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let deploy = deploy(
+            &trail,
+            &classifying(vec![drop_legacy_flag()]),
+            RolloutStrategy::AllAtOnce,
+        );
+
+        let outcome = deploy.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn an_approved_rollout_inspects_the_migration_adapter_once() {
+        // Both halves at once: sign-off unblocks the rollout, and the lint and
+        // the gate share one `describe` + `preflight` between them.
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let deploy = gated(
+            &trail,
+            &classifying(vec![drop_legacy_flag()]),
+            RolloutStrategy::AllAtOnce,
+            PolicyGate::new(Policy::default().with_approval_hook(true))
+                .with_hook(Some(Arc::new(FixedApproval::approving("oncall")))),
+        );
+
+        let outcome = deploy.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+        let trail = drain_trail(&trail);
+        for call in ["describe", "preflight"] {
+            assert_eq!(
+                trail.iter().filter(|entry| *entry == call).count(),
+                1,
+                "`{call}` ran more than once: {trail:?}"
+            );
+        }
     }
 }

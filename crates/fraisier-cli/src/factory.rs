@@ -483,6 +483,8 @@ pub struct ResolvedMultiHost {
     pub ctx: AdapterCtx,
     /// Whether to run the forward-compatibility preflight lint.
     pub forward_compatible_lint: bool,
+    /// The schema policy gate resolved from `[policy]` (default: no tier gate).
+    pub policy: PolicyGate,
     /// The artifact adapter.
     pub artifact: Arc<dyn ArtifactAdapter>,
     /// The migration adapter (run once on the orchestrator).
@@ -562,6 +564,7 @@ pub fn build_multi_host(
         plan,
         ctx,
         forward_compatible_lint,
+        policy: build_policy_gate(config),
         artifact,
         migration,
         service,
@@ -1174,8 +1177,8 @@ pub struct ResolvedBlueGreen {
 
 /// Build a **blue-green** deploy from a `[deploy].strategy = "blue-green"` config:
 /// the green fleet over the artifact/service/health adapters, the built-in nginx
-/// [`TrafficDirector`], the window-safety gate's migration adapter, and (when a
-/// DSN is configured) the connection-budget probe.
+/// [`TrafficDirector`], the policy gate's migration adapter, and (when a DSN is
+/// configured) the connection-budget probe.
 ///
 /// # Errors
 /// Fails if a required section/field is missing or an adapter name is unsupported.
@@ -1275,6 +1278,7 @@ pub fn build_blue_green(
         hold: Duration::from_secs(bg.hold_secs.unwrap_or(DEFAULT_HOLD_SECS)),
         green_pool: bg.green_pool.unwrap_or(0),
         budget_margin: bg.connection_margin.unwrap_or(DEFAULT_BUDGET_MARGIN),
+        policy: build_policy_gate(config),
     };
 
     Ok(ResolvedBlueGreen {

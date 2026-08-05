@@ -65,6 +65,38 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `fetch`) is unaffected. Multi-host deploys are unchanged: they migrate once on
   the orchestrator, where the per-host release is not present.
 
+### Removed
+
+- **BREAKING (embedders): the `fraisier_core::window_safety` module is gone**,
+  together with its `WindowSafety` type, `evaluate` and `check`. Its rule — the
+  one that refuses a blue-green swap when confiture cannot certify the migration
+  forward-compatible for a two-version window — is **not** gone: it is the
+  always-on `Baseline::WindowSafety` half of `policy::evaluate`, applied with or
+  without a `[policy]` section, and a blue-green deploy that is refused today is
+  refused after this change for the same cause. Only the reason string is new
+  (it now opens with `policy::REFUSED`).
+
+  The break is taken now, pre-GA, so there is one gate rather than two places a
+  future rule could be forgotten. An embedder calling the module directly moves
+  to the one decision function:
+
+  ```rust
+  // before
+  if let WindowSafety::Refused(reason) = window_safety::check(&*migration, &ctx).await {
+      return Err(refuse(reason));
+  }
+
+  // after — one `describe` + `preflight` for the window rule *and* the policy
+  let inspection = policy::inspect(&*migration, &ctx).await?;
+  gate.admit(Baseline::WindowSafety, inspection.capabilities, inspection.report.as_ref(), &ctx)
+      .await
+      .map_err(refuse)?;
+  ```
+
+  `BlueGreenParams` gains a `policy: PolicyGate` field for the same reason;
+  `PolicyGate::default()` is the "no `[policy]` section" value and keeps the
+  window rule on.
+
 ### Added
 
 - **A risk-keyed policy engine, and the `[policy]` section that drives it.**
@@ -109,12 +141,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   baseline.** `policy::evaluate` applies it *before* the tier policy and with or
   without a `[policy]` section: the tier policy is opt-in, the window-safety
   baseline is not, so folding the two gates into one decision function does not
-  quietly delete today's blue-green block for anyone. `window_safety::evaluate`
-  is now a thin delegation to that single implementation and keeps behaving
-  exactly as before; the module is removed once the blue-green flow calls the
-  policy gate directly. `window_safe` stays on the wire as an *input* to the
-  decision — it carries "confiture could not read this migration", which no risk
-  tier expresses.
+  quietly delete today's blue-green block for anyone. `window_safe` stays on the
+  wire as an *input* to the decision — it carries "confiture could not read this
+  migration", which no risk tier expresses. The `window_safety` module it
+  replaces is removed (see **Removed**).
 
 - **The Confiture adapter reads the schema change-set, and advertises
   `risk_tier` only when the installed binary can produce one.** `preflight` now

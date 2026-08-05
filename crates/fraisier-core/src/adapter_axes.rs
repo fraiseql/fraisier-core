@@ -994,7 +994,8 @@ impl PreflightReport {
         self
     }
 
-    /// State the two-version window-safety verdict (see [`crate::window_safety`]).
+    /// State the two-version window-safety verdict (see
+    /// [`Baseline::WindowSafety`](crate::policy::Baseline::WindowSafety)).
     #[must_use]
     pub const fn with_window_safe(mut self, window_safe: bool) -> Self {
         self.window_safe = Some(window_safe);

@@ -1,8 +1,8 @@
 //! HTTP-tier **blue-green** deploy flow.
 //!
-//! Composes the traffic-swap primitive ([`TrafficDirector`]) and the
-//! window-safety gate ([`crate::window_safety`]) into a saga, reusing the frozen
-//! saga engine + its compensation.
+//! Composes the traffic-swap primitive ([`TrafficDirector`]) and the schema
+//! policy gate ([`crate::policy`]) into a saga, reusing the frozen saga engine +
+//! its compensation.
 //!
 //! Flow (each transition a saga step):
 //! `Preflight (window-safety hard gate)` → `ProvisionGreen` (start green; takes
@@ -33,7 +33,7 @@ use fraisier_saga::state_store::StateStore;
 
 use crate::adapter_axes::{AdapterCtx, MigrationAdapter, TrafficDirector, TrafficTarget};
 use crate::connection_budget::{self, BudgetVerdict, ConnectionBudget};
-use crate::window_safety::{self, WindowSafety};
+use crate::policy::{self, Baseline, PolicyGate};
 
 /// Operations on the blue/green fleets the flow drives.
 ///
@@ -88,6 +88,10 @@ struct BgShared {
     fleet: Arc<dyn FleetOps>,
     /// Optional pre-swap connection-budget probe (None skips the check).
     budget: Option<Arc<dyn ConnectionBudget>>,
+    /// The schema policy gate. Its [`Baseline::WindowSafety`] rule applies with
+    /// or without a `[policy]` section — blue-green's shared hold window is not
+    /// something a config can switch off.
+    policy: PolicyGate,
 }
 
 /// The mutable run state threaded to every step by the saga engine.
@@ -142,17 +146,31 @@ impl BgShared {
     }
 
     /// The headline gate: refuse the whole deploy if confiture cannot certify the
-    /// migration window-safe — **before** any instance or traffic change — and, if
-    /// a probe is configured, if doubling connections would exhaust the shared DB.
+    /// migration window-safe, or if the schema policy will not allow the pending
+    /// changes — **before** any instance or traffic change — and, if a probe is
+    /// configured, if doubling connections would exhaust the shared DB.
+    ///
+    /// One decision function answers both questions from one preflight report
+    /// (D3). The window rule is the [`Baseline::WindowSafety`] half and applies
+    /// unconditionally; the tier policy is the opt-in half.
     async fn run_preflight(&self) -> Result<(), SagaError> {
-        if let WindowSafety::Refused(reason) =
-            window_safety::check(&*self.migration, &self.ctx).await
-        {
-            return Err(Self::failed(
-                "preflight",
-                format!("blue-green refused: migration not window-safe: {reason}"),
-            ));
-        }
+        let inspection = policy::inspect(&*self.migration, &self.ctx)
+            .await
+            .map_err(|e| {
+                Self::failed(
+                    "preflight",
+                    format!("cannot certify the migration for the hold window: {e}"),
+                )
+            })?;
+        self.policy
+            .admit(
+                Baseline::WindowSafety,
+                inspection.capabilities,
+                inspection.report.as_ref(),
+                &self.ctx,
+            )
+            .await
+            .map_err(|reason| Self::failed("preflight", reason))?;
         // The connection-budget edge: both fleets are live during the window.
         if let Some(budget) = &self.budget {
             let snapshot = budget
@@ -323,6 +341,9 @@ pub struct BlueGreenParams {
     pub green_pool: u32,
     /// The connection-budget warn margin below `max_connections`.
     pub budget_margin: u32,
+    /// The schema policy gate resolved from `[policy]`. `Default` runs no tier
+    /// policy — blue-green's window-safety baseline applies either way.
+    pub policy: PolicyGate,
 }
 
 impl BlueGreenDeploy {
@@ -348,6 +369,7 @@ impl BlueGreenDeploy {
                 traffic,
                 fleet,
                 budget,
+                policy: params.policy,
             }),
         }
     }
@@ -376,48 +398,82 @@ impl BlueGreenDeploy {
 mod tests {
     use super::{BlueGreenDeploy, BlueGreenParams, FleetOps};
     use crate::adapter_axes::{
-        AdapterCtx, AdapterDescription, AdapterError, MigrationAdapter, MigrationOutcome,
-        PreflightReport, Revision, SwapToken, TrafficDirector, TrafficTarget, VerifyReport,
+        AdapterCtx, AdapterDescription, AdapterError, ChangeSet, MigrationAdapter,
+        MigrationOutcome, PreflightReport, Revision, RiskTier, SchemaChange, SwapToken,
+        TrafficDirector, TrafficTarget, VerifyReport,
     };
+    use crate::policy::{testing::FixedApproval, Policy, PolicyGate, REFUSED};
     use async_trait::async_trait;
     use fraisier_saga::saga::SagaOutcome;
     use fraisier_saga::state_store::MemoryStateStore;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    /// A migration adapter that advertises `preflight` and returns `report`.
+    /// A migration adapter that advertises `preflight` and returns `report`,
+    /// recording every call so a test can prove the adapter is asked once.
     struct FakeMigration {
         report: PreflightReport,
+        classifies: bool,
+        calls: Mutex<Vec<String>>,
     }
     impl FakeMigration {
-        fn window_safe() -> Arc<Self> {
+        fn reporting(report: PreflightReport, classifies: bool) -> Arc<Self> {
             Arc::new(Self {
-                report: PreflightReport {
+                report,
+                classifies,
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+        fn window_safe() -> Arc<Self> {
+            Self::reporting(
+                PreflightReport {
                     ok: true,
                     window_safe: Some(true),
                     ..Default::default()
                 },
-            })
+                false,
+            )
         }
         fn unsafe_drop_column() -> Arc<Self> {
             // confiture's typed verdict: NOT forward-compatible for a two-version window.
-            Arc::new(Self {
-                report: PreflightReport {
+            Self::reporting(
+                PreflightReport {
                     ok: true,
                     window_safe: Some(false),
                     ..Default::default()
                 },
-            })
+                false,
+            )
+        }
+        /// A window-safe migration whose changes carry risk tiers.
+        fn classified(changes: Vec<SchemaChange>) -> Arc<Self> {
+            Self::reporting(
+                PreflightReport::new(true)
+                    .with_window_safe(true)
+                    .with_change_set(ChangeSet::new(changes)),
+                true,
+            )
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls").clone()
+        }
+        fn record(&self, call: &str) {
+            self.calls.lock().expect("calls").push(call.to_owned());
         }
     }
     #[async_trait]
     impl MigrationAdapter for FakeMigration {
         async fn describe(&self) -> Result<AdapterDescription, AdapterError> {
+            self.record("describe");
+            let mut capabilities = vec!["up".to_owned(), "preflight".to_owned()];
+            if self.classifies {
+                capabilities.push("risk_tier".to_owned());
+            }
             Ok(AdapterDescription {
                 name: "fake".to_owned(),
                 version: "0".to_owned(),
                 protocol_version: 1,
-                capabilities: vec!["up".to_owned(), "preflight".to_owned()],
+                capabilities,
             })
         }
         async fn current_revision(
@@ -447,6 +503,7 @@ mod tests {
             })
         }
         async fn preflight(&self, _ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {
+            self.record("preflight");
             Ok(self.report.clone())
         }
     }
@@ -545,6 +602,11 @@ mod tests {
     }
 
     fn params() -> BlueGreenParams {
+        policed(PolicyGate::default())
+    }
+
+    /// The same parameters with a schema policy gate applied.
+    fn policed(policy: PolicyGate) -> BlueGreenParams {
         BlueGreenParams {
             fraise: "checkout".to_owned(),
             environment: "production".to_owned(),
@@ -553,6 +615,19 @@ mod tests {
             hold: Duration::from_millis(20),
             green_pool: 20,
             budget_margin: 10,
+            policy,
+        }
+    }
+
+    /// The reason a run was rolled back at `step`, or a panic naming what
+    /// happened instead.
+    fn refusal(outcome: &SagaOutcome, step: &str) -> String {
+        match outcome {
+            SagaOutcome::RolledBack {
+                failed_step,
+                reason,
+            } if failed_step == step => reason.clone(),
+            other => panic!("expected a rollback at {step}, got {other:?}"),
         }
     }
 
@@ -699,5 +774,116 @@ mod tests {
         );
         assert!(traffic.swaps().is_empty(), "refused before any swap");
         assert!(fleet.log().is_empty(), "refused before any instance change");
+    }
+
+    // -----------------------------------------------------------------------
+    // The schema policy gate (#45, D3). Blue-green is the strategy whose
+    // window-safety rule the policy gate replaced: one decision function now
+    // answers both "can N-1 and N share this database?" and "is this change
+    // destructive enough to need a human?".
+    // -----------------------------------------------------------------------
+
+    /// Run a blue-green deploy with `policy` and `migration`, returning the
+    /// outcome and the traffic director (to prove nothing moved).
+    async fn run_gated(
+        policy: PolicyGate,
+        migration: Arc<FakeMigration>,
+    ) -> (SagaOutcome, Arc<FakeTraffic>) {
+        let traffic = FakeTraffic::blue();
+        let fleet = FakeFleet::new(true, true);
+        let bg = BlueGreenDeploy::new(
+            policed(policy),
+            migration,
+            Arc::clone(&traffic) as Arc<dyn TrafficDirector>,
+            Arc::clone(&fleet) as Arc<dyn FleetOps>,
+            None,
+        );
+        let outcome = bg.run(MemoryStateStore::new()).await.expect("run");
+        assert!(fleet.log().is_empty() || matches!(outcome, SagaOutcome::Committed));
+        (outcome, traffic)
+    }
+
+    #[tokio::test]
+    async fn one_gate_refuses_for_either_cause_with_distinguishable_reasons() {
+        // The test that pins D3's resolved reading. `window_safe` is not a second
+        // gate, it is an input to the one gate — and a refusal has to say which
+        // rule fired, because the two have completely different fixes: one is
+        // "rewrite the migration expand/contract", the other is "get sign-off".
+        let (window, traffic) = run_gated(
+            PolicyGate::new(Policy::default().with_approval_hook(true))
+                .with_hook(Some(Arc::new(FixedApproval::approving("oncall")))),
+            FakeMigration::unsafe_drop_column(),
+        )
+        .await;
+        let window = refusal(&window, "preflight");
+        assert!(traffic.swaps().is_empty(), "no traffic moved");
+
+        let (tier, traffic) = run_gated(
+            PolicyGate::new(Policy::default()),
+            FakeMigration::classified(vec![SchemaChange::new(
+                "drop_column",
+                "public.tb_user.legacy_flag",
+            )
+            .with_tier(RiskTier::Irreversible)]),
+        )
+        .await;
+        let tier = refusal(&tier, "preflight");
+        assert!(traffic.swaps().is_empty(), "no traffic moved");
+
+        // Both are the one gate refusing...
+        assert!(window.contains(REFUSED), "{window}");
+        assert!(tier.contains(REFUSED), "{tier}");
+        // ...and an operator can tell them apart at a glance.
+        assert!(window.contains("two-version window"), "{window}");
+        assert!(!window.contains("public.tb_user.legacy_flag"), "{window}");
+        assert!(tier.contains("public.tb_user.legacy_flag"), "{tier}");
+        assert!(!tier.contains("two-version window"), "{tier}");
+    }
+
+    #[tokio::test]
+    async fn blue_green_is_still_gated_with_no_policy_section() {
+        // The D6 carve-out at the saga level: the tier policy is opt-in, the
+        // window-safety baseline is not. If this ever passes, replacing the
+        // window-safety gate has silently deleted it for every existing user —
+        // which is all of them, since nobody has a `[policy]` section today.
+        let (outcome, traffic) =
+            run_gated(PolicyGate::default(), FakeMigration::unsafe_drop_column()).await;
+        let reason = refusal(&outcome, "preflight");
+        assert!(reason.contains("window_safe = false"), "{reason}");
+        assert!(traffic.swaps().is_empty(), "no traffic moved");
+    }
+
+    #[tokio::test]
+    async fn an_approved_irreversible_change_swaps_traffic() {
+        // The other half of the gate: sign-off unblocks what it holds, and the
+        // deploy runs to completion.
+        let (outcome, traffic) = run_gated(
+            PolicyGate::new(Policy::default().with_approval_hook(true))
+                .with_hook(Some(Arc::new(FixedApproval::approving("oncall")))),
+            FakeMigration::classified(vec![SchemaChange::new(
+                "drop_column",
+                "public.tb_user.legacy_flag",
+            )
+            .with_tier(RiskTier::Irreversible)]),
+        )
+        .await;
+        assert!(matches!(outcome, SagaOutcome::Committed), "{outcome:?}");
+        assert_eq!(traffic.live(), "green");
+    }
+
+    #[tokio::test]
+    async fn a_blue_green_deploy_inspects_the_migration_adapter_once() {
+        // The window rule and the tier policy read one report. Two subprocesses
+        // and two round-trips for the same answer is what the one decision
+        // function exists to avoid.
+        let migration = FakeMigration::classified(vec![SchemaChange::new(
+            "add_column",
+            "public.tb_user.nickname",
+        )
+        .with_tier(RiskTier::Additive)]);
+        let (outcome, _traffic) =
+            run_gated(PolicyGate::new(Policy::default()), Arc::clone(&migration)).await;
+        assert!(matches!(outcome, SagaOutcome::Committed), "{outcome:?}");
+        assert_eq!(migration.calls(), vec!["describe", "preflight"]);
     }
 }

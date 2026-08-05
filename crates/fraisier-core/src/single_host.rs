@@ -497,12 +497,12 @@ impl DeployShared {
     ///
     /// The schema policy gate runs **first**: a deploy the policy will not allow
     /// should not first be told about lint findings in a change the operator is
-    /// not permitted to make anyway.
+    /// not permitted to make anyway. Both read one [`Inspection`], so the adapter
+    /// is asked once.
     async fn run_preflight(&self) -> Result<(), SagaError> {
-        self.run_policy_gate().await?;
-        if self.forward_compatible_lint {
-            self.run_forward_compat_lint().await?;
-        }
+        let inspection = self.inspect().await?;
+        self.run_policy_gate(&inspection).await?;
+        Self::run_forward_compat_lint(&inspection)?;
         // The restore rehearsal proves a *forward* migrate applies; it is irrelevant
         // to a deliberate rollback (which migrates `down`), so skip it there.
         if let Some(db) = &self.restore_rehearsal {
@@ -513,27 +513,39 @@ impl DeployShared {
         Ok(())
     }
 
+    /// Ask the migration adapter what it can do and, when it lints, run its
+    /// preflight — **once** for the whole step.
+    ///
+    /// Opting out of the lint (`[migration].preflight_mode = "off"` /
+    /// `--skip-preflight`) means no adapter call at all, so nothing inspected
+    /// the pending changes. A configured `[policy]` then refuses on exactly that
+    /// basis, which is why that combination is a config-time warning rather than
+    /// a silent pass.
+    async fn inspect(&self) -> Result<Inspection, SagaError> {
+        if !self.forward_compatible_lint {
+            return Ok(Inspection::default());
+        }
+        policy::inspect(self.migration.as_ref(), &self.ctx)
+            .await
+            .map_err(|e| Self::failed("preflight", &e))
+    }
+
     /// Apply the schema policy gate to this deploy.
     ///
     /// Single-host runs one version at a time against the database, so there is
     /// no shared hold window to certify: the baseline is [`Baseline::None`] and
     /// the gate is entirely opt-in through `[policy]` (D6). With no section
-    /// configured this is a no-op that touches no adapter.
+    /// configured this decides nothing and allows.
     ///
-    /// When the operator turned preflight off, nothing inspected the pending
-    /// changes and a configured policy refuses on that basis — which is why
-    /// `[policy]` with `preflight_mode = "off"` is a config-time warning.
-    async fn run_policy_gate(&self) -> Result<(), SagaError> {
-        if !self.policy.needs_inspection(Baseline::None) {
+    /// A deliberate rollback is **not** gated, for the same reason the restore
+    /// rehearsal skips one: the preflight report describes the pending *forward*
+    /// changes, so judging a `down_to` run by it would rule on a change-set this
+    /// run will not apply — and would hold an emergency rollback behind an
+    /// approver who may be the reason it is happening.
+    async fn run_policy_gate(&self, inspection: &Inspection) -> Result<(), SagaError> {
+        if self.rollback_to.is_some() {
             return Ok(());
         }
-        let inspection = if self.forward_compatible_lint {
-            policy::inspect(self.migration.as_ref(), &self.ctx)
-                .await
-                .map_err(|e| Self::failed("preflight", &e))?
-        } else {
-            Inspection::default()
-        };
         self.policy
             .admit(
                 Baseline::None,
@@ -548,23 +560,14 @@ impl DeployShared {
             })
     }
 
-    /// Run the migration adapter's forward-compatibility lint against the **live**
-    /// database. The adapter must advertise the `preflight` capability or the lint
-    /// is skipped (proceed at the operator's risk rather than fail — Decision 4).
-    async fn run_forward_compat_lint(&self) -> Result<(), SagaError> {
-        let described = self
-            .migration
-            .describe()
-            .await
-            .map_err(|e| Self::failed("preflight", &e))?;
-        if !described.capabilities.iter().any(|c| c == "preflight") {
+    /// Apply the migration adapter's forward-compatibility lint to the report
+    /// [`inspect`](Self::inspect) gathered. No report — the adapter does not
+    /// advertise `preflight`, or the operator opted out — means no lint (proceed
+    /// at the operator's risk rather than fail: Decision 4).
+    fn run_forward_compat_lint(inspection: &Inspection) -> Result<(), SagaError> {
+        let Some(report) = inspection.report.as_ref() else {
             return Ok(());
-        }
-        let report = self
-            .migration
-            .preflight(&self.ctx)
-            .await
-            .map_err(|e| Self::failed("preflight", &e))?;
+        };
         let blocking = report
             .issues
             .iter()
@@ -945,6 +948,10 @@ mod tests {
         /// `run_to`). Guards the [`run_migrate`] contract that `self.target` is
         /// `None` unless an operator explicitly pinned one.
         decline_targeted_up: bool,
+        /// Whether the report says the migration is NOT forward-compatible for
+        /// a two-version window — blue-green's baseline input, which single-host
+        /// must ignore.
+        window_unsafe: bool,
         /// The classified change-set the preflight report carries. `Some` also
         /// makes the adapter advertise `risk_tier` — an adapter that claims to
         /// classify and emits nothing is its own (tested) failure mode.
@@ -964,6 +971,7 @@ mod tests {
                 fail_up: false,
                 verify_ok: true,
                 decline_targeted_up: false,
+                window_unsafe: false,
                 change_set: None,
                 seen_workdirs: Arc::new(Mutex::new(Vec::new())),
             }
@@ -1072,6 +1080,7 @@ mod tests {
             if let Some(changes) = self.change_set.clone() {
                 report = report.with_change_set(changes);
             }
+            report.window_safe = Some(!self.window_unsafe);
             Ok(report)
         }
     }
@@ -1170,6 +1179,11 @@ mod tests {
             }))
             .build()
             .expect("all adapters provided")
+    }
+
+    /// One additive change: a new nullable column no reader can trip over.
+    fn add_nickname() -> SchemaChange {
+        SchemaChange::new("add_column", "public.tb_user.nickname").with_tier(RiskTier::Additive)
     }
 
     /// One irreversible change: dropping a column, data and all.
@@ -1980,5 +1994,82 @@ mod tests {
             !trail.iter().any(|entry| entry == "stage" || entry == "up"),
             "nothing was staged or migrated: {trail:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_gated_deploy_inspects_the_migration_adapter_once() {
+        // The lint and the policy gate answer different questions from the same
+        // two facts. Asking the adapter for them twice means two confiture
+        // subprocesses and two database round-trips per deploy, for answers that
+        // cannot legitimately differ within one run.
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let plan = policed(
+            &trail,
+            FakeMigration::classifying(&trail, vec![add_nickname()]),
+            PolicyGate::new(Policy::default()),
+        );
+
+        let outcome = plan.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+        let trail = drain(&trail);
+        for call in ["describe", "preflight"] {
+            assert_eq!(
+                trail.iter().filter(|entry| *entry == call).count(),
+                1,
+                "`{call}` ran more than once: {trail:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn single_host_is_not_gated_by_window_safety() {
+        // Blue-green's rule must not leak onto a strategy that has no shared-DB
+        // hold window: single-host runs one version at a time, so a migration
+        // confiture calls window-unsafe is none of its business.
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let mut migration = FakeMigration::classifying(&trail, vec![add_nickname()]);
+        migration.window_unsafe = true;
+        let plan = policed(&trail, migration, PolicyGate::new(Policy::default()));
+
+        let outcome = plan.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_deliberate_rollback_is_not_policy_gated() {
+        // A rollback migrates *down*. The preflight report describes the pending
+        // *forward* changes, so gating on it would judge a change-set this run
+        // will not apply — and would put an approver between an operator and an
+        // emergency rollback. The restore rehearsal is skipped here for exactly
+        // the same reason.
+        let (_dir, store) = store();
+        seed_prior(&store).await;
+        let trail = Trail::default();
+        let plan = SingleHostDeploy::builder("checkout", "production", HostId::new("localhost"))
+            .policy(PolicyGate::new(Policy::default()))
+            .rollback_to(Revision::new("rev-old"))
+            .artifact(Arc::new(FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            }))
+            .migration(Arc::new(FakeMigration::classifying(
+                &trail,
+                vec![drop_legacy_flag()],
+            )))
+            .service(Arc::new(FakeService {
+                trail: trail.clone(),
+                fail_restarts: Arc::new(Mutex::new(0)),
+            }))
+            .health(Arc::new(FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            }))
+            .build()
+            .expect("all adapters provided");
+
+        let outcome = plan.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
     }
 }

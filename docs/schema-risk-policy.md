@@ -235,9 +235,14 @@ to gate on and never fires.
 3. If the change was not intended: fix the migration and re-deploy. Splitting a
    destructive migration into expand → deploy → contract is usually the answer,
    and is what makes the change `additive` twice over.
-4. If the adapter cannot classify: upgrade the producer (confiture ≥ 0.40.0
-   emits the change-set) — or set `unclassified = "require_approval"` to route
-   its deploys through the hook instead of refusing them outright.
+4. If the adapter cannot classify: **no released confiture emits a change-set
+   yet** ([confiture#197](https://github.com/fraiseql/confiture/issues/197) is
+   open), so upgrading will not help today and fraisier deliberately does not
+   advertise `risk_tier` against a binary that cannot classify. Until that
+   release lands, a `[policy]` section on the confiture adapter classifies
+   nothing: set `unclassified = "require_approval"` to route its deploys
+   through the hook, or leave `[policy]` out and keep today's behaviour. When
+   #197 ships, upgrading the producer is the fix.
 
 ## Audit
 

@@ -619,21 +619,28 @@ async fn a_confiture_that_writes_no_output_file_still_errors() {
 /// The capability gate, through `describe` itself rather than the pure function
 /// under it: what reaches the version comparison must be the *parsed* version,
 /// not the raw `confiture version 0.40.0` line — which would fail to parse and
-/// silently withhold the capability for ever.
+/// silently withhold the capability for ever. That is asserted directly on
+/// `desc.version`, because while no released confiture classifies the capability
+/// is withheld for *every* version and could no longer distinguish the two.
+///
+/// No confiture a user can install emits a change-set (fraiseql/confiture#197 is
+/// open; 0.40.0–0.42.0 shipped without it), so `describe` must never advertise
+/// `risk_tier` — the end-to-end statement of the `RISK_TIER_MIN_CONFITURE`
+/// = `None` rule. When #197 releases and the floor is pinned, the `classifies`
+/// column returns here with the real version in it.
 #[cfg(unix)]
 #[tokio::test]
 async fn describe_advertises_risk_tier_only_when_the_binary_can_emit_it() {
-    for (version, classifies) in [("0.39.0", false), ("0.40.0", true), ("1.2.3", true)] {
+    for version in ["0.39.0", "0.40.0", "0.42.0", "1.2.3"] {
         let desc = FakeConfiture::adapter_reporting(version)
             .describe()
             .await
             .expect("the fake answers --version");
 
         assert_eq!(desc.version, version, "the reported version is parsed out");
-        assert_eq!(
-            desc.capabilities.iter().any(|cap| cap == "risk_tier"),
-            classifies,
-            "confiture {version}: {:?}",
+        assert!(
+            !desc.capabilities.iter().any(|cap| cap == "risk_tier"),
+            "confiture {version} cannot emit a change-set: {:?}",
             desc.capabilities
         );
         // The rest of the handshake never depends on the version.

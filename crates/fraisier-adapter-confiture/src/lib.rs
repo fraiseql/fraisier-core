@@ -41,8 +41,11 @@
 //!
 //! The **`risk_tier`** capability (a per-change risk-tiered change-set, parsed
 //! from the `preflight` report's `change_set` object) requires a confiture that
-//! implements the migration risk contract — provisionally **≥ 0.40.0**, the
-//! `RISK_TIER_MIN_CONFITURE` floor.
+//! implements the migration risk contract. **No released confiture does yet**
+//! (fraiseql/confiture#197), so the `RISK_TIER_MIN_CONFITURE` floor is `None`
+//! and the capability is never advertised. The parsing and the gate behind it
+//! are complete; pinning the floor to the release that implements #197 is the
+//! one change that activates them.
 //! Unlike the capabilities above it is **advertised conditionally**, on the
 //! version the installed binary reports: claiming it against a confiture that
 //! cannot classify would make fraisier's policy gate expect a change-set and
@@ -112,7 +115,8 @@ const CAPABILITIES: &[&str] = &[
 /// to, so there is no useful intermediate state to advertise.
 const RISK_TIER_CAPABILITY: &str = "risk_tier";
 
-/// The first confiture release that emits a change-set (fraiseql/confiture#197).
+/// The first confiture release that emits a change-set (fraiseql/confiture#197),
+/// or `None` while no released confiture does.
 ///
 /// Gating on the **installed** version is what keeps the capability honest.
 /// Advertising `risk_tier` against a confiture that cannot classify would make
@@ -121,10 +125,20 @@ const RISK_TIER_CAPABILITY: &str = "risk_tier";
 /// handle deliberately, and which keeps a deploy with no risk policy working
 /// exactly as it does today.
 ///
-/// The floor is **provisional**: confiture 0.39.0 emits no change-set, so the
-/// producer half of the contract lands no earlier than 0.40.0. It is confirmed
-/// against the real binary when the two repositories land together.
-const RISK_TIER_MIN_CONFITURE: (u32, u32, u32) = (0, 40, 0);
+/// **`None` is the current, correct value, not a placeholder.** confiture#197 is
+/// open and confiture has released past every floor previously guessed for it
+/// (0.40.0, 0.41.0 and 0.42.0 all shipped on 2026-08-05 with unrelated
+/// features). A floor named for an unreleased version is not a safety property
+/// — it is a bet that the next release implements #197, and that bet has already
+/// lost three times. `None` cannot lose it, because it asserts only what is
+/// verified: *no confiture a user can install classifies*.
+///
+/// Setting this to `Some(version)` is the single change that activates the
+/// capability, and it is only correct once the real binary has been observed
+/// emitting a conforming change-set. Everything downstream — parsing, the
+/// contract-version check, the policy gate, the dry-run preview — is built and
+/// tested behind it.
+const RISK_TIER_MIN_CONFITURE: Option<(u32, u32, u32)> = None;
 
 /// The `kind` given to a change entry this build could not read.
 ///
@@ -744,7 +758,17 @@ fn capabilities_for(version: &str) -> Vec<String> {
 /// capability the installed binary cannot fulfil, which is the one failure this
 /// gate exists to prevent.
 fn supports_risk_tier(version: &str) -> bool {
-    version_triple(version).is_some_and(|triple| triple >= RISK_TIER_MIN_CONFITURE)
+    RISK_TIER_MIN_CONFITURE.is_some_and(|floor| version_at_or_above(version, floor))
+}
+
+/// Whether `version` parses and is at least `floor`.
+///
+/// Split out from [`supports_risk_tier`] so the comparison stays under test
+/// while the floor itself is withheld: the ordering rules (numeric not lexical,
+/// unreadable never qualifies) are the part that would be silently wrong, and
+/// they must not go untested just because no released confiture clears the bar.
+fn version_at_or_above(version: &str, floor: (u32, u32, u32)) -> bool {
+    version_triple(version).is_some_and(|triple| triple >= floor)
 }
 
 /// The `(major, minor, patch)` of a plain numeric version string, comparable as
@@ -899,8 +923,8 @@ mod tests {
         args_contain, capabilities_for, classify, error_code_of, is_error_envelope,
         parse_change_set, parse_current_revision, parse_down_to_outcome, parse_preflight_report,
         parse_up_outcome, parse_verify_report, parse_version, plan, reports_uninitialised,
-        subcommand_takes_migrations_dir, supports_risk_tier, version_triple, ConfitureMigration,
-        CONFITURE_DSN_ENV,
+        subcommand_takes_migrations_dir, supports_risk_tier, version_at_or_above, version_triple,
+        ConfitureMigration, CONFITURE_DSN_ENV,
     };
     use fraisier_core::adapter_axes::{
         AdapterCtx, AdapterErrorKind, ChangeSetUnavailable, PreflightReport, Revision, RiskTier,
@@ -1699,17 +1723,53 @@ mod tests {
         }
     }
 
+    /// **No confiture that a user can actually install emits a change-set.**
+    ///
+    /// This is the test that keeps the floor honest against a moving upstream.
+    /// fraiseql/confiture#197 — the producer half of the contract — is open, and
+    /// confiture kept releasing without it (0.40.0 `validate composes`, 0.41.0
+    /// `ledger probe`, 0.42.0 `analyzer scoping`, all on 2026-08-05). A floor
+    /// *guessed* at the next unreleased minor is not a safety property; it is a
+    /// bet against a repository that ships several times a day.
+    ///
+    /// Advertising the capability against any of these makes `evaluate` take the
+    /// `NO_CHANGE_SET` branch — *"the adapter advertises `risk_tier` and then
+    /// emitted no change-set, which is an adapter bug"* — and, under the
+    /// deny-by-default rule, refuse **every** deploy for anyone who adopts
+    /// `[policy]`. The adapter bug would be this constant.
     #[test]
-    fn describe_advertises_risk_tier_on_a_new_confiture() {
-        for version in ["0.40.0", "0.40.1", "0.41.0", "1.0.0"] {
+    fn no_released_confiture_advertises_risk_tier() {
+        for version in ["0.38.1", "0.39.0", "0.40.0", "0.41.0", "0.42.0"] {
             assert!(
-                supports_risk_tier(version),
-                "confiture {version} classifies"
+                !supports_risk_tier(version),
+                "confiture {version} is released and does not implement #197, so the adapter \
+                 must not claim it classifies"
             );
-            assert!(capabilities_for(version)
-                .iter()
-                .any(|cap| cap == "risk_tier"));
+            assert!(
+                !capabilities_for(version)
+                    .iter()
+                    .any(|cap| cap == "risk_tier"),
+                "confiture {version} must not advertise `risk_tier`"
+            );
         }
+    }
+
+    /// The consumer half is complete and stays exercised: flipping the floor to
+    /// a released version is the *only* change needed to light the capability
+    /// up, and it lights up for exactly the versions at or above it.
+    #[test]
+    fn a_confirmed_floor_advertises_risk_tier_at_and_above_itself() {
+        let floor = (0, 43, 0);
+        assert!(!version_at_or_above("0.42.0", floor));
+        assert!(version_at_or_above("0.43.0", floor));
+        assert!(version_at_or_above("0.43.1", floor));
+        assert!(
+            version_at_or_above("0.100.0", floor),
+            "numeric, not lexical"
+        );
+        assert!(version_at_or_above("1.0.0", floor));
+        // Unreadable stays unreadable regardless of the floor.
+        assert!(!version_at_or_above("0.43.0rc1", floor));
     }
 
     /// A confiture that changes its `--version` format must degrade to *"I do
@@ -1740,11 +1800,18 @@ mod tests {
     /// The floor is a numeric comparison, not a lexicographic one: as strings,
     /// `"0.100.0" < "0.40.0"`, which would silently withdraw the capability the
     /// first time confiture's minor reaches three digits.
+    ///
+    /// Asserted through [`version_at_or_above`] against an explicit floor rather
+    /// than through `supports_risk_tier`, so the ordering rule stays under test
+    /// while [`RISK_TIER_MIN_CONFITURE`] is `None`.
     #[test]
     fn the_capability_floor_is_a_numeric_comparison() {
-        assert!(supports_risk_tier("0.100.0"));
-        assert!(supports_risk_tier("0.40"), "a missing patch reads as .0");
-        assert!(!supports_risk_tier("0.9.0"));
+        assert!(version_at_or_above("0.100.0", (0, 40, 0)));
+        assert!(
+            version_at_or_above("0.40", (0, 40, 0)),
+            "a missing patch reads as .0"
+        );
+        assert!(!version_at_or_above("0.9.0", (0, 40, 0)));
         assert_eq!(version_triple("0.40.1"), Some((0, 40, 1)));
         assert_eq!(version_triple("1"), Some((1, 0, 0)));
     }

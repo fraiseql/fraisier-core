@@ -254,8 +254,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   parses the `change_set` object out of `confiture migrate preflight --format
   json` into the typed `ChangeSet` the policy gate will read, and `describe`
   appends the **`risk_tier`** capability only when the detected confiture
-  version is at or above the release that implements the contract
-  (provisionally 0.40.0 — 0.39.0 emits no change-set). Claiming the capability
+  version is at or above the release that implements the contract. **No
+  released confiture implements it yet** ([confiture#197][c197] is open, and
+  0.40.0–0.42.0 shipped unrelated features), so the floor is `None` and the
+  capability is currently never advertised — the consumer half ships complete
+  and dormant, exactly as `window_safe` shipped ahead of confiture#154.
+  Claiming the capability
   against a confiture that cannot classify would make the gate expect a
   change-set and deny every deploy: safe, and useless. Withholding it is the
   honest *"I do not classify"*, so a deploy with no risk policy configured
@@ -534,5 +538,6 @@ migration-safe rollback across one host or a fleet.
   `cargo xtask dist` cross-builds the static musl binary via `cargo-zigbuild`.
 - **GitHub Actions CI** that runs `cargo xtask ci`.
 
+[c197]: https://github.com/fraiseql/confiture/issues/197
 [Unreleased]: https://github.com/fraiseql/fraisier-core/compare/v1.0.0-beta.1...HEAD
 [1.0.0-beta.1]: https://github.com/fraiseql/fraisier-core/releases/tag/v1.0.0-beta.1

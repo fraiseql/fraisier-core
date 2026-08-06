@@ -10,12 +10,16 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use fraisier_core::adapter_axes::{AdapterCtx, HostId};
+use fraisier_core::adapter_axes::{AdapterCtx, HostId, RiskTier};
 use fraisier_core::multi_host::{HostEntry, HostInventory, RolloutStrategy};
+use fraisier_core::policy::{
+    Policy, PolicyAction, UnclassifiedAction, DEFAULT_AUTO_APPLY, DEFAULT_REQUIRE_APPROVAL,
+};
 use fraisier_core::single_host::PreflightMode;
 use fraisier_core::token_provider::TokenProvider;
 use serde::{Deserialize, Serialize};
 
+use crate::validate::is_set;
 use crate::SpecqlPreset;
 
 /// The logical secret name the migration DSN is exposed under (Decision 5). The
@@ -102,6 +106,11 @@ pub struct DeployConfig {
     /// version.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<CheckSection>,
+    /// The `[policy]` section: the risk-keyed schema policy gate. Absent leaves
+    /// the tier gate switched off entirely — configuring the section is the
+    /// opt-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicySection>,
     /// The `[specql]` preset. Present only in the *unexpanded* form; both
     /// [`from_toml_str`](DeployConfig::from_toml_str) and
     /// [`load`](DeployConfig::load) consume it and leave this `None`.
@@ -169,6 +178,101 @@ pub struct CheckSection {
     /// directory. Absent runs in the project root the command is invoked from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<PathBuf>,
+}
+
+/// The `[policy]` section — the risk-keyed schema policy gate.
+///
+/// Flat by design: fraisier's config is already one file per environment
+/// (`[deploy].environment`), so "per-environment thresholds" is satisfied by
+/// construction and does not need a nested table.
+///
+/// Every key is optional and falls back to the documented default; the section's
+/// *presence* is what switches the tier gate on. Resolve it into the engine's
+/// [`Policy`] with [`resolve`](PolicySection::resolve).
+///
+/// ```toml
+/// [policy]
+/// auto_apply = ["additive", "reversible"]
+/// require_approval = ["lock_risky", "destructive", "irreversible"]
+/// unclassified = "deny"
+/// approval_command = "scripts/deploy/approve.sh"
+/// approval_timeout_secs = 300
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicySection {
+    /// Tiers that apply without asking. Omitted ⇒ [`DEFAULT_AUTO_APPLY`].
+    ///
+    /// A tier in neither list is **denied**: the lists are exhaustive, not a
+    /// pair of hints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_apply: Option<Vec<String>>,
+    /// Tiers that need the approval hook to say yes. Omitted ⇒
+    /// [`DEFAULT_REQUIRE_APPROVAL`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_approval: Option<Vec<String>>,
+    /// What to do with a change the adapter did not classify — or a change-set
+    /// it did not emit at all. `"deny"` (the default) or `"require_approval"`;
+    /// auto-applying the unclassified is deliberately not expressible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unclassified: Option<String>,
+    /// The approval hook. Absent, with a tier that needs approval, is a refusal
+    /// at deploy time — never a silent pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_command: Option<String>,
+    /// How long the approval hook may take before it counts as a refusal.
+    /// Omitted ⇒ [`DEFAULT_APPROVAL_TIMEOUT_SECS`]. A hook that has not answered
+    /// by then is a refusal, never a pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_timeout_secs: Option<u64>,
+}
+
+/// The accepted `[policy].unclassified` values, in the order they are offered to
+/// an operator who typed something else.
+pub const UNCLASSIFIED_ACTIONS: [&str; 2] = ["deny", "require_approval"];
+
+/// How long an approval hook may take when `approval_timeout_secs` is omitted.
+///
+/// Five minutes: long enough for a human paged out of hours to answer, short
+/// enough that an unattended deploy is not pinned open by a hook nobody will
+/// ever answer.
+pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 300;
+
+impl PolicySection {
+    /// Resolve the section into the engine's [`Policy`] — the single
+    /// config→engine bridge.
+    ///
+    /// Assumes the config validated clean (the house accessor convention).
+    /// Anything [`validate`](DeployConfig::validate) would have rejected still
+    /// resolves the **safe** way rather than panicking: an unparseable tier name
+    /// maps no tier, and a tier this policy does not mention is denied.
+    #[must_use]
+    pub fn resolve(&self) -> Policy {
+        let listed = |names: Option<&Vec<String>>, fallback: &[RiskTier]| -> Vec<RiskTier> {
+            names.map_or_else(
+                || fallback.to_vec(),
+                |names| names.iter().filter_map(|name| name.parse().ok()).collect(),
+            )
+        };
+        let actions = listed(self.auto_apply.as_ref(), &DEFAULT_AUTO_APPLY)
+            .into_iter()
+            .map(|tier| (tier, PolicyAction::AutoApply))
+            .chain(
+                listed(self.require_approval.as_ref(), &DEFAULT_REQUIRE_APPROVAL)
+                    .into_iter()
+                    .map(|tier| (tier, PolicyAction::RequireApproval)),
+            )
+            .collect();
+        // Only the one non-default value opts out of denying; every other
+        // spelling — including one validation rejected — denies.
+        let unclassified = if self.unclassified.as_deref() == Some(UNCLASSIFIED_ACTIONS[1]) {
+            UnclassifiedAction::RequireApproval
+        } else {
+            UnclassifiedAction::Deny
+        };
+        Policy::new(actions, unclassified)
+            .with_approval_hook(is_set(self.approval_command.as_ref()))
+    }
 }
 
 /// The `[artifact]` section. `source` selects which of the source-specific

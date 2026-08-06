@@ -1,0 +1,12 @@
+{
+  "ok": true,
+  "window_safe": true,
+  "summary": {
+    "errors": 0,
+    "warnings": 0,
+    "info": 0,
+    "migrations_checked": 1
+  },
+  "issues": [],
+  "change_set": "additive"
+}

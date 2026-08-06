@@ -10,12 +10,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use fraisier_config::{DeployConfig, Severity, ValidationReport};
 use fraisier_core::multi_host::MultiHostDeploy;
+use fraisier_core::policy::Baseline;
 use fraisier_core::single_host::{DeployRecord, SingleHostDeploy};
 use fraisier_saga::saga::SagaOutcome;
 use fraisier_saga::state_store::{FilesystemStateStore, FraiseKey, StateStore};
 use serde_json::{json, Value};
 
 use crate::factory;
+use crate::preview::{self, SchemaPreview, Unavailable};
 
 /// The result of a command: an exit code and both renderings of its output.
 pub(crate) struct CommandOutput {
@@ -214,6 +216,7 @@ pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
         args.state_dir,
         args.host,
         Some(&report.new_version),
+        false,
         false,
         false,
     )
@@ -1199,6 +1202,7 @@ pub(crate) async fn rollback(
     )
     .context(resolved.ctx)
     .forward_compatible_lint(resolved.forward_compatible_lint)
+    .policy(resolved.policy)
     .artifact(resolved.artifact)
     .migration(resolved.migration)
     .service(resolved.service)
@@ -1451,10 +1455,37 @@ fn render_summary(summary: &factory::PlanSummary) -> String {
         lines.push(format!("  database_url_env: {source}"));
     }
     lines.push(format!("  settings:  {}", summary.settings_keys.join(", ")));
+    push_schema(&mut lines, &summary.schema);
     lines.push("(dry run — nothing was executed)".to_owned());
     let mut out = lines.join("\n");
     out.push('\n');
     out
+}
+
+/// Fold `extra`'s keys into `target`.
+///
+/// The blue-green payload is hand-built rather than serialized from a summary
+/// struct, so this is how it carries the same flattened schema keys the other
+/// two strategies' plans do — one shape across all three, not three that drift.
+fn merge(target: &mut Value, extra: Value) {
+    let (Some(target), Value::Object(extra)) = (target.as_object_mut(), extra) else {
+        return;
+    };
+    target.extend(extra);
+}
+
+/// Append the schema preview to a plan, set off by blank lines.
+///
+/// A silent preview appends nothing at all — not even the blank lines — which
+/// is how `--dry-run --skip-preflight` keeps printing the plan byte-for-byte.
+fn push_schema(lines: &mut Vec<String>, schema: &SchemaPreview) {
+    let rendered = preview::render(schema);
+    if rendered.is_empty() {
+        return;
+    }
+    lines.push(String::new());
+    lines.push(rendered);
+    lines.push(String::new());
 }
 
 /// Render only a report's non-blocking issues (warnings/info), in the same shape
@@ -1484,7 +1515,7 @@ fn render_multi_host_summary(
     report: &ValidationReport,
 ) -> String {
     let mut out = render_warnings(report);
-    let lines = vec![
+    let mut lines = vec![
         format!(
             "multi-host deploy plan for {}/{}:",
             summary.fraise, summary.environment
@@ -1497,11 +1528,69 @@ fn render_multi_host_summary(
         format!("  service:   {}", summary.service),
         format!("  health:    {}", summary.health),
         format!("  lb:        {}", summary.lb),
-        "(dry run — nothing was executed)".to_owned(),
     ];
+    push_schema(&mut lines, &summary.schema);
+    lines.push("(dry run — nothing was executed)".to_owned());
     out.push_str(&lines.join("\n"));
     out.push('\n');
     out
+}
+
+/// Inspect the migration adapter for a `--dry-run`, degrading rather than
+/// aborting.
+///
+/// Every way of failing to see the schema — the operator turned preflight off,
+/// the config did, the adapter cannot be built, the database is unreachable —
+/// yields a plan carrying an explicit unavailability instead of an error exit
+/// (rule 2, D8). The one thing it never does is produce a plan that reads as
+/// clean.
+async fn preview_schema(
+    config: &DeployConfig,
+    host: Option<&str>,
+    app_version: Option<&str>,
+    baseline: Baseline,
+    skip_preflight: bool,
+) -> SchemaPreview {
+    let (gate, approval_command) = factory::preview_gate(config);
+    let approval_command = approval_command.as_deref();
+    let uninspected =
+        |reason: Unavailable| preview::not_inspected(reason, &gate, approval_command, baseline);
+    if skip_preflight {
+        return uninspected(Unavailable::new(
+            Unavailable::SKIPPED,
+            "preflight was skipped for this run (`--skip-preflight`), so nothing inspected the \
+             pending schema changes",
+        ));
+    }
+    let target = match factory::build_preview(config, host, app_version) {
+        Ok(target) => target,
+        // An unset DSN env var is the common one. Today's dry-run never resolves
+        // secrets, so this is a failure mode the plan did not have before D8 —
+        // and it must not turn a plan into an error exit.
+        Err(error) => {
+            return uninspected(Unavailable::new(
+                Unavailable::ADAPTER_UNAVAILABLE,
+                preview::redact_credentials(&format!(
+                    "the migration adapter could not be built: {error:#}"
+                )),
+            ))
+        }
+    };
+    if !target.forward_compatible_lint {
+        return uninspected(Unavailable::new(
+            Unavailable::PREFLIGHT_OFF,
+            "`[migration].preflight_mode = \"off\"` turns every preflight off, so the deploy \
+             itself will not inspect the pending schema changes either",
+        ));
+    }
+    preview::gather(
+        target.migration.as_ref(),
+        &target.ctx,
+        &gate,
+        approval_command,
+        baseline,
+    )
+    .await
 }
 
 /// `deploy`: validate, then either summarize the plan (`--dry-run`) or run the
@@ -1513,6 +1602,7 @@ pub(crate) async fn deploy(
     app_version: Option<&str>,
     dry_run: bool,
     skip_preflight: bool,
+    fail_on_block: bool,
 ) -> Result<CommandOutput> {
     let config = load(config_path)?;
     let report = config.validate();
@@ -1528,7 +1618,7 @@ pub(crate) async fn deploy(
 
     // `[deploy].strategy = "blue-green"` selects the HTTP-tier traffic-swap flow.
     if config.deploy.as_ref().and_then(|d| d.strategy.as_deref()) == Some("blue-green") {
-        return run_blue_green(&config, app_version, state_dir, dry_run).await;
+        return run_blue_green(&config, app_version, state_dir, dry_run, fail_on_block).await;
     }
 
     // A config with [hosts] runs the multi-host rollout — unless an explicit
@@ -1536,17 +1626,26 @@ pub(crate) async fn deploy(
     let multi_host = config.hosts.is_some() && host.is_none();
 
     if dry_run {
+        // Single-host and multi-host run one version at a time against the
+        // database, so neither has a shared hold window to certify.
+        let schema =
+            preview_schema(&config, host, app_version, Baseline::None, skip_preflight).await;
+        // A plan *was* produced, so the command succeeds — terraform semantics.
+        // `--fail-on-block` is the pipeline's opt-in to the stricter reading.
+        let exit_code = i32::from(fail_on_block && preview::would_block(&schema));
         if multi_host {
-            let summary = factory::summarize_multi_host(&config, app_version)?;
+            let mut summary = factory::summarize_multi_host(&config, app_version)?;
+            summary.schema = schema;
             return Ok(CommandOutput {
-                exit_code: 0,
+                exit_code,
                 pretty: render_multi_host_summary(&summary, &report),
                 json: serde_json::to_value(&summary)?,
             });
         }
-        let summary = factory::summarize(&config, host, app_version)?;
+        let mut summary = factory::summarize(&config, host, app_version)?;
+        summary.schema = schema;
         return Ok(CommandOutput {
-            exit_code: 0,
+            exit_code,
             pretty: render_summary(&summary),
             json: serde_json::to_value(&summary)?,
         });
@@ -1569,6 +1668,7 @@ pub(crate) async fn deploy(
     )
     .context(resolved.ctx)
     .forward_compatible_lint(resolved.forward_compatible_lint && !skip_preflight)
+    .policy(resolved.policy)
     .artifact(resolved.artifact)
     .migration(resolved.migration)
     .service(resolved.service)
@@ -1610,6 +1710,7 @@ async fn run_multi_host(
     )
     .context(resolved.ctx)
     .forward_compatible_lint(resolved.forward_compatible_lint)
+    .policy(resolved.policy)
     .artifact(resolved.artifact)
     .migration(resolved.migration)
     .service(resolved.service)
@@ -1641,22 +1742,32 @@ async fn run_blue_green(
     app_version: Option<&str>,
     state_dir: &Path,
     dry_run: bool,
+    fail_on_block: bool,
 ) -> Result<CommandOutput> {
     let resolved = factory::build_blue_green(config, app_version)?;
     if dry_run {
-        let pretty = format!(
-            "blue-green deploy plan for {}/{} (dry run — nothing executed)\n",
+        // Blue-green holds N-1 and N against one database for the swap window,
+        // so its plan answers the question no other strategy has to ask — and
+        // `--skip-preflight` is deliberately not honoured here, because the live
+        // blue-green preflight does not honour it either.
+        let schema = preview_schema(config, None, app_version, Baseline::WindowSafety, false).await;
+        let mut lines = vec![format!(
+            "blue-green deploy plan for {}/{}:",
             resolved.fraise, resolved.environment
-        );
+        )];
+        push_schema(&mut lines, &schema);
+        lines.push("(dry run — nothing was executed)".to_owned());
+        let mut json = json!({
+            "strategy": "blue-green",
+            "fraise": resolved.fraise,
+            "environment": resolved.environment,
+            "dry_run": true,
+        });
+        merge(&mut json, serde_json::to_value(&schema)?);
         return Ok(CommandOutput {
-            exit_code: 0,
-            pretty,
-            json: json!({
-                "strategy": "blue-green",
-                "fraise": resolved.fraise,
-                "environment": resolved.environment,
-                "dry_run": true,
-            }),
+            exit_code: i32::from(fail_on_block && preview::would_block(&schema)),
+            pretty: format!("{}\n", lines.join("\n")),
+            json,
         });
     }
 
@@ -2168,6 +2279,7 @@ impl fraisier_webhook::WebhookHandler for DeployHandler {
             version.as_deref(),
             false,
             false,
+            false,
         )
         .await
         .map_err(|error| format!("{error:#}"))?;
@@ -2623,6 +2735,11 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
 /// deploy of a sick build rolls back **and** emits a notification, reusing the
 /// self-upgrade notify primitive. A committed deploy, or a config with no notify
 /// sink, fires nothing.
+///
+/// A deploy the **schema policy** blocked is reported as its own event: it is
+/// not "the deploy broke", it is "a pending migration needs a human", and an
+/// operator triaging the alert should not have to parse a reason string to tell
+/// those apart.
 async fn notify_deploy_failure(
     config: &DeployConfig,
     fraise: &str,
@@ -2638,7 +2755,11 @@ async fn notify_deploy_failure(
     };
     let (_, label, detail) = outcome_result(outcome);
     let payload = fraisier_self_upgrade::FailurePayload {
-        event: "scheduled-deploy-failed".to_owned(),
+        event: if detail.contains(fraisier_core::policy::REFUSED) {
+            "policy-blocked".to_owned()
+        } else {
+            "scheduled-deploy-failed".to_owned()
+        },
         failed: Some(format!("{fraise}/{environment}")),
         restored: None,
         reason: format!("{label}{detail}").trim().to_owned(),
@@ -2668,19 +2789,7 @@ mod tests {
     };
     use std::path::Path;
 
-    /// Serializes the env-mutating db-op tests so `set_var`/`var` don't race the
-    /// process environment across threads.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Drive an async command to completion on a fresh current-thread runtime.
-    /// Kept synchronous so the [`ENV_LOCK`] guard is never held across an `.await`.
-    fn block_on<F: std::future::Future>(future: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime")
-            .block_on(future)
-    }
+    use crate::test_env::{block_on, ENV_LOCK};
 
     /// A db-ops config naming `dsn_env` as the DSN source (no-op command adapter).
     fn db_ops_config(dsn_env: &str) -> String {
@@ -3301,6 +3410,7 @@ url = "http://127.0.0.1:8080/health"
             Some("1.2.3"),
             true,
             false,
+            false,
         )
         .await
         .expect("dry run");
@@ -3310,6 +3420,160 @@ url = "http://127.0.0.1:8080/health"
             serde_json::json!("confiture (in-process)")
         );
         assert_eq!(out.json["host"], serde_json::json!("127.0.0.1"));
+    }
+
+    /// Today's dry-run plan, byte for byte. Rule 1: `--skip-preflight` is the
+    /// documented way back to the pure offline check, so a CI job that used
+    /// `--dry-run` as a cheap config gate keeps its exact output.
+    const OFFLINE_PLAN: &str = "deploy plan for checkout/staging → host 127.0.0.1\n  \
+        artifact:  release\n  migration: confiture (in-process)\n  service:   systemd\n  \
+        health:    http\n  database_url_env: CHECKOUT_DATABASE_URL\n  \
+        settings:  checksum_url, expected_status, release_url, unit, url, version\n\
+        (dry run — nothing was executed)\n";
+
+    #[tokio::test]
+    async fn skip_preflight_produces_the_pre_change_set_plan_verbatim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", VALID);
+        let out = deploy(
+            &config,
+            &dir.path().join("state"),
+            Some("127.0.0.1"),
+            Some("1.2.3"),
+            true,
+            true,
+            false,
+        )
+        .await
+        .expect("dry run");
+        assert_eq!(out.pretty, OFFLINE_PLAN);
+        assert_eq!(out.exit_code, 0);
+        // The machine form is still honest about what it did not look at: an
+        // agent must not read the silence as "no changes".
+        assert_eq!(out.json["change_set"], serde_json::Value::Null);
+        assert_eq!(
+            out.json["change_set_unavailable"]["code"],
+            serde_json::json!("preflight_skipped")
+        );
+    }
+
+    /// A config with `[policy]` configured and a migration adapter that cannot
+    /// be built here (the DSN env var is deliberately unset), so the gate decides
+    /// on *"nothing looked at the pending changes"* — a refusal, and one that
+    /// needs no subprocess, no database, and no installed confiture to reproduce.
+    fn policy_config() -> String {
+        let unbuildable = VALID.replace(
+            "adapter = \"confiture\"\ndatabase_url_env = \"CHECKOUT_DATABASE_URL\"",
+            "adapter = \"sqlx\"\ndatabase_url_env = \"FRAISIER_TEST_DSN_DELIBERATELY_UNSET\"",
+        );
+        format!(
+            "{unbuildable}\n[policy]\nauto_apply = [\"additive\"]\n\
+             require_approval = [\"irreversible\"]\nunclassified = \"deny\"\n\
+             approval_command = \"scripts/deploy/approve.sh\"\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_would_block_without_blocking() {
+        // Terraform semantics: a plan *was* produced, so the command succeeds.
+        // The block is reported, not enforced.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", &policy_config());
+        let out = deploy(
+            &config,
+            &dir.path().join("state"),
+            Some("127.0.0.1"),
+            Some("1.2.3"),
+            true,
+            false,
+            false,
+        )
+        .await
+        .expect("dry run");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert!(out.pretty.contains("WOULD BLOCK"), "{}", out.pretty);
+        assert_eq!(out.json["policy"]["decision"], serde_json::json!("deny"));
+    }
+
+    #[tokio::test]
+    async fn fail_on_block_turns_a_would_block_into_a_nonzero_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", &policy_config());
+        let out = deploy(
+            &config,
+            &dir.path().join("state"),
+            Some("127.0.0.1"),
+            Some("1.2.3"),
+            true,
+            false,
+            true,
+        )
+        .await
+        .expect("dry run");
+        assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
+        // The plan is still printed — a pipeline needs to see *why* it failed.
+        assert!(out.pretty.contains("deploy plan for"), "{}", out.pretty);
+    }
+
+    #[tokio::test]
+    async fn no_policy_section_renders_no_policy_line() {
+        // D6 again, at the CLI: an operator who has not opted in sees the
+        // change-set (or why there is none) and nothing else.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", VALID);
+        let out = deploy(
+            &config,
+            &dir.path().join("state"),
+            Some("127.0.0.1"),
+            Some("1.2.3"),
+            true,
+            false,
+            true,
+        )
+        .await
+        .expect("dry run");
+        assert!(!out.pretty.contains("policy:"), "{}", out.pretty);
+        assert_eq!(out.json["policy"], serde_json::Value::Null);
+        // ...and `--fail-on-block` has nothing to gate on, so it does not fire.
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+    }
+
+    #[tokio::test]
+    async fn a_missing_dsn_degrades_rather_than_aborting() {
+        // The IPC path resolves the DSN env var when it builds the adapter, so
+        // an unset one fails the build. Today's dry-run never resolved secrets;
+        // under D8 it does, and that new failure mode must not turn a plan into
+        // an error exit.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = VALID.replace(
+            "adapter = \"confiture\"\ndatabase_url_env = \"CHECKOUT_DATABASE_URL\"",
+            "adapter = \"sqlx\"\ndatabase_url_env = \"FRAISIER_TEST_DSN_DELIBERATELY_UNSET\"",
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let out = deploy(
+            &config,
+            &dir.path().join("state"),
+            Some("127.0.0.1"),
+            Some("1.2.3"),
+            true,
+            false,
+            false,
+        )
+        .await
+        .expect("a plan was produced");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        assert!(out.pretty.contains("deploy plan for"), "{}", out.pretty);
+        assert_eq!(
+            out.json["change_set_unavailable"]["code"],
+            serde_json::json!("adapter_unavailable")
+        );
+        assert!(
+            out.json["change_set_unavailable"]["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("FRAISIER_TEST_DSN_DELIBERATELY_UNSET")),
+            "{}",
+            out.json
+        );
     }
 
     #[tokio::test]
@@ -3329,12 +3593,115 @@ url = "http://127.0.0.1:8080/health"
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let state = dir.path().join("state");
         // Dry run: the strategy is recognized and routed; nothing is executed.
-        let out = deploy(&config, &state, None, Some("1.2.3"), true, false)
+        let out = deploy(&config, &state, None, Some("1.2.3"), true, false, false)
             .await
             .expect("dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
         assert_eq!(out.json["strategy"], serde_json::json!("blue-green"));
         assert_eq!(out.json["dry_run"], serde_json::json!(true));
+    }
+
+    /// A blue-green config over `body`'s `[deploy]`/axes.
+    fn blue_green_config(dir: &Path, body: &str) -> std::path::PathBuf {
+        let cfg = format!(
+            "{}\n[lb]\nadapter = \"nginx\"\nupstream = \"checkout_upstream\"\n\
+             include_dir = \"{}\"\n\n[blue_green]\ngreen_unit = \"checkout-green.service\"\n\
+             green_health_url = \"http://127.0.0.1:8081/healthz\"\n\
+             green_servers = [\"127.0.0.1:8081\"]\nblue_servers = [\"127.0.0.1:8080\"]\n",
+            body.replace(
+                "environment = \"staging\"",
+                "environment = \"staging\"\nstrategy = \"blue-green\""
+            ),
+            dir.join("nginx").display(),
+        );
+        write(dir, "fraisier.toml", &cfg)
+    }
+
+    #[tokio::test]
+    async fn blue_green_dry_run_shows_the_change_set() {
+        // The strategy with the highest schema stakes had the thinnest preview:
+        // four JSON fields and one line of prose. It reaches parity here.
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A `command` adapter with no preflight command configured: it builds,
+        // it describes itself, and it advertises no `preflight` — a degradation
+        // that needs no database, no subprocess, and no installed confiture.
+        let lints_nothing = VALID.replace(
+            "adapter = \"confiture\"\ndatabase_url_env = \"CHECKOUT_DATABASE_URL\"\n",
+            "adapter = \"command\"\ndatabase_url_env = \"CHECKOUT_DATABASE_URL\"\n\n             [migration.settings]\nup = \"true\"\n",
+        );
+        let config = blue_green_config(dir.path(), &lints_nothing);
+        let out = deploy(
+            &config,
+            &dir.path().join("state"),
+            None,
+            Some("1.2.3"),
+            true,
+            false,
+            false,
+        )
+        .await
+        .expect("dry run");
+        assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+        // The existing four fields keep their names and types.
+        assert_eq!(out.json["strategy"], serde_json::json!("blue-green"));
+        assert_eq!(out.json["dry_run"], serde_json::json!(true));
+        // ...and the schema preview is beside them, in the same shape the
+        // single-host plan carries.
+        assert_eq!(
+            out.json["change_set_unavailable"]["code"],
+            serde_json::json!("no_preflight_capability")
+        );
+        assert!(out.pretty.contains("UNAVAILABLE"), "{}", out.pretty);
+        assert!(
+            out.pretty.contains("Risk is unknown, not zero."),
+            "{}",
+            out.pretty
+        );
+    }
+
+    #[tokio::test]
+    async fn blue_green_dry_run_shows_the_window_safety_verdict() {
+        // The baseline is not opt-in (the D3 carve-out), so blue-green always
+        // has a verdict to report — with no `[policy]` section anywhere.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = blue_green_config(dir.path(), VALID);
+        let out = deploy(
+            &config,
+            &dir.path().join("state"),
+            None,
+            Some("1.2.3"),
+            true,
+            false,
+            false,
+        )
+        .await
+        .expect("dry run");
+        assert!(
+            out.pretty.contains("window safety:"),
+            "no window-safety line: {}",
+            out.pretty
+        );
+        assert!(out.pretty.contains("WOULD BLOCK"), "{}", out.pretty);
+        assert_eq!(out.json["policy"]["decision"], serde_json::json!("deny"));
+        assert_eq!(out.json["window_safe"], serde_json::json!("unknown"));
+    }
+
+    #[tokio::test]
+    async fn blue_green_dry_run_honours_fail_on_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = blue_green_config(dir.path(), VALID);
+        let out = deploy(
+            &config,
+            &dir.path().join("state"),
+            None,
+            Some("1.2.3"),
+            true,
+            false,
+            true,
+        )
+        .await
+        .expect("dry run");
+        assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
     }
 
     #[tokio::test]
@@ -3343,7 +3710,7 @@ url = "http://127.0.0.1:8080/health"
         let bad = VALID.replace("database_url_env = \"CHECKOUT_DATABASE_URL\"\n", "");
         let config = write(dir.path(), "fraisier.toml", &bad);
         let state = dir.path().join("state");
-        let out = deploy(&config, &state, None, None, false, false)
+        let out = deploy(&config, &state, None, None, false, false, false)
             .await
             .expect("run");
         assert_eq!(out.exit_code, 1);
@@ -3620,7 +3987,7 @@ upstream = "checkout_upstream"
         let config = write(dir.path(), "fraisier.toml", MULTI_HOST);
         let state = dir.path().join("state");
         // No --host override: [hosts] selects the multi-host path.
-        let out = deploy(&config, &state, None, Some("1.2.3"), true, false)
+        let out = deploy(&config, &state, None, Some("1.2.3"), true, false, false)
             .await
             .expect("multi-host dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
@@ -3657,6 +4024,7 @@ upstream = "checkout_upstream"
             Some("1.2.3"),
             true,
             false,
+            false,
         )
         .await
         .expect("single-host dry run");
@@ -3672,7 +4040,7 @@ upstream = "checkout_upstream"
         let pull = MULTI_HOST.replace("source = \"release\"", "source = \"pull\"");
         let config = write(dir.path(), "fraisier.toml", &pull);
         let state = dir.path().join("state");
-        let out = deploy(&config, &state, None, Some("1.2.3"), true, false)
+        let out = deploy(&config, &state, None, Some("1.2.3"), true, false, false)
             .await
             .expect("multi-host pull dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
@@ -4299,6 +4667,91 @@ current_revision = "true"
         std::fs::remove_file(&out).expect("rm");
         notify_deploy_failure(&config, "checkout", "production", &SagaOutcome::Committed).await;
         assert!(!out.exists(), "no notify on a committed deploy");
+    }
+
+    #[tokio::test]
+    async fn a_policy_block_exits_nonzero_and_names_the_cause() {
+        // End-to-end through the real wiring: config → factory → builder → saga
+        // → exit code. The `command` migration adapter advertises only the
+        // methods it is configured with, so it cannot classify — and a policy
+        // that cannot see the pending changes refuses rather than assuming they
+        // are safe.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let toml = format!(
+            "{}\n[policy]\nauto_apply = [\"additive\"]\n",
+            VALID.replace(
+                "adapter = \"confiture\"\ndatabase_url_env = \"CHECKOUT_DATABASE_URL\"",
+                "adapter = \"command\"\n\n[migration.settings.commands]\n\
+                 up = \"true\"\ncurrent_revision = \"true\"",
+            )
+        );
+        let config = write(dir.path(), "fraisier.toml", &toml);
+        let state = dir.path().join("state");
+
+        let out = deploy(&config, &state, None, Some("1.2.3"), false, false, false)
+            .await
+            .expect("the deploy runs and is refused");
+        assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
+        assert!(out.pretty.contains("policy refused"), "{}", out.pretty);
+        assert!(
+            out.pretty.contains("no preflight report"),
+            "the refusal names its cause: {}",
+            out.pretty
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_block_notifies_as_its_own_event() {
+        // A scheduled deploy blocked by the schema policy is not "the deploy
+        // broke" — it is "someone has to look at this migration". The operator
+        // reading the alert needs to tell the two apart without parsing a
+        // reason string, so the block gets its own event name.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("captured");
+        let command = format!("echo \"$FRAISIER_NOTIFY_EVENT\" > {}", out.display());
+        let toml = format!("[schedule]\nnotify = '{command}'\n");
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+
+        notify_deploy_failure(
+            &config,
+            "checkout",
+            "production",
+            &SagaOutcome::RolledBack {
+                failed_step: "preflight".to_owned(),
+                reason: format!(
+                    "step 'preflight' failed: {} approval is required for \
+                     public.tb_user.legacy_flag",
+                    fraisier_core::policy::REFUSED
+                ),
+            },
+        )
+        .await;
+        let captured = std::fs::read_to_string(&out).expect("hook ran");
+        assert_eq!(captured.trim(), "policy-blocked", "{captured}");
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_failure_keeps_the_scheduled_deploy_event() {
+        // The discrimination is on the policy's own refusal marker, not on the
+        // step name: plenty of preflight failures are not policy blocks.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("captured");
+        let command = format!("echo \"$FRAISIER_NOTIFY_EVENT\" > {}", out.display());
+        let toml = format!("[schedule]\nnotify = '{command}'\n");
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+
+        notify_deploy_failure(
+            &config,
+            "checkout",
+            "production",
+            &SagaOutcome::RolledBack {
+                failed_step: "preflight".to_owned(),
+                reason: "step 'preflight' failed: 2 host(s) unreachable".to_owned(),
+            },
+        )
+        .await;
+        let captured = std::fs::read_to_string(&out).expect("hook ran");
+        assert_eq!(captured.trim(), "scheduled-deploy-failed", "{captured}");
     }
 
     #[tokio::test]

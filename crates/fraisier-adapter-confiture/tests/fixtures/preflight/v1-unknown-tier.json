@@ -1,0 +1,30 @@
+{
+  "ok": true,
+  "window_safe": true,
+  "summary": {
+    "errors": 0,
+    "warnings": 0,
+    "info": 0,
+    "migrations_checked": 2
+  },
+  "issues": [],
+  "change_set": {
+    "contract_version": 1,
+    "changes": [
+      {
+        "kind": "add_column",
+        "object": "public.tb_user.nickname",
+        "migration": "20260804120000",
+        "tier": "additive",
+        "detail": "ADD COLUMN nickname text NULL"
+      },
+      {
+        "kind": "entangle_column",
+        "object": "public.tb_user.spin_state",
+        "migration": "20260804120200",
+        "tier": "quantum",
+        "detail": "a tier this build of fraisier does not recognise"
+      }
+    ]
+  }
+}

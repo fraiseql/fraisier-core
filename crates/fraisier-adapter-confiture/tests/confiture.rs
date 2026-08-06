@@ -6,7 +6,10 @@
 //! a usable, empty database.
 
 use fraisier_adapter_confiture::ConfitureMigration;
-use fraisier_core::adapter_axes::{AdapterCtx, AdapterErrorKind, MigrationAdapter, Revision};
+use fraisier_core::adapter_axes::{
+    AdapterCtx, AdapterErrorKind, ChangeSetUnavailable, MigrationAdapter, Revision, RiskTier,
+    RISK_CONTRACT_VERSION,
+};
 use tokio::sync::Mutex;
 
 /// `set_var`/`var` are process-global; serialise the env-mutating tests. An
@@ -277,59 +280,93 @@ const REPORT_WITH_FAILURES: &str = r#"{
 #[cfg(unix)]
 const ETXTBSY: i32 = 26;
 
-/// The one and only fake `confiture` executable, written once per test process.
-///
-/// It is deliberately *shared* and never rewritten. Writing an executable and
-/// immediately exec'ing it from a multi-threaded process races with any sibling
-/// test's `fork`: the child inherits the still-open write fd, and the exec fails
-/// with `ETXTBSY` — which the adapter reports as a spawn failure, silently
-/// turning an assertion about exit-code handling into an assertion about
-/// nothing. Writing the script exactly once and passing per-test data in files
-/// the script *reads* removes that race rather than papering over it.
+/// The version the shared fake reports to `describe` unless a test asks for
+/// another one. Old enough that it does not classify, so the capability-gated
+/// tests have to opt in explicitly.
 #[cfg(unix)]
-fn fake_confiture_program() -> &'static std::path::Path {
-    static PROGRAM: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-    PROGRAM
-        .get_or_init(|| {
-            use std::os::unix::fs::PermissionsExt;
+const FAKE_DEFAULT_VERSION: &str = "0.39.0";
 
-            let dir =
-                std::env::temp_dir().join(format!("fraisier-fake-bin-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).expect("mkdir fake bin dir");
-            let script = dir.join("confiture");
-            // Copies ./payload.json to the path following `--output` and exits with
-            // ./exit_code — both read from the per-call working directory the
-            // adapter sets, which is how each test supplies its own scenario.
-            std::fs::write(
-                &script,
-                "#!/bin/sh\n\
-                 out=\"\"\n\
-                 while [ $# -gt 0 ]; do\n\
-                 \x20   [ \"$1\" = \"--output\" ] && out=\"$2\"\n\
-                 \x20   shift\n\
-                 done\n\
-                 [ -n \"$out\" ] && cat payload.json > \"$out\"\n\
-                 exit \"$(cat exit_code)\"\n",
-            )
-            .expect("write fake confiture");
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod fake confiture");
+/// A fake `confiture` executable reporting `version`, written **once per
+/// version** per test process.
+///
+/// Each script is deliberately written once and never rewritten. Writing an
+/// executable and immediately exec'ing it from a multi-threaded process races
+/// with any sibling test's `fork`: the child inherits the still-open write fd,
+/// and the exec fails with `ETXTBSY` — which the adapter reports as a spawn
+/// failure, silently turning an assertion about exit-code handling into an
+/// assertion about nothing. Per-test data travels in files the script *reads*,
+/// which removes that race rather than papering over it. The version is the one
+/// input `describe` cannot pass that way (it sets no working directory), so it
+/// keys the script instead of riding in it.
+#[cfg(unix)]
+fn fake_confiture_program_reporting(version: &str) -> std::path::PathBuf {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+    static PROGRAMS: std::sync::Mutex<BTreeMap<String, std::path::PathBuf>> =
+        std::sync::Mutex::new(BTreeMap::new());
 
-            // Burn the ETXTBSY window left by any sibling fork that inherited the
-            // write fd. Those fds are O_CLOEXEC, so they clear as soon as the child
-            // execs; this converges immediately in practice.
-            for _ in 0..200 {
-                match std::process::Command::new(&script).output() {
-                    Ok(_) => return script,
-                    Err(err) if err.raw_os_error() == Some(ETXTBSY) => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(err) => panic!("fake confiture is not executable: {err}"),
-                }
+    let mut programs = PROGRAMS.lock().expect("fake program registry");
+    if let Some(script) = programs.get(version) {
+        return script.clone();
+    }
+
+    let slug: String = version
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    let dir = std::env::temp_dir().join(format!("fraisier-fake-bin-{}-{slug}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir fake bin dir");
+    std::fs::write(dir.join("version"), version).expect("write fake version");
+    let script = dir.join("confiture");
+    // Answers `--version` from the file beside it, and otherwise copies
+    // ./payload.json to the path following `--output` and exits with
+    // ./exit_code — both read from the per-call working directory the adapter
+    // sets, which is how each test supplies its own scenario.
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+         for arg in \"$@\"; do\n\
+         \x20   if [ \"$arg\" = \"--version\" ]; then\n\
+         \x20       echo \"confiture version $(cat \"$(dirname \"$0\")/version\")\"\n\
+         \x20       exit 0\n\
+         \x20   fi\n\
+         done\n\
+         out=\"\"\n\
+         while [ $# -gt 0 ]; do\n\
+         \x20   [ \"$1\" = \"--output\" ] && out=\"$2\"\n\
+         \x20   shift\n\
+         done\n\
+         [ -n \"$out\" ] && cat payload.json > \"$out\"\n\
+         exit \"$(cat exit_code)\"\n",
+    )
+    .expect("write fake confiture");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake confiture");
+
+    // Burn the ETXTBSY window left by any sibling fork that inherited the write
+    // fd. Those fds are O_CLOEXEC, so they clear as soon as the child execs;
+    // this converges immediately in practice.
+    for _ in 0..200 {
+        match std::process::Command::new(&script)
+            .arg("--version")
+            .output()
+        {
+            Ok(_) => {
+                programs.insert(version.to_owned(), script.clone());
+                // The registry lock is held across the write *and* the burn-in
+                // on purpose: it is what stops two threads racing to create the
+                // same script, which is the race this whole helper exists to
+                // avoid.
+                drop(programs);
+                return script;
             }
-            panic!("fake confiture stayed ETXTBSY");
-        })
-        .as_path()
+            Err(err) if err.raw_os_error() == Some(ETXTBSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => panic!("fake confiture is not executable: {err}"),
+        }
+    }
+    panic!("fake confiture stayed ETXTBSY");
 }
 
 /// A scenario for the shared fake: a working directory holding the payload it
@@ -350,11 +387,23 @@ impl FakeConfiture {
         Self { dir }
     }
 
+    /// The scenario with no report to write at all — a confiture that exits
+    /// without producing its `--output` file.
+    fn without_payload(self) -> Self {
+        std::fs::remove_file(self.dir.join("payload.json")).expect("drop the payload");
+        self
+    }
+
     /// An adapter pointed at the shared fake. The scenario travels in the
     /// context's workdir, not in the program, which is why the program can be
     /// written once and shared.
     fn adapter() -> ConfitureMigration {
-        ConfitureMigration::with_program(fake_confiture_program())
+        Self::adapter_reporting(FAKE_DEFAULT_VERSION)
+    }
+
+    /// An adapter whose fake reports `version` to `describe`.
+    fn adapter_reporting(version: &str) -> ConfitureMigration {
+        ConfitureMigration::with_program(fake_confiture_program_reporting(version))
     }
 
     /// A context whose DSN is resolved in-process, so these tests mutate no
@@ -485,6 +534,119 @@ async fn uninitialised_database_is_a_precondition_not_an_invalid_config_error() 
         "PRECON_1001 is an unmet precondition, its own kind — not Execution, not InvalidConfig"
     );
     assert_ne!(err.code, -32602);
+}
+
+// ---------------------------------------------------------------------------
+// The migration risk contract, end to end
+//
+// The producer half lives in confiture (fraiseql/confiture#197); until it ships,
+// the golden fixtures stand in for it — the same bytes both repositories test
+// against. These drive the *whole* adapter path: spawn, `--output` file, report
+// parse, and the typed change-set the policy gate will read.
+// ---------------------------------------------------------------------------
+
+/// The pact fixture with three tiers in one set.
+#[cfg(unix)]
+const FIXTURE_V1_MIXED: &str = include_str!("fixtures/preflight/v1-mixed.json");
+
+/// The pre-contract payload: a confiture that emits no change-set at all.
+#[cfg(unix)]
+const FIXTURE_V0: &str = include_str!("fixtures/preflight/v0-no-change-set.json");
+
+#[cfg(unix)]
+#[tokio::test]
+async fn preflight_surfaces_the_change_set_end_to_end() {
+    let fake = FakeConfiture::new("preflight-change-set", FIXTURE_V1_MIXED, 0);
+    let report = FakeConfiture::adapter()
+        .preflight(&fake.ctx())
+        .await
+        .expect("a classified preflight report");
+
+    // The fields that predate this contract are untouched.
+    assert!(report.ok);
+    assert_eq!(report.window_safe, Some(true));
+    assert_eq!(report.issues.len(), 1);
+
+    let set = report
+        .usable_change_set()
+        .expect("the change-set crosses the adapter seam");
+    assert_eq!(set.contract_version, RISK_CONTRACT_VERSION);
+    assert_eq!(set.changes.len(), 3);
+    // Migration order, and every tier typed rather than inferred from a code.
+    assert_eq!(set.changes[1].object, "public.tb_order.idx_placed_at");
+    assert_eq!(set.changes[1].tier, Some(RiskTier::LockRisky));
+    assert_eq!(set.changes[1].migration.as_deref(), Some("20260804120050"));
+    assert_eq!(set.worst_tier(), Some(RiskTier::Irreversible));
+    assert_eq!(set.unclassified().count(), 0);
+}
+
+/// The back-compat guarantee, driven through the real surface: a confiture that
+/// predates the contract still produces a perfectly good report, and lands in
+/// *did not classify* rather than *nothing to change*.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pre_contract_confiture_still_preflights_but_never_classifies() {
+    let fake = FakeConfiture::new("preflight-v0", FIXTURE_V0, 0);
+    let report = FakeConfiture::adapter()
+        .preflight(&fake.ctx())
+        .await
+        .expect("an old confiture still lints");
+
+    assert!(report.ok);
+    assert_eq!(report.window_safe, Some(true));
+    assert_eq!(
+        report.usable_change_set(),
+        Err(ChangeSetUnavailable::NotEmitted),
+        "no change-set is unclassified, which is never a clean bill of health"
+    );
+}
+
+/// A confiture that exits cleanly but writes no report is an **error**, not an
+/// empty green result — the same law as `verify`. Reading "no JSON" as "no
+/// findings" would pass the gate on a preflight that never ran.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_confiture_that_writes_no_output_file_still_errors() {
+    let fake = FakeConfiture::new("preflight-no-output", FIXTURE_V1_MIXED, 0).without_payload();
+    let err = FakeConfiture::adapter()
+        .preflight(&fake.ctx())
+        .await
+        .expect_err("a missing report is not a passing report");
+
+    assert_eq!(err.operation.as_deref(), Some("preflight"));
+}
+
+/// The capability gate, through `describe` itself rather than the pure function
+/// under it: what reaches the version comparison must be the *parsed* version,
+/// not the raw `confiture version 0.40.0` line — which would fail to parse and
+/// silently withhold the capability for ever. That is asserted directly on
+/// `desc.version`, because while no released confiture classifies the capability
+/// is withheld for *every* version and could no longer distinguish the two.
+///
+/// No confiture a user can install emits a change-set (fraiseql/confiture#197 is
+/// open; 0.40.0–0.42.0 shipped without it), so `describe` must never advertise
+/// `risk_tier` — the end-to-end statement of the `RISK_TIER_MIN_CONFITURE`
+/// = `None` rule. When #197 releases and the floor is pinned, the `classifies`
+/// column returns here with the real version in it.
+#[cfg(unix)]
+#[tokio::test]
+async fn describe_advertises_risk_tier_only_when_the_binary_can_emit_it() {
+    for version in ["0.39.0", "0.40.0", "0.42.0", "1.2.3"] {
+        let desc = FakeConfiture::adapter_reporting(version)
+            .describe()
+            .await
+            .expect("the fake answers --version");
+
+        assert_eq!(desc.version, version, "the reported version is parsed out");
+        assert!(
+            !desc.capabilities.iter().any(|cap| cap == "risk_tier"),
+            "confiture {version} cannot emit a change-set: {:?}",
+            desc.capabilities
+        );
+        // The rest of the handshake never depends on the version.
+        assert!(desc.capabilities.iter().any(|cap| cap == "preflight"));
+        assert!(desc.capabilities.iter().any(|cap| cap == "window_safe"));
+    }
 }
 
 /// ...but a *genuine* configuration problem — no usable DSN (`CONFIG_010`) —

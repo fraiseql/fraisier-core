@@ -6,6 +6,285 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-beta.7] - 2026-08-06
+
+### Added
+
+- **A risk-keyed policy engine, and the `[policy]` section that drives it.**
+  `fraisier_core::policy::evaluate` is one pure decision function over one
+  preflight report: it auto-applies the tiers a policy trusts, sends the rest to
+  an approval hook, and **denies anything it cannot classify**. The `[policy]`
+  section configures it:
+
+  ```toml
+  [policy]
+  auto_apply = ["additive", "reversible"]
+  require_approval = ["lock_risky", "destructive", "irreversible"]
+  unclassified = "deny"              # or "require_approval"
+  approval_command = "scripts/deploy/approve.sh"
+  approval_timeout_secs = 300
+  ```
+
+  The section is flat because fraisier's config is already one file per
+  environment, so per-environment thresholds are satisfied by construction. Its
+  *presence* is the opt-in: with no `[policy]` section the tier gate does not run
+  at all and every existing deploy behaves byte-for-byte as before. Nothing calls
+  the engine yet — wiring it into the deploy flow, running the approval hook, and
+  auditing the decision ship separately — so this release adds the decision and
+  its configuration, not a behaviour change.
+
+  Deny-by-default is the law, and it is spelled out in the types rather than left
+  to a validation rule: a tier listed in **neither** list is denied (a tier added
+  to the taxonomy later cannot silently auto-apply on a config written today), a
+  policy that requires approval with no `approval_command` configured **denies**
+  rather than passing silently, a change-set written to a newer contract version
+  is never approvable, and `unclassified` accepts only `deny` or
+  `require_approval` — auto-applying what nobody classified is not expressible.
+  A refusal names which rule fired and which objects are responsible.
+
+  `[policy]` validation reports a mistyped tier name (`"destructve"`) as a
+  located error rather than letting it become an unlisted-and-therefore-denied
+  tier, refuses a tier claimed by both lists instead of picking a winner, and
+  warns when the approval hook and the tiers that need it disagree in either
+  direction.
+
+- **The blue-green window-safety rule now lives in `policy` as the always-on
+  baseline.** `policy::evaluate` applies it *before* the tier policy and with or
+  without a `[policy]` section: the tier policy is opt-in, the window-safety
+  baseline is not, so folding the two gates into one decision function does not
+  quietly delete today's blue-green block for anyone. `window_safe` stays on the
+  wire as an *input* to the decision — it carries "confiture could not read this
+  migration", which no risk tier expresses. The `window_safety` module it
+  replaces is removed (see **Removed**).
+
+- **The Confiture adapter reads the schema change-set, and advertises
+  `risk_tier` only when the installed binary can produce one.** `preflight` now
+  parses the `change_set` object out of `confiture migrate preflight --format
+  json` into the typed `ChangeSet` the policy gate will read, and `describe`
+  appends the **`risk_tier`** capability only when the detected confiture
+  version is at or above the release that implements the contract. **No
+  released confiture implements it yet** ([confiture#197][c197] is open, and
+  0.40.0–0.42.0 shipped unrelated features), so the floor is `None` and the
+  capability is currently never advertised — the consumer half ships complete
+  and dormant, exactly as `window_safe` shipped ahead of confiture#154.
+  Claiming the capability
+  against a confiture that cannot classify would make the gate expect a
+  change-set and deny every deploy: safe, and useless. Withholding it is the
+  honest *"I do not classify"*, so a deploy with no risk policy configured
+  behaves exactly as it does today, and a version string this adapter cannot
+  parse degrades to *no capability*, never to *capability*.
+
+  Every way of failing resolves to **unclassified**, which is never *safe*:
+  a missing `change_set` key, an envelope that is not an object, a missing or
+  non-integer `contract_version`, a `changes` key that is not a list, and an
+  error envelope from a crashed confiture all yield no change-set at all. A
+  `contract_version` from the future is *preserved* rather than swallowed, so
+  `usable_change_set()` can name both versions in the refusal, and
+  `ChangeSet::with_contract_version` (new, additive) is what lets an adapter
+  reconstruct a wire payload without restamping it with this build's version.
+
+  One asymmetry is deliberate: a broken **envelope** voids the whole
+  change-set, while a broken **entry** becomes an unclassified placeholder that
+  holds its position in the plan. Dropping the entry would shrink the set
+  silently, and a shorter list of fully-classified changes reads as a *cleaner*
+  plan than the truth. Warnings name the JSON *shape* that arrived and never
+  quote its content: a payload that is off the contract has also left the
+  contract's promise that `detail` carries no credential.
+
+  The eight golden fixtures at
+  `crates/fraisier-adapter-confiture/tests/fixtures/preflight/` are now a
+  committed pact test — confiture asserts it emits those bytes, this adapter
+  asserts it parses them — and a further test pins that this hand-rolled parser
+  and `fraisier-core`'s `serde` path classify the same bytes identically.
+
+- **The `command` migration adapter exposes the release context to its
+  commands.** Every migration command now receives `FRAISIER_RELEASE_DIR` (the
+  command's working directory — the staged release), and, when configured,
+  `FRAISIER_ACTIVE_PATH` (the `active_path` symlink target) and
+  `FRAISIER_APP_VERSION` (the version being deployed). A prepare script can
+  reference the deploy's paths portably instead of coupling to a fixed
+  `--app-version`. The two optional vars are omitted when their `[artifact]`
+  settings are absent, so a script can tell "not configured" from an empty value.
+
+- **`deploy --dry-run` shows the schema change-set and the policy verdict** —
+  terraform-plan for schema change, in both human and JSON form. The plan lists
+  every classified change (`tier`, `kind`, `object`, `migration`) **worst-first**
+  — unclassified, then most severe down to least, stable within a tier so equal
+  changes keep the order they will apply in — and states what the gate *would*
+  decide, computed with the same `policy::evaluate` the live gate calls. A
+  dry-run **never calls the approval hook**: it reports that sign-off would be
+  needed rather than going to ask for it, which is structural — only
+  `PolicyGate::admit` runs a hook. Blue-green's plan, previously four JSON
+  fields and one line of prose, reaches the same parity and adds the
+  window-safety verdict its baseline already reads.
+
+  **Unknown is never rendered as zero.** *"The adapter looked and there is
+  nothing to change"* is `change_set: { "changes": [], … }`; *"nobody looked, or
+  nobody could classify"* is `change_set: null` with a
+  `change_set_unavailable: { code, detail }` beside it — a stable machine code
+  (`preflight_skipped`, `preflight_off`, `adapter_unavailable`,
+  `no_preflight_capability`, `preflight_failed`, `no_risk_tier_capability`,
+  `no_change_set`, `unreadable_change_set`), so a pipeline tells the two apart
+  without parsing prose. The human render ends every such line with *"Risk is
+  unknown, not zero."* Existing dry-run JSON keys keep their names and types;
+  the additions are strictly additive.
+
+  Every way of failing to see the schema **degrades rather than aborting**: an
+  unreachable database, an unset DSN, an adapter with no `preflight`, a
+  change-set from a contract this build cannot read. The plan still prints and
+  still exits 0, because a plan *was* produced. Degradation reasons are stripped
+  of URL credentials before they are printed or logged.
+
+  **`--fail-on-block`** (new, on `deploy`) turns a would-be block into a nonzero
+  exit for CI — both a refusal and a decision waiting on a human, because
+  neither deploys unattended. Without a `[policy]` section there is no verdict,
+  so it has nothing to gate on and never fires.
+
+- **The policy gate runs, and an approval hook can unblock it.** `[policy]` now
+  stops a deploy: the gate applies at the `preflight` step of all three
+  strategies, ahead of the forward-compat lint, so a refused deploy stages
+  nothing, migrates nothing and restarts nothing. A refusal names the objects
+  responsible and opens with `policy refused:`.
+
+  `approval_command` is the one way to unblock a change that needs sign-off —
+  there is deliberately no `--force` or `--approve` flag, so "an agent with
+  authority" means configuring a hook that can authenticate that agent. The hook
+  runs via `sh -c` with the request as **JSON on stdin** (never argv) and the
+  deploy's identity in `FRAISIER_APPROVAL_FRAISE` / `_ENVIRONMENT` /
+  `_WORST_TIER` / `_CHANGE_COUNT`. Exit 0 approves, and the first non-empty line
+  of stdout is recorded as the approver. **Every other outcome refuses** — a
+  non-zero exit, a command that cannot be executed, a spawn failure, or a hook
+  still running at `approval_timeout_secs` (now read; default 300s). The hook
+  receives the identity and the triggering changes and no `AdapterCtx`, so no
+  DSN or secret can reach it by construction.
+
+  Which deploys are gated: single-host, multi-host and blue-green, opt-in by the
+  section's presence (D6). `fraisier rollback` is **not** gated — it migrates
+  `down`, while the preflight report describes the pending *forward* changes, so
+  gating it would rule on a change-set the run will not apply and would put an
+  approver between an operator and an emergency rollback.
+
+  Every decision is audited: a `schema policy` tracing event with the deploy's
+  identity (and the approver, on an approval), and a blocked deploy fires
+  `[schedule].notify` with the event **`policy-blocked`** rather than
+  `scheduled-deploy-failed`, so an unattended deploy held for sign-off is
+  distinguishable from one that broke.
+
+  `validate-config` now warns when `[policy]` is configured together with
+  `[migration].preflight_mode = "off"`: nothing then inspects the pending schema
+  changes, so every deploy is refused at the gate — correct, and baffling to
+  debug from the refusal alone.
+
+  Operator guide: [`docs/schema-risk-policy.md`](docs/schema-risk-policy.md).
+
+- **One `describe` + `preflight` per deploy.** The lint, the blue-green window
+  rule and the tier policy read one report instead of asking the adapter each —
+  previously up to two confiture subprocesses and two database round-trips per
+  deploy for answers that cannot differ within a run.
+
+### Changed
+
+- **BREAKING (adapter authors): `PreflightReport` is now `#[non_exhaustive]`,
+  and carries a `change_set`.** The migration adapter contract can now carry a
+  per-change **risk tier** across the seam as typed data, instead of inferring it
+  from `issues[].code` strings. `PreflightReport` gains
+  `change_set: Option<ChangeSet>`, and the new
+  `RiskTier` / `SchemaChange` / `ChangeSet` / `RISK_CONTRACT_VERSION` vocabulary
+  lands in `fraisier_core::adapter_axes`. Nothing reads the change-set yet — the
+  policy gate that consumes it ships separately — so this release is a contract
+  change with no behaviour change. `window_safe` is untouched and stays. The wire
+  contract is specified in `docs/proposals/migration-risk-contract.md`, with
+  golden fixtures at
+  `crates/fraisier-adapter-confiture/tests/fixtures/preflight/`.
+
+  The `#[non_exhaustive]` marker is the one deliberate break, taken now, pre-GA,
+  so that every future field on this struct is additive. It forbids **all**
+  struct-expression construction from outside `fraisier-core` — including
+  `..Default::default()`, which is rejected just as a full literal is (E0639).
+  Downstream adapters (e.g. the reference `fraisier-adapter-sqlx`) move to the
+  builder:
+
+  ```rust
+  // before
+  PreflightReport { ok, issues, window_safe: Some(true) }
+
+  // after
+  PreflightReport::new(ok).with_issues(issues).with_window_safe(true)
+  ```
+
+  Reading a report is unchanged; only construction moves. `SchemaChange` and
+  `ChangeSet` are `#[non_exhaustive]` for the same reason and ship with the same
+  shape of builder (`SchemaChange::new(kind, object).with_tier(…)`,
+  `ChangeSet::new(changes)`).
+
+  An adapter that classifies advertises the **`risk_tier`** capability, and only
+  when the installed producer can actually emit a change-set. Consumers read the
+  set through `PreflightReport::usable_change_set()`, which centralises the
+  contract-version check: a change-set stamped with a version newer than this
+  build understands is reported as unavailable — naming both versions — rather
+  than best-effort parsed. Every way of being missing (no capability, no
+  change-set, a version from the future, an entry with no recognised tier)
+  resolves to *unclassified*, and unclassified is never *safe*.
+
+- **BREAKING (CI pipelines): `deploy --dry-run` now reads the database.** A
+  change-set can only come from `MigrationAdapter::preflight`, which for
+  confiture means running `confiture migrate preflight` against the target
+  database — so a dry-run needs a DSN where it previously needed nothing, spawned
+  no process, and touched no database. **A CI job that runs `deploy --dry-run`
+  as a cheap offline config check now needs either database credentials or
+  `--skip-preflight`.**
+
+  ```sh
+  # before — offline, no credentials
+  fraisier deploy --dry-run
+
+  # after, unchanged output and still offline
+  fraisier deploy --dry-run --skip-preflight
+  ```
+
+  `--dry-run --skip-preflight` restores the previous plan **byte-for-byte** (the
+  machine form still records `change_set_unavailable.code =
+  "preflight_skipped"`, so an agent cannot mistake the silence for *"no
+  changes"*). Without the flag the dry-run degrades rather than failing: an
+  unreachable database or an unset DSN yields the plan plus an explicit
+  unavailability line, at exit 0. Blue-green's dry-run does **not** honour
+  `--skip-preflight`, because its live preflight does not either — the
+  window-safety rule is not something a flag can switch off.
+
+### Removed
+
+- **BREAKING (embedders): the `fraisier_core::window_safety` module is gone**,
+  together with its `WindowSafety` type, `evaluate` and `check`. Its rule — the
+  one that refuses a blue-green swap when confiture cannot certify the migration
+  forward-compatible for a two-version window — is **not** gone: it is the
+  always-on `Baseline::WindowSafety` half of `policy::evaluate`, applied with or
+  without a `[policy]` section, and a blue-green deploy that is refused today is
+  refused after this change for the same cause. Only the reason string is new
+  (it now opens with `policy::REFUSED`).
+
+  The break is taken now, pre-GA, so there is one gate rather than two places a
+  future rule could be forgotten. An embedder calling the module directly moves
+  to the one decision function:
+
+  ```rust
+  // before
+  if let WindowSafety::Refused(reason) = window_safety::check(&*migration, &ctx).await {
+      return Err(refuse(reason));
+  }
+
+  // after — one `describe` + `preflight` for the window rule *and* the policy
+  let inspection = policy::inspect(&*migration, &ctx).await?;
+  gate.admit(Baseline::WindowSafety, inspection.capabilities, inspection.report.as_ref(), &ctx)
+      .await
+      .map_err(refuse)?;
+  ```
+
+  `BlueGreenParams` gains a `policy: PolicyGate` field for the same reason;
+  `PolicyGate::default()` is the "no `[policy]` section" value and keeps the
+  window rule on.
+
+## [1.0.0-beta.6] - 2026-07-23
+
 ### Changed
 
 - **Migrations now run from the staged release directory.** On a single-host
@@ -22,17 +301,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   host — keeps the previous base working directory. Preflight (which runs before
   `fetch`) is unaffected. Multi-host deploys are unchanged: they migrate once on
   the orchestrator, where the per-host release is not present.
-
-### Added
-
-- **The `command` migration adapter exposes the release context to its
-  commands.** Every migration command now receives `FRAISIER_RELEASE_DIR` (the
-  command's working directory — the staged release), and, when configured,
-  `FRAISIER_ACTIVE_PATH` (the `active_path` symlink target) and
-  `FRAISIER_APP_VERSION` (the version being deployed). A prepare script can
-  reference the deploy's paths portably instead of coupling to a fixed
-  `--app-version`. The two optional vars are omitted when their `[artifact]`
-  settings are absent, so a script can tell "not configured" from an empty value.
 
 ## [1.0.0-beta.5] - 2026-07-21
 
@@ -274,5 +542,8 @@ migration-safe rollback across one host or a fleet.
   `cargo xtask dist` cross-builds the static musl binary via `cargo-zigbuild`.
 - **GitHub Actions CI** that runs `cargo xtask ci`.
 
-[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/v1.0.0-beta.1...HEAD
+[c197]: https://github.com/fraiseql/confiture/issues/197
+[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.7...HEAD
+[1.0.0-beta.7]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.6...fraisier-v1.0.0-beta.7
+[1.0.0-beta.6]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.5...fraisier-v1.0.0-beta.6
 [1.0.0-beta.1]: https://github.com/fraiseql/fraisier-core/releases/tag/v1.0.0-beta.1

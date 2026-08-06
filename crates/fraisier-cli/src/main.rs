@@ -12,12 +12,16 @@
 // a public API that a binary crate does not actually expose.
 #![allow(clippy::redundant_pub_crate)]
 
+mod approval;
 mod commands;
 mod doctor;
 #[cfg(test)]
 mod e2e;
 mod factory;
 mod pg_rehearsal;
+mod preview;
+#[cfg(test)]
+mod test_env;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -338,6 +342,13 @@ struct DeployArgs {
     /// blocks a deploy you know is safe). Overrides `[migration].preflight_mode`.
     #[arg(long)]
     skip_preflight: bool,
+
+    /// With `--dry-run`, exit nonzero when the schema policy would block the
+    /// deploy — either refusing it or holding it for approval. Without it a
+    /// dry-run always exits 0, because a plan was produced. Has no effect on a
+    /// real deploy, which a policy block fails outright.
+    #[arg(long)]
+    fail_on_block: bool,
 }
 
 #[derive(Debug, Args)]
@@ -709,6 +720,7 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
                 args.app_version.as_deref(),
                 args.dry_run,
                 args.skip_preflight,
+                args.fail_on_block,
             )
             .await
         }
@@ -901,6 +913,13 @@ mod cli_tests {
     fn ship_requires_a_level_or_no_bump() {
         assert!(Cli::try_parse_from(["fraisier", "ship"]).is_err());
         assert!(Cli::try_parse_from(["fraisier", "ship", "patch"]).is_ok());
+    }
+
+    #[test]
+    fn deploy_accepts_fail_on_block_beside_dry_run() {
+        assert!(
+            Cli::try_parse_from(["fraisier", "deploy", "--dry-run", "--fail-on-block"]).is_ok()
+        );
     }
 
     #[test]

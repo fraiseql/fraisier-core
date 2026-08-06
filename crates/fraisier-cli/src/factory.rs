@@ -24,12 +24,15 @@ use fraisier_core::adapter_axes::{
     AdapterCtx, ArtifactAdapter, HealthAdapter, HostId, LbAdapter, MigrationAdapter, ServiceAdapter,
 };
 use fraisier_core::multi_host::{MultiHostPlan, RolloutStrategy};
+use fraisier_core::policy::{ApprovalHook, PolicyGate};
 use fraisier_core::restore_rehearsal::{BackupSource, RehearsalDb};
 use fraisier_core::single_host::PreflightMode;
 use fraisier_ipc::{Launcher, SshLauncher};
 use serde_json::Value;
 
+use crate::approval::ExecApproval;
 use crate::pg_rehearsal::PgRehearsalDb;
+use crate::preview::SchemaPreview;
 
 /// The logical secret name every migration adapter resolves the DSN under.
 const DATABASE_URL_LOGICAL: &str = "DATABASE_URL";
@@ -60,6 +63,122 @@ pub struct PlanSummary {
     pub settings_keys: Vec<String>,
     /// The source env var the DSN is read from, if configured.
     pub database_url_env: Option<String>,
+    /// Always `true`: this payload exists only on the `--dry-run` path, and the
+    /// blue-green plan already carries the same marker.
+    pub dry_run: bool,
+    /// What would change in the schema, and what the policy would decide about
+    /// it. Empty until the dry-run inspects the migration adapter.
+    #[serde(flatten)]
+    pub schema: SchemaPreview,
+}
+
+/// Resolve the `[policy]` section into the gate a deploy runs at preflight.
+///
+/// An absent section is the D6 opt-out and yields the default gate: no tier
+/// policy at all, and whatever always-on baseline the strategy itself applies.
+/// An `approval_command` becomes the one [`ApprovalHook`] implementation; without
+/// one, anything the policy sends for sign-off is refused rather than passed.
+fn build_policy_gate(config: &DeployConfig) -> PolicyGate {
+    let Some(section) = config.policy.as_ref() else {
+        return PolicyGate::default();
+    };
+    let hook: Option<Arc<dyn ApprovalHook>> = section
+        .approval_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(|command| {
+            Arc::new(ExecApproval::new(
+                command,
+                Duration::from_secs(
+                    section
+                        .approval_timeout_secs
+                        .unwrap_or(fraisier_config::DEFAULT_APPROVAL_TIMEOUT_SECS),
+                ),
+            )) as Arc<dyn ApprovalHook>
+        });
+    PolicyGate::new(section.resolve()).with_hook(hook)
+}
+
+/// The gate a `--dry-run` renders, and the command that could unblock what it
+/// holds.
+///
+/// Resolved apart from the adapter because a preview whose migration adapter
+/// cannot even be built — an unset DSN env var is the common one — still owes
+/// the operator the verdict that failure implies. The gate itself carries no
+/// command string (nothing at deploy time needs one), so the render reads it off
+/// the config here.
+#[must_use]
+pub fn preview_gate(config: &DeployConfig) -> (PolicyGate, Option<String>) {
+    let approval_command = config
+        .policy
+        .as_ref()
+        .and_then(|section| section.approval_command.clone())
+        .map(|command| command.trim().to_owned())
+        .filter(|command| !command.is_empty());
+    (build_policy_gate(config), approval_command)
+}
+
+/// The migration adapter a `--dry-run` inspects, and the context it inspects
+/// under.
+pub struct PreviewTarget {
+    /// The migration adapter (in-process or IPC).
+    pub migration: Arc<dyn MigrationAdapter>,
+    /// The context the preview inspects under — the same one the deploy would
+    /// use, so the two cannot decide on different facts.
+    pub ctx: AdapterCtx,
+    /// Whether any preflight runs at all (`[migration].preflight_mode`). When
+    /// this is false the deploy inspects nothing, and neither does its preview.
+    pub forward_compatible_lint: bool,
+}
+
+/// Build just what a `--dry-run` needs to inspect the pending schema change.
+///
+/// The single site all three strategies' previews resolve through. The host is
+/// resolved when the config names one and left unset otherwise: a multi-host
+/// rollout migrates one database for the whole fleet, so it previews one
+/// change-set, not one per host.
+///
+/// # Errors
+/// Fails if `[deploy]`/`[migration]` is missing or incomplete, the adapter name
+/// is unsupported in this build, or (IPC path) the configured DSN env var is
+/// unset. Every one of those degrades the plan rather than failing the command —
+/// see `preview::gather`'s callers.
+pub fn build_preview(
+    config: &DeployConfig,
+    host_override: Option<&str>,
+    app_version: Option<&str>,
+) -> Result<PreviewTarget> {
+    let deploy = config.deploy.as_ref().context("missing [deploy] section")?;
+    let fraise = deploy.name.clone().context("[deploy].name is required")?;
+    let environment = deploy
+        .environment
+        .clone()
+        .context("[deploy].environment is required")?;
+
+    let database_url_env = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.database_url_env.clone());
+    let mut env_secrets = BTreeMap::new();
+    let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
+    add_token_provider_secrets(config, &mut env_secrets);
+
+    let mut ctx = AdapterCtx::new(fraise, environment);
+    ctx.host = resolve_host(config, host_override).ok();
+    ctx.workdir = PathBuf::from(".");
+    ctx.migrations_path = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.migrations_path.clone());
+    ctx.env_secrets = env_secrets;
+    ctx.settings = settings_map(config, app_version);
+
+    Ok(PreviewTarget {
+        migration,
+        ctx,
+        forward_compatible_lint: resolve_preflight(config).0,
+    })
 }
 
 /// The fully-built adapters and context, ready to hand to a `SingleHostDeploy`.
@@ -75,6 +194,8 @@ pub struct ResolvedDeploy {
     /// Whether to run the migration adapter's forward-compatibility `preflight`
     /// lint (`[migration].forward_compatible_lint`, default `true`).
     pub forward_compatible_lint: bool,
+    /// The schema policy gate resolved from `[policy]` (default: no tier gate).
+    pub policy: PolicyGate,
     /// When set, the restore-rehearsal preflight provisions a throwaway DB (via
     /// the given [`RehearsalDb`]) seeded from [`BackupSource`] and rehearses the
     /// pending migrations there. Populated when `preflight_mode = "restore_rehearsal"`.
@@ -372,6 +493,8 @@ pub fn summarize(
             .migration
             .as_ref()
             .and_then(|m| m.database_url_env.clone()),
+        dry_run: true,
+        schema: SchemaPreview::default(),
     })
 }
 
@@ -430,6 +553,7 @@ pub fn build(
         host,
         ctx,
         forward_compatible_lint,
+        policy: build_policy_gate(config),
         restore_rehearsal,
         artifact,
         migration,
@@ -450,6 +574,8 @@ pub struct ResolvedMultiHost {
     pub ctx: AdapterCtx,
     /// Whether to run the forward-compatibility preflight lint.
     pub forward_compatible_lint: bool,
+    /// The schema policy gate resolved from `[policy]` (default: no tier gate).
+    pub policy: PolicyGate,
     /// The artifact adapter.
     pub artifact: Arc<dyn ArtifactAdapter>,
     /// The migration adapter (run once on the orchestrator).
@@ -529,6 +655,7 @@ pub fn build_multi_host(
         plan,
         ctx,
         forward_compatible_lint,
+        policy: build_policy_gate(config),
         artifact,
         migration,
         service,
@@ -561,6 +688,12 @@ pub struct MultiHostSummary {
     pub health: String,
     /// The selected load-balancer adapter.
     pub lb: String,
+    /// Always `true`: this payload exists only on the `--dry-run` path.
+    pub dry_run: bool,
+    /// What would change in the schema, and what the policy would decide about
+    /// it — the same shape the single-host plan carries.
+    #[serde(flatten)]
+    pub schema: SchemaPreview,
 }
 
 /// Build the read-only multi-host plan summary (no secrets, no adapters built).
@@ -615,6 +748,8 @@ pub fn summarize_multi_host(
         service: axis_name(config.service.as_ref().and_then(|s| s.adapter.as_deref())),
         health: axis_name(config.health.as_ref().and_then(|h| h.adapter.as_deref())),
         lb: axis_name(config.lb.as_ref().and_then(|l| l.adapter.as_deref())),
+        dry_run: true,
+        schema: SchemaPreview::default(),
     })
 }
 
@@ -1141,8 +1276,8 @@ pub struct ResolvedBlueGreen {
 
 /// Build a **blue-green** deploy from a `[deploy].strategy = "blue-green"` config:
 /// the green fleet over the artifact/service/health adapters, the built-in nginx
-/// [`TrafficDirector`], the window-safety gate's migration adapter, and (when a
-/// DSN is configured) the connection-budget probe.
+/// [`TrafficDirector`], the policy gate's migration adapter, and (when a DSN is
+/// configured) the connection-budget probe.
 ///
 /// # Errors
 /// Fails if a required section/field is missing or an adapter name is unsupported.
@@ -1242,6 +1377,7 @@ pub fn build_blue_green(
         hold: Duration::from_secs(bg.hold_secs.unwrap_or(DEFAULT_HOLD_SECS)),
         green_pool: bg.green_pool.unwrap_or(0),
         budget_margin: bg.connection_margin.unwrap_or(DEFAULT_BUDGET_MARGIN),
+        policy: build_policy_gate(config),
     };
 
     Ok(ResolvedBlueGreen {
@@ -1254,10 +1390,59 @@ pub fn build_blue_green(
 #[cfg(test)]
 mod tests {
     use super::{
-        build, build_health, build_health_probe, build_multi_host, summarize, summarize_multi_host,
+        build, build_health, build_health_probe, build_multi_host, build_policy_gate, summarize,
+        summarize_multi_host,
     };
     use fraisier_config::DeployConfig;
+    use fraisier_core::adapter_axes::RiskTier;
+    use fraisier_core::policy::{PolicyAction, UnclassifiedAction};
     use fraisier_core::restore_rehearsal::BackupSource;
+
+    #[test]
+    fn an_absent_policy_section_builds_no_gate() {
+        // The D6 opt-out, at the wiring layer: nothing to configure means
+        // nothing to decide, and no approval hook to spawn.
+        let config = DeployConfig::from_toml_str(&single_host_with_migration("")).expect("parses");
+        let gate = build_policy_gate(&config);
+        assert!(gate.policy().is_none());
+        assert!(!gate.has_hook());
+    }
+
+    #[test]
+    fn the_factory_builds_a_policy_and_its_hook_from_config() {
+        let toml = format!(
+            "{}\n[policy]\nauto_apply = [\"additive\"]\n\
+             require_approval = [\"irreversible\"]\n\
+             unclassified = \"require_approval\"\n\
+             approval_command = \"scripts/deploy/approve.sh\"\n",
+            single_host_with_migration("")
+        );
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+        let gate = build_policy_gate(&config);
+        let policy = gate.policy().expect("a configured section builds a policy");
+        assert_eq!(policy.actions[&RiskTier::Additive], PolicyAction::AutoApply);
+        assert_eq!(
+            policy.actions[&RiskTier::Irreversible],
+            PolicyAction::RequireApproval
+        );
+        // A tier in neither list is denied, not defaulted back in.
+        assert!(!policy.actions.contains_key(&RiskTier::Destructive));
+        assert_eq!(policy.unclassified, UnclassifiedAction::RequireApproval);
+        assert!(gate.has_hook());
+    }
+
+    #[test]
+    fn a_blank_approval_command_wires_no_hook() {
+        // Whitespace is not a hook. The policy still claims one would be needed,
+        // so the gate refuses rather than running `sh -c ""` and reading its
+        // exit 0 as a sign-off.
+        let toml = format!(
+            "{}\n[policy]\napproval_command = \"   \"\n",
+            single_host_with_migration("")
+        );
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+        assert!(!build_policy_gate(&config).has_hook());
+    }
 
     /// A single-host confiture config with the given extra `[migration]` lines.
     fn single_host_with_migration(extra_migration: &str) -> String {

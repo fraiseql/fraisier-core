@@ -201,8 +201,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so that every future field on this struct is additive. It forbids **all**
   struct-expression construction from outside `fraisier-core` — including
   `..Default::default()`, which is rejected just as a full literal is (E0639).
-  Downstream adapters (e.g. the reference `fraisier-adapter-sqlx`) move to the
-  builder:
+  An **in-process** adapter — one that links `fraisier-core` and returns this
+  struct directly, as the bundled `confiture` and `command` adapters do — moves
+  to the builder:
 
   ```rust
   // before
@@ -216,6 +217,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ChangeSet` are `#[non_exhaustive]` for the same reason and ship with the same
   shape of builder (`SchemaChange::new(kind, object).with_tier(…)`,
   `ChangeSet::new(changes)`).
+
+  **Out-of-process IPC adapters are unaffected**, whatever language they are
+  written in: they serialise their own JSON per `PROTOCOL.md` and never name
+  this type. The reference `fraisier-adapter-sqlx` is one of these — it declares
+  no fraisier dependency at all, and the only fraisier code in its tree is a
+  dev-dependency used by the integration test, which reads a report rather than
+  building one. It needs no change.
 
   An adapter that classifies advertises the **`risk_tier`** capability, and only
   when the installed producer can actually emit a change-set. Consumers read the

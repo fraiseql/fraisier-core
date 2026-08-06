@@ -6,6 +6,33 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The IPC spawn no longer fails a call on a transient `ETXTBSY`.** Linux
+  refuses to `exec` a file any process still holds open for writing, so
+  spawning an adapter can lose a race against a writer that is about to close.
+  `fraisier-ipc` had no retry, alone among fraisier's spawn paths —
+  `fraisier-adapter-support` has retried its shell-out spawns for as long as it
+  has existed — so the IPC client turned that race into a failed call. It now
+  retries the same way: five extra attempts, 20 ms apart.
+
+  Retrying is safe because `ETXTBSY` is the one spawn failure that is *always*
+  transient — the writer will close. It cannot mask a real misconfiguration: a
+  missing binary reports `NotFound` and a non-executable one `PermissionDenied`,
+  and neither is retried. A binary that is genuinely held busy still fails, with
+  the same error as before, after at most ~100 ms.
+
+  **Where this was observed:** in fraisier's own test suite, where parallel
+  async tests each write a fake adapter and spawn it while sibling threads fork.
+  It is not a production bug report. The production window is much narrower and
+  needs an *external* writer — nothing fraisier does reaches it: every binary
+  the IPC client spawns (`fraisier-adapter-<name>` on `PATH`,
+  `[artifact].adapter_bin`, `ssh`) is installed out of band, and
+  `fraisier self-upgrade` never `exec`s the binary it swaps — by design, it
+  hands the restart to the supervisor. What remains reachable is a
+  config-management or package run rewriting an adapter binary at the moment a
+  deploy spawns it, which this now rides out.
+
 ## [1.0.0-beta.7] - 2026-08-06
 
 ### Added

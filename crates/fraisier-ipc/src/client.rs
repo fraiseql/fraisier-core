@@ -25,6 +25,41 @@ const REQUEST_ID: u64 = 1;
 /// so a hung subprocess can never wedge a deploy.
 const DEFAULT_TIMEOUT: Duration = Duration::from_mins(1);
 
+/// How many extra times to retry a spawn that fails with `ETXTBSY`.
+///
+/// Deliberately the same budget as `fraisier-adapter-support`'s shell-out spawn:
+/// same race, same shape of answer. The two are not shared code — that crate
+/// retries a run-to-completion `output()`, this one a streaming `spawn()`, and
+/// `fraisier-ipc` keeps its dependency list to the protocol essentials.
+const ETXTBSY_RETRIES: u32 = 5;
+
+/// How long to wait between `ETXTBSY` spawn retries.
+const ETXTBSY_BACKOFF: Duration = Duration::from_millis(20);
+
+/// Spawn `command`, retrying a few times on `ETXTBSY` ("text file busy").
+///
+/// Linux refuses to `exec` a file any process still holds open for writing, so a
+/// spawn can lose a race against a writer that is about to close: a concurrent
+/// install of the adapter binary, or — the common case in this repo's own test
+/// suite — a sibling thread that forked while a writer fd to a just-written
+/// executable was still open. It is the one spawn failure that is *always*
+/// transient, so a short bounded retry resolves it without masking a genuine
+/// one: a missing binary is `NotFound` and an unexecutable one is
+/// `PermissionDenied`, neither of which is retried.
+async fn spawn_with_etxtbsy_retry(
+    command: &mut tokio::process::Command,
+) -> std::io::Result<tokio::process::Child> {
+    for _ in 0..ETXTBSY_RETRIES {
+        match command.spawn() {
+            Err(cause) if cause.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                tokio::time::sleep(ETXTBSY_BACKOFF).await;
+            }
+            other => return other,
+        }
+    }
+    command.spawn()
+}
+
 /// Render an exit status for an error message.
 fn describe_exit(status: ExitStatus) -> String {
     status.code().map_or_else(
@@ -160,13 +195,15 @@ impl IpcClient {
             )
         })?;
 
-        let mut child = self
-            .launcher
-            .command(&self.program, &self.args, &self.envs, ctx, method)?
+        let mut command =
+            self.launcher
+                .command(&self.program, &self.args, &self.envs, ctx, method)?;
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped());
+        let mut child = spawn_with_etxtbsy_retry(&mut command)
+            .await
             .map_err(|e| self.spawn_error(method, &e))?;
 
         // Send the request, then signal EOF by dropping stdin. The request is

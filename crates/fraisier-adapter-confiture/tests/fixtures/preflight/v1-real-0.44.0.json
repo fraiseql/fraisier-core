@@ -1,0 +1,118 @@
+{
+  "ok": true,
+  "window_safe": false,
+  "summary": {
+    "errors": 0,
+    "warnings": 5,
+    "info": 0,
+    "migrations_checked": 6
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_RENAME_COLUMN",
+      "message": "readers reference the old column name during the lag window Multi-step fix: add the new column \u2192 dual-write \u2192 migrate readers \u2192 drop the old column.",
+      "migration": "public.tb_widget",
+      "file": "20260808010100_rename.up.sql",
+      "line": null,
+      "actionable": "add the new column \u2192 dual-write \u2192 migrate readers \u2192 drop the old column",
+      "details": {
+        "operation": "RenameColumn"
+      }
+    },
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_CREATE_INDEX",
+      "message": "a non-concurrent index blocks writes; the lock propagates to replicas Multi-step fix: use CREATE INDEX CONCURRENTLY in its own non-transactional migration.",
+      "migration": "public.tb_widget",
+      "file": "20260808010200_index.up.sql",
+      "line": null,
+      "actionable": "use CREATE INDEX CONCURRENTLY in its own non-transactional migration",
+      "details": {
+        "operation": "CreateIndex"
+      }
+    },
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_TRUNCATE",
+      "message": "the rows readers on the old version expect are removed Multi-step fix: stop reading the table \u2192 wait one release \u2192 truncate it.",
+      "migration": "public.tb_widget",
+      "file": "20260808010300_truncate.up.sql",
+      "line": null,
+      "actionable": "stop reading the table \u2192 wait one release \u2192 truncate it",
+      "details": {
+        "operation": "Truncate"
+      }
+    },
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_DROP_TABLE",
+      "message": "readers on the old version still SELECT from the table Multi-step fix: stop reading the table \u2192 wait one release \u2192 drop it.",
+      "migration": "public.tb_widget",
+      "file": "20260808010400_drop.up.sql",
+      "line": null,
+      "actionable": "stop reading the table \u2192 wait one release \u2192 drop it",
+      "details": {
+        "operation": "DropTable"
+      }
+    },
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_UNCLASSIFIED",
+      "message": "could not classify (do); review manually",
+      "migration": null,
+      "file": "20260808010500_weird.up.sql",
+      "line": null,
+      "actionable": null,
+      "details": {
+        "operation": "Other"
+      }
+    }
+  ],
+  "change_set": {
+    "contract_version": 1,
+    "changes": [
+      {
+        "kind": "create_table",
+        "object": "public.tb_widget",
+        "migration": "20260808010000",
+        "tier": "additive",
+        "detail": "CREATE TABLE"
+      },
+      {
+        "kind": "rename_column",
+        "object": "public.tb_widget.name",
+        "migration": "20260808010100",
+        "tier": "reversible",
+        "detail": "RENAME COLUMN name TO label \u2014 readers on the old name break until they are redeployed"
+      },
+      {
+        "kind": "create_index",
+        "object": "public.tb_widget.idx_widget_label",
+        "migration": "20260808010200",
+        "tier": "lock_risky",
+        "detail": "CREATE INDEX \u2014 blocks writes"
+      },
+      {
+        "kind": "truncate",
+        "object": "public.tb_widget",
+        "migration": "20260808010300",
+        "tier": "destructive",
+        "detail": "TRUNCATE"
+      },
+      {
+        "kind": "drop_table",
+        "object": "public.tb_widget",
+        "migration": "20260808010400",
+        "tier": "irreversible",
+        "detail": "DROP TABLE"
+      },
+      {
+        "kind": "unclassified",
+        "object": "20260808010500_weird.up.sql",
+        "migration": "20260808010500",
+        "detail": "DO \u2014 confiture does not classify this statement"
+      }
+    ]
+  }
+}

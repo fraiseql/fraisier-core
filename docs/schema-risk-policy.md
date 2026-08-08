@@ -54,6 +54,16 @@ Every way of not knowing is a refusal, and the refusal says which one it was:
 | It advertises `risk_tier` and emits no change-set | refused — that is an adapter bug, and the message says so |
 | The change-set is stamped with a contract version this build cannot read | refused, naming both versions. Never approvable: an approver would be signing off on a payload nobody can read |
 | One entry carries a tier this build does not recognise | refused — an unknown tier is *no* tier, never a nearest match |
+| One entry carries **no tier**, because the producer declined to classify it | refused — and the reason names the object, so you can find the statement |
+
+The last row is the one you are most likely to meet, and with the confiture
+adapter it has a specific and common cause: **an `ALTER COLUMN … TYPE` is
+unclassified.** Telling a widening `varchar(10) → varchar(20)` from a narrowing
+one needs the column's current type and the server version; confiture gathers
+those only when it is asked to compare against a live database, and fraisier does
+not ask. So it declines to guess rather than guessing wrong, and a configured
+`[policy]` refuses the deploy. That is the contract working as designed — see
+*How to unblock a refused deploy* below.
 
 Configuring `[policy]` together with `[migration].preflight_mode = "off"`
 therefore refuses **every** deploy. `fraisier validate-config` warns about that
@@ -235,14 +245,26 @@ to gate on and never fires.
 3. If the change was not intended: fix the migration and re-deploy. Splitting a
    destructive migration into expand → deploy → contract is usually the answer,
    and is what makes the change `additive` twice over.
-4. If the adapter cannot classify: **no released confiture emits a change-set
-   yet** ([confiture#197](https://github.com/fraiseql/confiture/issues/197) is
-   open), so upgrading will not help today and fraisier deliberately does not
-   advertise `risk_tier` against a binary that cannot classify. Until that
-   release lands, a `[policy]` section on the confiture adapter classifies
-   nothing: set `unclassified = "require_approval"` to route its deploys
-   through the hook, or leave `[policy]` out and keep today's behaviour. When
-   #197 ships, upgrading the producer is the fix.
+4. If the adapter did not classify: **upgrade confiture to ≥ 0.44.0.** That is
+   the fix. fraisier withholds `risk_tier` from every earlier release — the
+   change-set arrived in 0.43.0, but that release still misreads `DROP TABLE`
+   ([confiture#206](https://github.com/fraiseql/confiture/issues/206)), and a
+   classifier that cannot be trusted about the window is not trusted about the
+   tier either. Below the floor a `[policy]` section classifies nothing and
+   refuses everything; `fraisier doctor` reports the installed version against
+   the floor.
+
+   For a producer that will **never** classify — an external adapter that lints
+   but does not tier — `unclassified = "require_approval"` routes its deploys
+   through the hook instead. That is the option for a producer with no upgrade
+   path, not the general answer to a refusal.
+
+5. If the refused change is an `ALTER COLUMN … TYPE`, nothing is broken.
+   Confiture will not guess whether a type change widens or narrows without the
+   column's current type, and it gathers that only when comparing against a live
+   database — which fraisier does not ask it to do. The change arrives
+   unclassified and is refused. Approve it through the hook, or split it into
+   expand → backfill → contract, which classifies cleanly at every step.
 
 ## Audit
 

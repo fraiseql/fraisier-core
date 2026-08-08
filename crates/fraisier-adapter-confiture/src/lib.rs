@@ -51,11 +51,20 @@
 //!
 //! The **`risk_tier`** capability (a per-change risk-tiered change-set, parsed
 //! from the `preflight` report's `change_set` object) requires a confiture that
-//! implements the migration risk contract. **No released confiture does yet**
-//! (fraiseql/confiture#197), so the `RISK_TIER_MIN_CONFITURE` floor is `None`
-//! and the capability is never advertised. The parsing and the gate behind it
-//! are complete; pinning the floor to the release that implements #197 is the
-//! one change that activates them.
+//! implements the migration risk contract, and requires **Confiture ≥ 0.44.0**
+//! — the same floor, reached by the same argument. The change-set itself
+//! shipped in 0.43.0 (fraiseql/confiture#197), but that release is also the last
+//! one whose classifier misreads `DROP TABLE`, and a classifier that cannot be
+//! trusted about the window cannot be trusted about the tier. One binary, one
+//! verdict about it: both capabilities light up together, at 0.44.0.
+//!
+//! One consequence is worth stating because an operator will meet it: an
+//! `ALTER COLUMN … TYPE` arrives **unclassified**, and a configured `[policy]`
+//! therefore refuses it. Confiture will not guess whether a type change widens
+//! or narrows without the column's current type, which it gathers only when
+//! comparing against a live database — something this adapter does not ask it to
+//! do. The refusal is the contract working.
+//!
 //! Both are **advertised conditionally**, on the version the installed binary
 //! reports: claiming `risk_tier` against a confiture that cannot classify would
 //! make fraisier's policy gate expect a change-set and deny every deploy.
@@ -145,8 +154,8 @@ const WINDOW_SAFE_MIN_CONFITURE: (u32, u32, u32) = (0, 44, 0);
 /// to, so there is no useful intermediate state to advertise.
 const RISK_TIER_CAPABILITY: &str = "risk_tier";
 
-/// The first confiture release that emits a change-set (fraiseql/confiture#197),
-/// or `None` while no released confiture does.
+/// The lowest confiture whose classification this adapter trusts, or `None` if
+/// none is trusted.
 ///
 /// Gating on the **installed** version is what keeps the capability honest.
 /// Advertising `risk_tier` against a confiture that cannot classify would make
@@ -155,20 +164,47 @@ const RISK_TIER_CAPABILITY: &str = "risk_tier";
 /// handle deliberately, and which keeps a deploy with no risk policy working
 /// exactly as it does today.
 ///
-/// **`None` is the current, correct value, not a placeholder.** confiture#197 is
-/// open and confiture has released past every floor previously guessed for it
-/// (0.40.0, 0.41.0 and 0.42.0 all shipped on 2026-08-05 with unrelated
-/// features). A floor named for an unreleased version is not a safety property
-/// — it is a bet that the next release implements #197, and that bet has already
-/// lost three times. `None` cannot lose it, because it asserts only what is
-/// verified: *no confiture a user can install classifies*.
+/// **Why 0.44.0 and not 0.43.0**, which is where the change-set itself first
+/// shipped: 0.43.0 also reports `window_safe: true` for a `DROP TABLE`, which
+/// [`WINDOW_SAFE_MIN_CONFITURE`] already refuses. Trusting that binary's risk
+/// classification while refusing its window verdict would have one adapter
+/// saying two things about one process. The floor is not the release that added
+/// the feature; it is the release whose whole verdict is trustworthy.
 ///
-/// Setting this to `Some(version)` is the single change that activates the
-/// capability, and it is only correct once the real binary has been observed
-/// emitting a conforming change-set. Everything downstream — parsing, the
-/// contract-version check, the policy gate, the dry-run preview — is built and
-/// tested behind it.
-const RISK_TIER_MIN_CONFITURE: Option<(u32, u32, u32)> = None;
+/// The value was set from an **observed capture**, not from a changelog — three
+/// earlier floors were guessed from release notes and all three were wrong. The
+/// capture is the golden fixture `tests/fixtures/preflight/v1-real-0.44.0.json`,
+/// and its README records which binary and which invocation produced it. Raising
+/// this floor means producing that evidence again.
+///
+/// The type stays [`Option`] even though it is now populated: it keeps the
+/// ordering logic in [`version_at_or_above`] testable independently of whichever
+/// number the floor holds, which is why the two were split apart to begin with.
+const RISK_TIER_MIN_CONFITURE: Option<(u32, u32, u32)> = Some((0, 44, 0));
+
+/// Every version-gated capability this adapter has, with the confiture release
+/// it starts trusting for it. `None` means the capability is withheld from every
+/// version.
+///
+/// Public so that anything telling an operator *"your confiture is new enough"*
+/// — `doctor`, today — can read the floors the deploy actually enforces instead
+/// of keeping its own copy of the number. Certifying a binary that a deploy will
+/// then refuse is a worse failure than not checking at all, because the operator
+/// stops looking.
+///
+/// The floors are stated separately rather than reduced to one number here: they
+/// are independent facts about independent capabilities, and a consumer that
+/// wants a single "is this binary fully trusted" bar should take the highest of
+/// them and keep the reason it moved.
+pub const CAPABILITY_FLOORS: &[CapabilityFloor] = &[
+    (WINDOW_SAFE_CAPABILITY, Some(WINDOW_SAFE_MIN_CONFITURE)),
+    (RISK_TIER_CAPABILITY, RISK_TIER_MIN_CONFITURE),
+];
+
+/// One row of [`CAPABILITY_FLOORS`]: the capability's advertised name, and the
+/// `(major, minor, patch)` it is advertised from — `None` if it is withheld from
+/// every version.
+pub type CapabilityFloor = (&'static str, Option<(u32, u32, u32)>);
 
 /// The `kind` given to a change entry this build could not read.
 ///
@@ -806,10 +842,11 @@ fn supports_risk_tier(version: &str) -> bool {
 
 /// Whether `version` parses and is at least `floor`.
 ///
-/// Split out from [`supports_risk_tier`] so the comparison stays under test
-/// while the floor itself is withheld: the ordering rules (numeric not lexical,
-/// unreadable never qualifies) are the part that would be silently wrong, and
-/// they must not go untested just because no released confiture clears the bar.
+/// Split out from [`supports_risk_tier`] so the comparison stays testable
+/// independently of whichever number the floor holds: the ordering rules
+/// (numeric not lexical, unreadable never qualifies) are the part that would be
+/// silently wrong, and they are worth exercising against versions no release
+/// has reached.
 fn version_at_or_above(version: &str, floor: (u32, u32, u32)) -> bool {
     version_triple(version).is_some_and(|triple| triple >= floor)
 }
@@ -967,7 +1004,7 @@ mod tests {
         parse_change_set, parse_current_revision, parse_down_to_outcome, parse_preflight_report,
         parse_up_outcome, parse_verify_report, parse_version, plan, reports_uninitialised,
         subcommand_takes_migrations_dir, supports_risk_tier, version_at_or_above, version_triple,
-        ConfitureMigration, CONFITURE_DSN_ENV,
+        ConfitureMigration, CONFITURE_DSN_ENV, RISK_TIER_MIN_CONFITURE,
     };
     use fraisier_core::adapter_axes::{
         AdapterCtx, AdapterErrorKind, ChangeSetUnavailable, PreflightReport, Revision, RiskTier,
@@ -981,46 +1018,82 @@ mod tests {
     /// embedded rather than read at runtime: deleting one breaks the *build*,
     /// which is what their `_README.md` promises. Confiture asserts it emits
     /// these bytes; the tests below assert this adapter parses them.
-    const FIXTURES: &[(&str, &str)] = &[
+    ///
+    /// The third column is the `window_safe` verdict the bytes carry. It is a
+    /// column rather than a constant because the hand-authored shapes were
+    /// written around a safe scenario while the capture from a real binary
+    /// reports `false` — it drops a table. Pinning it per row keeps the
+    /// universal assertion strong: a parser that inverted the boolean, or read
+    /// it off the wrong key, is still caught.
+    const FIXTURES: &[(&str, &str, bool)] = &[
         (
             "v0-no-change-set",
             include_str!("../tests/fixtures/preflight/v0-no-change-set.json"),
+            true,
         ),
         (
             "v1-empty",
             include_str!("../tests/fixtures/preflight/v1-empty.json"),
+            true,
         ),
         (
             "v1-additive",
             include_str!("../tests/fixtures/preflight/v1-additive.json"),
+            true,
         ),
         (
             "v1-mixed",
             include_str!("../tests/fixtures/preflight/v1-mixed.json"),
+            true,
         ),
         (
             "v1-unknown-tier",
             include_str!("../tests/fixtures/preflight/v1-unknown-tier.json"),
+            true,
         ),
         (
             "v1-missing-tier",
             include_str!("../tests/fixtures/preflight/v1-missing-tier.json"),
+            true,
         ),
         (
             "v2-future",
             include_str!("../tests/fixtures/preflight/v2-future.json"),
+            true,
         ),
         (
             "malformed",
             include_str!("../tests/fixtures/preflight/malformed.json"),
+            true,
+        ),
+        (
+            REAL_CAPTURE,
+            include_str!("../tests/fixtures/preflight/v1-real-0.44.0.json"),
+            false,
+        ),
+        (
+            REAL_TYPE_CHANGE,
+            include_str!("../tests/fixtures/preflight/v1-real-type-change.json"),
+            false,
         ),
     ];
 
+    /// The one fixture that is a *capture* rather than a hand-authored shape:
+    /// what confiture 0.44.0 actually emitted, through the argv [`plan`] builds.
+    /// Named because several tests below single it out — the others pin what the
+    /// producer must be able to emit, this one pins what it does emit.
+    const REAL_CAPTURE: &str = "v1-real-0.44.0";
+
+    /// The other capture, and the one an operator is most likely to meet by
+    /// accident: a column type change, which confiture declines to classify on
+    /// the path this adapter drives.
+    const REAL_TYPE_CHANGE: &str = "v1-real-type-change";
+
     /// One golden fixture, by name (without the `.json`).
     fn fixture(name: &str) -> Value {
-        let (_, bytes) = FIXTURES
+        let (_, bytes, _) = FIXTURES
             .iter()
-            .find(|(fixture, _)| *fixture == name)
+            .find(|(fixture, _, _)| *fixture == name)
             .unwrap_or_else(|| panic!("no golden fixture named {name}"));
         serde_json::from_str(bytes)
             .unwrap_or_else(|err| panic!("golden fixture {name} is not valid JSON: {err}"))
@@ -1028,22 +1101,63 @@ mod tests {
 
     #[test]
     fn every_fixture_parses_without_panicking() {
-        for (name, _) in FIXTURES {
+        for (name, _, window_safe) in FIXTURES {
             let json = fixture(name);
             // Whichever way a fixture breaks the change-set, it never breaks the
             // report: `ok`, `issues` and `window_safe` predate this contract and
             // the deploy already blocks on them.
             let report = parse_preflight_report(&json);
-            assert!(report.ok, "{name}: every fixture is a clean lint result");
+            assert!(
+                report.ok,
+                "{name}: no fixture is an error-level lint failure"
+            );
             assert_eq!(
                 report.window_safe,
-                Some(true),
+                Some(*window_safe),
                 "{name}: window_safe still crosses the seam untouched"
             );
             // And reaching the classification never panics, however it is missing.
             let _ = parse_change_set(&json);
             let _ = report.usable_change_set();
         }
+    }
+
+    /// The pact, read off a binary instead of off a specification.
+    ///
+    /// Every other fixture was written by reading the contract; this one is what
+    /// confiture 0.44.0 emitted for a migration set covering all five tiers plus
+    /// a statement it declines to classify. It is the observation the risk-tier
+    /// floor rests on, so it asserts the whole shape rather than one corner of
+    /// it: five known tiers in migration order, the sixth entry surviving with no
+    /// tier at all, and the worst tier read independently of both.
+    #[test]
+    fn the_real_capture_carries_all_five_tiers_and_one_unclassified_change() {
+        let set = parse_change_set(&fixture(REAL_CAPTURE)).expect("0.44.0 classifies");
+        assert_eq!(set.contract_version, RISK_CONTRACT_VERSION);
+        assert_eq!(set.changes.len(), 6);
+
+        // Migration order is the producer's order, preserved on the way through.
+        let tiers: Vec<Option<RiskTier>> = set.changes.iter().map(|c| c.tier).collect();
+        assert_eq!(
+            tiers,
+            vec![
+                Some(RiskTier::Additive),
+                Some(RiskTier::Reversible),
+                Some(RiskTier::LockRisky),
+                Some(RiskTier::Destructive),
+                Some(RiskTier::Irreversible),
+                None,
+            ],
+            "the capture must exercise every tier the taxonomy has"
+        );
+
+        // The unclassified entry is held, not dropped: the refusal has to name it.
+        let unclassified: Vec<&str> = set.unclassified().map(|c| c.kind.as_str()).collect();
+        assert_eq!(unclassified, ["unclassified"]);
+        assert_eq!(set.unclassified().count(), 1);
+
+        // Not folded into the worst tier, and not rounded up by it either.
+        assert_eq!(set.worst_tier(), Some(RiskTier::Irreversible));
     }
 
     /// A preflight report carrying `change_set` verbatim.
@@ -1282,7 +1396,7 @@ mod tests {
     /// deny; this one can say more about why.
     #[test]
     fn the_manual_parser_agrees_with_the_typed_deserializer() {
-        for (name, bytes) in FIXTURES {
+        for (name, bytes, _) in FIXTURES {
             let typed: PreflightReport =
                 serde_json::from_str(bytes).unwrap_or_else(|err| panic!("{name}: {err}"));
             let manual = parse_preflight_report(&fixture(name));
@@ -1412,7 +1526,7 @@ mod tests {
         on_disk.sort();
         let mut tabled: Vec<String> = FIXTURES
             .iter()
-            .map(|(name, _)| (*name).to_owned())
+            .map(|(name, _, _)| (*name).to_owned())
             .collect();
         tabled.sort();
         assert_eq!(
@@ -1798,14 +1912,16 @@ mod tests {
         }
     }
 
-    /// **No confiture that a user can actually install emits a change-set.**
+    /// **Below the floor, the capability is withheld — including from the
+    /// release that implements the feature.**
     ///
-    /// This is the test that keeps the floor honest against a moving upstream.
-    /// fraiseql/confiture#197 — the producer half of the contract — is open, and
-    /// confiture kept releasing without it (0.40.0 `validate composes`, 0.41.0
-    /// `ledger probe`, 0.42.0 `analyzer scoping`, all on 2026-08-05). A floor
-    /// *guessed* at the next unreleased minor is not a safety property; it is a
-    /// bet against a repository that ships several times a day.
+    /// The interesting row is `0.43.0`. It is where the producer half of the
+    /// contract shipped (fraiseql/confiture#197), so it *can* classify, and it is
+    /// refused anyway: the same binary still reports `window_safe: true` for a
+    /// `DROP TABLE` (#206). The floor is not the release that added the feature;
+    /// it is the release whose whole verdict is trustworthy. That distinction has
+    /// exactly one guard, and this is it — a later edit "correcting" the floor
+    /// down to 0.43.0 fails here and nowhere else.
     ///
     /// Advertising the capability against any of these makes `evaluate` take the
     /// `NO_CHANGE_SET` branch — *"the adapter advertises `risk_tier` and then
@@ -1813,12 +1929,12 @@ mod tests {
     /// deny-by-default rule, refuse **every** deploy for anyone who adopts
     /// `[policy]`. The adapter bug would be this constant.
     #[test]
-    fn no_released_confiture_advertises_risk_tier() {
-        for version in ["0.38.1", "0.39.0", "0.40.0", "0.41.0", "0.42.0"] {
+    fn no_confiture_below_the_floor_advertises_risk_tier() {
+        for version in ["0.38.1", "0.39.0", "0.40.0", "0.41.0", "0.42.0", "0.43.0"] {
             assert!(
                 !supports_risk_tier(version),
-                "confiture {version} is released and does not implement #197, so the adapter \
-                 must not claim it classifies"
+                "confiture {version} is below the floor, so the adapter must not \
+                 claim it classifies"
             );
             assert!(
                 !capabilities_for(version)
@@ -1829,22 +1945,29 @@ mod tests {
         }
     }
 
-    /// The consumer half is complete and stays exercised: flipping the floor to
-    /// a released version is the *only* change needed to light the capability
-    /// up, and it lights up for exactly the versions at or above it.
+    /// The live floor's ordering rules, read off the constant rather than
+    /// hard-coded: numeric and not lexical, and a version this build cannot read
+    /// never qualifies however high it looks.
+    ///
+    /// Reading [`RISK_TIER_MIN_CONFITURE`] is what keeps this test doing its own
+    /// job after the next bump instead of restating
+    /// `describe_advertises_risk_tier_from_the_release_that_classifies`. The
+    /// rules below are the half that would be silently wrong: a string compare
+    /// puts `0.100.0` below `0.44.0`, and a lenient version parse would admit a
+    /// release candidate the adapter cannot actually place.
     #[test]
-    fn a_confirmed_floor_advertises_risk_tier_at_and_above_itself() {
-        let floor = (0, 43, 0);
-        assert!(!version_at_or_above("0.42.0", floor));
-        assert!(version_at_or_above("0.43.0", floor));
-        assert!(version_at_or_above("0.43.1", floor));
+    fn the_floor_admits_exactly_the_versions_at_or_above_it() {
+        let floor = RISK_TIER_MIN_CONFITURE.expect("the floor is pinned");
+        assert!(!version_at_or_above("0.43.0", floor));
+        assert!(version_at_or_above("0.44.0", floor));
+        assert!(version_at_or_above("0.44.1", floor));
         assert!(
             version_at_or_above("0.100.0", floor),
             "numeric, not lexical"
         );
         assert!(version_at_or_above("1.0.0", floor));
         // Unreadable stays unreadable regardless of the floor.
-        assert!(!version_at_or_above("0.43.0rc1", floor));
+        assert!(!version_at_or_above("0.44.0rc1", floor));
     }
 
     /// A confiture that changes its `--version` format must degrade to *"I do

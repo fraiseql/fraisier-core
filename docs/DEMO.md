@@ -302,6 +302,13 @@ pattern-matching (confiture ≥ 0.44.0). The script probes for it:
   adapter therefore withholds the capability below 0.44.0. The script asserts
   this fail-safe and skips the full gates.
 
+The same 0.44.0 boundary governs the **`risk_tier`** capability, so below it a
+configured `[policy]` also classifies nothing. The script does not exercise the
+tier gate: it would need its own migration corpus and a `[policy]` section, which
+is a different demo from the window-safety one. The tier path is covered by test
+against a change-set captured from the real binary — see
+`crates/fraisier-adapter-confiture/tests/fixtures/preflight/_README.md`.
+
 ```sh
 scripts/checkpoint-blue-green.sh                 # throwaway Postgres (cached *-alpine), zero spend
 scripts/checkpoint-blue-green.sh --db-dsn <url>  # query an existing Postgres for the budget gate

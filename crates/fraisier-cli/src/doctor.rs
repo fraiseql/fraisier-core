@@ -15,14 +15,17 @@ use serde_json::json;
 
 use crate::commands::CommandOutput;
 
-/// The confiture version floor the in-process adapter needs (window-safe verdict).
+/// The confiture version floor the in-process adapter needs for both of its
+/// version-gated capabilities — the window-safe verdict and the risk-tiered
+/// change-set.
 ///
-/// Tracks `fraisier-adapter-confiture`'s `WINDOW_SAFE_MIN_CONFITURE`, and is
-/// pinned to it by test. 0.23.0 introduced the `window_safe` *field*, but every
-/// release through 0.43.0 reported `true` for statements its classifier could
-/// not read (fraiseql/confiture#206), so the adapter withholds the capability
-/// and blue-green refuses. A floor below 0.44 would pass exactly the versions a
-/// deploy denies.
+/// Tracks the highest floor in `fraisier-adapter-confiture`'s
+/// `CAPABILITY_FLOORS`, and is pinned to it by test. Both sit on 0.44.0, for the
+/// same underlying reason: through 0.43.0 confiture's classifier reads only part
+/// of the statement matrix (fraiseql/confiture#206), so a `DROP TABLE` reports
+/// `window_safe: true` — and a classifier that cannot be trusted about the
+/// window cannot be trusted about the tier either. A floor below 0.44 would pass
+/// exactly the versions a deploy denies.
 const CONFITURE_FLOOR: (u32, u32) = (0, 44);
 
 /// A single doctor check outcome.
@@ -126,8 +129,9 @@ fn check_confiture(config: &DeployConfig) -> Check {
                     name: "confiture",
                     status: Status::Warn,
                     detail: format!(
-                        "{}.{} is below the {}.{} floor; its window-safety verdict is not \
-                         trusted (confiture#206), so a blue-green deploy is refused",
+                        "{}.{} is below the {}.{} floor; neither its window-safety verdict nor \
+                         its risk classification is trusted (confiture#206), so a blue-green \
+                         deploy is refused and a configured `[policy]` classifies nothing",
                         version.0, version.1, CONFITURE_FLOOR.0, CONFITURE_FLOOR.1
                     ),
                 },
@@ -357,18 +361,35 @@ url = "http://127.0.0.1/health"
     /// enforces, or the check tells an operator they are ready for a deploy that
     /// will be refused.
     ///
-    /// `fraisier-adapter-confiture` withholds the `window_safe` capability below
-    /// 0.44.0 because every earlier release reports `window_safe: true` for
-    /// statements its classifier cannot read (fraiseql/confiture#206). A doctor
-    /// floor of 0.23 — the release that merely introduced the *field* — passes
-    /// exactly the versions blue-green now denies.
+    /// Read off the adapter's own constants rather than restated, so the two
+    /// cannot drift apart silently. Both of its version-gated capabilities sit
+    /// on 0.44.0 today; if one ever moves, `doctor` must follow the **higher**
+    /// of them. Certifying a binary that a deploy refuses is the failure this
+    /// check exists to prevent, and it is a failure in either direction: too low
+    /// passes versions that will be denied, too high sends an operator chasing
+    /// an upgrade nothing requires.
     #[test]
-    fn the_doctor_floor_matches_the_version_the_adapter_trusts() {
+    fn the_doctor_floor_matches_the_versions_the_adapter_trusts() {
+        let highest = fraisier_adapter_confiture::CAPABILITY_FLOORS
+            .iter()
+            .filter_map(|(_, floor)| *floor)
+            .max()
+            .expect("at least one capability has a pinned floor");
         assert_eq!(
             CONFITURE_FLOOR,
-            (0, 44),
-            "doctor must not certify a confiture whose window_safe verdict the \
-             blue-green gate refuses"
+            (highest.0, highest.1),
+            "doctor certifies {CONFITURE_FLOOR:?} but the adapter withholds a \
+             capability below {highest:?}"
+        );
+        // Nothing is withheld from every version — a `None` floor would mean a
+        // capability doctor cannot speak for at all, and this check would be
+        // quietly ignoring it.
+        assert!(
+            fraisier_adapter_confiture::CAPABILITY_FLOORS
+                .iter()
+                .all(|(_, floor)| floor.is_some()),
+            "a withheld capability is invisible to this check: {:?}",
+            fraisier_adapter_confiture::CAPABILITY_FLOORS
         );
     }
 

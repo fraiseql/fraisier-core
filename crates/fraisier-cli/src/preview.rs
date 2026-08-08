@@ -1272,8 +1272,12 @@ mod tests {
     async fn blue_green_previews_a_verdict_with_no_policy_section() {
         // The D6 carve-out: the window-safety baseline is not opt-in, so
         // blue-green always has something to report.
+        // `window_safe` is advertised as well as returned: a verdict from an
+        // adapter that never claimed the capability is refused for *that*
+        // reason, which is a different row of the table (see
+        // `an_unadvertised_window_safe_verdict_is_not_trusted`).
         let adapter = FakeMigration::new(
-            &["up", "preflight"],
+            &["up", "preflight", "window_safe"],
             Ok(PreflightReport::new(true).with_window_safe(false)),
         );
         let preview = gather(

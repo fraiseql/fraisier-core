@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(policy)* the blue-green baseline now requires the `window_safe` **capability**
+  before it reads the verdict. Previously it checked only `preflight`, so an
+  adapter that ran the lint without being able to classify every statement could
+  answer `Some(true)` and clear the gate. The capability is what distinguishes
+  *"nothing unsafe was found"* from *"nothing was recognised"* — two states a
+  producer deriving its verdict from an absence of findings cannot tell apart.
+  This is not redundant with the existing `None` arm: `None` catches a producer
+  that stays silent, the capability catches one that answers confidently about
+  statements it never read.
+
+### Added
+
+- *(policy)* `Capabilities::window_safe`, set through the new
+  `Capabilities::with_window_safe`. Additive: `Capabilities::new` keeps its
+  two-argument signature, and the field defaults to `false` — the safe
+  direction, since a gate that needs the capability refuses without it.
+
 ## [1.0.0-beta.7](https://github.com/fraiseql/fraisier-core/compare/fraisier-core-v1.0.0-beta.6...fraisier-core-v1.0.0-beta.7) - 2026-08-06
 
 ### Added

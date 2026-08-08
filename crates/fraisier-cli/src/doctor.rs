@@ -16,7 +16,14 @@ use serde_json::json;
 use crate::commands::CommandOutput;
 
 /// The confiture version floor the in-process adapter needs (window-safe verdict).
-const CONFITURE_FLOOR: (u32, u32) = (0, 23);
+///
+/// Tracks `fraisier-adapter-confiture`'s `WINDOW_SAFE_MIN_CONFITURE`, and is
+/// pinned to it by test. 0.23.0 introduced the `window_safe` *field*, but every
+/// release through 0.43.0 reported `true` for statements its classifier could
+/// not read (fraiseql/confiture#206), so the adapter withholds the capability
+/// and blue-green refuses. A floor below 0.44 would pass exactly the versions a
+/// deploy denies.
+const CONFITURE_FLOOR: (u32, u32) = (0, 44);
 
 /// A single doctor check outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +126,8 @@ fn check_confiture(config: &DeployConfig) -> Check {
                     name: "confiture",
                     status: Status::Warn,
                     detail: format!(
-                        "{}.{} is below the {}.{} floor (window-safe verdict needs the floor)",
+                        "{}.{} is below the {}.{} floor; its window-safety verdict is not \
+                         trusted (confiture#206), so a blue-green deploy is refused",
                         version.0, version.1, CONFITURE_FLOOR.0, CONFITURE_FLOOR.1
                     ),
                 },
@@ -310,7 +318,7 @@ pub(crate) fn env_check(config_path: &Path, subcommand: &str) -> CommandOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{doctor, env_check, parse_version};
+    use super::{doctor, env_check, parse_version, CONFITURE_FLOOR};
     use std::io::Write as _;
 
     fn write_config(body: &str) -> tempfile::NamedTempFile {
@@ -343,6 +351,25 @@ url = "http://127.0.0.1/health"
         assert_eq!(parse_version("confiture 0.31.0"), Some((0, 31)));
         assert_eq!(parse_version("v1.2.3"), Some((1, 2)));
         assert_eq!(parse_version("no version here"), None);
+    }
+
+    /// The floor `doctor` reports must be the floor the deploy actually
+    /// enforces, or the check tells an operator they are ready for a deploy that
+    /// will be refused.
+    ///
+    /// `fraisier-adapter-confiture` withholds the `window_safe` capability below
+    /// 0.44.0 because every earlier release reports `window_safe: true` for
+    /// statements its classifier cannot read (fraiseql/confiture#206). A doctor
+    /// floor of 0.23 — the release that merely introduced the *field* — passes
+    /// exactly the versions blue-green now denies.
+    #[test]
+    fn the_doctor_floor_matches_the_version_the_adapter_trusts() {
+        assert_eq!(
+            CONFITURE_FLOOR,
+            (0, 44),
+            "doctor must not certify a confiture whose window_safe verdict the \
+             blue-green gate refuses"
+        );
     }
 
     #[test]

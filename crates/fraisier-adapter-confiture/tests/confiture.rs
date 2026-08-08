@@ -631,7 +631,16 @@ async fn a_confiture_that_writes_no_output_file_still_errors() {
 #[cfg(unix)]
 #[tokio::test]
 async fn describe_advertises_risk_tier_only_when_the_binary_can_emit_it() {
-    for version in ["0.39.0", "0.40.0", "0.42.0", "1.2.3"] {
+    for (version, certifies_window) in [
+        ("0.39.0", false),
+        ("0.40.0", false),
+        ("0.42.0", false),
+        // The boundary of fraiseql/confiture#206, straddled: 0.43.0 emits a
+        // `window_safe` that reads `true` for `DROP TABLE`, 0.44.0 does not.
+        ("0.43.0", false),
+        ("0.44.0", true),
+        ("1.2.3", true),
+    ] {
         let desc = FakeConfiture::adapter_reporting(version)
             .describe()
             .await
@@ -643,9 +652,16 @@ async fn describe_advertises_risk_tier_only_when_the_binary_can_emit_it() {
             "confiture {version} cannot emit a change-set: {:?}",
             desc.capabilities
         );
-        // The rest of the handshake never depends on the version.
+        // `preflight` never depends on the version — the lint has always run.
         assert!(desc.capabilities.iter().any(|cap| cap == "preflight"));
-        assert!(desc.capabilities.iter().any(|cap| cap == "window_safe"));
+        // `window_safe` does, and this is the end-to-end statement of it: the
+        // *parsed* version has to reach the floor, not the raw `--version` line.
+        assert_eq!(
+            desc.capabilities.iter().any(|cap| cap == "window_safe"),
+            certifies_window,
+            "confiture {version}: {:?}",
+            desc.capabilities
+        );
     }
 }
 

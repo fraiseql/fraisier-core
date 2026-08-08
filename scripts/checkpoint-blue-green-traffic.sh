@@ -92,18 +92,23 @@ say "building fraisier"
 FRAISIER="$REPO_ROOT/target/debug/fraisier"
 [ -x "$FRAISIER" ] || die "fraisier binary missing"
 
-# Blue-green requires confiture's first-class window_safe verdict (confiture#154
-# Phase 3) — the happy swap needs window-safety to PASS, which needs window_safe.
-# An older confiture returns no verdict and is refused, so the swap can't run.
-probe="$WORK/probe"; mkdir -p "$probe"
-printf 'CREATE TABLE _bg_probe (id int);\n' > "$probe/001_p.up.sql"
-printf 'DROP TABLE _bg_probe;\n' > "$probe/001_p.down.sql"
-CONFITURE_DATABASE_URL='postgresql://u@127.0.0.1:1/n?sslmode=disable' \
-  confiture migrate preflight --no-config --format json --output "$probe/r.json" \
-  --migrations-dir "$probe" >/dev/null 2>&1 || true
-grep -q '"window_safe"' "$probe/r.json" 2>/dev/null \
-  || die "this confiture does not emit window_safe — blue-green needs confiture#154 Phase 3 ($(confiture --version 2>&1 | head -1)). The traffic-tier gates are also proven hermetically in fraisier-core::blue_green."
-ok "confiture emits window_safe (Phase 3)"
+# Blue-green requires a window_safe verdict fraisier will trust — the happy swap
+# needs window-safety to PASS. The bar is the **version**, not the presence of
+# the field: confiture has emitted it since 0.23.0 (confiture#154), but below
+# 0.44.0 it reads `true` for statements the classifier never recognised, so the
+# adapter withholds the capability and the gate refuses (confiture#206).
+WINDOW_SAFE_MIN=0.44.0
+confiture_version() {
+  confiture --version 2>&1 | head -1 | grep -oE '[0-9]+(\.[0-9]+){1,2}' | head -1
+}
+version_at_least() { # $1 >= $2, numeric not lexical
+  [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]
+}
+CONFITURE_VERSION="$(confiture_version)"
+if [ -z "$CONFITURE_VERSION" ] || ! version_at_least "$CONFITURE_VERSION" "$WINDOW_SAFE_MIN"; then
+  die "confiture ${CONFITURE_VERSION:-unknown} < $WINDOW_SAFE_MIN — its window_safe reads true for DROP TABLE (confiture#206), so fraisier refuses the swap. The traffic-tier gates are also proven hermetically in fraisier-core::blue_green."
+fi
+ok "confiture $CONFITURE_VERSION >= $WINDOW_SAFE_MIN — window_safe is trusted"
 
 # --- the trivial blue/green app -------------------------------------------
 cat > "$WORK/app.py" <<'PY'

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.8](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-confiture-v1.0.0-beta.7...fraisier-adapter-confiture-v1.0.0-beta.8) - 2026-08-08
+
+### Added
+
+- *(confiture)* advertise risk_tier against a confiture that classifies
+
+### Fixed
+
+- *(policy)* stop trusting window_safe from a confiture that cannot classify
+
+### Other
+
+- *(release)* 1.0.0-beta.8
+- say what is true now that confiture classifies
+- prove the real change-set travels the whole path
+- *(confiture)* land a change-set captured from the real binary
+- release v1.0.0-beta.7
+
 ### Fixed
 
 - *(adapter)* stop trusting `window_safe` from a confiture that cannot classify.

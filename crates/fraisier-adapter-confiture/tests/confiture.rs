@@ -539,10 +539,11 @@ async fn uninitialised_database_is_a_precondition_not_an_invalid_config_error() 
 // ---------------------------------------------------------------------------
 // The migration risk contract, end to end
 //
-// The producer half lives in confiture (fraiseql/confiture#197); until it ships,
-// the golden fixtures stand in for it — the same bytes both repositories test
-// against. These drive the *whole* adapter path: spawn, `--output` file, report
-// parse, and the typed change-set the policy gate will read.
+// The producer half lives in confiture. The golden fixtures are the bytes both
+// repositories test against — hand-authored shapes the producer must be able to
+// emit, plus one capture of what it does emit. These drive the *whole* adapter
+// path: spawn, `--output` file, report parse, and the typed change-set the
+// policy gate reads.
 // ---------------------------------------------------------------------------
 
 /// The pact fixture with three tiers in one set.
@@ -619,27 +620,28 @@ async fn a_confiture_that_writes_no_output_file_still_errors() {
 /// The capability gate, through `describe` itself rather than the pure function
 /// under it: what reaches the version comparison must be the *parsed* version,
 /// not the raw `confiture version 0.40.0` line — which would fail to parse and
-/// silently withhold the capability for ever. That is asserted directly on
-/// `desc.version`, because while no released confiture classifies the capability
-/// is withheld for *every* version and could no longer distinguish the two.
+/// silently withhold both capabilities for ever. That is asserted directly on
+/// `desc.version` as well as through the columns below.
 ///
-/// No confiture a user can install emits a change-set (fraiseql/confiture#197 is
-/// open; 0.40.0–0.42.0 shipped without it), so `describe` must never advertise
-/// `risk_tier` — the end-to-end statement of the `RISK_TIER_MIN_CONFITURE`
-/// = `None` rule. When #197 releases and the floor is pinned, the `classifies`
-/// column returns here with the real version in it.
+/// Both version-gated capabilities light up on the **same release**, and the
+/// interesting row is `0.43.0`: it is the release that first emits a change-set
+/// (fraiseql/confiture#197), and it is refused anyway, because the same binary
+/// still reports `window_safe: true` for a `DROP TABLE` (#206). A floor that
+/// trusted 0.43.0's classification while refusing its window verdict would have
+/// one adapter saying two things about one process.
 #[cfg(unix)]
 #[tokio::test]
-async fn describe_advertises_risk_tier_only_when_the_binary_can_emit_it() {
-    for (version, certifies_window) in [
-        ("0.39.0", false),
-        ("0.40.0", false),
-        ("0.42.0", false),
-        // The boundary of fraiseql/confiture#206, straddled: 0.43.0 emits a
-        // `window_safe` that reads `true` for `DROP TABLE`, 0.44.0 does not.
-        ("0.43.0", false),
-        ("0.44.0", true),
-        ("1.2.3", true),
+async fn describe_advertises_risk_tier_from_the_release_that_classifies() {
+    for (version, certifies_window, classifies) in [
+        ("0.39.0", false, false),
+        ("0.40.0", false, false),
+        ("0.42.0", false, false),
+        // The boundary of fraiseql/confiture#206 and #197 at once: 0.43.0 emits
+        // a change-set *and* a `window_safe` that reads `true` for `DROP TABLE`.
+        // Neither capability is advertised for it. 0.44.0 earns both.
+        ("0.43.0", false, false),
+        ("0.44.0", true, true),
+        ("1.2.3", true, true),
     ] {
         let desc = FakeConfiture::adapter_reporting(version)
             .describe()
@@ -647,19 +649,20 @@ async fn describe_advertises_risk_tier_only_when_the_binary_can_emit_it() {
             .expect("the fake answers --version");
 
         assert_eq!(desc.version, version, "the reported version is parsed out");
-        assert!(
-            !desc.capabilities.iter().any(|cap| cap == "risk_tier"),
-            "confiture {version} cannot emit a change-set: {:?}",
-            desc.capabilities
-        );
         // `preflight` never depends on the version — the lint has always run.
         assert!(desc.capabilities.iter().any(|cap| cap == "preflight"));
-        // `window_safe` does, and this is the end-to-end statement of it: the
+        // The two that do, and this is the end-to-end statement of both: the
         // *parsed* version has to reach the floor, not the raw `--version` line.
         assert_eq!(
             desc.capabilities.iter().any(|cap| cap == "window_safe"),
             certifies_window,
-            "confiture {version}: {:?}",
+            "confiture {version} window_safe: {:?}",
+            desc.capabilities
+        );
+        assert_eq!(
+            desc.capabilities.iter().any(|cap| cap == "risk_tier"),
+            classifies,
+            "confiture {version} risk_tier: {:?}",
             desc.capabilities
         );
     }

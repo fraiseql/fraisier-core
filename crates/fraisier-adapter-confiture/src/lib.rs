@@ -145,8 +145,8 @@ const WINDOW_SAFE_MIN_CONFITURE: (u32, u32, u32) = (0, 44, 0);
 /// to, so there is no useful intermediate state to advertise.
 const RISK_TIER_CAPABILITY: &str = "risk_tier";
 
-/// The first confiture release that emits a change-set (fraiseql/confiture#197),
-/// or `None` while no released confiture does.
+/// The lowest confiture whose classification this adapter trusts, or `None` if
+/// none is trusted.
 ///
 /// Gating on the **installed** version is what keeps the capability honest.
 /// Advertising `risk_tier` against a confiture that cannot classify would make
@@ -155,20 +155,23 @@ const RISK_TIER_CAPABILITY: &str = "risk_tier";
 /// handle deliberately, and which keeps a deploy with no risk policy working
 /// exactly as it does today.
 ///
-/// **`None` is the current, correct value, not a placeholder.** confiture#197 is
-/// open and confiture has released past every floor previously guessed for it
-/// (0.40.0, 0.41.0 and 0.42.0 all shipped on 2026-08-05 with unrelated
-/// features). A floor named for an unreleased version is not a safety property
-/// — it is a bet that the next release implements #197, and that bet has already
-/// lost three times. `None` cannot lose it, because it asserts only what is
-/// verified: *no confiture a user can install classifies*.
+/// **Why 0.44.0 and not 0.43.0**, which is where the change-set itself first
+/// shipped: 0.43.0 also reports `window_safe: true` for a `DROP TABLE`, which
+/// [`WINDOW_SAFE_MIN_CONFITURE`] already refuses. Trusting that binary's risk
+/// classification while refusing its window verdict would have one adapter
+/// saying two things about one process. The floor is not the release that added
+/// the feature; it is the release whose whole verdict is trustworthy.
 ///
-/// Setting this to `Some(version)` is the single change that activates the
-/// capability, and it is only correct once the real binary has been observed
-/// emitting a conforming change-set. Everything downstream — parsing, the
-/// contract-version check, the policy gate, the dry-run preview — is built and
-/// tested behind it.
-const RISK_TIER_MIN_CONFITURE: Option<(u32, u32, u32)> = None;
+/// The value was set from an **observed capture**, not from a changelog — three
+/// earlier floors were guessed from release notes and all three were wrong. The
+/// capture is the golden fixture `tests/fixtures/preflight/v1-real-0.44.0.json`,
+/// and its README records which binary and which invocation produced it. Raising
+/// this floor means producing that evidence again.
+///
+/// The type stays [`Option`] even though it is now populated: it keeps the
+/// ordering logic in [`version_at_or_above`] testable independently of whichever
+/// number the floor holds, which is why the two were split apart to begin with.
+const RISK_TIER_MIN_CONFITURE: Option<(u32, u32, u32)> = Some((0, 44, 0));
 
 /// The `kind` given to a change entry this build could not read.
 ///
@@ -806,10 +809,11 @@ fn supports_risk_tier(version: &str) -> bool {
 
 /// Whether `version` parses and is at least `floor`.
 ///
-/// Split out from [`supports_risk_tier`] so the comparison stays under test
-/// while the floor itself is withheld: the ordering rules (numeric not lexical,
-/// unreadable never qualifies) are the part that would be silently wrong, and
-/// they must not go untested just because no released confiture clears the bar.
+/// Split out from [`supports_risk_tier`] so the comparison stays testable
+/// independently of whichever number the floor holds: the ordering rules
+/// (numeric not lexical, unreadable never qualifies) are the part that would be
+/// silently wrong, and they are worth exercising against versions no release
+/// has reached.
 fn version_at_or_above(version: &str, floor: (u32, u32, u32)) -> bool {
     version_triple(version).is_some_and(|triple| triple >= floor)
 }
@@ -967,7 +971,7 @@ mod tests {
         parse_change_set, parse_current_revision, parse_down_to_outcome, parse_preflight_report,
         parse_up_outcome, parse_verify_report, parse_version, plan, reports_uninitialised,
         subcommand_takes_migrations_dir, supports_risk_tier, version_at_or_above, version_triple,
-        ConfitureMigration, CONFITURE_DSN_ENV,
+        ConfitureMigration, CONFITURE_DSN_ENV, RISK_TIER_MIN_CONFITURE,
     };
     use fraisier_core::adapter_axes::{
         AdapterCtx, AdapterErrorKind, ChangeSetUnavailable, PreflightReport, Revision, RiskTier,
@@ -1865,14 +1869,16 @@ mod tests {
         }
     }
 
-    /// **No confiture that a user can actually install emits a change-set.**
+    /// **Below the floor, the capability is withheld — including from the
+    /// release that implements the feature.**
     ///
-    /// This is the test that keeps the floor honest against a moving upstream.
-    /// fraiseql/confiture#197 — the producer half of the contract — is open, and
-    /// confiture kept releasing without it (0.40.0 `validate composes`, 0.41.0
-    /// `ledger probe`, 0.42.0 `analyzer scoping`, all on 2026-08-05). A floor
-    /// *guessed* at the next unreleased minor is not a safety property; it is a
-    /// bet against a repository that ships several times a day.
+    /// The interesting row is `0.43.0`. It is where the producer half of the
+    /// contract shipped (fraiseql/confiture#197), so it *can* classify, and it is
+    /// refused anyway: the same binary still reports `window_safe: true` for a
+    /// `DROP TABLE` (#206). The floor is not the release that added the feature;
+    /// it is the release whose whole verdict is trustworthy. That distinction has
+    /// exactly one guard, and this is it — a later edit "correcting" the floor
+    /// down to 0.43.0 fails here and nowhere else.
     ///
     /// Advertising the capability against any of these makes `evaluate` take the
     /// `NO_CHANGE_SET` branch — *"the adapter advertises `risk_tier` and then
@@ -1880,12 +1886,12 @@ mod tests {
     /// deny-by-default rule, refuse **every** deploy for anyone who adopts
     /// `[policy]`. The adapter bug would be this constant.
     #[test]
-    fn no_released_confiture_advertises_risk_tier() {
-        for version in ["0.38.1", "0.39.0", "0.40.0", "0.41.0", "0.42.0"] {
+    fn no_confiture_below_the_floor_advertises_risk_tier() {
+        for version in ["0.38.1", "0.39.0", "0.40.0", "0.41.0", "0.42.0", "0.43.0"] {
             assert!(
                 !supports_risk_tier(version),
-                "confiture {version} is released and does not implement #197, so the adapter \
-                 must not claim it classifies"
+                "confiture {version} is below the floor, so the adapter must not \
+                 claim it classifies"
             );
             assert!(
                 !capabilities_for(version)
@@ -1896,22 +1902,29 @@ mod tests {
         }
     }
 
-    /// The consumer half is complete and stays exercised: flipping the floor to
-    /// a released version is the *only* change needed to light the capability
-    /// up, and it lights up for exactly the versions at or above it.
+    /// The live floor's ordering rules, read off the constant rather than
+    /// hard-coded: numeric and not lexical, and a version this build cannot read
+    /// never qualifies however high it looks.
+    ///
+    /// Reading [`RISK_TIER_MIN_CONFITURE`] is what keeps this test doing its own
+    /// job after the next bump instead of restating
+    /// `describe_advertises_risk_tier_from_the_release_that_classifies`. The
+    /// rules below are the half that would be silently wrong: a string compare
+    /// puts `0.100.0` below `0.44.0`, and a lenient version parse would admit a
+    /// release candidate the adapter cannot actually place.
     #[test]
-    fn a_confirmed_floor_advertises_risk_tier_at_and_above_itself() {
-        let floor = (0, 43, 0);
-        assert!(!version_at_or_above("0.42.0", floor));
-        assert!(version_at_or_above("0.43.0", floor));
-        assert!(version_at_or_above("0.43.1", floor));
+    fn the_floor_admits_exactly_the_versions_at_or_above_it() {
+        let floor = RISK_TIER_MIN_CONFITURE.expect("the floor is pinned");
+        assert!(!version_at_or_above("0.43.0", floor));
+        assert!(version_at_or_above("0.44.0", floor));
+        assert!(version_at_or_above("0.44.1", floor));
         assert!(
             version_at_or_above("0.100.0", floor),
             "numeric, not lexical"
         );
         assert!(version_at_or_above("1.0.0", floor));
         // Unreadable stays unreadable regardless of the floor.
-        assert!(!version_at_or_above("0.43.0rc1", floor));
+        assert!(!version_at_or_above("0.44.0rc1", floor));
     }
 
     /// A confiture that changes its `--version` format must degrade to *"I do

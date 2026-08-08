@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.8](https://github.com/fraiseql/fraisier-core/compare/fraisier-core-v1.0.0-beta.7...fraisier-core-v1.0.0-beta.8) - 2026-08-08
+
+### Fixed
+
+- *(policy)* stop trusting window_safe from a confiture that cannot classify
+
+### Other
+
+- *(release)* 1.0.0-beta.8
+- release v1.0.0-beta.7
+
 ### Fixed
 
 - *(policy)* the blue-green baseline now requires the `window_safe` **capability**

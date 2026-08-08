@@ -297,3 +297,14 @@ configuration, at the same trust level as any other command in `fraisier.toml`.
 The contract's job is to make sure that *silence, error, and confusion* are never
 mistaken for a clean bill of health; it is not to defend against a producer that
 lies.
+
+One consequence of that boundary is worth stating plainly, because it is where
+the obligation on `changes[].detail` earns its keep: **`detail` reaches the
+operator's terminal verbatim.** The plan render appends it to the row unescaped,
+so a producer that put a DSN in it has printed and logged that DSN. This is
+acceptable at exactly the trust level above — the producer is a binary the
+operator installed, reading migrations the operator wrote — and it is *not*
+acceptable for a payload that has left the contract. That is why the adapter's
+`unclassified_placeholder` and `warn_unusable` name the entry's **shape** and
+**position** and quote nothing from inside it: a payload that broke the envelope
+also broke its promise about `detail`.

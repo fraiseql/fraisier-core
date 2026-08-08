@@ -981,46 +981,72 @@ mod tests {
     /// embedded rather than read at runtime: deleting one breaks the *build*,
     /// which is what their `_README.md` promises. Confiture asserts it emits
     /// these bytes; the tests below assert this adapter parses them.
-    const FIXTURES: &[(&str, &str)] = &[
+    ///
+    /// The third column is the `window_safe` verdict the bytes carry. It is a
+    /// column rather than a constant because the hand-authored shapes were
+    /// written around a safe scenario while the capture from a real binary
+    /// reports `false` — it drops a table. Pinning it per row keeps the
+    /// universal assertion strong: a parser that inverted the boolean, or read
+    /// it off the wrong key, is still caught.
+    const FIXTURES: &[(&str, &str, bool)] = &[
         (
             "v0-no-change-set",
             include_str!("../tests/fixtures/preflight/v0-no-change-set.json"),
+            true,
         ),
         (
             "v1-empty",
             include_str!("../tests/fixtures/preflight/v1-empty.json"),
+            true,
         ),
         (
             "v1-additive",
             include_str!("../tests/fixtures/preflight/v1-additive.json"),
+            true,
         ),
         (
             "v1-mixed",
             include_str!("../tests/fixtures/preflight/v1-mixed.json"),
+            true,
         ),
         (
             "v1-unknown-tier",
             include_str!("../tests/fixtures/preflight/v1-unknown-tier.json"),
+            true,
         ),
         (
             "v1-missing-tier",
             include_str!("../tests/fixtures/preflight/v1-missing-tier.json"),
+            true,
         ),
         (
             "v2-future",
             include_str!("../tests/fixtures/preflight/v2-future.json"),
+            true,
         ),
         (
             "malformed",
             include_str!("../tests/fixtures/preflight/malformed.json"),
+            true,
+        ),
+        (
+            REAL_CAPTURE,
+            include_str!("../tests/fixtures/preflight/v1-real-0.44.0.json"),
+            false,
         ),
     ];
 
+    /// The one fixture that is a *capture* rather than a hand-authored shape:
+    /// what confiture 0.44.0 actually emitted, through the argv [`plan`] builds.
+    /// Named because several tests below single it out — the others pin what the
+    /// producer must be able to emit, this one pins what it does emit.
+    const REAL_CAPTURE: &str = "v1-real-0.44.0";
+
     /// One golden fixture, by name (without the `.json`).
     fn fixture(name: &str) -> Value {
-        let (_, bytes) = FIXTURES
+        let (_, bytes, _) = FIXTURES
             .iter()
-            .find(|(fixture, _)| *fixture == name)
+            .find(|(fixture, _, _)| *fixture == name)
             .unwrap_or_else(|| panic!("no golden fixture named {name}"));
         serde_json::from_str(bytes)
             .unwrap_or_else(|err| panic!("golden fixture {name} is not valid JSON: {err}"))
@@ -1028,22 +1054,63 @@ mod tests {
 
     #[test]
     fn every_fixture_parses_without_panicking() {
-        for (name, _) in FIXTURES {
+        for (name, _, window_safe) in FIXTURES {
             let json = fixture(name);
             // Whichever way a fixture breaks the change-set, it never breaks the
             // report: `ok`, `issues` and `window_safe` predate this contract and
             // the deploy already blocks on them.
             let report = parse_preflight_report(&json);
-            assert!(report.ok, "{name}: every fixture is a clean lint result");
+            assert!(
+                report.ok,
+                "{name}: no fixture is an error-level lint failure"
+            );
             assert_eq!(
                 report.window_safe,
-                Some(true),
+                Some(*window_safe),
                 "{name}: window_safe still crosses the seam untouched"
             );
             // And reaching the classification never panics, however it is missing.
             let _ = parse_change_set(&json);
             let _ = report.usable_change_set();
         }
+    }
+
+    /// The pact, read off a binary instead of off a specification.
+    ///
+    /// Every other fixture was written by reading the contract; this one is what
+    /// confiture 0.44.0 emitted for a migration set covering all five tiers plus
+    /// a statement it declines to classify. It is the observation the risk-tier
+    /// floor rests on, so it asserts the whole shape rather than one corner of
+    /// it: five known tiers in migration order, the sixth entry surviving with no
+    /// tier at all, and the worst tier read independently of both.
+    #[test]
+    fn the_real_capture_carries_all_five_tiers_and_one_unclassified_change() {
+        let set = parse_change_set(&fixture(REAL_CAPTURE)).expect("0.44.0 classifies");
+        assert_eq!(set.contract_version, RISK_CONTRACT_VERSION);
+        assert_eq!(set.changes.len(), 6);
+
+        // Migration order is the producer's order, preserved on the way through.
+        let tiers: Vec<Option<RiskTier>> = set.changes.iter().map(|c| c.tier).collect();
+        assert_eq!(
+            tiers,
+            vec![
+                Some(RiskTier::Additive),
+                Some(RiskTier::Reversible),
+                Some(RiskTier::LockRisky),
+                Some(RiskTier::Destructive),
+                Some(RiskTier::Irreversible),
+                None,
+            ],
+            "the capture must exercise every tier the taxonomy has"
+        );
+
+        // The unclassified entry is held, not dropped: the refusal has to name it.
+        let unclassified: Vec<&str> = set.unclassified().map(|c| c.kind.as_str()).collect();
+        assert_eq!(unclassified, ["unclassified"]);
+        assert_eq!(set.unclassified().count(), 1);
+
+        // Not folded into the worst tier, and not rounded up by it either.
+        assert_eq!(set.worst_tier(), Some(RiskTier::Irreversible));
     }
 
     /// A preflight report carrying `change_set` verbatim.
@@ -1282,7 +1349,7 @@ mod tests {
     /// deny; this one can say more about why.
     #[test]
     fn the_manual_parser_agrees_with_the_typed_deserializer() {
-        for (name, bytes) in FIXTURES {
+        for (name, bytes, _) in FIXTURES {
             let typed: PreflightReport =
                 serde_json::from_str(bytes).unwrap_or_else(|err| panic!("{name}: {err}"));
             let manual = parse_preflight_report(&fixture(name));
@@ -1412,7 +1479,7 @@ mod tests {
         on_disk.sort();
         let mut tabled: Vec<String> = FIXTURES
             .iter()
-            .map(|(name, _)| (*name).to_owned())
+            .map(|(name, _, _)| (*name).to_owned())
             .collect();
         tabled.sort();
         assert_eq!(

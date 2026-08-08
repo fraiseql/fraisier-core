@@ -33,11 +33,21 @@
 //!
 //! The **`window_safe`** capability (the first-class blue-green forward-compat
 //! verdict, parsed from the `preflight` report's top-level `window_safe` boolean)
-//! requires **Confiture ≥ 0.23.0** (fraiseql/confiture#154). The verdict is
-//! purely forward-compatibility for a two-version window — `false` for any
-//! replica-unsafe op or any migration the classifier cannot read (`.py`), `true`
-//! for online-safe ops including `CREATE INDEX CONCURRENTLY`. An older confiture
-//! omits the field; fraisier's blue-green gate then refuses (fail-safe).
+//! requires **Confiture ≥ 0.44.0**. The verdict is purely forward-compatibility
+//! for a two-version window — `false` for any replica-unsafe op or any migration
+//! the classifier cannot read (`.py`), `true` for online-safe ops including
+//! `CREATE INDEX CONCURRENTLY`.
+//!
+//! The field itself arrived in 0.23.0 (fraiseql/confiture#154), but the floor is
+//! **0.44.0**, not 0.23.0, because emitting the field is not the same as being
+//! able to compute it. Up to 0.43.0 confiture's `OperationClassifier` recognised
+//! four AST node types and silently returned nothing for the rest, so
+//! `DROP TABLE` classified to `[]` — and since `window_safe` is derived from the
+//! *absence* of `PFLIGHT_REPLICA_*` findings, a table drop reported
+//! `window_safe: true` (fraiseql/confiture#206). Withholding the capability is
+//! the fix rather than reinterpreting the value: this adapter consumes
+//! confiture's verdict and never reimplements its classifier, so the only honest
+//! move is to stop asking a binary that cannot answer.
 //!
 //! The **`risk_tier`** capability (a per-change risk-tiered change-set, parsed
 //! from the `preflight` report's `change_set` object) requires a confiture that
@@ -46,12 +56,12 @@
 //! and the capability is never advertised. The parsing and the gate behind it
 //! are complete; pinning the floor to the release that implements #197 is the
 //! one change that activates them.
-//! Unlike the capabilities above it is **advertised conditionally**, on the
-//! version the installed binary reports: claiming it against a confiture that
-//! cannot classify would make fraisier's policy gate expect a change-set and
-//! deny every deploy. Withholding it says *"I do not classify"*, and a deploy
-//! with no risk policy configured then behaves exactly as it does today. The
-//! contract is specified in `docs/proposals/migration-risk-contract.md`.
+//! Both are **advertised conditionally**, on the version the installed binary
+//! reports: claiming `risk_tier` against a confiture that cannot classify would
+//! make fraisier's policy gate expect a change-set and deny every deploy.
+//! Withholding it says *"I do not classify"*, and a deploy with no risk policy
+//! configured then behaves exactly as it does today. The contract is specified
+//! in `docs/proposals/migration-risk-contract.md`.
 //!
 //! ## Double locking (intentional)
 //!
@@ -98,14 +108,34 @@ const PROGRAM_ENV: &str = "FRAISIER_CONFITURE_BIN";
 /// advertise a capability it cannot meaningfully fulfil (PRD review Decision 3).
 ///
 /// [`describe`]: MigrationAdapter::describe
-const CAPABILITIES: &[&str] = &[
-    "current_revision",
-    "up",
-    "down_to",
-    "verify",
-    "preflight",
-    "window_safe",
-];
+const CAPABILITIES: &[&str] = &["current_revision", "up", "down_to", "verify", "preflight"];
+
+/// The capability advertised when the installed confiture's window-safety
+/// verdict is worth reading.
+const WINDOW_SAFE_CAPABILITY: &str = "window_safe";
+
+/// The first confiture release whose `window_safe` verdict covers the whole
+/// statement matrix (fraiseql/confiture#206).
+///
+/// Not `Option`, unlike [`RISK_TIER_MIN_CONFITURE`]: this floor names a release
+/// that exists and has been observed fixing the defect, so there is nothing to
+/// withhold.
+///
+/// **Why the floor is not 0.23.0**, the release that introduced the field
+/// (fraiseql/confiture#154): up to and including 0.43.0 confiture's
+/// `OperationClassifier` maps four AST node types and returns nothing for the
+/// rest, so `DROP TABLE` classifies to `[]`. Because `window_safe` is derived
+/// from the *presence* of `PFLIGHT_REPLICA_*` findings, an unclassified
+/// statement and a safe one are indistinguishable, and a table drop — which no
+/// two-version window survives — reports `window_safe: true`.
+///
+/// That is the one error direction the consumer cannot recover from. A *missing*
+/// verdict is refused by the policy gate; a present-and-wrong one is admitted.
+/// So the fix is to stop claiming the capability rather than to reinterpret the
+/// value: fraisier consumes confiture's verdict and never second-guesses its
+/// classifier, which leaves *"do not ask a binary that cannot answer"* as the
+/// only honest move.
+const WINDOW_SAFE_MIN_CONFITURE: (u32, u32, u32) = (0, 44, 0);
 
 /// The capability advertised when the installed confiture classifies the
 /// pending schema changes into a risk-tiered change-set.
@@ -745,10 +775,23 @@ fn capabilities_for(version: &str) -> Vec<String> {
         .iter()
         .map(|capability| (*capability).to_owned())
         .collect();
+    if supports_window_safe(version) {
+        capabilities.push(WINDOW_SAFE_CAPABILITY.to_owned());
+    }
     if supports_risk_tier(version) {
         capabilities.push(RISK_TIER_CAPABILITY.to_owned());
     }
     capabilities
+}
+
+/// Whether the confiture at `version` emits a window-safety verdict that covers
+/// every statement it might be shown.
+///
+/// A version string this build cannot read degrades to `false`, for the same
+/// reason [`supports_risk_tier`] does: the unreadable case must never be the one
+/// that grants a safety claim.
+fn supports_window_safe(version: &str) -> bool {
+    version_at_or_above(version, WINDOW_SAFE_MIN_CONFITURE)
 }
 
 /// Whether the confiture at `version` can emit a risk-tiered change-set.
@@ -1700,6 +1743,38 @@ mod tests {
         assert_eq!(unsafe_.window_safe, Some(false));
     }
 
+    /// A `window_safe` verdict is only worth reading from a confiture that can
+    /// classify the statements it is judging.
+    ///
+    /// Up to and including 0.43.0 it cannot: `OperationClassifier` maps four AST
+    /// node types and returns nothing for anything else, so `DROP TABLE`
+    /// classifies to `[]`. `window_safe` is computed from the *presence* of
+    /// `PFLIGHT_REPLICA_*` findings, which makes "nothing classified" and
+    /// "nothing unsafe" the same answer — and a table drop, which no two-version
+    /// window survives, reports `window_safe: true` (fraiseql/confiture#206).
+    ///
+    /// That is the one failure direction the blue-green baseline cannot absorb:
+    /// an absent verdict refuses, but a *present and wrong* one admits. So the
+    /// capability is withheld below the release that fixed it, exactly as
+    /// `risk_tier` is.
+    #[test]
+    fn describe_omits_window_safe_below_the_release_that_classifies() {
+        for version in ["0.22.0", "0.23.0", "0.31.0", "0.42.0", "0.43.0"] {
+            let capabilities = capabilities_for(version);
+            assert!(
+                !capabilities.iter().any(|cap| cap == "window_safe"),
+                "confiture {version} reports window_safe = true for DROP TABLE: {capabilities:?}"
+            );
+        }
+        for version in ["0.44.0", "0.44.1", "0.45.0", "1.0.0"] {
+            let capabilities = capabilities_for(version);
+            assert!(
+                capabilities.iter().any(|cap| cap == "window_safe"),
+                "confiture {version} classifies the whole statement matrix: {capabilities:?}"
+            );
+        }
+    }
+
     /// The capability must describe the **installed** confiture, not this
     /// crate's ambitions. Advertising `risk_tier` against a binary that cannot
     /// classify makes the policy gate expect a change-set and deny every
@@ -1717,9 +1792,9 @@ mod tests {
                 "confiture {version}: {capabilities:?}"
             );
             // The base handshake is untouched — an old confiture keeps every
-            // capability it had.
+            // capability it had. `window_safe` is not among them: see
+            // `describe_omits_window_safe_below_the_release_that_classifies`.
             assert!(capabilities.iter().any(|cap| cap == "preflight"));
-            assert!(capabilities.iter().any(|cap| cap == "window_safe"));
         }
     }
 

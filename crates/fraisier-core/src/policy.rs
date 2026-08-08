@@ -49,6 +49,16 @@
 //!   nothing can certify the window (mirrors the `MethodNotSupported`-never-a-pass
 //!   design). An adapter without the `preflight` capability is likewise refused.
 //!
+//! The read happens only for an adapter that advertises **`window_safe`**, and
+//! that check comes first. The capability is what separates *"I looked and found
+//! nothing unsafe"* from *"I could not read this"* — two states a producer that
+//! derives the verdict from an absence of findings cannot tell apart, and which
+//! arrive here as the same `Some(true)`. Refusing on the missing capability is
+//! therefore not redundant with the `None` arm: `None` catches a producer that
+//! stays silent, the capability catches one that answers confidently about
+//! statements it never recognised (confiture ≤ 0.43.0 did exactly this for
+//! `DROP TABLE` — fraiseql/confiture#206).
+//!
 //! There is **no force-equivalent** (a silent override would re-introduce the
 //! exact shared-DB-corruption footgun the rule exists to prevent) and **no
 //! fallback to pattern-matching issue codes** — the typed verdict is the contract.
@@ -60,11 +70,18 @@
 //! ### Cross-repo contract (tracked in fraiseql/confiture#154)
 //!
 //! confiture emits `window_safe` on the `migrate preflight` JSON report and pins
-//! it in its contract test. `window_safe == false` for **any** migration confiture
-//! cannot certify — including ones its replica classifier cannot read (non-SQL /
-//! `.py`) — so "can't see" can never masquerade as "safe". fraisier requires a
-//! confiture release that emits the field; an older one returns `None` and is
-//! refused (fail safe).
+//! it in its contract test. The contract is that `window_safe == false` for
+//! **any** migration confiture cannot certify — including ones its replica
+//! classifier cannot read (non-SQL / `.py`) — so "can't see" can never
+//! masquerade as "safe".
+//!
+//! **The producer did not hold up that half until 0.44.0.** Through 0.43.0 the
+//! classifier recognised four statement kinds and the verdict was computed from
+//! the absence of findings, so an unreadable statement produced `true` rather
+//! than `false` — `DROP TABLE` among them (fraiseql/confiture#206). Emitting the
+//! field was therefore never sufficient evidence that the contract held, which
+//! is why the gate keys on the advertised capability and the confiture adapter
+//! withholds it below 0.44.0, instead of trusting the field's presence.
 //!
 //! ## The tier policy
 //!
@@ -441,11 +458,16 @@ mod kinds {
     pub const UNREADABLE_CHANGE_SET: &str = "unreadable_change_set";
 }
 
-/// What the adapter says it can do — the two capability strings this gate reads.
+/// What the adapter says it can do — the capability strings this gate reads.
 ///
-/// A struct rather than loose booleans because the two are read by different
+/// A struct rather than loose booleans because they are read by different
 /// halves of the decision and a positional `bool, bool` at the call site is a
-/// silent-swap waiting to happen.
+/// silent-swap waiting to happen. For the same reason `window_safe` is set
+/// through [`with_window_safe`](Self::with_window_safe) rather than by widening
+/// [`new`](Self::new) to a third positional `bool`.
+///
+/// Every capability defaults to **absent**, which is the safe direction: a gate
+/// that needs one refuses when it is missing.
 ///
 /// # Example
 /// ```
@@ -454,6 +476,8 @@ mod kinds {
 /// let capabilities = Capabilities::from_advertised(&advertised);
 /// assert!(capabilities.preflight);
 /// assert!(!capabilities.risk_tier);
+/// // Linting is not classifying: this adapter never claimed a window verdict.
+/// assert!(!capabilities.window_safe);
 /// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -462,16 +486,35 @@ pub struct Capabilities {
     pub preflight: bool,
     /// `risk_tier` — its [`PreflightReport`] carries a classified change-set.
     pub risk_tier: bool,
+    /// `window_safe` — its [`PreflightReport`] carries a window-safety verdict
+    /// the producer was actually able to compute.
+    ///
+    /// Separate from [`preflight`](Self::preflight) because linting and
+    /// classifying are different jobs: a producer can run the lint and still be
+    /// unable to read the statement it is judging, and when it cannot, its
+    /// `window_safe` is an absence of findings rather than a finding of safety.
+    pub window_safe: bool,
 }
 
 impl Capabilities {
-    /// State both capabilities directly.
+    /// State the two capabilities that gate *which calls run*.
+    ///
+    /// `window_safe` is absent; add it with
+    /// [`with_window_safe`](Self::with_window_safe).
     #[must_use]
     pub const fn new(preflight: bool, risk_tier: bool) -> Self {
         Self {
             preflight,
             risk_tier,
+            window_safe: false,
         }
+    }
+
+    /// Add the `window_safe` capability.
+    #[must_use]
+    pub const fn with_window_safe(mut self, window_safe: bool) -> Self {
+        self.window_safe = window_safe;
+        self
     }
 
     /// Read them off an [`AdapterDescription::capabilities`] list.
@@ -483,6 +526,7 @@ impl Capabilities {
             capabilities.iter().any(|c| c == "preflight"),
             capabilities.iter().any(|c| c == "risk_tier"),
         )
+        .with_window_safe(capabilities.iter().any(|c| c == "window_safe"))
     }
 }
 
@@ -523,6 +567,15 @@ fn baseline_verdict(
                 return Some(
                     "the migration adapter does not advertise `preflight`; nothing can certify \
                      the migration window-safe for a two-version blue-green window"
+                        .to_owned(),
+                );
+            }
+            if !capabilities.window_safe {
+                return Some(
+                    "the migration adapter does not advertise `window_safe`; it runs the \
+                     forward-compatibility lint but cannot classify every statement, so a `true` \
+                     from it would mean *nothing was recognised*, not *nothing is unsafe* — see \
+                     fraiseql/confiture#206"
                         .to_owned(),
                 );
             }
@@ -995,6 +1048,15 @@ mod tests {
     const CLASSIFIES: Capabilities = Capabilities::new(true, true);
     /// `preflight` only — an adapter that lints but does not classify.
     const NO_TIERS: Capabilities = Capabilities::new(true, false);
+    /// Lints and can certify the window, but emits no risk tiers.
+    ///
+    /// The blue-green baseline rows below need this rather than [`NO_TIERS`]:
+    /// they are about what the gate does with a verdict it *can* trust, so the
+    /// adapter has to have claimed it. [`NO_TIERS`] is the confiture that lints
+    /// without classifying, whose verdict is refused before it is ever read.
+    const CERTIFIES_WINDOW: Capabilities = NO_TIERS.with_window_safe(true);
+    /// Classifies statements *and* tiers them — a fully-capable confiture.
+    const CLASSIFIES_AND_CERTIFIES: Capabilities = CLASSIFIES.with_window_safe(true);
 
     /// The default policy, with an approval hook configured.
     fn policy() -> Policy {
@@ -1326,7 +1388,7 @@ mod tests {
         let decision = evaluate(
             None,
             Baseline::WindowSafety,
-            NO_TIERS,
+            CERTIFIES_WINDOW,
             Some(&blue_green(Some(false))),
         );
         assert!(denial(&decision).contains("window_safe = false"));
@@ -1337,7 +1399,7 @@ mod tests {
         let decision = evaluate(
             None,
             Baseline::WindowSafety,
-            NO_TIERS,
+            CERTIFIES_WINDOW,
             Some(&blue_green(Some(true))),
         );
         assert_eq!(decision, PolicyDecision::Allow { changes: 0 });
@@ -1350,10 +1412,36 @@ mod tests {
         let decision = evaluate(
             None,
             Baseline::WindowSafety,
-            NO_TIERS,
+            CERTIFIES_WINDOW,
             Some(&blue_green(None)),
         );
         assert!(denial(&decision).contains("window_safe"));
+    }
+
+    /// A `window_safe: true` from an adapter that never advertised the
+    /// capability is not a verdict — it is an unclassified statement wearing
+    /// one.
+    ///
+    /// This is the only direction the baseline cannot absorb. An *absent*
+    /// verdict refuses (see [`no_window_safety_verdict_is_denied`]), but a
+    /// present-and-wrong one admits, and confiture up to 0.43.0 emits exactly
+    /// that for `DROP TABLE`: its classifier maps four AST node types, `DropStmt`
+    /// is not among them, and `window_safe` is derived from the *absence* of
+    /// findings — so "I could not read this" and "this is safe" produce the same
+    /// `true` (fraiseql/confiture#206). Requiring the capability is what makes
+    /// the gate reject a verdict its producer was never able to give.
+    #[test]
+    fn an_unadvertised_window_safe_verdict_is_not_trusted() {
+        let decision = evaluate(
+            None,
+            Baseline::WindowSafety,
+            NO_TIERS,
+            Some(&blue_green(Some(true))),
+        );
+        assert!(
+            denial(&decision).contains("window_safe"),
+            "an unadvertised verdict must not certify the window"
+        );
     }
 
     #[test]
@@ -1369,7 +1457,7 @@ mod tests {
 
     #[test]
     fn no_preflight_report_cannot_certify_the_window() {
-        let decision = evaluate(None, Baseline::WindowSafety, NO_TIERS, None);
+        let decision = evaluate(None, Baseline::WindowSafety, CERTIFIES_WINDOW, None);
         assert!(denial(&decision).contains("cannot certify the window"));
     }
 
@@ -1381,7 +1469,12 @@ mod tests {
         // concern, because blue-green does no DB rollback.
         let tolerated = PreflightReport::new(false).with_window_safe(true);
         assert_eq!(
-            evaluate(None, Baseline::WindowSafety, NO_TIERS, Some(&tolerated)),
+            evaluate(
+                None,
+                Baseline::WindowSafety,
+                CERTIFIES_WINDOW,
+                Some(&tolerated)
+            ),
             PolicyDecision::Allow { changes: 0 }
         );
     }
@@ -1408,7 +1501,7 @@ mod tests {
         let decision = evaluate(
             Some(&policy()),
             Baseline::WindowSafety,
-            CLASSIFIES,
+            CLASSIFIES_AND_CERTIFIES,
             Some(&report),
         );
         let PolicyDecision::Deny { reason, reasons } = &decision else {
@@ -1434,7 +1527,7 @@ mod tests {
         let decision = evaluate(
             Some(&policy()),
             Baseline::WindowSafety,
-            CLASSIFIES,
+            CLASSIFIES_AND_CERTIFIES,
             Some(&report),
         );
         assert!(denial(&decision).contains("window_safe = false"));

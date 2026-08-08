@@ -88,27 +88,31 @@ FRAISIER="$REPO_ROOT/target/debug/fraisier"
 [ -x "$FRAISIER" ] || die "fraisier binary missing after build"
 ok "confiture: $(confiture --version 2>&1 | head -1)"
 
-# Does the installed confiture emit the first-class `window_safe` verdict
-# (confiture#154 Phase 3)? fraisier's blue-green gate requires it; an older
-# confiture returns no verdict and is refused (fail-safe). The full DROP/ADD/budget
-# gates need it; without it we assert only the fail-safe.
+# Is the installed confiture's `window_safe` verdict one fraisier will trust?
+#
+# This reads the **version**, not the presence of the field, because the field
+# alone proves nothing: confiture has emitted it since 0.23.0 (confiture#154),
+# but every release up to 0.43.0 derived it from an *absence* of classifier
+# findings, so a `DROP TABLE` it could not read reported `window_safe: true`
+# (confiture#206). The adapter withholds the capability below 0.44.0 and the
+# deploy is refused, so probing for the key would take the wrong branch for any
+# confiture in 0.23–0.43. The full DROP/ADD/budget gates need a trusted verdict;
+# without one we assert only the fail-safe.
+WINDOW_SAFE_MIN=0.44.0
 WINDOW_SAFE=0
-probe_window_safe() {
-  local d="$1"
-  mkdir -p "$d"
-  printf 'CREATE TABLE _bg_probe (id int);\n' > "$d/001_p.up.sql"
-  printf 'DROP TABLE _bg_probe;\n' > "$d/001_p.down.sql"
-  CONFITURE_DATABASE_URL='postgresql://u@127.0.0.1:1/n?sslmode=disable' \
-    confiture migrate preflight --no-config --format json --output "$d/r.json" \
-    --migrations-dir "$d" >/dev/null 2>&1 || true
-  grep -q '"window_safe"' "$d/r.json" 2>/dev/null
+confiture_version() {
+  confiture --version 2>&1 | head -1 | grep -oE '[0-9]+(\.[0-9]+){1,2}' | head -1
 }
-if probe_window_safe "$WORK/probe"; then
+version_at_least() { # $1 >= $2, numeric not lexical
+  [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]
+}
+CONFITURE_VERSION="$(confiture_version)"
+if [ -n "$CONFITURE_VERSION" ] && version_at_least "$CONFITURE_VERSION" "$WINDOW_SAFE_MIN"; then
   WINDOW_SAFE=1
-  ok "confiture emits window_safe (Phase 3) — running the full window-safety gates"
+  ok "confiture $CONFITURE_VERSION >= $WINDOW_SAFE_MIN — running the full window-safety gates"
 else
-  say "confiture has no window_safe verdict yet — asserting the FAIL-SAFE only"
-  say "      (the full DROP/ADD/budget gates validate once confiture#154 Phase 3 ships)"
+  say "confiture ${CONFITURE_VERSION:-unknown} < $WINDOW_SAFE_MIN — asserting the FAIL-SAFE only"
+  say "      (below $WINDOW_SAFE_MIN its window_safe reads true for DROP TABLE — confiture#206)"
 fi
 
 # A dummy local artifact (provision-green's stage step reads it; the deploy never
@@ -218,8 +222,9 @@ deploy() {
 say "BLUE-GREEN — preflight GA gates (real confiture + real Postgres)"
 
 # --- Gate 1: a non-window-safe migration is refused at the window-safety gate -
-# With Phase 3 confiture: DROP COLUMN -> window_safe = false. Without it: ANY
-# migration -> no verdict -> refused (fail-safe). Both cite `window_safe`.
+# With a trusted confiture (>= 0.44.0): DROP COLUMN -> window_safe = false.
+# Below it: the capability is withheld, so ANY migration is refused without the
+# verdict being read at all (fail-safe). Both refusals cite `window_safe`.
 say "gate: migration not window-safe -> refused at preflight"
 reset_migrations; write_drop
 write_config ""   # no connection-budget probe
@@ -234,7 +239,7 @@ echo "$DEPLOY_OUT" | grep -qi "window_safe" \
 if [ "$WINDOW_SAFE" = 1 ]; then
   ok "DROP COLUMN: confiture window_safe=false -> refused before any change"
 else
-  ok "no window_safe verdict -> refused (fail-safe; an un-upgraded confiture can't certify)"
+  ok "window_safe not advertised -> refused (fail-safe; this confiture can't certify)"
 fi
 
 if [ "$WINDOW_SAFE" != 1 ]; then

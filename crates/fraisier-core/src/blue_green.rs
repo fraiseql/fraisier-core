@@ -466,6 +466,13 @@ mod tests {
         async fn describe(&self) -> Result<AdapterDescription, AdapterError> {
             self.record("describe");
             let mut capabilities = vec!["up".to_owned(), "preflight".to_owned()];
+            // Advertise exactly what this fake can produce. A real adapter only
+            // claims `window_safe` when the installed producer can classify
+            // every statement it is shown; deriving it from the report keeps the
+            // fake from claiming a verdict it never emits.
+            if self.report.window_safe.is_some() {
+                capabilities.push("window_safe".to_owned());
+            }
             if self.classifies {
                 capabilities.push("risk_tier".to_owned());
             }

@@ -285,7 +285,7 @@ Drives the real `fraisier deploy` (with `[deploy].strategy = "blue-green"`)
 through its **preflight gates** against **real confiture** and a **real
 Postgres**. The gate consumes
 confiture's first-class **`window_safe`** verdict — one typed boolean, no code
-pattern-matching (confiture ≥ 0.23.0). The script probes for it:
+pattern-matching (confiture ≥ 0.44.0). The script probes for it:
 
 - **with `window_safe`:** a `DROP COLUMN` migration → `window_safe = false` →
   **refused** before any instance/traffic change; an `ADD COLUMN` (nullable)
@@ -293,9 +293,14 @@ pattern-matching (confiture ≥ 0.23.0). The script probes for it:
   CONCURRENTLY` (replica-safe but non-transactional) also clears it; and with
   green's pool larger than the shared DB's headroom the pre-swap
   **connection-budget** probe (a real `psql` query) refuses before the swap;
-- **without it (confiture < 0.23):** any migration → *no verdict* → **refused**
-  (the fail-safe — an un-upgraded confiture can't certify the window). The script
-  asserts this fail-safe and skips the full gates.
+- **without it (confiture < 0.44):** any migration → *no verdict* → **refused**
+  (the fail-safe — a confiture that cannot certify the window is not asked to).
+  The field itself dates from 0.23.0, but every release up to 0.43.0 reported
+  `window_safe = true` for `DROP TABLE`: its classifier recognised four
+  statement kinds and derived the verdict from the *absence* of findings, so
+  "unreadable" and "safe" were the same answer (fraiseql/confiture#206). The
+  adapter therefore withholds the capability below 0.44.0. The script asserts
+  this fail-safe and skips the full gates.
 
 ```sh
 scripts/checkpoint-blue-green.sh                 # throwaway Postgres (cached *-alpine), zero spend
@@ -329,7 +334,7 @@ scripts/checkpoint-blue-green-traffic.sh          # rootless podman + user syste
 The include dir is bind-mounted into the nginx container at its *same absolute
 path*, so fraisier's absolute swap symlink resolves identically inside. Together
 with `checkpoint-blue-green.sh`, all four blue-green gates are proven end-to-end
-against real infra. (This fixture needs a confiture that emits `window_safe`
-(≥ 0.23.0) — the swap requires the window-safety gate to *pass*; it dies early
+against real infra. (This fixture needs a confiture whose `window_safe` is trusted
+(≥ 0.44.0) — the swap requires the window-safety gate to *pass*; it dies early
 with a clear message otherwise. The traffic-tier gates are also proven
 hermetically in `fraisier-core::blue_green`.)

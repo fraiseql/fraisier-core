@@ -149,7 +149,7 @@ never crosses the wire.
 Set the strategy to `blue-green` and give fraisier an `lb` adapter. fraisier
 brings up a green fleet alongside blue, **refuses to proceed unless the pending
 migration is certified forward-compatible for a two-version window** (it consumes
-confiture's first-class `window_safe` verdict — confiture ≥ 0.23.0 — as the
+confiture's first-class `window_safe` verdict — confiture ≥ 0.44.0 — as the
 always-on half of the [schema risk policy gate](docs/schema-risk-policy.md)),
 checks the
 connection budget against the shared database, swaps traffic at the load

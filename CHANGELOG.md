@@ -6,6 +6,41 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **The schema risk policy gate now classifies.** `[policy]` has been able to
+  turn a per-change risk tier into a deploy decision for several releases, but
+  no installable confiture emitted a change-set, so fraisier withheld the
+  `risk_tier` capability from every version and a configured `[policy]` refused
+  every deploy on the grounds that nothing had classified them. The confiture
+  adapter now advertises `risk_tier` against **confiture ≥ 0.44.0**, which
+  closes [#44](https://github.com/fraiseql/fraisier-core/issues/44) and
+  [#46](https://github.com/fraiseql/fraisier-core/issues/46).
+
+  **The operator-visible change:** with confiture ≥ 0.44.0 installed, a
+  `[policy]` section that classified nothing now classifies. Tiers you listed
+  under `auto_apply` apply; the rest go to the approval hook or refuse, as
+  configured. Deploys with no `[policy]` section are unaffected, and so are
+  deploys against an older confiture — below the floor the capability stays
+  withheld, and `fraisier doctor` names the version and the floor.
+
+  The floor is 0.44.0 and not 0.43.0, where the change-set itself shipped:
+  0.43.0 is also the last release whose classifier reports `window_safe: true`
+  for a `DROP TABLE` (fraiseql/confiture#206), and a classifier that cannot be
+  trusted about the window is not trusted about the tier. Both version-gated
+  capabilities now light up on the same release.
+
+  One refusal survives the upgrade by design: an `ALTER COLUMN … TYPE` arrives
+  **unclassified** and is therefore refused. Confiture will not guess whether a
+  type change widens or narrows without the column's current type, which it
+  gathers only when comparing against a live database — something fraisier does
+  not ask it to do. Approve it through the hook, or split it into expand →
+  backfill → contract. This is documented in `docs/schema-risk-policy.md`.
+
+  `fraisier deploy --dry-run` renders the change-set worst-first and carries it
+  in `--json`; the serialized form reports `null` for an unclassified change and
+  never invents a tier for it.
+
 ### Fixed
 
 - **The IPC spawn no longer fails a call on a transient `ETXTBSY`.** Linux

@@ -267,6 +267,15 @@ as they did. There is no `--force`; approval arrives only through the hook, and 
 hook that fails, times out, or cannot be spawned is a **refusal**. Blue-green's
 window-safety rule applies with or without the section.
 
+With the confiture adapter this needs **confiture ≥ 0.44.0** — the same floor as
+the `window_safe` verdict above, because both rest on the same classifier.
+Below it fraisier withholds the capability, so a `[policy]` section classifies
+nothing and refuses everything; `fraisier doctor` reports the installed version
+against the floor. One case survives the upgrade by design: an
+`ALTER COLUMN … TYPE` is unclassified — confiture will not guess widening from
+narrowing without schema facts fraisier does not ask it for — so a type change
+is refused until it is approved or split.
+
 `fraisier deploy --dry-run` previews all of it — the change-set, worst-first,
 and the verdict the gate would reach — without ever calling the hook. Add
 `--fail-on-block` to turn a would-be block into a nonzero exit for CI. A plan

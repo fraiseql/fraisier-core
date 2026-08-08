@@ -51,11 +51,20 @@
 //!
 //! The **`risk_tier`** capability (a per-change risk-tiered change-set, parsed
 //! from the `preflight` report's `change_set` object) requires a confiture that
-//! implements the migration risk contract. **No released confiture does yet**
-//! (fraiseql/confiture#197), so the `RISK_TIER_MIN_CONFITURE` floor is `None`
-//! and the capability is never advertised. The parsing and the gate behind it
-//! are complete; pinning the floor to the release that implements #197 is the
-//! one change that activates them.
+//! implements the migration risk contract, and requires **Confiture ≥ 0.44.0**
+//! — the same floor, reached by the same argument. The change-set itself
+//! shipped in 0.43.0 (fraiseql/confiture#197), but that release is also the last
+//! one whose classifier misreads `DROP TABLE`, and a classifier that cannot be
+//! trusted about the window cannot be trusted about the tier. One binary, one
+//! verdict about it: both capabilities light up together, at 0.44.0.
+//!
+//! One consequence is worth stating because an operator will meet it: an
+//! `ALTER COLUMN … TYPE` arrives **unclassified**, and a configured `[policy]`
+//! therefore refuses it. Confiture will not guess whether a type change widens
+//! or narrows without the column's current type, which it gathers only when
+//! comparing against a live database — something this adapter does not ask it to
+//! do. The refusal is the contract working.
+//!
 //! Both are **advertised conditionally**, on the version the installed binary
 //! reports: claiming `risk_tier` against a confiture that cannot classify would
 //! make fraisier's policy gate expect a change-set and deny every deploy.
@@ -172,6 +181,30 @@ const RISK_TIER_CAPABILITY: &str = "risk_tier";
 /// ordering logic in [`version_at_or_above`] testable independently of whichever
 /// number the floor holds, which is why the two were split apart to begin with.
 const RISK_TIER_MIN_CONFITURE: Option<(u32, u32, u32)> = Some((0, 44, 0));
+
+/// Every version-gated capability this adapter has, with the confiture release
+/// it starts trusting for it. `None` means the capability is withheld from every
+/// version.
+///
+/// Public so that anything telling an operator *"your confiture is new enough"*
+/// — `doctor`, today — can read the floors the deploy actually enforces instead
+/// of keeping its own copy of the number. Certifying a binary that a deploy will
+/// then refuse is a worse failure than not checking at all, because the operator
+/// stops looking.
+///
+/// The floors are stated separately rather than reduced to one number here: they
+/// are independent facts about independent capabilities, and a consumer that
+/// wants a single "is this binary fully trusted" bar should take the highest of
+/// them and keep the reason it moved.
+pub const CAPABILITY_FLOORS: &[CapabilityFloor] = &[
+    (WINDOW_SAFE_CAPABILITY, Some(WINDOW_SAFE_MIN_CONFITURE)),
+    (RISK_TIER_CAPABILITY, RISK_TIER_MIN_CONFITURE),
+];
+
+/// One row of [`CAPABILITY_FLOORS`]: the capability's advertised name, and the
+/// `(major, minor, patch)` it is advertised from — `None` if it is withheld from
+/// every version.
+pub type CapabilityFloor = (&'static str, Option<(u32, u32, u32)>);
 
 /// The `kind` given to a change entry this build could not read.
 ///

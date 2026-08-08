@@ -665,6 +665,16 @@ mod tests {
             }
         }
 
+        /// Report `version` to `describe`.
+        ///
+        /// The version lands in the rendered plan header, so a test whose output
+        /// is read as an example of what an operator sees must report one that
+        /// could really advertise the capabilities beside it.
+        fn reporting(mut self, version: &str) -> Self {
+            self.version = version.to_owned();
+            self
+        }
+
         /// One that classifies, and reports `changes`.
         fn classifying(changes: Vec<SchemaChange>) -> Self {
             Self::new(
@@ -775,6 +785,10 @@ mod tests {
     /// is held where the file lives; here, a missing file is a loud panic rather
     /// than a skip, because a dry-run test that silently stops running is how
     /// this whole contract would rot.
+    /// The confiture the captures came from — and the version the fake reports,
+    /// so the rendered plan names a binary that could really have produced them.
+    const CAPTURED_FROM: &str = "0.44.0";
+
     fn real_capture() -> PreflightReport {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../fraisier-adapter-confiture/tests/fixtures/preflight/v1-real-0.44.0.json");
@@ -798,7 +812,8 @@ mod tests {
         let adapter = FakeMigration::new(
             &["up", "preflight", "risk_tier", "window_safe"],
             Ok(real_capture()),
-        );
+        )
+        .reporting(CAPTURED_FROM);
         let preview = gather(
             &adapter,
             &ctx(),
@@ -865,7 +880,8 @@ mod tests {
         let adapter = FakeMigration::new(
             &["up", "preflight", "risk_tier", "window_safe"],
             Ok(real_capture()),
-        );
+        )
+        .reporting(CAPTURED_FROM);
         let preview = gather(
             &adapter,
             &ctx(),

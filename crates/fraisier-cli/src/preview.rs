@@ -634,6 +634,7 @@ mod tests {
     use fraisier_core::adapter_axes::{
         AdapterCtx, AdapterDescription, AdapterError, ChangeSet, MigrationAdapter,
         MigrationOutcome, PreflightReport, Revision, RiskTier, SchemaChange, VerifyReport,
+        RISK_CONTRACT_VERSION,
     };
     use fraisier_core::policy::{
         ApprovalHook, ApprovalRequest, ApprovalVerdict, Baseline, Policy, PolicyGate, PolicyReason,
@@ -763,6 +764,200 @@ mod tests {
             .change_set_unavailable
             .as_ref()
             .unwrap_or_else(|| panic!("expected an unavailable change-set, got {preview:?}"))
+    }
+
+    /// The golden capture from the real binary, read from the confiture
+    /// adapter's pact directory at run time.
+    ///
+    /// Read rather than `include_str!`-embedded: this crate is published on its
+    /// own, and a compile-time include reaching into a sibling crate's directory
+    /// would not survive packaging. The build-break guarantee the pact promises
+    /// is held where the file lives; here, a missing file is a loud panic rather
+    /// than a skip, because a dry-run test that silently stops running is how
+    /// this whole contract would rot.
+    fn real_capture() -> PreflightReport {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../fraisier-adapter-confiture/tests/fixtures/preflight/v1-real-0.44.0.json");
+        let bytes = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("the pact capture must be readable at {path:?}: {err}"));
+        serde_json::from_str(&bytes).expect("the capture is a preflight report")
+    }
+
+    /// The dry-run an operator actually sees, over bytes confiture wrote.
+    ///
+    /// Two properties, both of which a tidy-up could silently invert:
+    ///
+    /// - **Unclassified sorts first.** Nothing vouched for that change, so it
+    ///   leads the table — ahead even of the `DROP TABLE`. A sort by severity
+    ///   alone would bury the one row the refusal is actually about.
+    /// - **Every column the operator needs is on the row**: the tier, what kind
+    ///   of change it is, which object, which migration, and the producer's own
+    ///   one-line detail.
+    #[tokio::test]
+    async fn the_dry_run_renders_the_real_change_set_worst_first() {
+        let adapter = FakeMigration::new(
+            &["up", "preflight", "risk_tier", "window_safe"],
+            Ok(real_capture()),
+        );
+        let preview = gather(
+            &adapter,
+            &ctx(),
+            &PolicyGate::new(Policy::default()),
+            None,
+            Baseline::None,
+        )
+        .await;
+        let rendered = super::render(&preview);
+
+        let rows: Vec<&str> = rendered.lines().filter(|line| line.contains('[')).collect();
+        assert_eq!(rows.len(), 6, "one row per change:\n{rendered}");
+        assert!(
+            rows[0].contains("[unclassified]"),
+            "nothing vouched for it, so it leads the table:\n{rendered}"
+        );
+        let order: Vec<&str> = rows
+            .iter()
+            .skip(1)
+            .map(|row| {
+                row.split(']')
+                    .next()
+                    .expect("a tier tag")
+                    .trim_start()
+                    .trim_start_matches('[')
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "irreversible",
+                "destructive",
+                "lock_risky",
+                "reversible",
+                "additive"
+            ],
+            "most severe first below the unclassified row:\n{rendered}"
+        );
+
+        // The `DROP TABLE` row carries every column an operator acts on.
+        let dropped = rows
+            .iter()
+            .find(|row| row.contains("[irreversible]"))
+            .expect("the drop_table row");
+        for column in [
+            "drop_table",
+            "public.tb_widget",
+            "20260808010400",
+            "DROP TABLE",
+        ] {
+            assert!(dropped.contains(column), "{column} missing from: {dropped}");
+        }
+    }
+
+    /// The machine-readable half of the same plan (#46's second criterion).
+    ///
+    /// The hazard this pins is narrow and specific: an agent reading a missing
+    /// tier as a safe default. So the serialized form must carry one entry per
+    /// change and must **not** invent a tier for the change confiture declined
+    /// to classify — `null` is the answer, and a fabricated `"additive"` is the
+    /// bug that would never be noticed until it approved something.
+    #[tokio::test]
+    async fn the_dry_run_json_never_invents_a_tier() {
+        let adapter = FakeMigration::new(
+            &["up", "preflight", "risk_tier", "window_safe"],
+            Ok(real_capture()),
+        );
+        let preview = gather(
+            &adapter,
+            &ctx(),
+            &PolicyGate::new(Policy::default()),
+            None,
+            Baseline::None,
+        )
+        .await;
+        let json: serde_json::Value =
+            serde_json::to_value(&preview).expect("the preview serializes");
+
+        // The key path a consuming agent reads.
+        let changes = json["change_set"]["changes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("change_set.changes must be an array: {json}"));
+        assert_eq!(changes.len(), 6, "one entry per change: {json}");
+        assert_eq!(
+            json["change_set"]["contract_version"], 1,
+            "the contract the producer wrote to travels with the payload"
+        );
+
+        // Migration order is preserved on the wire — the renderer sorts, the
+        // payload does not, so an agent diffing two plans sees apply order.
+        let tiers: Vec<&serde_json::Value> = changes.iter().map(|c| &c["tier"]).collect();
+        assert_eq!(
+            tiers
+                .iter()
+                .map(|t| t.as_str().unwrap_or("<null>"))
+                .collect::<Vec<_>>(),
+            [
+                "additive",
+                "reversible",
+                "lock_risky",
+                "destructive",
+                "irreversible",
+                "<null>"
+            ],
+            "{json}"
+        );
+        assert!(
+            tiers[5].is_null(),
+            "an unclassified change must serialize as null, never as a tier: {json}"
+        );
+        // And the verdict is on the same document, so a pipeline branches on one
+        // read rather than on the rendered text.
+        assert_eq!(json["policy"]["decision"], "deny");
+    }
+
+    /// A change-set from a contract this build cannot read is refused — and the
+    /// refusal reaches the operator carrying **both** version numbers.
+    ///
+    /// Refusing is the easy half and is already tested. The half that a refactor
+    /// could quietly drop is the pair of numbers: without them the operator is
+    /// told a payload is unreadable and has no way to know which side to
+    /// upgrade, which is the entire reason `VersionTooNew` carries two fields
+    /// rather than being a unit variant.
+    #[tokio::test]
+    async fn a_future_contract_version_names_both_versions_in_the_plan() {
+        let future = RISK_CONTRACT_VERSION + 1;
+        let adapter = FakeMigration::new(
+            &["up", "preflight", "risk_tier"],
+            Ok(PreflightReport::new(true)
+                .with_window_safe(true)
+                .with_change_set(
+                    ChangeSet::new(vec![change("drop_column", "public.tb_user.legacy_flag")])
+                        .with_contract_version(future),
+                )),
+        );
+        let preview = gather(
+            &adapter,
+            &ctx(),
+            &PolicyGate::new(Policy::default()),
+            None,
+            Baseline::None,
+        )
+        .await;
+
+        assert_eq!(
+            unavailable(&preview).code,
+            Unavailable::UNREADABLE_CHANGE_SET
+        );
+        assert!(super::would_block(&preview), "{preview:?}");
+
+        let rendered = super::render(&preview);
+        assert!(
+            rendered.contains(&future.to_string()),
+            "the version the producer wrote must be named: {rendered}"
+        );
+        assert!(
+            rendered.contains(&RISK_CONTRACT_VERSION.to_string()),
+            "the version this build understands must be named: {rendered}"
+        );
     }
 
     #[tokio::test]

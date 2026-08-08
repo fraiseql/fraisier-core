@@ -7,9 +7,10 @@
 
 use fraisier_adapter_confiture::ConfitureMigration;
 use fraisier_core::adapter_axes::{
-    AdapterCtx, AdapterErrorKind, ChangeSetUnavailable, MigrationAdapter, Revision, RiskTier,
-    RISK_CONTRACT_VERSION,
+    AdapterCtx, AdapterErrorKind, ChangeSet, ChangeSetUnavailable, MigrationAdapter,
+    PreflightReport, Revision, RiskTier, RISK_CONTRACT_VERSION,
 };
+use fraisier_core::policy::{self, PolicyDecision};
 use tokio::sync::Mutex;
 
 /// `set_var`/`var` are process-global; serialise the env-mutating tests. An
@@ -554,6 +555,20 @@ const FIXTURE_V1_MIXED: &str = include_str!("fixtures/preflight/v1-mixed.json");
 #[cfg(unix)]
 const FIXTURE_V0: &str = include_str!("fixtures/preflight/v0-no-change-set.json");
 
+/// The capture: what confiture 0.44.0 actually emitted. See the pact README.
+#[cfg(unix)]
+const FIXTURE_REAL: &str = include_str!("fixtures/preflight/v1-real-0.44.0.json");
+
+/// The capture for a column type change — unclassified on the path this adapter
+/// drives, and therefore denied.
+#[cfg(unix)]
+const FIXTURE_REAL_TYPE_CHANGE: &str = include_str!("fixtures/preflight/v1-real-type-change.json");
+
+/// The version the capture came from — and therefore the version the fake must
+/// report for the adapter to advertise `risk_tier` at all.
+#[cfg(unix)]
+const CAPTURED_FROM: &str = "0.44.0";
+
 #[cfg(unix)]
 #[tokio::test]
 async fn preflight_surfaces_the_change_set_end_to_end() {
@@ -600,6 +615,280 @@ async fn a_pre_contract_confiture_still_preflights_but_never_classifies() {
         Err(ChangeSetUnavailable::NotEmitted),
         "no change-set is unclassified, which is never a clean bill of health"
     );
+}
+
+/// The whole path, driven by bytes confiture wrote rather than bytes fraisier
+/// wrote for itself: `describe` → `preflight` → `usable_change_set` →
+/// `evaluate` → a refusal an operator can act on.
+///
+/// `preflight_surfaces_the_change_set_end_to_end` above pins the *pact shape*
+/// against a hand-authored fixture. This one pins the *decision*, and it is the
+/// test the risk-tier floor rests on: every component below has been green since
+/// before a producer existed, so the only thing that distinguishes "the fixtures
+/// were faithful" from "the code works" is running it against a capture.
+///
+/// The change that decides the outcome is the one confiture declined to
+/// classify. Five tiers are present and none of them refuses under the default
+/// policy — the two auto-apply, the three need sign-off. It is the sixth, with
+/// no tier at all, that turns the deploy into a refusal, which is the contract's
+/// §6 rule stated end to end: absence is never safety.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_real_confiture_payload_denies_on_its_unclassified_change() {
+    let fake = FakeConfiture::new("preflight-real-capture", FIXTURE_REAL, 0);
+    let inspection = policy::inspect(
+        &FakeConfiture::adapter_reporting(CAPTURED_FROM),
+        &fake.ctx(),
+    )
+    .await
+    .expect("0.44.0 describes and preflights");
+
+    // The capability is advertised because the binary earns it — not asserted
+    // here by hand, which would test the test.
+    assert!(inspection.capabilities.risk_tier);
+    assert!(inspection.capabilities.window_safe);
+
+    let report = inspection.report.as_ref().expect("preflight ran");
+    let set = report
+        .usable_change_set()
+        .expect("the change-set crosses the adapter seam");
+    assert_eq!(set.contract_version, RISK_CONTRACT_VERSION);
+    assert_eq!(set.changes.len(), 6, "every change survives the crossing");
+    assert_eq!(
+        set.changes
+            .iter()
+            .filter_map(|change| change.migration.as_deref())
+            .collect::<Vec<_>>(),
+        [
+            "20260808010000",
+            "20260808010100",
+            "20260808010200",
+            "20260808010300",
+            "20260808010400",
+            "20260808010500",
+        ],
+        "migration order is the producer's order"
+    );
+    assert_eq!(set.worst_tier(), Some(RiskTier::Irreversible));
+    assert_eq!(set.unclassified().count(), 1);
+
+    let decision = policy::evaluate(
+        Some(&policy::Policy::default()),
+        policy::Baseline::None,
+        inspection.capabilities,
+        inspection.report.as_ref(),
+    );
+
+    let PolicyDecision::Deny { reason, reasons } = &decision else {
+        panic!("an unclassified change must refuse, got {decision:?}");
+    };
+    // The operator has to be able to find the statement. `object` for an
+    // unclassified entry is the file confiture could not read.
+    assert!(
+        reason.contains("20260808010500_weird.up.sql"),
+        "the refusal must name the change it is about: {reason}"
+    );
+    // The refusal is about that one change, and the five classified ones are
+    // still carried so an operator sees the whole picture.
+    assert_eq!(
+        reasons.iter().filter(|r| r.tier.is_none()).count(),
+        1,
+        "exactly one reason is the unclassified change"
+    );
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.tier == Some(RiskTier::Irreversible)),
+        "the DROP TABLE is carried into the decision beside it"
+    );
+
+    // §6, stated as sharply as this payload allows: give every tier confiture
+    // *did* classify a blanket auto-apply, and the deploy is still refused —
+    // by the one change it declined to classify, and by nothing else. This is
+    // the assertion that fails open if a future parser ever drops a tierless
+    // entry instead of holding its place, which no count assertion above would
+    // distinguish from a producer that emitted five changes.
+    let permissive = policy::Policy::new(
+        RiskTier::ALL
+            .into_iter()
+            .map(|tier| (tier, policy::PolicyAction::AutoApply))
+            .collect(),
+        policy::UnclassifiedAction::Deny,
+    );
+    let decision = policy::evaluate(
+        Some(&permissive),
+        policy::Baseline::None,
+        inspection.capabilities,
+        inspection.report.as_ref(),
+    );
+    let PolicyDecision::Deny { reasons, .. } = &decision else {
+        panic!("the unclassified change alone must refuse, got {decision:?}");
+    };
+    assert_eq!(
+        reasons.len(),
+        1,
+        "nothing but the unclassified change is holding this deploy"
+    );
+    assert_eq!(reasons[0].tier, None);
+}
+
+/// Every tier the producer emitted selects the action the operator configured
+/// for it — the producer's real strings against the operator's real settings.
+///
+/// The taxonomy round-tripping through serde is already tested. What is not, and
+/// what this pins, is the join between the two halves of the pact: confiture
+/// writes `"lock_risky"` on the wire, an operator writes `lock_risky` in
+/// `[policy]`, and the same change has to come out the other side. Each tier is
+/// driven by the change the real binary classified into it, evaluated on its own
+/// so the decision has exactly one cause.
+#[cfg(unix)]
+#[tokio::test]
+async fn every_tier_the_producer_emits_selects_its_configured_action() {
+    let fake = FakeConfiture::new("preflight-tier-actions", FIXTURE_REAL, 0);
+    let inspection = policy::inspect(
+        &FakeConfiture::adapter_reporting(CAPTURED_FROM),
+        &fake.ctx(),
+    )
+    .await
+    .expect("0.44.0 describes and preflights");
+    let capabilities = inspection.capabilities;
+    let captured = inspection
+        .report
+        .as_ref()
+        .expect("preflight ran")
+        .usable_change_set()
+        .expect("the change-set crosses the adapter seam")
+        .clone();
+
+    for tier in RiskTier::ALL {
+        let change = captured
+            .changes
+            .iter()
+            .find(|change| change.tier == Some(tier))
+            .unwrap_or_else(|| panic!("the capture must carry a {} change", tier.as_str()))
+            .clone();
+        // One change, so the decision has one cause and the assertion below is
+        // about this tier rather than about whatever else shared the set.
+        let report = PreflightReport::new(true)
+            .with_window_safe(false)
+            .with_change_set(ChangeSet::new(vec![change]));
+
+        for (action, expected) in [
+            (policy::PolicyAction::AutoApply, "allow"),
+            (policy::PolicyAction::RequireApproval, "needs-approval"),
+            (policy::PolicyAction::Deny, "deny"),
+        ] {
+            // Only the tier under test carries the action; every other tier
+            // auto-applies. A gate that reached the decision by any route other
+            // than *this change's* tier would come out `allow` here.
+            let configured = policy::Policy::new(
+                RiskTier::ALL
+                    .into_iter()
+                    .map(|t| {
+                        let mapped = if t == tier {
+                            action
+                        } else {
+                            policy::PolicyAction::AutoApply
+                        };
+                        (t, mapped)
+                    })
+                    .collect(),
+                policy::UnclassifiedAction::Deny,
+            )
+            // Present, so `require_approval` resolves to `NeedsApproval` rather
+            // than collapsing into the no-hook refusal and hiding the mapping.
+            .with_approval_hook(true);
+
+            let decision = policy::evaluate(
+                Some(&configured),
+                policy::Baseline::None,
+                capabilities,
+                Some(&report),
+            );
+            let got = match &decision {
+                PolicyDecision::Allow { .. } => "allow",
+                PolicyDecision::NeedsApproval { .. } => "needs-approval",
+                PolicyDecision::Deny { .. } => "deny",
+                // `PolicyDecision` is `#[non_exhaustive]`. A variant added later
+                // is not silently one of the three above.
+                other => panic!("unhandled decision variant: {other:?}"),
+            };
+            assert_eq!(
+                got,
+                expected,
+                "confiture's `{}` under {action:?}: {decision:?}",
+                tier.as_str()
+            );
+        }
+    }
+}
+
+/// A column type change is refused, and the refusal names the column.
+///
+/// This is asserted rather than discovered, because it is the denial an operator
+/// is most likely to meet by accident and the one most likely to be read as a
+/// bug. It is not a parser limitation: telling a widening `varchar(10) →
+/// varchar(20)` from a narrowing one needs the column's current type and the
+/// server version, confiture gathers those only when asked to compare against a
+/// live database, and this adapter does not ask. So it declines to guess, and
+/// fraisier consumes that refusal faithfully rather than inventing a tier for it.
+///
+/// The fix is not to loosen this. It is to give confiture the schema facts —
+/// which is a different change, to a different code path, with a live-database
+/// cost, and it has its own issue.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_column_type_change_is_unclassified_and_therefore_refused() {
+    let fake = FakeConfiture::new("preflight-type-change", FIXTURE_REAL_TYPE_CHANGE, 0);
+    let inspection = policy::inspect(
+        &FakeConfiture::adapter_reporting(CAPTURED_FROM),
+        &fake.ctx(),
+    )
+    .await
+    .expect("0.44.0 describes and preflights");
+
+    let set = inspection
+        .report
+        .as_ref()
+        .expect("preflight ran")
+        .usable_change_set()
+        .expect("the change-set crosses the adapter seam");
+    assert_eq!(set.changes.len(), 1);
+    assert_eq!(set.changes[0].kind, "alter_column_type");
+    assert_eq!(
+        set.changes[0].tier, None,
+        "confiture declines to classify a type change on this path"
+    );
+    assert_eq!(
+        set.worst_tier(),
+        None,
+        "an unclassified change is not tier zero"
+    );
+
+    // Even under a policy that auto-applies every tier there is.
+    let permissive = policy::Policy::new(
+        RiskTier::ALL
+            .into_iter()
+            .map(|tier| (tier, policy::PolicyAction::AutoApply))
+            .collect(),
+        policy::UnclassifiedAction::Deny,
+    );
+    let decision = policy::evaluate(
+        Some(&permissive),
+        policy::Baseline::None,
+        inspection.capabilities,
+        inspection.report.as_ref(),
+    );
+
+    let PolicyDecision::Deny { reason, reasons } = &decision else {
+        panic!("a type change nobody classified must refuse, got {decision:?}");
+    };
+    assert!(
+        reason.contains("public.tb_widget.label"),
+        "the refusal must name the column: {reason}"
+    );
+    assert_eq!(reasons.len(), 1);
+    assert_eq!(reasons[0].tier, None);
 }
 
 /// A confiture that exits cleanly but writes no report is an **error**, not an

@@ -1,0 +1,35 @@
+{
+  "ok": true,
+  "window_safe": false,
+  "summary": {
+    "errors": 0,
+    "warnings": 1,
+    "info": 0,
+    "migrations_checked": 1
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_CHANGE_TYPE",
+      "message": "readers on the old type break when the column type changes Multi-step fix: add a new column \u2192 backfill \u2192 swap readers \u2192 drop the old column.",
+      "migration": "public.tb_widget",
+      "file": "20260808030000_narrow.up.sql",
+      "line": null,
+      "actionable": "add a new column \u2192 backfill \u2192 swap readers \u2192 drop the old column",
+      "details": {
+        "operation": "ChangeColumnType"
+      }
+    }
+  ],
+  "change_set": {
+    "contract_version": 1,
+    "changes": [
+      {
+        "kind": "alter_column_type",
+        "object": "public.tb_widget.label",
+        "migration": "20260808030000",
+        "detail": "ALTER COLUMN label TYPE \u2014 reversible when widening and irreversible when narrowing; preflight cannot tell without the source and target types"
+      }
+    ]
+  }
+}

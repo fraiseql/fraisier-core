@@ -1038,6 +1038,11 @@ mod tests {
             include_str!("../tests/fixtures/preflight/v1-real-0.44.0.json"),
             false,
         ),
+        (
+            REAL_TYPE_CHANGE,
+            include_str!("../tests/fixtures/preflight/v1-real-type-change.json"),
+            false,
+        ),
     ];
 
     /// The one fixture that is a *capture* rather than a hand-authored shape:
@@ -1045,6 +1050,11 @@ mod tests {
     /// Named because several tests below single it out — the others pin what the
     /// producer must be able to emit, this one pins what it does emit.
     const REAL_CAPTURE: &str = "v1-real-0.44.0";
+
+    /// The other capture, and the one an operator is most likely to meet by
+    /// accident: a column type change, which confiture declines to classify on
+    /// the path this adapter drives.
+    const REAL_TYPE_CHANGE: &str = "v1-real-type-change";
 
     /// One golden fixture, by name (without the `.json`).
     fn fixture(name: &str) -> Value {

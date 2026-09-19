@@ -885,10 +885,9 @@ impl RolloutShared {
             .await
             .map_err(|e| Self::failed("verify", &e))?;
         if !report.ok {
-            let failed = report.checks.iter().filter(|check| !check.ok).count();
             return Err(SagaError::StepFailed {
                 step: "verify".to_owned(),
-                message: format!("post-migration verify failed {failed} check(s)"),
+                message: report.failure_message(),
             });
         }
 
@@ -1198,6 +1197,19 @@ mod tests {
             .map_or_else(|| "<none>".to_owned(), |h| h.as_str().to_owned())
     }
 
+    /// What the fake migration's post-migration `verify` reports. One enum
+    /// rather than a flag per outcome: the outcomes exclude each other.
+    #[derive(Clone, Copy, Default)]
+    enum VerifyFault {
+        /// Every check passes.
+        #[default]
+        Passes,
+        /// One check fails.
+        FailingCheck,
+        /// The run examined nothing.
+        Skipped,
+    }
+
     /// Failure-injection knobs, shared by reference across the fakes.
     #[derive(Clone, Default)]
     struct Faults {
@@ -1219,8 +1231,8 @@ mod tests {
         /// the new release's restart but lets a rollback restart succeed; a larger
         /// value also fails the rollback restart (forcing `PartialRollback`).
         restart_fail: BTreeMap<String, usize>,
-        /// Whether the post-migration `verify` reports a failing check.
-        verify_fail: bool,
+        /// What the post-migration `verify` reports.
+        verify: VerifyFault,
         /// The classified change-set the preflight report carries. `Some` also
         /// makes the adapter advertise `risk_tier`.
         change_set: Option<ChangeSet>,
@@ -1350,16 +1362,17 @@ mod tests {
                 ctx.host.is_none(),
                 "global verify runs against the shared DB"
             );
-            let checks = if self.faults.verify_fail {
-                vec![VerifyCheck {
-                    name: "row count".to_owned(),
-                    ok: false,
-                    detail: Some("expected 3 rows, found 0".to_owned()),
-                }]
-            } else {
-                Vec::new()
-            };
-            Ok(VerifyReport::new(!self.faults.verify_fail).with_checks(checks))
+            Ok(match self.faults.verify {
+                VerifyFault::Passes => VerifyReport::new(true),
+                VerifyFault::FailingCheck => {
+                    VerifyReport::new(false).with_checks(vec![VerifyCheck {
+                        name: "row count".to_owned(),
+                        ok: false,
+                        detail: Some("expected 3 rows, found 0".to_owned()),
+                    }])
+                }
+                VerifyFault::Skipped => VerifyReport::new(false).with_skipped(true),
+            })
         }
 
         async fn preflight(&self, _ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {
@@ -2058,7 +2071,7 @@ mod tests {
         seed_prior(&store).await;
         let trail = Trail::default();
         let faults = Arc::new(Faults {
-            verify_fail: true,
+            verify: VerifyFault::FailingCheck,
             ..Faults::default()
         });
         let plan = deploy(&trail, &faults, RolloutStrategy::Rolling(1));
@@ -2068,6 +2081,10 @@ mod tests {
             matches!(&outcome, SagaOutcome::RolledBack { failed_step, .. } if failed_step == "verify"),
             "got {outcome:?}"
         );
+        let SagaOutcome::RolledBack { reason, .. } = &outcome else {
+            unreachable!("asserted just above");
+        };
+        assert!(reason.contains("failed 1 check(s)"), "{reason}");
         let trail = drain_trail(&trail);
         assert_eq!(
             count(&trail, "down_to:rev-prev"),
@@ -2085,6 +2102,29 @@ mod tests {
         // Reverse host order (the last-advanced host restores first), DB last.
         assert!(pos(&trail, "activate:web-3:v-old") < pos(&trail, "activate:web-1:v-old"));
         assert!(pos(&trail, "activate:web-1:v-old") < pos(&trail, "down_to:rev-prev"));
+    }
+
+    #[tokio::test]
+    async fn a_verify_that_verified_nothing_rolls_back_the_fleet_saying_so() {
+        let (_dir, store) = store();
+        seed_prior(&store).await;
+        let trail = Trail::default();
+        let faults = Arc::new(Faults {
+            verify: VerifyFault::Skipped,
+            ..Faults::default()
+        });
+        let plan = deploy(&trail, &faults, RolloutStrategy::Rolling(1));
+
+        let outcome = plan.run(store).await.expect("run completes with rollback");
+        let SagaOutcome::RolledBack {
+            failed_step,
+            reason,
+        } = &outcome
+        else {
+            panic!("expected a rollback at verify, got {outcome:?}");
+        };
+        assert_eq!(failed_step, "verify");
+        assert!(reason.contains("verified nothing"), "{reason}");
     }
 
     // -----------------------------------------------------------------------

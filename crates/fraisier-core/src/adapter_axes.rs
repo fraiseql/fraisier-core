@@ -497,6 +497,21 @@ impl VerifyReport {
         self.was_skipped = was_skipped;
         self
     }
+
+    /// The deploy's account of a failed verify, for the rollback reason: what
+    /// happened, in terms the operator can act on — a run that examined
+    /// nothing is not "0 checks failed".
+    pub(crate) fn failure_message(&self) -> String {
+        if self.was_skipped {
+            return "post-migration verify verified nothing: the migration adapter \
+                    reported the run as skipped"
+                .to_owned();
+        }
+        match self.checks.iter().filter(|check| !check.ok).count() {
+            0 => "post-migration verify reported a failure without a failing check".to_owned(),
+            failed => format!("post-migration verify failed {failed} check(s)"),
+        }
+    }
 }
 
 /// Severity of a [`PreflightIssue`].
@@ -2305,5 +2320,36 @@ mod tests {
         assert!(!report.ok);
         assert_eq!(report.checks, vec![check]);
         assert!(report.was_skipped);
+    }
+
+    #[test]
+    fn a_failed_verify_is_worded_by_what_actually_happened() {
+        let skipped = VerifyReport::new(false).with_skipped(true);
+        assert!(
+            skipped.failure_message().contains("verified nothing"),
+            "{}",
+            skipped.failure_message()
+        );
+
+        let silent = VerifyReport::new(false);
+        assert!(!silent.failure_message().contains("failed 0"));
+        assert!(silent.failure_message().contains("without a failing check"));
+
+        let failing = VerifyReport::new(false).with_checks(vec![
+            VerifyCheck {
+                name: "001_init".into(),
+                ok: false,
+                detail: None,
+            },
+            VerifyCheck {
+                name: "002_more".into(),
+                ok: true,
+                detail: None,
+            },
+        ]);
+        assert_eq!(
+            failing.failure_message(),
+            "post-migration verify failed 1 check(s)"
+        );
     }
 }

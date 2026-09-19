@@ -760,10 +760,9 @@ impl DeployShared {
         if report.ok {
             return Ok(());
         }
-        let failed = report.checks.iter().filter(|check| !check.ok).count();
         Err(SagaError::StepFailed {
             step: "verify".to_owned(),
-            message: format!("post-migration verify failed {failed} check(s)"),
+            message: report.failure_message(),
         })
     }
 }
@@ -942,7 +941,8 @@ mod tests {
         current: Option<Revision>,
         preflight_blocking: bool,
         fail_up: bool,
-        verify_ok: bool,
+        /// What `verify` reports.
+        verify: VerifyReport,
         /// Mirror the real sqlx adapter: a forward deploy must call `up(None)`, so
         /// a non-null target reaching `up` is an error (the adapter has no
         /// `run_to`). Guards the [`run_migrate`] contract that `self.target` is
@@ -969,7 +969,7 @@ mod tests {
                 current: Some(Revision::new("rev-prev")),
                 preflight_blocking: false,
                 fail_up: false,
-                verify_ok: true,
+                verify: VerifyReport::new(true),
                 decline_targeted_up: false,
                 window_unsafe: false,
                 change_set: None,
@@ -1054,7 +1054,7 @@ mod tests {
 
         async fn verify(&self, _ctx: &AdapterCtx) -> Result<VerifyReport, AdapterError> {
             log(&self.trail, "verify");
-            Ok(VerifyReport::new(self.verify_ok))
+            Ok(self.verify.clone())
         }
 
         async fn preflight(&self, _ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {
@@ -1684,6 +1684,40 @@ mod tests {
                 "down_to:rev-prev",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_verify_that_verified_nothing_rolls_back_saying_so() {
+        let (_dir, store) = store();
+        seed_prior(&store).await;
+        let trail = Trail::default();
+        let plan = deploy(
+            &trail,
+            FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            },
+            FakeMigration {
+                verify: VerifyReport::new(false).with_skipped(true),
+                ..FakeMigration::healthy(&trail)
+            },
+            FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            },
+        );
+
+        let outcome = plan.run(store).await.expect("run completes with rollback");
+        let SagaOutcome::RolledBack {
+            failed_step,
+            reason,
+        } = &outcome
+        else {
+            panic!("expected a rollback at verify, got {outcome:?}");
+        };
+        assert_eq!(failed_step, "verify");
+        assert!(reason.contains("verified nothing"), "{reason}");
+        assert!(!reason.contains("failed 0"), "{reason}");
     }
 
     #[tokio::test]

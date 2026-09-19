@@ -635,6 +635,34 @@ async fn a_confiture_that_writes_no_verify_report_still_errors() {
     assert!(err.message.contains("wrote no report"), "{}", err.message);
 }
 
+/// At a failing exit a payload that is no report takes the ordinary error path,
+/// which names the exit — never the "exited 0" wording, which would blame a
+/// clean run for what a failing one did.
+#[cfg(unix)]
+#[tokio::test]
+async fn verify_of_a_non_report_at_a_failing_exit_names_the_exit() {
+    for (tag, payload) in [
+        ("verify-empty-object-exit-1", "{}"),
+        (
+            "verify-ok-as-string-exit-1",
+            r#"{"ok": "true", "results": []}"#,
+        ),
+    ] {
+        let fake = FakeConfiture::new(tag, payload, 1);
+        let err = FakeConfiture::adapter()
+            .verify(&fake.ctx())
+            .await
+            .expect_err("a non-report is never a verdict");
+        assert_eq!(err.operation.as_deref(), Some("verify"));
+        assert!(
+            err.message.contains("exited with 1"),
+            "{tag}: {}",
+            err.message
+        );
+        assert!(!err.message.contains("exited 0"), "{tag}: {}", err.message);
+    }
+}
+
 /// `preflight` shares `verify`'s return-JSON-before-checking-exit-code shape.
 /// It failed *closed* rather than open — an envelope carries `"ok": false` — but
 /// it reported a clean refusal: zero issues, and no trace of the unreachable

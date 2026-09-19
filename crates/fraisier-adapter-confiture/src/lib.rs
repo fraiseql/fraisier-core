@@ -1535,6 +1535,62 @@ mod tests {
         );
     }
 
+    /// Real `migrate verify` payloads (`tests/fixtures/verify/`): transcripts of
+    /// what each confiture binary wrote, never edited. Embedded like the
+    /// preflight fixtures, so deleting one breaks the build.
+    const VERIFY_1_12_VERIFIED: &str =
+        include_str!("../tests/fixtures/verify/real-1.12.0-verified.json");
+    const VERIFY_1_12_FAILED: &str =
+        include_str!("../tests/fixtures/verify/real-1.12.0-failed.json");
+    const VERIFY_1_12_NO_LEDGER: &str =
+        include_str!("../tests/fixtures/verify/real-1.12.0-no-ledger.json");
+    const VERIFY_1_12_EMPTY_SIDECAR: &str =
+        include_str!("../tests/fixtures/verify/real-1.12.0-empty-sidecar.json");
+    const VERIFY_0_44_VERIFIED: &str =
+        include_str!("../tests/fixtures/verify/real-0.44.0-verified.json");
+    const VERIFY_0_44_NO_LEDGER: &str =
+        include_str!("../tests/fixtures/verify/real-0.44.0-no-ledger.json");
+    const VERIFY_0_20_VERIFIED: &str =
+        include_str!("../tests/fixtures/verify/real-0.20.0-verified.json");
+
+    /// A capture, parsed.
+    fn capture(text: &str) -> Value {
+        serde_json::from_str(text).expect("a capture is valid JSON")
+    }
+
+    /// Each capture carries the facts its name claims. The verify verdict rule
+    /// rests on these, so they are asserted rather than trusted.
+    #[test]
+    fn verify_captures_pin_the_payloads_they_are_named_for() {
+        // confiture 1.12.0 states its verdict (fraiseql/confiture#311) — and a
+        // run that verified nothing says so, with a failure count of zero.
+        let no_ledger = capture(VERIFY_1_12_NO_LEDGER);
+        assert_eq!(no_ledger["ok"], false);
+        assert_eq!(no_ledger["was_skipped"], true);
+        assert_eq!(no_ledger["failed_count"], 0, "zero because nothing ran");
+        assert_eq!(capture(VERIFY_1_12_VERIFIED)["ok"], true);
+        assert_eq!(capture(VERIFY_1_12_FAILED)["failed_count"], 1);
+        assert_eq!(
+            capture(VERIFY_1_12_EMPTY_SIDECAR)["results"][0]["status"],
+            "skipped"
+        );
+
+        // Earlier releases carry only the counts: there is no verdict to read.
+        for text in [
+            VERIFY_0_44_VERIFIED,
+            VERIFY_0_44_NO_LEDGER,
+            VERIFY_0_20_VERIFIED,
+        ] {
+            assert!(capture(text).get("ok").is_none());
+        }
+        let old_no_ledger = capture(VERIFY_0_44_NO_LEDGER);
+        assert_eq!(old_no_ledger["ledger_present"], false);
+        assert_eq!(old_no_ledger["failed_count"], 0);
+        assert!(capture(VERIFY_0_20_VERIFIED)
+            .get("ledger_present")
+            .is_none());
+    }
+
     /// The composed `envelope -> AdapterErrorKind` projection `into_error` applies:
     /// read `error.code` from the JSON, classify, project. Exercises `error_code_of`
     /// + `classify` + `to_adapter_kind` together, the way the adapter really does.

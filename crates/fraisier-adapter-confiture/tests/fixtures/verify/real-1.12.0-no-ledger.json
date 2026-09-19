@@ -1,0 +1,14 @@
+{
+  "ok": false,
+  "was_skipped": true,
+  "verified_count": 0,
+  "failed_count": 0,
+  "skipped_count": 0,
+  "total_applied": 0,
+  "ledger_present": false,
+  "results": [],
+  "parser": {
+    "pglast": "8.4",
+    "pg_major": 18
+  }
+}

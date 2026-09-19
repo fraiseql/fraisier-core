@@ -1,0 +1,31 @@
+{
+  "ok": true,
+  "was_skipped": false,
+  "verified_count": 0,
+  "failed_count": 0,
+  "skipped_count": 2,
+  "total_applied": 2,
+  "ledger_present": true,
+  "results": [
+    {
+      "version": "001",
+      "name": "init",
+      "status": "skipped",
+      "actual_value": null,
+      "verify_file": "/tmp/fvc-Sanx3B/emptysidecar/db/migrations/001_init.verify.sql",
+      "error": null
+    },
+    {
+      "version": "002",
+      "name": "002",
+      "status": "no_file",
+      "actual_value": null,
+      "verify_file": null,
+      "error": null
+    }
+  ],
+  "parser": {
+    "pglast": "8.4",
+    "pg_major": 18
+  }
+}

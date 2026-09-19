@@ -1054,10 +1054,7 @@ mod tests {
 
         async fn verify(&self, _ctx: &AdapterCtx) -> Result<VerifyReport, AdapterError> {
             log(&self.trail, "verify");
-            Ok(VerifyReport {
-                ok: self.verify_ok,
-                checks: Vec::new(),
-            })
+            Ok(VerifyReport::new(self.verify_ok))
         }
 
         async fn preflight(&self, _ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {

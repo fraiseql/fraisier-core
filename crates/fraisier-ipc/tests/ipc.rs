@@ -101,3 +101,29 @@ async fn hung_adapter_is_killed_on_timeout() {
         err.message
     );
 }
+
+#[tokio::test]
+async fn verify_reads_was_skipped_when_sent_and_defaults_it_when_not() {
+    // An adapter written before `was_skipped` existed never sends it; one that
+    // knows the field says when a run examined nothing.
+    for (body, skipped) in [
+        (
+            r#"{"jsonrpc":"2.0","id":1,"result":{"ok":false,"checks":[]}}"#,
+            false,
+        ),
+        (
+            r#"{"jsonrpc":"2.0","id":1,"result":{"ok":false,"checks":[],"was_skipped":true}}"#,
+            true,
+        ),
+    ] {
+        let adapter = IpcMigrationAdapter::new("sh", "fixture")
+            .with_args(["-c", FIXTURE_SCRIPT])
+            .with_env("FIXTURE_BODY", body);
+        let report = adapter
+            .verify(&AdapterCtx::new("checkout", "production"))
+            .await
+            .expect("verify round-trips");
+        assert!(!report.ok);
+        assert_eq!(report.was_skipped, skipped, "{body}");
+    }
+}

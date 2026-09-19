@@ -650,7 +650,9 @@ fn parse_verify_report(json: &Value, exit_code: Option<i32>) -> Result<VerifyRep
         && checks.iter().all(|check| check.ok)
         && !was_skipped
         && exit_code == Some(0);
-    Ok(VerifyReport { ok, checks })
+    Ok(VerifyReport::new(ok)
+        .with_checks(checks)
+        .with_skipped(was_skipped))
 }
 
 /// `json[key]` as a boolean: `None` when absent, [`NotAReport::IllTyped`] when
@@ -1796,6 +1798,23 @@ mod tests {
         for (json, expected) in cases {
             assert_eq!(parse_verify_report(&json, Some(0)), Err(expected), "{json}");
         }
+    }
+
+    /// A run that examined nothing says so, on both sides of 1.12.0 — so the
+    /// deploy can tell the operator "nothing was verified", not "0 checks
+    /// failed".
+    #[test]
+    fn a_run_that_verified_nothing_says_so() {
+        for (name, text) in [
+            ("real-1.12.0-no-ledger", VERIFY_1_12_NO_LEDGER),
+            ("real-0.44.0-no-ledger", VERIFY_0_44_NO_LEDGER),
+        ] {
+            let report = parse_verify_report(&capture(text), Some(0)).expect("a report");
+            assert!(report.was_skipped, "{name}");
+        }
+        let verified =
+            parse_verify_report(&capture(VERIFY_1_12_VERIFIED), Some(0)).expect("a report");
+        assert!(!verified.was_skipped);
     }
 
     /// The composed `envelope -> AdapterErrorKind` projection `into_error` applies:

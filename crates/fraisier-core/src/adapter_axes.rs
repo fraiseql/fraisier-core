@@ -439,18 +439,64 @@ pub struct VerifyCheck {
 
 /// The result of a post-apply correctness `verify` (PRD review Decision 2).
 ///
+/// This struct is `#[non_exhaustive]`, so adapters in other crates build it
+/// through [`VerifyReport::new`] and the `with_*` methods; every future field
+/// is then additive for them.
+///
 /// # Example
 /// ```
 /// # use fraisier_core::adapter_axes::VerifyReport;
-/// let report = VerifyReport { ok: true, checks: Vec::new() };
+/// let report = VerifyReport::new(true);
 /// assert!(report.ok);
+/// assert!(!report.was_skipped);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct VerifyReport {
-    /// Whether every check passed.
+    /// Whether verification happened and every check passed — the verdict,
+    /// and the only field a deploy gates on.
     pub ok: bool,
     /// The individual checks performed.
     pub checks: Vec<VerifyCheck>,
+    /// Whether the run examined nothing at all — for confiture, a database
+    /// with no migration ledger.
+    ///
+    /// It explains a verdict; it is not one. `!was_skipped` is **not** a
+    /// success signal: read [`ok`](Self::ok). Whether a run with nothing to
+    /// examine passes is the adapter's call; this field only lets the operator
+    /// be told which kind of failure they are looking at.
+    ///
+    /// `default` keeps an IPC adapter that never sends the field working, and
+    /// `skip_serializing_if` keeps an examined run's serialized form
+    /// byte-identical to what it always was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub was_skipped: bool,
+}
+
+impl VerifyReport {
+    /// A report carrying `ok`, with no checks, for a run that examined
+    /// something.
+    #[must_use]
+    pub fn new(ok: bool) -> Self {
+        Self {
+            ok,
+            ..Self::default()
+        }
+    }
+
+    /// Attach the individual checks.
+    #[must_use]
+    pub fn with_checks(mut self, checks: Vec<VerifyCheck>) -> Self {
+        self.checks = checks;
+        self
+    }
+
+    /// State whether the run examined nothing at all.
+    #[must_use]
+    pub const fn with_skipped(mut self, was_skipped: bool) -> Self {
+        self.was_skipped = was_skipped;
+        self
+    }
 }
 
 /// Severity of a [`PreflightIssue`].
@@ -1608,7 +1654,8 @@ mod tests {
     use super::{
         AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, ChangeSet,
         ChangeSetUnavailable, MigrationAdapter, MigrationOutcome, PreflightIssue, PreflightReport,
-        Revision, RiskTier, SchemaChange, Severity, VerifyReport, RISK_CONTRACT_VERSION,
+        Revision, RiskTier, SchemaChange, Severity, VerifyCheck, VerifyReport,
+        RISK_CONTRACT_VERSION,
     };
     use std::collections::BTreeMap;
 
@@ -1650,10 +1697,7 @@ mod tests {
             Ok(MigrationOutcome::default())
         }
         async fn verify(&self, _ctx: &AdapterCtx) -> Result<VerifyReport, AdapterError> {
-            Ok(VerifyReport {
-                ok: true,
-                checks: Vec::new(),
-            })
+            Ok(VerifyReport::new(true))
         }
     }
 
@@ -2229,5 +2273,37 @@ mod tests {
             Err(ChangeSetUnavailable::NotEmitted),
             "a window-safe migration is still an unclassified one"
         );
+    }
+
+    /// An IPC adapter written before `was_skipped` existed never sends it, and
+    /// a run that examined something serialises exactly as it always did.
+    #[test]
+    fn verify_report_reads_without_was_skipped_and_writes_it_only_when_set() {
+        let old: VerifyReport = serde_json::from_str(r#"{"ok":true,"checks":[]}"#).expect("parses");
+        assert!(!old.was_skipped);
+        assert_eq!(
+            serde_json::to_string(&VerifyReport::new(true)).expect("serialises"),
+            r#"{"ok":true,"checks":[]}"#
+        );
+        let skipped = VerifyReport::new(false).with_skipped(true);
+        let round: VerifyReport =
+            serde_json::from_str(&serde_json::to_string(&skipped).expect("serialises"))
+                .expect("parses");
+        assert_eq!(round, skipped);
+    }
+
+    #[test]
+    fn verify_report_builder_sets_every_field() {
+        let check = VerifyCheck {
+            name: "001_init".into(),
+            ok: false,
+            detail: Some("failed".into()),
+        };
+        let report = VerifyReport::new(false)
+            .with_checks(vec![check.clone()])
+            .with_skipped(true);
+        assert!(!report.ok);
+        assert_eq!(report.checks, vec![check]);
+        assert!(report.was_skipped);
     }
 }

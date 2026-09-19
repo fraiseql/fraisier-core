@@ -349,10 +349,7 @@ impl MigrationAdapter for CommandMigration {
     async fn verify(&self, ctx: &AdapterCtx) -> Result<VerifyReport, AdapterError> {
         // No verify command configured ⇒ nothing to check (vacuously ok).
         if !self.commands.contains_key("verify") {
-            return Ok(VerifyReport {
-                ok: true,
-                checks: Vec::new(),
-            });
+            return Ok(VerifyReport::new(true));
         }
         let captured = self.run_method("verify", ctx, Vec::new()).await?;
         let ok = captured.succeeded();
@@ -364,14 +361,11 @@ impl MigrationAdapter for CommandMigration {
                 .stderr_opt()
                 .unwrap_or_else(|| captured.stdout.trim().to_owned())
         };
-        Ok(VerifyReport {
+        Ok(VerifyReport::new(ok).with_checks(vec![VerifyCheck {
+            name: "command verify".to_owned(),
             ok,
-            checks: vec![VerifyCheck {
-                name: "command verify".to_owned(),
-                ok,
-                detail: (!detail.is_empty()).then_some(detail),
-            }],
-        })
+            detail: (!detail.is_empty()).then_some(detail),
+        }]))
     }
 }
 

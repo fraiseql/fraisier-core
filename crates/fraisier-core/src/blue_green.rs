@@ -504,10 +504,7 @@ mod tests {
             Ok(MigrationOutcome::default())
         }
         async fn verify(&self, _ctx: &AdapterCtx) -> Result<VerifyReport, AdapterError> {
-            Ok(VerifyReport {
-                ok: true,
-                checks: Vec::new(),
-            })
+            Ok(VerifyReport::new(true))
         }
         async fn preflight(&self, _ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {
             self.record("preflight");

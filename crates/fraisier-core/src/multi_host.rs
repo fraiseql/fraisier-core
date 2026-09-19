@@ -1359,10 +1359,7 @@ mod tests {
             } else {
                 Vec::new()
             };
-            Ok(VerifyReport {
-                ok: !self.faults.verify_fail,
-                checks,
-            })
+            Ok(VerifyReport::new(!self.faults.verify_fail).with_checks(checks))
         }
 
         async fn preflight(&self, _ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {

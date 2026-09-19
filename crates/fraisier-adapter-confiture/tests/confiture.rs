@@ -101,9 +101,52 @@ async fn env_dsn_beats_decoy_config() {
     );
 }
 
+/// The round-trip's verify step against a real database: 001's sidecar runs
+/// and passes — a vacuous pass over `no_file` results proves nothing — and a
+/// failing sidecar is a not-ok result, not an adapter error.
+async fn verify_runs_real_sidecars(
+    adapter: &ConfitureMigration,
+    ctx: &AdapterCtx,
+    migrations: &std::path::Path,
+) {
+    let verified = adapter.verify(ctx).await.expect("verify");
+    assert!(
+        verified.ok && !verified.was_skipped,
+        "verify should pass on cleanly-applied migrations; checks = {:?}",
+        verified.checks
+    );
+    assert!(
+        verified
+            .checks
+            .iter()
+            .any(|check| check.name == "001_init" && check.ok && check.detail.is_none()),
+        "001_init's sidecar must actually run; checks = {:?}",
+        verified.checks
+    );
+
+    let failing = migrations.join("002_more.verify.sql");
+    std::fs::write(&failing, "SELECT count(*) > 0 FROM fraisier_rt_probe;\n")
+        .expect("write failing sidecar");
+    let failed = adapter
+        .verify(ctx)
+        .await
+        .expect("a failed check is a result, not an adapter error");
+    std::fs::remove_file(&failing).expect("remove failing sidecar");
+    assert!(!failed.ok && !failed.was_skipped);
+    assert!(
+        failed
+            .checks
+            .iter()
+            .any(|check| check.name.starts_with("002") && !check.ok),
+        "002's sidecar must be the failing check; checks = {:?}",
+        failed.checks
+    );
+}
+
 /// Full round-trip against a real Postgres, exercising every adapter-consumed
 /// Confiture subcommand: `current` → `up` → `verify` → `preflight` → `down-to`
 /// (the surface in Confiture's `docs/reference/fraisier-adapter-contract.md`).
+/// The verify step runs a real `.verify.sql` sidecar.
 /// Opt-in via `FRAISIER_TEST_DATABASE_URL` (must be an *empty* database — the test
 /// applies and rolls back migrations).
 #[tokio::test]
@@ -141,6 +184,12 @@ async fn roundtrip_against_postgres_covers_full_surface() {
         "ALTER TABLE fraisier_rt_probe DROP COLUMN note;\n",
     )
     .expect("write 002 down");
+    std::fs::write(
+        migrations.join("001_init.verify.sql"),
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_name = 'fraisier_rt_probe');\n",
+    )
+    .expect("write 001 verify");
 
     let source = "FRAISIER_CONF_IT_RT_DSN";
     std::env::set_var(source, &dsn);
@@ -159,6 +208,13 @@ async fn roundtrip_against_postgres_covers_full_surface() {
         .expect("current before");
     assert_eq!(before, None);
 
+    // The adapter's own argv never passes --allow-uninitialized, so a database
+    // with no migration ledger is an error here, never a verify verdict (#58).
+    adapter
+        .verify(&ctx)
+        .await
+        .expect_err("verify against an uninitialised database is not a verdict");
+
     // Apply all → current is 002.
     let up = adapter.up(&ctx, None).await.expect("up");
     assert_eq!(up.to, Some(Revision::new("002")));
@@ -170,13 +226,7 @@ async fn roundtrip_against_postgres_covers_full_surface() {
         Some(Revision::new("002"))
     );
 
-    // verify: every applied migration checks out (confiture's `ok`).
-    let verified = adapter.verify(&ctx).await.expect("verify");
-    assert!(
-        verified.ok,
-        "verify should pass on cleanly-applied migrations; checks = {:?}",
-        verified.checks
-    );
+    verify_runs_real_sidecars(&adapter, &ctx, &migrations).await;
 
     // preflight: the forward-compat lint must actually run against real Confiture.
     // Before Confiture 0.22, `migrate preflight` rejected the `--output` flag the

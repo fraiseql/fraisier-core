@@ -420,6 +420,26 @@ impl RunOutput {
             ..AdapterError::new(class.to_adapter_kind(), message)
         }
     }
+
+    /// Build an [`AdapterError`] for a run that exited 0 without leaving a
+    /// verdict behind. Exit 0 is not the failure here, so this does not go
+    /// through [`into_error`](Self::into_error), whose message would present
+    /// "exited with 0" as the cause. `why` names what was missing and never
+    /// quotes the payload.
+    fn not_a_report(&self, operation: &str, why: &str) -> AdapterError {
+        AdapterError {
+            adapter: Some(ADAPTER_NAME.to_owned()),
+            operation: Some(operation.to_owned()),
+            stderr: (!self.stderr.trim().is_empty()).then(|| self.stderr.clone()),
+            ..AdapterError::new(
+                AdapterErrorKind::Execution,
+                format!(
+                    "`confiture migrate {operation}` exited 0 but {why}; a clean exit \
+                     without a verdict is not a pass"
+                ),
+            )
+        }
+    }
 }
 
 /// Extract a human-readable failure detail from a Confiture JSON report,
@@ -454,7 +474,9 @@ fn report_detail(json: &Value) -> Option<String> {
 /// `--output` file a report would go to, on every error path — so "we got JSON
 /// back" says nothing about whether the command succeeded. An envelope carries
 /// a top-level `error` object and none of a report's counts; read as a verify
-/// report it would yield "0 failures", i.e. a pass.
+/// report it once yielded "0 failures", i.e. a pass. It would now parse as a
+/// clean `ok: false` (an envelope carries a boolean `ok`) — no longer a pass,
+/// but silent about the cause.
 ///
 /// The test is the presence of that object alone, not the absence of some
 /// report field: a payload wrongly judged an envelope merely becomes a loud
@@ -563,21 +585,80 @@ fn versions_from(array: Option<&Value>, field: &str) -> Vec<Revision> {
         .unwrap_or_default()
 }
 
-/// Parse a `migrate verify` JSON report into a [`VerifyReport`].
-fn parse_verify_report(json: &Value) -> VerifyReport {
-    let failed = json
-        .get("failed_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let checks = json
-        .get("results")
-        .and_then(Value::as_array)
-        .map(|items| items.iter().map(verify_check_from).collect())
-        .unwrap_or_default();
-    VerifyReport {
-        ok: failed == 0,
-        checks,
+/// Why a `migrate verify` payload that is not an error envelope is still not a
+/// verify report. Each variant names what was missing, so the operator is told
+/// more than "exited 0" — and never the payload itself, whose `actual_value`s
+/// can carry user data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotAReport {
+    /// Neither `ok` (confiture ≥ 1.12.0) nor `failed_count` (every release) is
+    /// present: there is no verdict to read.
+    NoVerdict,
+    /// A field the verdict is read from is present with the wrong JSON type.
+    IllTyped(&'static str),
+}
+
+impl std::fmt::Display for NotAReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoVerdict => f.write_str("wrote a payload with neither `ok` nor `failed_count`"),
+            Self::IllTyped(field) => write!(f, "wrote `{field}` with the wrong JSON type"),
+        }
     }
+}
+
+/// Parse a `migrate verify` JSON report, read with the exit code it came with.
+///
+/// Green needs every signal the payload carries to agree (#58). confiture
+/// 1.12.0 states its verdict as `ok` — `ledger_present && failed_count == 0` —
+/// beside `was_skipped` (fraiseql/confiture#311); earlier releases carry only
+/// the counts, plus `ledger_present` from 0.37.0. Reading `failed_count == 0`
+/// as success is wrong for a ledger-less run, where the count is 0 because
+/// nothing ran, so an absent ledger is not a pass on either side of 1.12.0.
+///
+/// Any disagreement — `ok: true` beside a failure count, a skipped run, an
+/// absent ledger, a failed result or a failing exit — reads as not-ok: a
+/// misjudged failure is loud, a misjudged pass is silent. Either way the report
+/// stays a *result*; failed checks are never an adapter error.
+///
+/// # Errors
+/// [`NotAReport`] when there is no verdict to read at all, or a field it is
+/// read from has the wrong JSON type.
+fn parse_verify_report(json: &Value, exit_code: Option<i32>) -> Result<VerifyReport, NotAReport> {
+    let stated_ok = optional_bool(json, "ok")?;
+    let failed_count = json
+        .get("failed_count")
+        .map(|value| value.as_u64().ok_or(NotAReport::IllTyped("failed_count")))
+        .transpose()?;
+    let skipped = optional_bool(json, "was_skipped")?;
+    let ledger_present = optional_bool(json, "ledger_present")?;
+    let checks: Vec<VerifyCheck> = match json.get("results") {
+        None => Vec::new(),
+        Some(results) => results
+            .as_array()
+            .ok_or(NotAReport::IllTyped("results"))?
+            .iter()
+            .map(verify_check_from)
+            .collect(),
+    };
+    if stated_ok.is_none() && failed_count.is_none() {
+        return Err(NotAReport::NoVerdict);
+    }
+    let was_skipped = skipped.unwrap_or(false) || ledger_present == Some(false);
+    let ok = stated_ok.unwrap_or(true)
+        && failed_count.unwrap_or(0) == 0
+        && checks.iter().all(|check| check.ok)
+        && !was_skipped
+        && exit_code == Some(0);
+    Ok(VerifyReport { ok, checks })
+}
+
+/// `json[key]` as a boolean: `None` when absent, [`NotAReport::IllTyped`] when
+/// present with any other JSON type, `null` included.
+fn optional_bool(json: &Value, key: &'static str) -> Result<Option<bool>, NotAReport> {
+    json.get(key)
+        .map(|value| value.as_bool().ok_or(NotAReport::IllTyped(key)))
+        .transpose()
 }
 
 /// Convert one Confiture verify `results[]` entry to a [`VerifyCheck`].
@@ -951,26 +1032,26 @@ impl MigrationAdapter for ConfitureMigration {
 
     async fn verify(&self, ctx: &AdapterCtx) -> Result<VerifyReport, AdapterError> {
         let output = self.run("verify", ctx, &[]).await?;
-        // A report (even one with failing checks) is a valid result, not an
-        // error; only the inability to produce one is an adapter error. An
-        // error envelope is *not* a report — see [`is_error_envelope`] — so it
-        // falls through to the error path carrying Confiture's own diagnosis,
-        // rather than being parsed into a green verdict.
-        let report = output
-            .json
-            .as_ref()
-            .filter(|json| !is_error_envelope(json))
-            .map(parse_verify_report);
-        if let Some(report) = report {
-            return Ok(report);
-        }
-        if output.json.is_none() && output.succeeded() {
-            return Ok(VerifyReport {
-                ok: true,
-                checks: Vec::new(),
+        // A report — even one whose checks failed — is a result; only the
+        // absence of one is an error. An error envelope is not a report (see
+        // [`is_error_envelope`]): it takes the error path carrying confiture's
+        // own diagnosis, at any exit code. Nor is a clean exit that left no
+        // verdict to read: passing it would be an assumption.
+        let Some(json) = output.json.as_ref() else {
+            return Err(if output.succeeded() {
+                output.not_a_report("verify", "wrote no report")
+            } else {
+                output.into_error("verify")
             });
+        };
+        if is_error_envelope(json) {
+            return Err(output.into_error("verify"));
         }
-        Err(output.into_error("verify"))
+        match parse_verify_report(json, output.code) {
+            Ok(report) => Ok(report),
+            Err(why) if output.succeeded() => Err(output.not_a_report("verify", &why.to_string())),
+            Err(_) => Err(output.into_error("verify")),
+        }
     }
 
     async fn preflight(&self, ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {
@@ -1004,7 +1085,7 @@ mod tests {
         parse_change_set, parse_current_revision, parse_down_to_outcome, parse_preflight_report,
         parse_up_outcome, parse_verify_report, parse_version, plan, reports_uninitialised,
         subcommand_takes_migrations_dir, supports_risk_tier, version_at_or_above, version_triple,
-        ConfitureMigration, CONFITURE_DSN_ENV, RISK_TIER_MIN_CONFITURE,
+        ConfitureMigration, NotAReport, CONFITURE_DSN_ENV, RISK_TIER_MIN_CONFITURE,
     };
     use fraisier_core::adapter_axes::{
         AdapterCtx, AdapterErrorKind, ChangeSetUnavailable, PreflightReport, Revision, RiskTier,
@@ -1591,6 +1672,132 @@ mod tests {
             .is_none());
     }
 
+    /// Every capture, read with the exit code its producer returned, lands on
+    /// the verdict the producer meant — including the two runs that verified
+    /// nothing and report `failed_count: 0` for exactly that reason (#58).
+    #[test]
+    fn every_real_verify_capture_parses_to_its_verdict() {
+        let cases: &[(&str, &str, i32, bool)] = &[
+            ("real-1.12.0-no-ledger", VERIFY_1_12_NO_LEDGER, 0, false),
+            ("real-0.44.0-no-ledger", VERIFY_0_44_NO_LEDGER, 0, false),
+            ("real-1.12.0-verified", VERIFY_1_12_VERIFIED, 0, true),
+            ("real-1.12.0-failed", VERIFY_1_12_FAILED, 1, false),
+            (
+                "real-1.12.0-empty-sidecar",
+                VERIFY_1_12_EMPTY_SIDECAR,
+                0,
+                true,
+            ),
+            ("real-0.44.0-verified", VERIFY_0_44_VERIFIED, 0, true),
+            ("real-0.20.0-verified", VERIFY_0_20_VERIFIED, 0, true),
+        ];
+        for &(name, text, exit, expected) in cases {
+            let report = parse_verify_report(&capture(text), Some(exit))
+                .unwrap_or_else(|why| panic!("{name} is a verify report, yet it {why}"));
+            assert_eq!(report.ok, expected, "{name}: ok");
+        }
+    }
+
+    /// Green needs every signal to agree. `ok: true` beside any evidence of a
+    /// failure, of a run that examined nothing, or of a failing exit comes from
+    /// a broken producer, and a broken producer fails closed: the report stays
+    /// a result — never an error — but it is not a pass.
+    #[test]
+    fn contradictory_verify_reports_are_not_green() {
+        let failed_result = serde_json::json!([
+            { "version": "001", "name": "init", "status": "failed", "error": "boom" }
+        ]);
+        let cases = [
+            (
+                "a failure count",
+                serde_json::json!({ "ok": true, "failed_count": 1, "results": [] }),
+                Some(0),
+            ),
+            (
+                "a skipped run",
+                serde_json::json!({ "ok": true, "was_skipped": true, "failed_count": 0, "results": [] }),
+                Some(0),
+            ),
+            (
+                "an absent ledger",
+                serde_json::json!({ "ok": true, "ledger_present": false, "failed_count": 0, "results": [] }),
+                Some(0),
+            ),
+            (
+                "a failed result",
+                serde_json::json!({ "ok": true, "failed_count": 0, "results": failed_result }),
+                Some(0),
+            ),
+            (
+                "a failing exit",
+                serde_json::json!({ "ok": true, "failed_count": 0, "results": [] }),
+                Some(1),
+            ),
+            (
+                "a failing exit before 1.12.0",
+                serde_json::json!({ "failed_count": 0, "results": [] }),
+                Some(1),
+            ),
+            (
+                "no exit code at all",
+                serde_json::json!({ "ok": true, "failed_count": 0, "results": [] }),
+                None,
+            ),
+        ];
+        for (signal, json, exit) in cases {
+            let report = parse_verify_report(&json, exit)
+                .unwrap_or_else(|why| panic!("{signal}: still a report, yet it {why}"));
+            assert!(!report.ok, "ok: true beside {signal} must not be green");
+        }
+    }
+
+    /// What is not a verify report never becomes one. A payload with no
+    /// verdict field at all — which `unwrap_or(0)` used to read as zero
+    /// failures, a pass — and one whose verdict fields have the wrong JSON type
+    /// are refused, by name.
+    #[test]
+    fn payloads_without_a_usable_verdict_are_not_reports() {
+        let cases = [
+            (serde_json::json!({}), NotAReport::NoVerdict),
+            (serde_json::json!({ "results": [] }), NotAReport::NoVerdict),
+            (
+                serde_json::json!({ "verified_count": 1, "results": [] }),
+                NotAReport::NoVerdict,
+            ),
+            (
+                serde_json::json!({ "ok": "true", "results": [] }),
+                NotAReport::IllTyped("ok"),
+            ),
+            (
+                serde_json::json!({ "ok": null, "failed_count": 0 }),
+                NotAReport::IllTyped("ok"),
+            ),
+            (
+                serde_json::json!({ "failed_count": "0", "results": [] }),
+                NotAReport::IllTyped("failed_count"),
+            ),
+            (
+                serde_json::json!({ "failed_count": -1, "results": [] }),
+                NotAReport::IllTyped("failed_count"),
+            ),
+            (
+                serde_json::json!({ "ok": true, "was_skipped": "no", "results": [] }),
+                NotAReport::IllTyped("was_skipped"),
+            ),
+            (
+                serde_json::json!({ "failed_count": 0, "ledger_present": 1, "results": [] }),
+                NotAReport::IllTyped("ledger_present"),
+            ),
+            (
+                serde_json::json!({ "ok": true, "failed_count": 0, "results": "none" }),
+                NotAReport::IllTyped("results"),
+            ),
+        ];
+        for (json, expected) in cases {
+            assert_eq!(parse_verify_report(&json, Some(0)), Err(expected), "{json}");
+        }
+    }
+
     /// The composed `envelope -> AdapterErrorKind` projection `into_error` applies:
     /// read `error.code` from the JSON, classify, project. Exercises `error_code_of`
     /// + `classify` + `to_adapter_kind` together, the way the adapter really does.
@@ -1785,13 +1992,14 @@ mod tests {
                 is_error_envelope(&envelope),
                 "{code} envelope must never be read as a report"
             );
-            // The trap this guards: an envelope has no counts, so parsing it as
-            // a verify report yields zero failures — a pass.
-            assert!(
-                parse_verify_report(&envelope).ok,
-                "{code}: the envelope still parses green, which is exactly why \
-                 verify() must reject it before parsing"
-            );
+            // An envelope carries a boolean `ok: false`, so it now parses as a
+            // clean failure: no longer a pass, but with no trace of the
+            // unreachable database or missing ledger behind it. That is why
+            // verify() still routes an envelope to the error path before any
+            // parse.
+            let parsed = parse_verify_report(&envelope, Some(0))
+                .expect("an envelope carries a boolean `ok`, so it parses");
+            assert!(!parsed.ok, "{code}: an envelope must never parse green");
         }
 
         // Genuine reports are not envelopes — including a clean one whose
@@ -1853,7 +2061,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_report_reflects_failed_count() {
+    fn verify_report_maps_checks_and_details() {
         let json = serde_json::json!({
             "verified_count": 1, "failed_count": 0, "skipped_count": 1, "total_applied": 2,
             "results": [
@@ -1861,7 +2069,7 @@ mod tests {
                 { "version": "002", "name": "002", "status": "no_file", "error": null }
             ]
         });
-        let report = parse_verify_report(&json);
+        let report = parse_verify_report(&json, Some(0)).expect("a report");
         assert!(report.ok);
         assert_eq!(report.checks.len(), 2);
         assert_eq!(report.checks[0].name, "001_init");
@@ -1871,7 +2079,7 @@ mod tests {
             "failed_count": 1,
             "results": [{ "version": "003", "name": "x", "status": "failed", "error": "boom" }]
         });
-        let report = parse_verify_report(&failing);
+        let report = parse_verify_report(&failing, Some(0)).expect("a report");
         assert!(!report.ok);
         assert!(!report.checks[0].ok);
         assert_eq!(report.checks[0].detail.as_deref(), Some("boom"));

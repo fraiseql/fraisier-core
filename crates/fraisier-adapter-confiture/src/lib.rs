@@ -72,6 +72,21 @@
 //! configured then behaves exactly as it does today. The contract is specified
 //! in `docs/proposals/migration-risk-contract.md`.
 //!
+//! ## Reading a `verify` verdict
+//!
+//! Confiture ≥ 1.12.0 states the verdict as `ok`, beside `was_skipped`
+//! (fraiseql/confiture#311). Earlier releases carry only the counts, so the
+//! adapter falls back to `failed_count == 0` and, from 0.37.0, to
+//! `ledger_present`. On both sides of 1.12.0 a run that examined nothing — a
+//! database with no migration ledger — is **not** a pass, although its failure
+//! count is 0, and it is reported as [`VerifyReport::was_skipped`].
+//!
+//! Green needs every signal to agree: a stated `ok`, the failure count, each
+//! result's status, the ledger and a clean exit. A contradiction is a not-ok
+//! result. A payload with no verdict to read, or a clean exit that wrote no
+//! report, is an adapter error. None of this needs a version floor: `ok` is
+//! read when present, and the fallback is fail-closed on its own.
+//!
 //! ## Double locking (intentional)
 //!
 //! Confiture takes its own DB-level migration lock; the saga takes a deploy-level

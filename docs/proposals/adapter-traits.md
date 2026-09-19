@@ -53,7 +53,7 @@ an axis can be promoted to IPC later without reshaping.
 | `AdapterError` | `{ adapter: String, operation: String, code: i32, message: String, stderr: Option<String>, source }` | `code` is the JSON-RPC error code for IPC; `stderr` captures subprocess output (PRD §9.3). |
 | `Revision` | `struct Revision(String)` | Opaque, adapter-defined format (e.g. `"20260531_abc123"`). |
 | `MigrationOutcome` | `{ from: Option<Revision>, to: Option<Revision>, applied: Vec<Revision>, log: String }` | Result of `up`/`down_to`. |
-| `VerifyReport` | `{ ok: bool, checks: Vec<{name, ok, detail}> }` | Result of `verify`. |
+| `VerifyReport` | `{ ok: bool, checks: Vec<{name, ok, detail}>, was_skipped: bool }` | Result of `verify`. `ok` is the verdict; `was_skipped` says the run examined nothing. Built with `VerifyReport::new(ok).with_checks(..)`. |
 | `AdapterDescription` | `{ name, version, protocol_version: u32, capabilities: Vec<String> }` | Result of `describe`; drives `fraisier adapter describe`. |
 | `HostId` | `struct HostId(String)` | A host name from the inventory. |
 | `LbMembership` | `{ state: InPool \| Draining \| Removed, weight: Option<u32> }` | Captured before drain so reattach can restore it exactly. |

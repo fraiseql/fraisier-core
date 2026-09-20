@@ -16,8 +16,8 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-fraisier-core = { path = "../fraisier-core", version = "1.0.0-beta.8" }
-fraisier-adapter-support = { path = "../fraisier-adapter-support", version = "1.0.0-beta.8" }
+fraisier-core = { path = "../fraisier-core", version = "1.0.0-beta.9" }
+fraisier-adapter-support = { path = "../fraisier-adapter-support", version = "1.0.0-beta.9" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

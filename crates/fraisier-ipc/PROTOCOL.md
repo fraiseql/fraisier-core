@@ -91,11 +91,16 @@ is the real secret. The adapter reads, e.g., `DATABASE_URL` from its environment
 | `current_revision` | — | `string \| null` (revision) | required |
 | `up` | `target: string \| null` | `MigrationOutcome` | required |
 | `down_to` | `target: string` | `MigrationOutcome` | required |
-| `verify` | — | `{ ok: bool, checks: [{ name, ok, detail }] }` | required |
+| `verify` | — | `{ ok: bool, checks: [{ name, ok, detail }], was_skipped?: bool }` | required |
 | `preflight` | — | `{ ok: bool, issues: [{ severity, code, message, migration }] }` | optional |
 | `post_migrate` | — | `null` | optional |
 
 `MigrationOutcome` = `{ from: string|null, to: string|null, applied: [string], log: string }`.
+
+`was_skipped` is optional and defaults to `false`. `true` means the run examined
+nothing — for example, a database with no migration ledger. It explains a
+verdict and is not one: the host gates on `ok` alone. An adapter that never
+sends it keeps working unchanged, and the protocol version does not change.
 
 ### Artifact axis methods
 

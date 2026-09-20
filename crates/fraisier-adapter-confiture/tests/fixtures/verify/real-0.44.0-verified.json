@@ -1,0 +1,25 @@
+{
+  "verified_count": 1,
+  "failed_count": 0,
+  "skipped_count": 1,
+  "total_applied": 2,
+  "ledger_present": true,
+  "results": [
+    {
+      "version": "001",
+      "name": "init",
+      "status": "verified",
+      "actual_value": true,
+      "verify_file": "/tmp/fvc-yJGBev/verified/db/migrations/001_init.verify.sql",
+      "error": null
+    },
+    {
+      "version": "002",
+      "name": "002",
+      "status": "no_file",
+      "actual_value": null,
+      "verify_file": null,
+      "error": null
+    }
+  ]
+}

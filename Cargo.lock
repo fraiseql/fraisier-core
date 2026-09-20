@@ -107,9 +107,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.0"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ec2f1fc3ec205783a5da9a7e6c1509cc69dedf09a1949e412c1e18469326d00"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -117,14 +117,15 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.41.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a2f9779ce85b93ab6170dd940ad0169b5766ff848247aff13bb788b832fe3f4"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
  "dunce",
  "fs_extra",
+ "pkg-config",
 ]
 
 [[package]]
@@ -457,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -494,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-command"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -505,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-confiture"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "fraisier-core",
@@ -516,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-docker-compose"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -527,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-http"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -539,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-nginx"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -551,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-rc"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -562,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-release"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "fraisier-artifact-release",
  "fraisier-core",
@@ -576,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-support"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "fraisier-core",
  "serde_json",
@@ -586,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-systemd"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -597,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-artifact-git"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -609,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-artifact-local"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -621,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-artifact-pull"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -634,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-artifact-release"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -647,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-bootstrap"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "fraisier-adapter-support",
  "fraisier-core",
@@ -657,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-check"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "fraisier-adapter-support",
  "futures",
@@ -667,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-config"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "fraisier-core",
  "serde",
@@ -678,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-core"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "fraisier-saga",
@@ -693,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-db"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "percent-encoding",
  "thiserror",
@@ -703,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-ipc"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "fraisier-core",
@@ -715,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-saga"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "chrono",
@@ -736,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-scaffold"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "fraisier-config",
  "tempfile",
@@ -745,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-self-upgrade"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "filetime",
@@ -762,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-ship"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "semver",
  "tempfile",
@@ -772,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-sync"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "tempfile",
  "thiserror",
@@ -780,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-webhook"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 dependencies = [
  "async-trait",
  "hex",
@@ -1805,9 +1806,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -1868,9 +1869,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -2963,7 +2964,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "1.0.0-beta.8"
+version = "1.0.0-beta.9"
 
 [[package]]
 name = "yoke"

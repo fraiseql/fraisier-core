@@ -6,6 +6,62 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-beta.9] - 2026-09-19
+
+### Fixed
+
+- **`verify` no longer passes a run that verified nothing.** The confiture
+  adapter read `migrate verify`'s `failed_count == 0` as success, but a
+  database with no migration ledger reports a failure count of zero for the
+  trivial reason that nothing ran. confiture 1.12.0 states the verdict itself,
+  as `ok` beside `was_skipped` (fraiseql/confiture#311). The adapter now reads
+  `ok`, and against an earlier confiture falls back to the counts with
+  `ledger_present: false` counted as not-ok. Closes
+  [#58](https://github.com/fraiseql/fraisier-core/issues/58).
+
+  Green now needs every signal in the payload to agree: `ok`, the failure
+  count, each result's status, the ledger, and a clean exit. Two more
+  fail-open paths are closed. A payload with no verdict field at all read as
+  zero failures, and a clean exit that wrote no report read as a pass. Both
+  are now adapter errors that name what was missing.
+
+  **Reachability.** fraisier never passes `--allow-uninitialized`, so the
+  ledger-less payload could not reach a deploy through the adapter's own
+  invocation. Without the flag, confiture exits 2 and the adapter already
+  reported an error. The fail-open defaults were reachable through any
+  producer drift. No version floor changes.
+
+### Changed
+
+- **BREAKING (adapter authors): `VerifyReport` is now `#[non_exhaustive]`, and
+  carries `was_skipped`.** A verify that examined nothing and one whose checks
+  failed used to reach the deploy as the same bare `ok: false`. The report now
+  says which. The marker is the same deliberate break `PreflightReport` took in
+  beta.7, so that every later field is additive. An **in-process** adapter,
+  one that links `fraisier-core` and returns this struct directly as the
+  bundled `confiture` and `command` adapters do, moves to the builder:
+
+  ```rust
+  // before
+  VerifyReport { ok, checks }
+  // after
+  VerifyReport::new(ok).with_checks(checks)
+  ```
+
+  **Out-of-process (IPC) adapters are unaffected.** On the wire `was_skipped`
+  is optional and defaults to `false`, and the protocol version does not
+  change.
+
+- A failed post-migration verify now says what happened in the rollback reason,
+  and so in the failure webhook. A run that examined nothing reads "verified
+  nothing" instead of "failed 0 check(s)". The gate itself is unchanged and
+  still decides on `ok` alone.
+
+### Added
+
+- `VerifyReport::was_skipped`, and an optional `was_skipped` on the IPC
+  `verify` result (`crates/fraisier-ipc/PROTOCOL.md`).
+
 ## [1.0.0-beta.8] - 2026-08-08
 
 ### Added
@@ -615,7 +671,8 @@ migration-safe rollback across one host or a fleet.
 - **GitHub Actions CI** that runs `cargo xtask ci`.
 
 [c197]: https://github.com/fraiseql/confiture/issues/197
-[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.8...HEAD
+[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.9...HEAD
+[1.0.0-beta.9]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.8...fraisier-v1.0.0-beta.9
 [1.0.0-beta.8]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.7...fraisier-v1.0.0-beta.8
 [1.0.0-beta.7]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.6...fraisier-v1.0.0-beta.7
 [1.0.0-beta.6]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.5...fraisier-v1.0.0-beta.6

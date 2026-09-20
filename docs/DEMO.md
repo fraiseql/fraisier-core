@@ -230,7 +230,7 @@ real OTLP→Jaeger) in two parts:
   - `health` — a deploy that starts but reports unhealthy.
   `verify` is asserted to *pass*; a verify-phase **failure** is not inducible by
   natural config (it is a post-migration success report — sqlx reads
-  `_sqlx_migrations.success`, confiture reflects its `failed_count`), so its
+  `_sqlx_migrations.success`, confiture reflects its `ok`), so its
   rollback is left to the unit tests (`fraisier-saga/tests/rollback.rs`,
   `single_host.rs`) rather than faked on the host.
 - **Part B** (`--real-config`) — PRD §10.3 criterion 1: N consecutive deploys of

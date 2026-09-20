@@ -101,9 +101,52 @@ async fn env_dsn_beats_decoy_config() {
     );
 }
 
+/// The round-trip's verify step against a real database: 001's sidecar runs
+/// and passes — a vacuous pass over `no_file` results proves nothing — and a
+/// failing sidecar is a not-ok result, not an adapter error.
+async fn verify_runs_real_sidecars(
+    adapter: &ConfitureMigration,
+    ctx: &AdapterCtx,
+    migrations: &std::path::Path,
+) {
+    let verified = adapter.verify(ctx).await.expect("verify");
+    assert!(
+        verified.ok && !verified.was_skipped,
+        "verify should pass on cleanly-applied migrations; checks = {:?}",
+        verified.checks
+    );
+    assert!(
+        verified
+            .checks
+            .iter()
+            .any(|check| check.name == "001_init" && check.ok && check.detail.is_none()),
+        "001_init's sidecar must actually run; checks = {:?}",
+        verified.checks
+    );
+
+    let failing = migrations.join("002_more.verify.sql");
+    std::fs::write(&failing, "SELECT count(*) > 0 FROM fraisier_rt_probe;\n")
+        .expect("write failing sidecar");
+    let failed = adapter
+        .verify(ctx)
+        .await
+        .expect("a failed check is a result, not an adapter error");
+    std::fs::remove_file(&failing).expect("remove failing sidecar");
+    assert!(!failed.ok && !failed.was_skipped);
+    assert!(
+        failed
+            .checks
+            .iter()
+            .any(|check| check.name.starts_with("002") && !check.ok),
+        "002's sidecar must be the failing check; checks = {:?}",
+        failed.checks
+    );
+}
+
 /// Full round-trip against a real Postgres, exercising every adapter-consumed
 /// Confiture subcommand: `current` → `up` → `verify` → `preflight` → `down-to`
 /// (the surface in Confiture's `docs/reference/fraisier-adapter-contract.md`).
+/// The verify step runs a real `.verify.sql` sidecar.
 /// Opt-in via `FRAISIER_TEST_DATABASE_URL` (must be an *empty* database — the test
 /// applies and rolls back migrations).
 #[tokio::test]
@@ -141,6 +184,12 @@ async fn roundtrip_against_postgres_covers_full_surface() {
         "ALTER TABLE fraisier_rt_probe DROP COLUMN note;\n",
     )
     .expect("write 002 down");
+    std::fs::write(
+        migrations.join("001_init.verify.sql"),
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_name = 'fraisier_rt_probe');\n",
+    )
+    .expect("write 001 verify");
 
     let source = "FRAISIER_CONF_IT_RT_DSN";
     std::env::set_var(source, &dsn);
@@ -159,6 +208,13 @@ async fn roundtrip_against_postgres_covers_full_surface() {
         .expect("current before");
     assert_eq!(before, None);
 
+    // The adapter's own argv never passes --allow-uninitialized, so a database
+    // with no migration ledger is an error here, never a verify verdict (#58).
+    adapter
+        .verify(&ctx)
+        .await
+        .expect_err("verify against an uninitialised database is not a verdict");
+
     // Apply all → current is 002.
     let up = adapter.up(&ctx, None).await.expect("up");
     assert_eq!(up.to, Some(Revision::new("002")));
@@ -170,13 +226,7 @@ async fn roundtrip_against_postgres_covers_full_surface() {
         Some(Revision::new("002"))
     );
 
-    // verify: every applied migration checks out (the contract's `failed_count == 0`).
-    let verified = adapter.verify(&ctx).await.expect("verify");
-    assert!(
-        verified.ok,
-        "verify should pass on cleanly-applied migrations; checks = {:?}",
-        verified.checks
-    );
+    verify_runs_real_sidecars(&adapter, &ctx, &migrations).await;
 
     // preflight: the forward-compat lint must actually run against real Confiture.
     // Before Confiture 0.22, `migrate preflight` rejected the `--output` flag the
@@ -265,8 +315,9 @@ const ENVELOPE_BAD_CONFIG: &str = r#"{
   "error": { "code": "CONFIG_010", "message": "no usable database URL" }
 }"#;
 
-/// A *genuine* verify report in which checks failed. Not an envelope: it carries
-/// the counts, so `ok ⇔ failed_count == 0` still applies.
+/// A *genuine* pre-1.12.0 verify report in which a check failed. Not an
+/// envelope: it carries the counts, and a failure count is not-ok. The same
+/// run on 1.12.0 also states `ok: false` (`fixtures/verify/real-1.12.0-failed.json`).
 #[cfg(unix)]
 const REPORT_WITH_FAILURES: &str = r#"{
   "verified_count": 1, "failed_count": 1, "skipped_count": 0, "total_applied": 2,
@@ -430,9 +481,11 @@ impl Drop for FakeConfiture {
 
 /// The ship gate's load-bearing test: `verify` must never call an error a pass.
 ///
-/// An envelope carries no `failed_count`, so reading it as a report yields zero
-/// failures — i.e. `ok = true` — and the deploy gate goes green on a database
-/// the adapter could not even reach.
+/// An envelope carries no `failed_count`, so reading it as a report once
+/// yielded zero failures — `ok = true` — and the deploy gate went green on a
+/// database the adapter could not even reach. It would now parse as a clean
+/// `ok: false`, which is no longer a pass but is silent about the cause; the
+/// envelope check is what keeps the cause.
 #[cfg(unix)]
 #[tokio::test]
 async fn verify_never_reports_green_for_an_error_envelope() {
@@ -478,9 +531,10 @@ async fn verify_never_reports_green_for_an_error_envelope() {
     }
 }
 
-/// The contract the fix must not break: a verify report whose *checks* failed is
-/// a valid result, not an adapter error — `ok ⇔ failed_count == 0`, whatever the
-/// exit code. Only a non-report may become an error.
+/// A verify report whose *checks* failed is a valid result, not an adapter
+/// error: `ok = false`, stated by confiture 1.12.0 and read from the counts
+/// before it, at the exit 1 confiture returns for it. Only a non-report may
+/// become an error.
 #[cfg(unix)]
 #[tokio::test]
 async fn verify_reports_genuine_check_failures_as_a_result() {
@@ -490,9 +544,123 @@ async fn verify_reports_genuine_check_failures_as_a_result() {
         .await
         .expect("a verify report with failed checks is a result, not an adapter error");
 
-    assert!(!report.ok, "failed_count = 1 must mean ok = false");
+    assert!(!report.ok, "a failed check must mean ok = false");
     assert_eq!(report.checks.len(), 2);
     assert!(!report.checks[1].ok);
+
+    let fake = FakeConfiture::new("verify-failed-checks-1-12", VERIFY_1_12_FAILED, 1);
+    let report = FakeConfiture::adapter()
+        .verify(&fake.ctx())
+        .await
+        .expect("a 1.12.0 report with a failed check is a result, not an error");
+    assert!(!report.ok);
+    assert_eq!(report.checks.len(), 2);
+    assert!(!report.checks[0].ok, "001's sidecar is the one that failed");
+}
+
+/// A real 1.12.0 report whose check failed (`fixtures/verify/`), exit 1.
+#[cfg(unix)]
+const VERIFY_1_12_FAILED: &str = include_str!("fixtures/verify/real-1.12.0-failed.json");
+
+/// A ledger-less run under confiture 1.12.0, captured from the real binary
+/// (`fixtures/verify/`).
+#[cfg(unix)]
+const VERIFY_1_12_NO_LEDGER: &str = include_str!("fixtures/verify/real-1.12.0-no-ledger.json");
+
+/// The whole adapter path — spawn, `--output`, parse — on the payload #58 is
+/// about: confiture 1.12.0 saying it verified nothing, at exit 0, with a
+/// failure count of zero. That is not a pass.
+#[cfg(unix)]
+#[tokio::test]
+async fn verify_reads_ok_through_the_whole_adapter_path() {
+    let fake = FakeConfiture::new("verify-1-12-no-ledger", VERIFY_1_12_NO_LEDGER, 0);
+    let report = FakeConfiture::adapter()
+        .verify(&fake.ctx())
+        .await
+        .expect("a ledger-less 1.12.0 run still writes a verify report");
+    assert!(
+        !report.ok,
+        "a run that verified nothing reported ok = true: failed_count 0 was read as success"
+    );
+}
+
+/// A clean exit that left something other than a verify report is not a pass:
+/// no `ok`, no `failed_count`, nothing to read a verdict from. It used to read
+/// as zero failures — a pass.
+#[cfg(unix)]
+#[tokio::test]
+async fn verify_refuses_a_payload_that_is_not_a_report() {
+    for (tag, payload, named) in [
+        (
+            "verify-empty-object",
+            "{}",
+            "neither `ok` nor `failed_count`",
+        ),
+        (
+            "verify-results-only",
+            r#"{"results": []}"#,
+            "neither `ok` nor `failed_count`",
+        ),
+        (
+            "verify-ok-as-string",
+            r#"{"ok": "true", "results": []}"#,
+            "`ok`",
+        ),
+    ] {
+        let fake = FakeConfiture::new(tag, payload, 0);
+        let err = FakeConfiture::adapter()
+            .verify(&fake.ctx())
+            .await
+            .expect_err("a payload with no usable verdict is not a report");
+        assert_eq!(err.operation.as_deref(), Some("verify"));
+        assert_eq!(err.kind, AdapterErrorKind::Execution, "{tag}");
+        assert!(err.message.contains("exited 0"), "{tag}: {}", err.message);
+        assert!(err.message.contains(named), "{tag}: {}", err.message);
+    }
+}
+
+/// The verify twin of `a_confiture_that_writes_no_output_file_still_errors`: a
+/// clean exit with no report is an error, not an empty green result. Every
+/// confiture from 0.20.0 to 1.12.0 writes its report on exit 0
+/// (`fixtures/verify/_README.md`), so this is never a legitimate state.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_confiture_that_writes_no_verify_report_still_errors() {
+    let fake = FakeConfiture::new("verify-no-output", "{}", 0).without_payload();
+    let err = FakeConfiture::adapter()
+        .verify(&fake.ctx())
+        .await
+        .expect_err("a missing report is not a passing report");
+    assert_eq!(err.operation.as_deref(), Some("verify"));
+    assert!(err.message.contains("wrote no report"), "{}", err.message);
+}
+
+/// At a failing exit a payload that is no report takes the ordinary error path,
+/// which names the exit — never the "exited 0" wording, which would blame a
+/// clean run for what a failing one did.
+#[cfg(unix)]
+#[tokio::test]
+async fn verify_of_a_non_report_at_a_failing_exit_names_the_exit() {
+    for (tag, payload) in [
+        ("verify-empty-object-exit-1", "{}"),
+        (
+            "verify-ok-as-string-exit-1",
+            r#"{"ok": "true", "results": []}"#,
+        ),
+    ] {
+        let fake = FakeConfiture::new(tag, payload, 1);
+        let err = FakeConfiture::adapter()
+            .verify(&fake.ctx())
+            .await
+            .expect_err("a non-report is never a verdict");
+        assert_eq!(err.operation.as_deref(), Some("verify"));
+        assert!(
+            err.message.contains("exited with 1"),
+            "{tag}: {}",
+            err.message
+        );
+        assert!(!err.message.contains("exited 0"), "{tag}: {}", err.message);
+    }
 }
 
 /// `preflight` shares `verify`'s return-JSON-before-checking-exit-code shape.
@@ -892,8 +1060,9 @@ async fn a_column_type_change_is_unclassified_and_therefore_refused() {
 }
 
 /// A confiture that exits cleanly but writes no report is an **error**, not an
-/// empty green result — the same law as `verify`. Reading "no JSON" as "no
-/// findings" would pass the gate on a preflight that never ran.
+/// empty green result — the same law as `verify`
+/// (`a_confiture_that_writes_no_verify_report_still_errors`). Reading "no JSON"
+/// as "no findings" would pass the gate on a preflight that never ran.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_confiture_that_writes_no_output_file_still_errors() {

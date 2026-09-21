@@ -13,8 +13,9 @@
 //! - `oauth2_refresh_token` — POST `grant_type=refresh_token`.
 //!
 //! Secrets (the OAuth2 `client_secret` / `refresh_token`) are referenced by the
-//! *source env var name* and resolved at use time via [`AdapterCtx::secret`]
-//! (Decision 5) — never carried as values here.
+//! *source env var name* and resolved at use time via
+//! [`AdapterCtx::secret`](crate::adapter_axes::AdapterCtx::secret) (Decision 5) —
+//! never carried as values here.
 
 // Reason: `{token}` is the literal injection placeholder this module manipulates,
 // not a Rust format argument (same pattern as the http adapter's `{host}`).
@@ -67,7 +68,8 @@ pub struct ClientCredentialsProvider {
     /// The OAuth2 client id.
     pub client_id: String,
     /// The *source env var name* holding the client secret (resolved via
-    /// [`AdapterCtx::secret`] under [`CLIENT_SECRET_LOGICAL`]).
+    /// [`AdapterCtx::secret`](crate::adapter_axes::AdapterCtx::secret) under
+    /// [`CLIENT_SECRET_LOGICAL`]).
     pub client_secret_env: String,
     /// Optional `audience` form field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,7 +98,8 @@ pub struct RefreshTokenProvider {
     /// The OAuth2 client id.
     pub client_id: String,
     /// The *source env var name* holding the refresh token (resolved via
-    /// [`AdapterCtx::secret`] under [`REFRESH_TOKEN_LOGICAL`]).
+    /// [`AdapterCtx::secret`](crate::adapter_axes::AdapterCtx::secret) under
+    /// [`REFRESH_TOKEN_LOGICAL`]).
     pub refresh_token_env: String,
     /// The header to inject the token into (default `Authorization`).
     #[serde(default = "default_header")]

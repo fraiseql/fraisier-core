@@ -500,17 +500,31 @@ impl VerifyReport {
 
     /// The deploy's account of a failed verify, for the rollback reason: what
     /// happened, in terms the operator can act on — a run that examined
-    /// nothing is not "0 checks failed".
+    /// nothing is not "0 checks failed", and a run that failed checks names
+    /// them, each with its detail when the adapter gave one.
     pub(crate) fn failure_message(&self) -> String {
         if self.was_skipped {
             return "post-migration verify verified nothing: the migration adapter \
                     reported the run as skipped"
                 .to_owned();
         }
-        match self.checks.iter().filter(|check| !check.ok).count() {
-            0 => "post-migration verify reported a failure without a failing check".to_owned(),
-            failed => format!("post-migration verify failed {failed} check(s)"),
+        let failed: Vec<String> = self
+            .checks
+            .iter()
+            .filter(|check| !check.ok)
+            .map(|check| match check.detail.as_deref().map(str::trim) {
+                Some(detail) if !detail.is_empty() => format!("{} ({detail})", check.name),
+                _ => check.name.clone(),
+            })
+            .collect();
+        if failed.is_empty() {
+            return "post-migration verify reported a failure without a failing check".to_owned();
         }
+        format!(
+            "post-migration verify failed {} check(s): {}",
+            failed.len(),
+            failed.join(", ")
+        )
     }
 }
 
@@ -2334,22 +2348,36 @@ mod tests {
         let silent = VerifyReport::new(false);
         assert!(!silent.failure_message().contains("failed 0"));
         assert!(silent.failure_message().contains("without a failing check"));
+    }
 
+    #[test]
+    fn a_failed_verify_names_each_failing_check_and_its_detail() {
         let failing = VerifyReport::new(false).with_checks(vec![
             VerifyCheck {
                 name: "001_init".into(),
                 ok: false,
-                detail: None,
+                detail: Some("relation \"tb_user\" does not exist\n".into()),
             },
             VerifyCheck {
                 name: "002_more".into(),
                 ok: true,
+                detail: Some("verified".into()),
+            },
+            VerifyCheck {
+                name: "003_seed".into(),
+                ok: false,
                 detail: None,
+            },
+            VerifyCheck {
+                name: "004_index".into(),
+                ok: false,
+                detail: Some("  ".into()),
             },
         ]);
         assert_eq!(
             failing.failure_message(),
-            "post-migration verify failed 1 check(s)"
+            "post-migration verify failed 3 check(s): \
+             001_init (relation \"tb_user\" does not exist), 003_seed, 004_index"
         );
     }
 }

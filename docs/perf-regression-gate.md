@@ -77,9 +77,10 @@ Two reasons this is the fallback, not the recommendation:
    "confiture"` (the FraiseQL default) cannot use this recipe — there is one
    migration adapter per deploy, and `confiture` owns `verify`. The health adapter
    has no such restriction.
-2. **The rollback reason does not name the regression.** The `Verify` step reports
-   a generic `post-migration verify failed N check(s)`; the scan's per-operation
-   detail is discarded. The health adapter carries the detail through instead.
+2. **The rollback reason carries raw output, not a named regression.** The
+   `Verify` step reports `post-migration verify failed 1 check(s): command verify
+   (…)` with the scan's captured stderr (or stdout) inside the parentheses. The
+   health adapter parses the scan into one named line instead.
 
 ## Security
 

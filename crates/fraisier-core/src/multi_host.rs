@@ -2084,7 +2084,10 @@ mod tests {
         let SagaOutcome::RolledBack { reason, .. } = &outcome else {
             unreachable!("asserted just above");
         };
-        assert!(reason.contains("failed 1 check(s)"), "{reason}");
+        assert!(
+            reason.contains("failed 1 check(s): row count (expected 3 rows, found 0)"),
+            "{reason}"
+        );
         let trail = drain_trail(&trail);
         assert_eq!(
             count(&trail, "down_to:rev-prev"),

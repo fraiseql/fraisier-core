@@ -6,6 +6,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- A failed post-migration verify now names its failing checks in the rollback
+  reason, and so in the failure webhook, each with the adapter's detail when it
+  gave one, for example
+  `post-migration verify failed 1 check(s): row count (expected 3 rows, found 0)`
+  where the reason used to stop at the count. A `command` migration adapter's
+  `verify` therefore carries its captured stderr (or stdout) into the reason.
+  The gate itself is unchanged and still decides on `ok` alone.
+
 ## [1.0.0-beta.9] - 2026-09-19
 
 ### Fixed

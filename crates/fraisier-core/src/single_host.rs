@@ -21,7 +21,8 @@
 //!
 //! The previously-active artifact was staged by an *earlier deploy process*, so
 //! its [`StagedArtifact`] (crucially, its on-disk path) cannot be reconstructed
-//! from a live `current()` query — that returns only an [`ArtifactRef`]. Instead,
+//! from a live `current()` query — that returns only an
+//! [`ArtifactRef`](crate::adapter_axes::ArtifactRef). Instead,
 //! every committed deploy records its active [`StagedArtifact`] in a durable
 //! **release ledger** ([`DeployRecord`]) via the state store's snapshot slot
 //! ([`StateStore::record_snapshot`]). A later deploy reads the prior record and
@@ -264,7 +265,8 @@ impl SingleHostDeployBuilder {
     /// Make this run a deliberate rollback to `revision`: the migrate step runs
     /// `down_to(revision)` instead of `up`, its compensation goes back `up` to the
     /// pre-rollback revision, and (as always) the artifact for the rolled-back-to
-    /// version is staged + activated. Mutually exclusive with [`target`] in intent.
+    /// version is staged + activated. Mutually exclusive with [`target`](Self::target)
+    /// in intent.
     #[must_use]
     pub fn rollback_to(mut self, revision: Revision) -> Self {
         self.rollback_to = Some(revision);

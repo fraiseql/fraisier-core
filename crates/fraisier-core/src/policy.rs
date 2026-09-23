@@ -350,9 +350,9 @@ pub enum PolicyDecision {
 /// What an [`ApprovalHook`] is asked to sign off on.
 ///
 /// Carries the deploy's identity and every change that needs sign-off — and
-/// nothing else. In particular it carries no [`AdapterCtx`](crate::adapter_axes::AdapterCtx),
-/// so no secret, DSN, or adapter setting can reach a hook by construction rather
-/// than by a filtering rule someone has to remember.
+/// nothing else. In particular it carries no [`AdapterCtx`], so no secret, DSN,
+/// or adapter setting can reach a hook by construction rather than by a
+/// filtering rule someone has to remember.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct ApprovalRequest {

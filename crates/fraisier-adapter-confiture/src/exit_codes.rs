@@ -148,6 +148,21 @@ mod tests {
     use super::{classify, ExitClass, NO_LEDGER_ERROR_CODE};
     use fraisier_core::adapter_axes::AdapterErrorKind;
 
+    /// Every [`ExitClass`], in exit-integer order. Rust cannot enumerate an enum, so this
+    /// is the one place the variants are listed; the tests below check it against the
+    /// vendored contract's `classes` rather than against a second copy of the wire strings.
+    const ALL_CLASSES: [ExitClass; 9] = [
+        ExitClass::Ok,
+        ExitClass::InternalError,
+        ExitClass::PreconditionFailed,
+        ExitClass::DbUnreachable,
+        ExitClass::SchemaError,
+        ExitClass::InvalidConfig,
+        ExitClass::LockContention,
+        ExitClass::GitError,
+        ExitClass::IrreversibleRollback,
+    ];
+
     /// The canonical `(exit_code, error_code) -> ExitClass` matrix, mirrored from
     /// confiture `docs/reference/exit-codes.md` ("Canonical table", frozen since
     /// #146). The Python adapter's `tests/test_confiture_contract.py` enumerates
@@ -232,38 +247,12 @@ mod tests {
 
     #[test]
     fn only_lock_contention_is_retriable() {
-        assert!(ExitClass::LockContention.is_retriable());
-        for class in [
-            ExitClass::Ok,
-            ExitClass::InternalError,
-            ExitClass::PreconditionFailed,
-            ExitClass::DbUnreachable,
-            ExitClass::SchemaError,
-            ExitClass::InvalidConfig,
-            ExitClass::GitError,
-            ExitClass::IrreversibleRollback,
-        ] {
-            assert!(!class.is_retriable(), "{class:?} must not be retriable");
-        }
-    }
-
-    #[test]
-    fn wire_strings_are_the_cross_repo_contract() {
-        // These exact strings are what the Python twin pins. Order is the exit
-        // integer 0..=8 so a reviewer can read it against exit-codes.md.
-        let expected = [
-            (ExitClass::Ok, "ok"),
-            (ExitClass::InternalError, "internal_error"),
-            (ExitClass::PreconditionFailed, "precondition_failed"),
-            (ExitClass::DbUnreachable, "db_unreachable"),
-            (ExitClass::SchemaError, "schema_error"),
-            (ExitClass::InvalidConfig, "invalid_config"),
-            (ExitClass::LockContention, "lock_contention"),
-            (ExitClass::GitError, "git_error"),
-            (ExitClass::IrreversibleRollback, "irreversible_rollback"),
-        ];
-        for (class, wire) in expected {
-            assert_eq!(class.as_str(), wire);
+        for class in ALL_CLASSES {
+            assert_eq!(
+                class.is_retriable(),
+                class == ExitClass::LockContention,
+                "{class:?} retriability"
+            );
         }
     }
 
@@ -278,8 +267,13 @@ mod tests {
     // --exit-codes-json`. Regenerate with the command in the module docs.
     const VENDORED_JSON: &str = include_str!("exit_codes.vendored.json");
 
-    /// Extract the frozen `{exit_int: class}` map from a `--exit-codes-json` doc,
-    /// ignoring the informational `meaning`/`symbolic_codes` (which grow additively).
+    /// Extract the `{exit_int: class}` map from a `--exit-codes-json` doc — the part of the
+    /// contract confiture froze, and all this projection may assume. `meaning` and
+    /// `symbolic_codes` are deliberately dropped here because the Rust table does not
+    /// encode them; they are held to the tool by
+    /// [`vendored_contract_equals_the_pinned_confitures_exit_codes_json`], which compares
+    /// the documents whole. (They were once called informational and additive. They are
+    /// neither: confiture 1.19.0 *removed* codes from six exits, #63.)
     fn class_map(doc: &serde_json::Value) -> std::collections::BTreeMap<i32, String> {
         doc["exit_codes"]
             .as_object()
@@ -312,28 +306,48 @@ mod tests {
                 "exit {code} disagrees with the vendored confiture contract"
             );
         }
-        // The Rust taxonomy's wire strings are exactly the vendored `classes` set.
+        // The Rust taxonomy's wire strings are exactly the vendored `classes` set — this is
+        // what pins `as_str`, so the strings live in the vendored file and nowhere else.
         let vendored_classes: std::collections::BTreeSet<&str> = doc["classes"]
             .as_array()
             .expect("classes array")
             .iter()
             .map(|v| v.as_str().expect("class string"))
             .collect();
-        let rust_classes: std::collections::BTreeSet<&str> = [
-            ExitClass::Ok,
-            ExitClass::InternalError,
-            ExitClass::PreconditionFailed,
-            ExitClass::DbUnreachable,
-            ExitClass::SchemaError,
-            ExitClass::InvalidConfig,
-            ExitClass::LockContention,
-            ExitClass::GitError,
-            ExitClass::IrreversibleRollback,
-        ]
-        .iter()
-        .map(|c| c.as_str())
-        .collect();
+        let rust_classes: std::collections::BTreeSet<&str> =
+            ALL_CLASSES.iter().map(|c| c.as_str()).collect();
         assert_eq!(rust_classes, vendored_classes);
+    }
+
+    #[test]
+    fn the_matrix_names_symbolic_codes_the_vendored_contract_lists() {
+        // MATRIX quotes confiture's symbolic codes as examples, and an example can go stale
+        // without any test noticing: it carried `MIGR_105` under exit 0 long after confiture
+        // dropped that code entirely (#63). Every example is therefore held to the vendored
+        // per-exit list, with two rows exempt by construction:
+        //   - exit 1 / `INTERNAL_ERROR` — the code confiture stamps on an unexpected
+        //     non-`ConfiturError`; real, and in no per-exit list;
+        //   - exit 5 / `PRECON_1001` — the deliberate skew row proving a present exit code
+        //     is never laundered by the error code, so the code belongs to exit 2 on purpose.
+        const EXEMPT: &[(i32, &str)] = &[(1, "INTERNAL_ERROR"), (5, "PRECON_1001")];
+        let doc: serde_json::Value =
+            serde_json::from_str(VENDORED_JSON).expect("vendored json parses");
+        for (exit, code) in MATRIX
+            .iter()
+            .filter_map(|(exit, code, _)| exit.zip(*code))
+            .filter(|pair| !EXEMPT.contains(pair))
+        {
+            let listed = doc["exit_codes"][exit.to_string()]["symbolic_codes"]
+                .as_array()
+                .unwrap_or_else(|| panic!("exit {exit} has no symbolic_codes in the contract"))
+                .iter()
+                .any(|listed| listed.as_str() == Some(code));
+            assert!(
+                listed,
+                "the matrix names {code} under exit {exit}, and the vendored confiture \
+                 contract does not list it there"
+            );
+        }
     }
 
     /// The confiture release the exit-code contract is measured against, read out of
@@ -368,6 +382,68 @@ mod tests {
         std::env::var_os("FRAISIER_CONFITURE_BIN")
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| std::ffi::OsString::from("confiture"))
+    }
+
+    /// The paths at which two `--exit-codes-json` documents differ, one per line, so the
+    /// failure below names what drifted instead of printing two 3 kB documents and leaving
+    /// the reader to find it. Only a hint: the assertion itself compares the documents
+    /// whole, so a difference this walker cannot localise still fails.
+    fn describe_drift(live: &serde_json::Value, vendored: &serde_json::Value) -> String {
+        /// The union of two objects' field names, so a field missing on one side is still
+        /// reported rather than skipped.
+        fn names(
+            left: Option<&serde_json::Value>,
+            right: Option<&serde_json::Value>,
+        ) -> std::collections::BTreeSet<String> {
+            [left, right]
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_object)
+                .flat_map(|object| object.keys().cloned())
+                .collect()
+        }
+        fn show(value: Option<&serde_json::Value>) -> String {
+            value.map_or_else(|| "absent".to_owned(), ToString::to_string)
+        }
+
+        let mut lines = Vec::new();
+        for key in names(Some(live), Some(vendored)) {
+            let (live_value, vendored_value) = (live.get(&key), vendored.get(&key));
+            if live_value == vendored_value {
+                continue;
+            }
+            if key != "exit_codes" {
+                lines.push(format!(
+                    "  {key}: vendored {}, confiture {}",
+                    show(vendored_value),
+                    show(live_value)
+                ));
+                continue;
+            }
+            for exit in names(live_value, vendored_value) {
+                let live_exit = live_value.and_then(|table| table.get(&exit));
+                let vendored_exit = vendored_value.and_then(|table| table.get(&exit));
+                if live_exit == vendored_exit {
+                    continue;
+                }
+                for field in names(live_exit, vendored_exit) {
+                    let live_field = live_exit.and_then(|entry| entry.get(&field));
+                    let vendored_field = vendored_exit.and_then(|entry| entry.get(&field));
+                    if live_field != vendored_field {
+                        lines.push(format!(
+                            "  exit {exit} {field}: vendored {}, confiture {}",
+                            show(vendored_field),
+                            show(live_field)
+                        ));
+                    }
+                }
+            }
+        }
+        if lines.is_empty() {
+            "  (the documents differ in a way this walker did not localise)".to_owned()
+        } else {
+            lines.join("\n")
+        }
     }
 
     /// Quoted in every failure below, so a red checkout is two commands from green.
@@ -435,10 +511,13 @@ mod tests {
         let vendored: serde_json::Value =
             serde_json::from_str(VENDORED_JSON).expect("vendored json parses");
         assert_eq!(
-            live, vendored,
-            "exit_codes.vendored.json is not what confiture {pin} emits; regenerate it:\n  \
+            live,
+            vendored,
+            "exit_codes.vendored.json is not what confiture {pin} emits. It drifts at:\n\
+             {}\nRegenerate it:\n  \
              {shown} --exit-codes-json > \
-             crates/fraisier-adapter-confiture/src/exit_codes.vendored.json"
+             crates/fraisier-adapter-confiture/src/exit_codes.vendored.json",
+            describe_drift(&live, &vendored)
         );
     }
 }

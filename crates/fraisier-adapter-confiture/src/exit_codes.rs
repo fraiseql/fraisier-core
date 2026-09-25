@@ -12,11 +12,13 @@
 //!
 //! Confiture is the single source of truth: it emits the whole table as JSON via
 //! `confiture --exit-codes-json` (from its `EXIT_CODE_SEMANTIC_CLASS`). This crate
-//! **vendors** that output in [`exit_codes.vendored.json`](./exit_codes.vendored.json)
-//! and the tests below diff the Rust table against it (always) and against the
-//! *live* command (when a new-enough `confiture` is on `PATH`) — so a drift fails
-//! CI here, and confiture's own contract test fails on its side. To adopt a
-//! confiture change, regenerate the vendored file:
+//! **vendors** that output in [`exit_codes.vendored.json`](./exit_codes.vendored.json).
+//! The tests below diff the Rust table against that file, and the file against what
+//! the pinned confiture emits — the whole document, and never a skip: the pin lives
+//! in `tools/confiture-requirements.txt` and CI installs it before the gate, so a
+//! drift fails CI here and confiture's own contract test fails on its side. To adopt
+//! a confiture change, bump that pin and regenerate the vendored file in the same
+//! commit:
 //!
 //! ```sh
 //! confiture --exit-codes-json > crates/fraisier-adapter-confiture/src/exit_codes.vendored.json
@@ -334,40 +336,109 @@ mod tests {
         assert_eq!(rust_classes, vendored_classes);
     }
 
-    #[test]
-    fn vendored_contract_matches_live_confiture_when_available() {
-        // The cross-repo freshness check: when a new-enough `confiture` is on PATH
-        // (or FRAISIER_CONFITURE_BIN), the vendored file must still equal what it
-        // emits. Skips otherwise (an older confiture lacks the flag; CI without
-        // confiture cannot run it) — the test above is the always-on guard.
-        let program = std::env::var_os("FRAISIER_CONFITURE_BIN")
+    /// The confiture release the exit-code contract is measured against, read out of
+    /// `tools/confiture-requirements.txt` so the pin has exactly one home. The test below
+    /// asserts the tool it runs reports *this* version, which couples a pin bump to a
+    /// regeneration of the vendored file in the same commit — and makes "too old to have
+    /// the flag" a named failure instead of a silent pass.
+    fn pinned_confiture_version() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("the workspace root is two levels above crates/<name>")
+            .join("tools/confiture-requirements.txt");
+        let pins = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("reading the confiture pin {}: {error}", path.display())
+        });
+        pins.lines()
+            .find_map(|line| line.trim().strip_prefix("fraiseql-confiture=="))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} names no `fraiseql-confiture==<version>`",
+                    path.display()
+                )
+            })
+            .to_owned()
+    }
+
+    /// The confiture to measure: `FRAISIER_CONFITURE_BIN` when set (CI points it at the
+    /// venv built from the pin), otherwise `confiture` on `PATH` — the same override the
+    /// adapter itself honours.
+    fn confiture_program() -> std::ffi::OsString {
+        std::env::var_os("FRAISIER_CONFITURE_BIN")
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| std::ffi::OsString::from("confiture"));
-        let output = match std::process::Command::new(&program)
-            .arg("--exit-codes-json")
+            .unwrap_or_else(|| std::ffi::OsString::from("confiture"))
+    }
+
+    /// Quoted in every failure below, so a red checkout is two commands from green.
+    fn install_hint(pin: &str) -> String {
+        format!(
+            "the exit-code contract is measured against confiture {pin}. Install it:\n  \
+             uv venv --python 3.11 /tmp/confiture\n  \
+             uv pip install --python /tmp/confiture/bin/python -r \
+             tools/confiture-requirements.txt\n  \
+             FRAISIER_CONFITURE_BIN=/tmp/confiture/bin/confiture cargo test -p \
+             fraisier-adapter-confiture\n\
+             (CI installs the same pin before `cargo xtask ci`.)"
+        )
+    }
+
+    #[test]
+    fn vendored_contract_equals_the_pinned_confitures_exit_codes_json() {
+        // The cross-repo freshness check, and the one that has to compare the WHOLE
+        // document: the reduced integer→class map above stayed identical through eight
+        // drifted `symbolic_codes` lists and two rewritten `meaning` strings (#63). Its
+        // predecessor also `return`ed with a printed `skip:` when confiture was absent,
+        // and CI installed no confiture, so it had never once run. A missing or unpinned
+        // confiture is therefore a failure here, never a skip.
+        let pin = pinned_confiture_version();
+        let program = confiture_program();
+        let shown = program.to_string_lossy().into_owned();
+
+        let version = match std::process::Command::new(&program)
+            .arg("--version")
             .output()
         {
-            Ok(output) if output.status.success() => output,
-            _ => {
-                eprintln!("skip: `confiture --exit-codes-json` unavailable (old or absent)");
-                return;
-            }
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+            other => panic!(
+                "`{shown} --version` did not answer ({other:?}).\n{}",
+                install_hint(&pin)
+            ),
         };
-        let Ok(live) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
-            eprintln!("skip: confiture output is not JSON (confiture too old?)");
-            return;
-        };
+        // `confiture --version` opens with `confiture version <semver>`; its later lines
+        // report the parser build and native extension, which are the machine's rather
+        // than the release's, so only the first line is the contract.
+        assert_eq!(
+            version,
+            format!("confiture version {pin}"),
+            "this is a different confiture, so any diff below would be the wrong \
+             release's.\n{}",
+            install_hint(&pin)
+        );
+
+        let output = std::process::Command::new(&program)
+            .arg("--exit-codes-json")
+            .output()
+            .unwrap_or_else(|error| panic!("running `{shown} --exit-codes-json`: {error}"));
+        assert!(
+            output.status.success(),
+            "`{shown} --exit-codes-json` exited {:?}",
+            output.status.code()
+        );
+        let live: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("confiture emits JSON");
         let vendored: serde_json::Value =
             serde_json::from_str(VENDORED_JSON).expect("vendored json parses");
         assert_eq!(
-            live["no_ledger_error_code"], vendored["no_ledger_error_code"],
-            "vendored exit_codes.vendored.json is stale (no_ledger); regenerate it"
-        );
-        assert_eq!(
-            class_map(&live),
-            class_map(&vendored),
-            "vendored exit_codes.vendored.json is stale; regenerate: \
-             confiture --exit-codes-json > crates/fraisier-adapter-confiture/src/exit_codes.vendored.json"
+            live, vendored,
+            "exit_codes.vendored.json is not what confiture {pin} emits; regenerate it:\n  \
+             {shown} --exit-codes-json > \
+             crates/fraisier-adapter-confiture/src/exit_codes.vendored.json"
         );
     }
 }

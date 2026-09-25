@@ -17,11 +17,14 @@
 //! the pinned confiture emits — the whole document, and never a skip: the pin lives
 //! in `tools/confiture-requirements.txt` and CI installs it before the gate, so a
 //! drift fails CI here and confiture's own contract test fails on its side. To adopt
-//! a confiture change, bump that pin and regenerate the vendored file in the same
-//! commit:
+//! a confiture change, bump that pin and regenerate the vendored file from the same
+//! release in one commit — the freshness test fails on either half alone:
 //!
 //! ```sh
-//! confiture --exit-codes-json > crates/fraisier-adapter-confiture/src/exit_codes.vendored.json
+//! uv venv --python 3.11 /tmp/confiture
+//! uv pip install --python /tmp/confiture/bin/python -r tools/confiture-requirements.txt
+//! /tmp/confiture/bin/confiture --exit-codes-json \
+//!   > crates/fraisier-adapter-confiture/src/exit_codes.vendored.json
 //! ```
 //!
 //! The Python adapter (`fraisier` `dbops/confiture_contract.py`) mirrors the same
@@ -446,16 +449,18 @@ mod tests {
         }
     }
 
-    /// Quoted in every failure below, so a red checkout is two commands from green.
+    /// Quoted in every failure below, so a red checkout is three commands from green. It
+    /// puts confiture on `PATH` rather than in `FRAISIER_CONFITURE_BIN`, which stays
+    /// honoured: an ambient `FRAISIER_*` variable reddens seven unrelated approval tests
+    /// (#64), so the hint must not hand anyone that trap.
     fn install_hint(pin: &str) -> String {
         format!(
             "the exit-code contract is measured against confiture {pin}. Install it:\n  \
              uv venv --python 3.11 /tmp/confiture\n  \
              uv pip install --python /tmp/confiture/bin/python -r \
              tools/confiture-requirements.txt\n  \
-             FRAISIER_CONFITURE_BIN=/tmp/confiture/bin/confiture cargo test -p \
-             fraisier-adapter-confiture\n\
-             (CI installs the same pin before `cargo xtask ci`.)"
+             PATH=/tmp/confiture/bin:$PATH cargo xtask ci\n\
+             (CI installs the same pin and puts it on PATH before the gate.)"
         )
     }
 

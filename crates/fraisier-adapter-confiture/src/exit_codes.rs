@@ -41,9 +41,9 @@ pub const NO_LEDGER_ERROR_CODE: &str = "PRECON_1001";
 pub enum ExitClass {
     /// Exit 0 — success. Present so the table is total; never an error.
     Ok,
-    /// Exit 1 — generic / unclassified failure: SQL or hook execution, an
-    /// ambiguous-change advisory, `status: pending`, or the `INTERNAL_ERROR`
-    /// envelope confiture emits for an unexpected exception.
+    /// Exit 1 — generic / unclassified failure: SQL or hook execution,
+    /// `status: pending`, or the `INTERNAL_ERROR` envelope confiture emits for an
+    /// unexpected non-`ConfiturError` exception.
     InternalError,
     /// Exit 2 — reachable-but-uninitialised database (`PRECON_1001`, no ledger).
     PreconditionFailed,
@@ -53,7 +53,7 @@ pub enum ExitClass {
     SchemaError,
     /// Exit 5 — configuration invalid, or a validation / sync / lint failure.
     InvalidConfig,
-    /// Exit 6 — lock or connection-pool contention (**retriable**).
+    /// Exit 6 — lock contention: another writer holds the lock (**retriable**).
     LockContention,
     /// Exit 7 — git / pgGit / grant-accompaniment error.
     GitError,
@@ -103,8 +103,8 @@ impl ExitClass {
         }
     }
 
-    /// Whether a failure of this class is worth retrying unchanged. Only lock /
-    /// pool contention is — another writer holds the lock; wait and retry.
+    /// Whether a failure of this class is worth retrying unchanged. Only lock
+    /// contention is — another writer holds the lock; wait and retry.
     pub const fn is_retriable(self) -> bool {
         matches!(self, Self::LockContention)
     }
@@ -155,7 +155,7 @@ mod tests {
     /// side fails CI. Symbolic codes are drawn from that doc's per-exit lists.
     const MATRIX: &[(Option<i32>, Option<&str>, ExitClass)] = &[
         (Some(0), None, ExitClass::Ok),
-        (Some(0), Some("MIGR_105"), ExitClass::Ok),
+        (Some(0), Some("MIGR_101"), ExitClass::Ok),
         (Some(1), None, ExitClass::InternalError),
         (Some(1), Some("INTERNAL_ERROR"), ExitClass::InternalError),
         (Some(1), Some("SQL_001"), ExitClass::InternalError),

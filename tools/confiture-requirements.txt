@@ -1,0 +1,49 @@
+# Pinned install of confiture for the CI gate, where
+# `crates/fraisier-adapter-confiture/src/exit_codes.rs` diffs the vendored exit-code
+# contract (`exit_codes.vendored.json`) against what this confiture emits.
+#
+# The vendored file is `confiture --exit-codes-json` captured verbatim. It had drifted in
+# eight of nine exit entries — every `symbolic_codes` list and two `meaning` strings —
+# while both guards stayed green, because the always-on one compares the integer→class map
+# alone and the live one returned a printed `skip:` whenever confiture was absent. CI
+# installed no confiture, so the freshness check had never run (issue #63). It now runs on
+# THIS confiture, named here, rather than on whatever PyPI serves on the day of the run.
+#
+# Every version is exact, transitive ones included: the verdict is produced by third-party
+# code, and an unpinned resolver hands someone else's release day the power to redden an
+# untouched tree. Bumping is a deliberate commit that regenerates the vendored file in the
+# same breath — the test asserts `confiture --version` reports the version pinned here, so
+# a bump without a regeneration fails, and a regeneration without a bump fails too.
+# Regenerate this list with:
+#
+#     uv venv --python 3.11 /tmp/confiture
+#     uv pip install --python /tmp/confiture/bin/python fraiseql-confiture==<version>
+#     uv pip freeze --python /tmp/confiture/bin/python
+#
+# Keep the interpreter at 3.11: it is confiture's own floor (`Requires-Python >=3.11`) and
+# the interpreter this transitive set was resolved on. fraiseql's wrapper carries the same
+# pin for its `integration (postgres)` leg (`tools/confiture-requirements.txt` there), and
+# the two are kept on the same confiture so the stack is measured against one release.
+#
+# The CLI reference this pin was checked against is confiture's docs/reference/exit-codes.md
+# at tag v1.19.0 (github.com/fraiseql/confiture).
+
+annotated-doc==0.0.5
+annotated-types==0.8.0
+fraiseql-confiture==1.19.0
+markdown-it-py==4.2.0
+mdurl==0.1.2
+pglast==8.4
+psycopg==3.3.6
+psycopg-binary==3.3.6
+psycopg-pool==3.3.3
+pydantic==2.13.5
+pydantic-core==2.46.5
+pygments==2.21.0
+pyyaml==6.0.3
+rich==15.0.0
+shellingham==1.5.4
+sqlglot==30.19.0
+typer==0.27.2
+typing-extensions==4.16.0
+typing-inspection==0.4.4

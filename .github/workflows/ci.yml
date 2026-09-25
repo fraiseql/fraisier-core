@@ -36,5 +36,20 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
+      # The exit-code contract test diffs `exit_codes.vendored.json` against what confiture
+      # itself emits, and fails rather than skips when confiture is missing or is not the
+      # pinned release. The gate installs that release — exact and transitive, on confiture's
+      # own 3.11 floor — so the contract is measured against a named version rather than
+      # against whatever PyPI serves today.
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      - name: Install the pinned confiture
+        run: |
+          uv venv --python 3.11 "$RUNNER_TEMP/confiture"
+          uv pip install --python "$RUNNER_TEMP/confiture/bin/python" \
+            -r tools/confiture-requirements.txt
+          echo "FRAISIER_CONFITURE_BIN=$RUNNER_TEMP/confiture/bin/confiture" >>"$GITHUB_ENV"
+
       - name: Run the gate
         run: cargo xtask ci

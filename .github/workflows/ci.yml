@@ -44,12 +44,18 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
+      # `confiture` goes on PATH rather than into `FRAISIER_CONFITURE_BIN`, and alone in its
+      # own directory so the venv's `python` does not shadow the runner's: the approval
+      # hook test asserts on the whole inherited `FRAISIER_*` set, so any such variable in
+      # the gate's environment reddens seven unrelated tests (fraiseql/fraisier-core#64).
       - name: Install the pinned confiture
         run: |
           uv venv --python 3.11 "$RUNNER_TEMP/confiture"
           uv pip install --python "$RUNNER_TEMP/confiture/bin/python" \
             -r tools/confiture-requirements.txt
-          echo "FRAISIER_CONFITURE_BIN=$RUNNER_TEMP/confiture/bin/confiture" >>"$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/confiture-bin"
+          ln -s "$RUNNER_TEMP/confiture/bin/confiture" "$RUNNER_TEMP/confiture-bin/confiture"
+          echo "$RUNNER_TEMP/confiture-bin" >>"$GITHUB_PATH"
 
       - name: Run the gate
         run: cargo xtask ci

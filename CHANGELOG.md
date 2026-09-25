@@ -6,6 +6,35 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The vendored confiture exit-code contract is confiture's again, and a test keeps
+  it so.** `crates/fraisier-adapter-confiture/src/exit_codes.vendored.json` is meant
+  to be `confiture --exit-codes-json` captured verbatim. Measured against confiture
+  1.19.0, it was stale in eight of its nine exit entries: every `symbolic_codes` list
+  but exit 2's, and the `meaning` of exit 1 ("ambiguous-change advisory") and exit 6
+  ("lock or connection-pool contention"). Exit 1 claimed eight codes where confiture
+  lists `SQL_001` alone, exit 6 claimed the two `POOL_*` codes confiture does not put
+  there, and exits 3, 4 and 5 were missing the codes confiture has added since. The
+  two `ExitClass` doc comments repeated the stale wording, and the test matrix used
+  `MIGR_105` as an example after confiture had dropped that code entirely. No
+  behaviour changes: `classify` keys on the exit integer and nothing dispatches on a
+  symbolic code. The file is regenerated and the comments now match it.
+
+  Both guards had stayed green. The always-on one reduces the document to
+  `{exit_int: class}`, which never drifted; the live one compared that same reduced map
+  and returned a printed `skip:` whenever confiture was absent or too old, and CI
+  installed no confiture, so it had never run. It is replaced by a test that compares
+  the whole document and fails, rather than skipping, when confiture is missing or is
+  not the pinned release — with the drifted fields named one per line. The pin is
+  `tools/confiture-requirements.txt` (exact and transitive, on confiture's own 3.11
+  floor, the same release fraiseql's migrate wrapper carries), and the CI gate installs
+  it and puts it on `PATH` before `cargo xtask ci` — on `PATH` rather than in
+  `FRAISIER_CONFITURE_BIN`, because an ambient `FRAISIER_*` variable fails the approval
+  hook test and poisons six more
+  ([#64](https://github.com/fraiseql/fraisier-core/issues/64), found here, not fixed here).
+  Closes [#63](https://github.com/fraiseql/fraisier-core/issues/63).
+
 ### Changed
 
 - A failed post-migration verify now names its failing checks in the rollback

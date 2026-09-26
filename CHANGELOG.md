@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-beta.11] - 2026-09-26
+
 ### Security
 
 - **`fraisier-self-upgrade` no longer hands a library consumer an artifact URL's
@@ -739,7 +741,8 @@ migration-safe rollback across one host or a fleet.
 - **GitHub Actions CI** that runs `cargo xtask ci`.
 
 [c197]: https://github.com/fraiseql/confiture/issues/197
-[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.10...HEAD
+[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.11...HEAD
+[1.0.0-beta.11]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.10...fraisier-v1.0.0-beta.11
 [1.0.0-beta.10]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.9...fraisier-v1.0.0-beta.10
 [1.0.0-beta.9]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.8...fraisier-v1.0.0-beta.9
 [1.0.0-beta.8]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.7...fraisier-v1.0.0-beta.8

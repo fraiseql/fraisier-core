@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-command"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-confiture"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "fraisier-core",
@@ -517,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-docker-compose"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-http"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-nginx"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -552,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-rc"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -563,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-release"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "fraisier-artifact-release",
  "fraisier-core",
@@ -577,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-support"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "fraisier-core",
  "serde_json",
@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-adapter-systemd"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-artifact-git"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-artifact-local"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-artifact-pull"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-artifact-release"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "fraisier-adapter-support",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-bootstrap"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "fraisier-adapter-support",
  "fraisier-core",
@@ -658,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-check"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "fraisier-adapter-support",
  "futures",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-config"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "fraisier-core",
  "serde",
@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-core"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "fraisier-saga",
@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-db"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "percent-encoding",
  "thiserror",
@@ -704,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-ipc"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "fraisier-core",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-saga"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "chrono",
@@ -737,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-scaffold"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "fraisier-config",
  "tempfile",
@@ -746,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-self-upgrade"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "filetime",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-ship"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "semver",
  "tempfile",
@@ -773,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-sync"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "tempfile",
  "thiserror",
@@ -781,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "fraisier-webhook"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 dependencies = [
  "async-trait",
  "hex",
@@ -2964,7 +2964,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "1.0.0-beta.9"
+version = "1.0.0-beta.10"
 
 [[package]]
 name = "yoke"

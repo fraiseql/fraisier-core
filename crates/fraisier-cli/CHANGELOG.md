@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.10](https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.9...fraisier-v1.0.0-beta.10) - 2026-09-26
+
+### Fixed
+
+- *(security)* redact the anyhow chain the webhook returns over HTTP
+- *(security)* redact credentials at the CLI's output edge
+- *(security)* redact credentials on the three paths that bypass the CLI
+
+### Other
+
+- *(saga)* one credential-redaction helper, reachable from the engine
+
 ## [1.0.0-beta.8](https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.7...fraisier-v1.0.0-beta.8) - 2026-08-08
 
 ### Fixed

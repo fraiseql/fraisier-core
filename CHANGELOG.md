@@ -6,6 +6,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The CI gate now runs rustdoc**, as `cargo xtask doc`
+  (`RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --all-features`).
+  Nothing ran rustdoc before, which is how nine broken doc links accumulated
+  across six crates unnoticed — a broken intra-doc link is invisible while
+  writing and ships as a dead link on docs.rs, the only documentation an
+  embedder of these crates reads. All nine are fixed: six redundant explicit
+  link targets, a hyphenated crate name that was never a valid path
+  (`fraisier-core`), and two links to the saga's feature-gated `otel` module.
+  Those last two are now code spans rather than links: these crates set no
+  docs.rs `all-features` metadata, so docs.rs builds them with default features
+  and a feature-gated path cannot be a working intra-doc link there.
+
 ## [1.0.0-beta.11] - 2026-09-26
 
 ### Security

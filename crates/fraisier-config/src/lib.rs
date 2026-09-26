@@ -4,7 +4,7 @@
 //! `fraisier.toml` deploy configuration (PRD §7.1 / §7.1a).
 //!
 //! This crate is the bridge between the config file and the **frozen** vocabulary
-//! types in [`fraisier-core`]. It depends on `fraisier-core` for those types only
+//! types in [`fraisier_core`]. It depends on `fraisier-core` for those types only
 //! and **never** on `fraisier-ipc` (the crate-graph rule); concrete adapter
 //! selection is wired at the CLI / embedder layer.
 //!

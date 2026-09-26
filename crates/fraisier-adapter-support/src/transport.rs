@@ -2,7 +2,7 @@
 //! `ssh`.
 //!
 //! The single-host adapters (`systemd`, `nginx`, `rc`, `docker-compose`) shell out
-//! with [`run_command`](crate::run_command), which runs on the **local** machine.
+//! with [`run_command`], which runs on the **local** machine.
 //! A multi-host rollout has to run those same commands on each remote host. Rather
 //! than teach every adapter about SSH, they dispatch through a [`Transport`]:
 //!
@@ -45,7 +45,7 @@ const SSH_PROGRAM_ENV: &str = "FRAISIER_SSH_BIN";
 ///
 /// Build with [`Transport::Local`] (the default) or
 /// [`Transport::ssh`](Transport::ssh); run a command with [`Transport::run`],
-/// whose signature matches [`run_command`](crate::run_command) plus the
+/// whose signature matches [`run_command`] plus the
 /// [`AdapterCtx`] (the SSH target is read from it).
 #[derive(Debug, Clone, Default)]
 pub enum Transport {
@@ -66,7 +66,7 @@ impl Transport {
 
     /// Run `program args` (with `envs`/`cwd`) on the transport's target, capturing
     /// its output. For [`Transport::Local`] this is exactly
-    /// [`run_command`](crate::run_command); for [`Transport::Ssh`] the command is
+    /// [`run_command`]; for [`Transport::Ssh`] the command is
     /// wrapped as a single remote shell command and `ssh` is spawned locally.
     ///
     /// # Errors

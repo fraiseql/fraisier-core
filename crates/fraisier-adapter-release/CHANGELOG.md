@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.11](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-release-v1.0.0-beta.10...fraisier-adapter-release-v1.0.0-beta.11) - 2026-09-26
+
+### Other
+
+- release v1.0.0-beta.10
+
 ## [1.0.0-beta.10](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-release-v1.0.0-beta.9...fraisier-adapter-release-v1.0.0-beta.10) - 2026-09-26
 
 ### Other

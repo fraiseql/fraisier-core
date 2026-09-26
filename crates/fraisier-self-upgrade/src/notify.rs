@@ -47,9 +47,20 @@ fn emit_event(payload: &FailurePayload) {
         event = %payload.event,
         failed = ?payload.failed,
         restored = ?payload.restored,
-        reason = %payload.reason,
+        reason = %safe_reason(payload),
         "fraisier unattended-failure notification"
     );
+}
+
+/// The payload's reason with credentials stripped.
+///
+/// A reason is built from whatever failed — an artifact URL that answered 401
+/// carries its basic-auth userinfo, for one — and this crate's types are public,
+/// so the payload may have been built by an embedder that fraisier's own
+/// redaction never touched. Stripping at the sink means the guarantee holds for
+/// every producer rather than for the one that happens to redact (#68).
+fn safe_reason(payload: &FailurePayload) -> String {
+    fraisier_core::redact::credentials(&payload.reason)
 }
 
 /// A [`Notifier`] that emits only the OTel/tracing event — the default sink when
@@ -102,6 +113,12 @@ impl Notifier for ExecHookNotifier {
     async fn notify(&self, payload: &FailurePayload) {
         emit_event(payload);
 
+        // One redacted copy drives both channels, so the env var and the JSON on
+        // stdin can never disagree about what the hook was told (#68).
+        let payload = &FailurePayload {
+            reason: safe_reason(payload),
+            ..payload.clone()
+        };
         let json = serde_json::to_string(payload).unwrap_or_default();
         let mut command = tokio::process::Command::new("sh");
         command
@@ -149,6 +166,40 @@ mod tests {
             restored: Some("1.0.0".to_owned()),
             reason: "boots-then-dies".to_owned(),
         }
+    }
+
+    #[tokio::test]
+    async fn the_hook_never_receives_a_credential_however_the_payload_was_built() {
+        // The guarantee belongs to the sink, not to one producer: `FailurePayload`
+        // and the notifiers are public, so an embedder builds payloads this crate
+        // never sees, and so does any new call site here (#68).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("captured");
+        let command = format!(
+            "printf 'REASON=%s\\n' \"$FRAISIER_NOTIFY_REASON\" > {out}; cat >> {out}",
+            out = out.display()
+        );
+        let leaky = FailurePayload {
+            event: "self-upgrade-manual-intervention".to_owned(),
+            failed: Some("2.0.0".to_owned()),
+            restored: None,
+            reason: "HTTP 401 Unauthorized fetching \
+                     https://ci:s3cr3t@artifacts.internal/fraisier.tar.gz"
+                .to_owned(),
+        };
+        ExecHookNotifier::new(command).notify(&leaky).await;
+
+        let captured = std::fs::read_to_string(&out).expect("hook wrote output");
+        assert!(
+            !captured.contains("s3cr3t"),
+            "env or stdin leaked: {captured}"
+        );
+        // Both channels carry the redacted form, and the host survives in both.
+        assert_eq!(
+            captured.matches("artifacts.internal").count(),
+            2,
+            "expected the host in REASON= and in the stdin JSON: {captured}"
+        );
     }
 
     #[tokio::test]

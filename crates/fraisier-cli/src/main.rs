@@ -692,12 +692,13 @@ async fn main() -> ExitCode {
     let _otel_guard = init_otel();
     match dispatch(&cli).await {
         Ok(output) => {
-            render(&output, cli.json, cli.verbose);
             // Exit codes are small and non-negative; the clamp is just for safety.
-            ExitCode::from(u8::try_from(output.exit_code).unwrap_or(1))
+            let code = ExitCode::from(u8::try_from(output.exit_code).unwrap_or(1));
+            render(output, cli.json, cli.verbose);
+            code
         }
         Err(error) => {
-            eprintln!("error: {error:#}");
+            eprintln!("{}", error_line(&error));
             ExitCode::FAILURE
         }
     }
@@ -867,29 +868,141 @@ fn init_otel() -> Option<fraisier_saga::otel::OtelGuard> {
     }
 }
 
-fn render(output: &CommandOutput, json: bool, verbose: u8) {
+/// Exactly what [`render`] will write, as `(stdout, stderr)`.
+///
+/// This is the CLI's output edge and its last line of defence: every command's
+/// text passes through here, and a command builds its text out of whatever its
+/// adapter reported — including, on a failed connection, a DSN in full. Redacting
+/// the output once, here, is what makes the guarantee hold for commands that do
+/// not exist yet; nothing downstream of this function may re-introduce raw text
+/// (#62).
+///
+/// Split out from `render` so the guarantee is assertable without running the
+/// binary or capturing its streams.
+fn rendered(output: CommandOutput, json: bool, verbose: u8) -> (String, String) {
+    use std::fmt::Write as _;
+
+    let output = output.redacted();
+    let (mut out, mut err) = (String::new(), String::new());
     if json {
         match serde_json::to_string_pretty(&output.json) {
-            Ok(rendered) => println!("{rendered}"),
-            Err(error) => eprintln!("error: failed to render JSON: {error}"),
+            Ok(rendered) => {
+                let _ = writeln!(out, "{rendered}");
+            }
+            Err(error) => {
+                let _ = writeln!(err, "error: failed to render JSON: {error}");
+            }
         }
     } else {
-        print!("{}", output.pretty);
+        out.push_str(&output.pretty);
         // Verbose adds the structured detail on stderr (kept off stdout so CI
         // greps of the compact output are unaffected). `--json`/`--verbose` are
         // mutually exclusive, so this never double-prints the JSON.
         if verbose > 0 {
             if let Ok(rendered) = serde_json::to_string_pretty(&output.json) {
-                eprintln!("{rendered}");
+                let _ = writeln!(err, "{rendered}");
             }
         }
     }
+    (out, err)
+}
+
+fn render(output: CommandOutput, json: bool, verbose: u8) {
+    let (out, err) = rendered(output, json, verbose);
+    print!("{out}");
+    eprint!("{err}");
+}
+
+/// The `error: …` line the process prints when a command returns `Err`.
+///
+/// Anyhow contexts wrap adapter errors (`"applying migrations"` over an
+/// `AdapterError`, say), so this line carries adapter text and is redacted for the
+/// same reason [`rendered`] is.
+fn error_line(error: &anyhow::Error) -> String {
+    fraisier_core::redact::credentials(&format!("error: {error:#}"))
 }
 
 #[cfg(test)]
 mod cli_tests {
-    use super::Cli;
+    use super::{error_line, rendered, Cli, CommandOutput};
     use clap::Parser as _;
+
+    /// A rollback-shaped output whose text carries a DSN, in both renderings.
+    fn leaky() -> CommandOutput {
+        let reason = "rolled_back (step 'migrate': [execution] connection to \
+                      postgresql://checkout:hunter2@db.internal:5432/checkout failed)";
+        CommandOutput {
+            exit_code: 1,
+            pretty: format!("deploy of checkout/staging {reason}\n"),
+            json: serde_json::json!({
+                "outcome": "rolled_back",
+                "detail": reason,
+                "nested": { "reasons": [reason] },
+                "attempts": 2,
+                "committed": false,
+                "revision": serde_json::Value::Null,
+            }),
+        }
+    }
+
+    #[test]
+    fn no_output_mode_can_print_a_credential() {
+        for (json, verbose) in [(true, 0), (false, 0), (false, 1)] {
+            let (out, err) = rendered(leaky(), json, verbose);
+            assert!(
+                !out.contains("hunter2") && !err.contains("hunter2"),
+                "json={json} verbose={verbose} leaked\nstdout: {out}\nstderr: {err}"
+            );
+            // Which database failed is the actionable half and must survive.
+            assert!(
+                out.contains("db.internal") || err.contains("db.internal"),
+                "json={json} verbose={verbose} dropped the host\nstdout: {out}\nstderr: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn redacting_json_keeps_it_parseable_and_leaves_non_strings_alone() {
+        let (out, _) = rendered(leaky(), true, 0);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("still valid JSON");
+        assert_eq!(parsed["outcome"], "rolled_back", "keys and labels intact");
+        assert_eq!(parsed["attempts"], 2, "a number is untouched");
+        assert_eq!(parsed["committed"], false, "a bool is untouched");
+        assert!(parsed["revision"].is_null(), "a null is untouched");
+        assert!(
+            parsed["nested"]["reasons"][0]
+                .as_str()
+                .expect("a string leaf")
+                .contains("db.internal"),
+            "nested string leaves are redacted in place, not dropped"
+        );
+    }
+
+    #[test]
+    fn the_pretty_rendering_is_byte_for_byte_when_there_is_nothing_to_redact() {
+        let clean = CommandOutput {
+            exit_code: 0,
+            pretty: "deploy of checkout/staging committed\n".to_owned(),
+            json: serde_json::json!({ "outcome": "committed" }),
+        };
+        let (out, err) = rendered(clean, false, 0);
+        assert_eq!(out, "deploy of checkout/staging committed\n");
+        assert!(err.is_empty(), "nothing on stderr without --verbose");
+    }
+
+    #[test]
+    fn the_error_line_is_redacted() {
+        let error = anyhow::anyhow!(
+            "[execution] connection to postgresql://checkout:hunter2@db.internal/checkout failed"
+        )
+        .context("applying migrations");
+        let line = error_line(&error);
+        assert!(!line.contains("hunter2"), "leaked: {line}");
+        assert!(
+            line.starts_with("error: applying migrations") && line.contains("db.internal"),
+            "the context and the host survive: {line}"
+        );
+    }
 
     /// The clap definition is internally consistent (catches arg-graph mistakes).
     #[test]

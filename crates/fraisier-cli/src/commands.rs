@@ -30,6 +30,44 @@ pub(crate) struct CommandOutput {
     pub json: Value,
 }
 
+impl CommandOutput {
+    /// The same output with credentials stripped out of every string it carries.
+    ///
+    /// Commands build their output from whatever their adapter reported, and an
+    /// adapter folds its tool's stderr into the error it returns — where a
+    /// database client that could not connect prints the DSN in full. Redacting at
+    /// the one place output is printed covers every command that exists and every
+    /// command added later, which is what redacting at each of the ~50 sites that
+    /// build a `CommandOutput` does not (#62).
+    ///
+    /// Only string *values* in [`Self::json`] are rewritten — never keys, and
+    /// never the serialized document — so the payload cannot stop being valid JSON
+    /// and a consumer's key lookups are unaffected.
+    pub(crate) fn redacted(self) -> Self {
+        Self {
+            exit_code: self.exit_code,
+            pretty: redact::credentials(&self.pretty),
+            json: redact_json(self.json),
+        }
+    }
+}
+
+/// Rewrite every string leaf of `value` through [`redact::credentials`].
+fn redact_json(value: Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(redact::credentials(&text)),
+        Value::Array(items) => Value::Array(items.into_iter().map(redact_json).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, field)| (key, redact_json(field)))
+                .collect(),
+        ),
+        // Numbers, booleans and null cannot carry a credential.
+        scalar => scalar,
+    }
+}
+
 fn load(config_path: &Path) -> Result<DeployConfig> {
     let toml = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading config {}", config_path.display()))?;

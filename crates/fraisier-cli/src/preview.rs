@@ -4,7 +4,7 @@
 //! inspects the migration adapter and renders two things the saga step list
 //! never showed: **what would change**, and **what the policy gate would decide
 //! about it**. The verdict comes from the same
-//! [`policy::evaluate`](fraisier_core::policy::evaluate) the live gate calls —
+//! [`policy::evaluate`] the live gate calls —
 //! never a parallel implementation — and the approval hook is structurally out
 //! of reach, because only
 //! [`PolicyGate::admit`](fraisier_core::policy::PolicyGate::admit) runs it.

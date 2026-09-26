@@ -8,7 +8,7 @@
 //! ## The model (systemd-managed swap)
 //!
 //! The supervised unit's `ExecStart` points at a stable symlink
-//! (`…/bin/current`). [`apply`](crate::apply) stages the new binary beside it,
+//! (`…/bin/current`). [`apply`] stages the new binary beside it,
 //! verifies its SHA-256, **atomically repoints the symlink**, restarts the unit,
 //! and health-checks it. On an unhealthy/timed-out start it **repoints the
 //! symlink back at the kept-old target**, restarts again, and re-probes.

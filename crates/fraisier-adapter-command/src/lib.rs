@@ -675,6 +675,15 @@ mod tests {
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Take `ENV_LOCK`, recovering it if a previous test panicked while holding
+    /// it, so one real failure is not reported as several `PoisonError`s that
+    /// name neither the cause nor the test (#64). The guarded data is `()`.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn settings_with(commands: Value) -> BTreeMap<String, Value> {
         let mut settings = BTreeMap::new();
         settings.insert("commands".to_owned(), commands);
@@ -731,7 +740,7 @@ mod tests {
 
     #[test]
     fn resolve_secret_env_reads_through_mapping() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_guard();
         let source = "FRAISIER_CMD_TEST_SECRET";
         std::env::set_var(source, "postgres://example/db");
         let mut ctx = AdapterCtx::new("checkout", "production");

@@ -339,27 +339,58 @@ mod tests {
         // Synchronous, under the shared lock: the child inherits the *process*
         // environment, so a db-op test mid-`set_var` on another thread would
         // otherwise show up here as a variable fraisier never exported.
-        let _guard = crate::test_env::ENV_LOCK.lock().expect("env lock");
+        const AMBIENT: &str = "FRAISIER_AMBIENT_PROBE";
+        const EXPORTED: [&str; 4] = [
+            "FRAISIER_APPROVAL_CHANGE_COUNT",
+            "FRAISIER_APPROVAL_ENVIRONMENT",
+            "FRAISIER_APPROVAL_FRAISE",
+            "FRAISIER_APPROVAL_WORST_TIER",
+        ];
+
+        let _guard = crate::test_env::env_guard();
+
+        // The claim is about what fraisier *adds*, so it is measured as a
+        // difference against the ambient environment — never as the child's whole
+        // `FRAISIER_*` set, which would be a claim about the machine. An ambient
+        // variable is exported here on purpose so the difference is exercised on
+        // every run: asserting the whole set is what made an ambient
+        // `FRAISIER_CONFITURE_BIN` — which the confiture adapter's own README
+        // tells people to set — fail this test and poison six more (#64).
+        std::env::set_var(AMBIENT, "set by the operator, not by fraisier");
+        let ambient: std::collections::BTreeSet<String> = std::env::vars()
+            .map(|(key, _)| key)
+            .filter(|key| key.starts_with("FRAISIER_"))
+            .collect();
+
         let dir = tempfile::tempdir().expect("tempdir");
         let seen = dir.path().join("env");
         let _ = crate::test_env::block_on(
             hook(&format!("env > {}; exit 1", seen.display())).request(&request()),
         );
+        std::env::remove_var(AMBIENT);
+
         let env = std::fs::read_to_string(&seen).expect("the hook ran");
-        let mut exported: Vec<&str> = env
+        let child: std::collections::BTreeSet<&str> = env
             .lines()
             .filter(|line| line.starts_with("FRAISIER_"))
             .filter_map(|line| line.split('=').next())
             .collect();
-        exported.sort_unstable();
-        assert_eq!(
-            exported,
-            [
-                "FRAISIER_APPROVAL_CHANGE_COUNT",
-                "FRAISIER_APPROVAL_ENVIRONMENT",
-                "FRAISIER_APPROVAL_FRAISE",
-                "FRAISIER_APPROVAL_WORST_TIER",
-            ]
+
+        for key in EXPORTED {
+            assert!(child.contains(key), "fraisier must export {key}: {child:?}");
+        }
+        // Nothing else: anything in the child that fraisier did not inherit and
+        // is not one of the four is a leak.
+        let added: Vec<&&str> = child
+            .iter()
+            .filter(|key| !ambient.contains(**key) && !EXPORTED.contains(key))
+            .collect();
+        assert!(
+            added.is_empty(),
+            "fraisier exported more than the identity: {added:?}"
         );
+        // The operator's own environment still reaches the hook, as it does for
+        // every fraisier hook.
+        assert!(child.contains(AMBIENT), "the hook lost the inherited env");
     }
 }

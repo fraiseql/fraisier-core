@@ -20,6 +20,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   docs.rs `all-features` metadata, so docs.rs builds them with default features
   and a feature-gated path cannot be a working intra-doc link there.
 
+### Fixed
+
+- **The test suite no longer fails because of a variable the environment happens
+  to carry.** `cargo test` went from 158 passing to 151 whenever any `FRAISIER_*`
+  variable was set — including `FRAISIER_CONFITURE_BIN`, which the confiture
+  adapter's own README tells people to set. The approval-hook test asserted on the
+  child process's *entire* inherited `FRAISIER_*` set, which is a claim about the
+  machine rather than about fraisier; it now measures what fraisier *adds*, and
+  exports an ambient variable itself so the difference is exercised on every run.
+  Separately, a panic under the shared environment lock poisoned it and took six
+  unrelated tests down with `PoisonError`, reporting one real failure as seven
+  that named neither the cause nor the test; the guard is now recovered, in all
+  four crates that keep such a lock. No library or CLI behaviour changes. Closes
+  [#64](https://github.com/fraiseql/fraisier-core/issues/64).
+
 ## [1.0.0-beta.11] - 2026-09-26
 
 ### Security

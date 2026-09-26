@@ -1842,6 +1842,15 @@ mod tests {
     /// Serialises env-mutating tests so `set_var`/`var` don't race.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Take `ENV_LOCK`, recovering it if a previous test panicked while holding
+    /// it, so one real failure is not reported as several `PoisonError`s that
+    /// name neither the cause nor the test (#64). The guarded data is `()`.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     const SECRET_DSN: &str = "postgresql://user:s3cr3t@db.internal:5432/app";
 
     fn ctx_with_secret(source_var: &str) -> AdapterCtx {
@@ -1855,7 +1864,7 @@ mod tests {
 
     #[test]
     fn plan_injects_dsn_in_env_never_argv() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_guard();
         let source = "FRAISIER_CONF_TEST_DSN_A";
         std::env::set_var(source, SECRET_DSN);
         let ctx = ctx_with_secret(source);
@@ -1885,7 +1894,7 @@ mod tests {
 
     #[test]
     fn plan_passes_migrations_dir_when_present() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_guard();
         let source = "FRAISIER_CONF_TEST_DSN_B";
         std::env::set_var(source, SECRET_DSN);
         let ctx = ctx_with_secret(source);
@@ -1902,7 +1911,7 @@ mod tests {
 
     #[test]
     fn plan_omits_migrations_dir_when_absent() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_guard();
         let source = "FRAISIER_CONF_TEST_DSN_C";
         std::env::set_var(source, SECRET_DSN);
         let mut ctx = ctx_with_secret(source);
@@ -1916,7 +1925,7 @@ mod tests {
 
     #[test]
     fn plan_current_never_passes_migrations_dir() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = env_guard();
         let source = "FRAISIER_CONF_TEST_DSN_D";
         std::env::set_var(source, SECRET_DSN);
         // ctx_with_secret sets migrations_path, yet `current` rejects the flag.

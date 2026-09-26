@@ -11,6 +11,7 @@ use anyhow::{Context as _, Result};
 use fraisier_config::{DeployConfig, Severity, ValidationReport};
 use fraisier_core::multi_host::MultiHostDeploy;
 use fraisier_core::policy::Baseline;
+use fraisier_core::redact;
 use fraisier_core::single_host::{DeployRecord, SingleHostDeploy};
 use fraisier_saga::saga::SagaOutcome;
 use fraisier_saga::state_store::{FilesystemStateStore, FraiseKey, StateStore};
@@ -1570,7 +1571,7 @@ async fn preview_schema(
         Err(error) => {
             return uninspected(Unavailable::new(
                 Unavailable::ADAPTER_UNAVAILABLE,
-                preview::redact_credentials(&format!(
+                redact::credentials(&format!(
                     "the migration adapter could not be built: {error:#}"
                 )),
             ))

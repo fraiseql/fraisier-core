@@ -43,3 +43,12 @@ pub mod policy;
 pub mod restore_rehearsal;
 pub mod single_host;
 pub mod token_provider;
+
+/// Credential redaction, re-exported from the engine layer.
+///
+/// The implementation lives in `fraisier-saga` because the saga is what persists
+/// and replicates a failure reason, and the crate-graph rule above puts saga
+/// *below* core — so core cannot own a helper saga has to call. Re-exporting it
+/// here is what lets core's dependents (`fraisier-ipc` in particular, which does
+/// not depend on saga) reach the one implementation instead of writing a second.
+pub use fraisier_saga::redact;

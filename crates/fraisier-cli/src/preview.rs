@@ -35,6 +35,7 @@ use fraisier_core::adapter_axes::{
 use fraisier_core::policy::{
     self, Baseline, Capabilities, Inspection, PolicyDecision, PolicyGate, PolicyReason,
 };
+use fraisier_core::redact;
 use serde::Serialize;
 
 /// The schema half of a `--dry-run` plan.
@@ -217,7 +218,7 @@ pub async fn gather(
             return assemble(
                 Err(Unavailable::new(
                     Unavailable::PREFLIGHT_FAILED,
-                    redact_credentials(&format!(
+                    redact::credentials(&format!(
                         "the migration adapter could not be inspected: {error}"
                     )),
                 )),
@@ -594,42 +595,9 @@ fn wrap(text: &str) -> Vec<String> {
     lines
 }
 
-/// Strip `user:password@` out of every URL in `text`.
-///
-/// A plan is printed and logged, and the confiture adapter folds the first line
-/// of stderr into its error message — where a failed connection prints the DSN
-/// in full. The host survives, because *which* database could not be reached is
-/// the actionable half; the credentials do not.
-pub fn redact_credentials(text: &str) -> String {
-    /// What ends a URL's authority section.
-    const AUTHORITY_END: [char; 8] = ['/', '?', '#', ' ', '\t', '"', '\'', ','];
-    /// What separates a scheme from the authority that may carry credentials.
-    const MARK: &str = "://";
-
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(mark) = rest.find(MARK) {
-        let (head, authority) = rest.split_at(mark + MARK.len());
-        out.push_str(head);
-        let end = authority.find(AUTHORITY_END).unwrap_or(authority.len());
-        if let Some(at) = authority[..end].rfind('@') {
-            out.push_str("***");
-            rest = &authority[at..];
-        } else {
-            out.push_str(&authority[..end]);
-            rest = &authority[end..];
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        gather, redact_credentials, ChangeSetPreview, PolicyPreview, SchemaPreview, Unavailable,
-        Verdict,
-    };
+    use super::{gather, ChangeSetPreview, PolicyPreview, SchemaPreview, Unavailable, Verdict};
     use async_trait::async_trait;
     use fraisier_core::adapter_axes::{
         AdapterCtx, AdapterDescription, AdapterError, ChangeSet, MigrationAdapter,
@@ -1052,18 +1020,6 @@ mod tests {
         assert!(!detail.contains("checkout:"), "userinfo leaked: {detail}");
         // The actionable part survives: which host, and that it failed.
         assert!(detail.contains("db.internal"), "{detail}");
-    }
-
-    #[test]
-    fn redaction_keeps_a_credential_free_url_intact() {
-        assert_eq!(
-            redact_credentials("connection to postgresql://db.internal:5432/checkout failed"),
-            "connection to postgresql://db.internal:5432/checkout failed"
-        );
-        assert_eq!(
-            redact_credentials("postgres://u:p@h/db and postgresql://a:b@c/d"),
-            "postgres://***@h/db and postgresql://***@c/d"
-        );
     }
 
     #[tokio::test]

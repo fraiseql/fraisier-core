@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - *(security)* redact credentials on the three paths that bypass the CLI
 
+## [1.0.0-beta.9](https://github.com/fraiseql/fraisier-core/compare/fraisier-ipc-v1.0.0-beta.8...fraisier-ipc-v1.0.0-beta.9) - 2026-09-20
+
+### Added
+
+- *(core)* VerifyReport says when a verify examined nothing
+
 ## [1.0.0-beta.8](https://github.com/fraiseql/fraisier-core/compare/fraisier-ipc-v1.0.0-beta.7...fraisier-ipc-v1.0.0-beta.8) - 2026-08-08
 
 ### Fixed

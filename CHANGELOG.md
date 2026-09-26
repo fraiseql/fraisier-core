@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-beta.10] - 2026-09-26
+
 ### Security
 
 - **Credentials no longer ride a failure reason off the host.** Adapters build
@@ -15,7 +17,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   persisted and sent to the failure webhook unchanged. Closes
   [#62](https://github.com/fraiseql/fraisier-core/issues/62).
 
-  Redaction now happens at four boundaries rather than at the places a reason is
+  Redaction now happens at five boundaries rather than at the places a reason is
   built, so it covers every present and future contributor to one:
 
   - the CLI's output edge, which is every command's text, its `--json` payload
@@ -716,7 +718,8 @@ migration-safe rollback across one host or a fleet.
 - **GitHub Actions CI** that runs `cargo xtask ci`.
 
 [c197]: https://github.com/fraiseql/confiture/issues/197
-[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.9...HEAD
+[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.10...HEAD
+[1.0.0-beta.10]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.9...fraisier-v1.0.0-beta.10
 [1.0.0-beta.9]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.8...fraisier-v1.0.0-beta.9
 [1.0.0-beta.8]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.7...fraisier-v1.0.0-beta.8
 [1.0.0-beta.7]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.6...fraisier-v1.0.0-beta.7

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.9](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-confiture-v1.0.0-beta.8...fraisier-adapter-confiture-v1.0.0-beta.9) - 2026-09-20
+
+### Added
+
+- *(core)* VerifyReport says when a verify examined nothing
+
+### Fixed
+
+- *(confiture)* verify reads confiture's ok and fails closed on anything less
+
+### Other
+
+- *(confiture)* pin verify's non-report at a failing exit
+- verify reads ok; VerifyReport carries was_skipped
+- *(confiture)* the live round-trip verifies for real
+- *(confiture)* capture migrate verify from 0.20.0, 0.44.0 and 1.12.0
+
 ## [1.0.0-beta.8](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-confiture-v1.0.0-beta.7...fraisier-adapter-confiture-v1.0.0-beta.8) - 2026-08-08
 
 ### Added

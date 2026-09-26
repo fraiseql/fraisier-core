@@ -22,9 +22,10 @@ step; there are four boundaries, and they cover the steps nobody has written yet
 |---|---|
 | The CLI's output edge (`rendered`) | every command's text, its `--json` payload, its `--verbose` stderr JSON |
 | A rendered anyhow chain (`error_detail`) | the CLI's `error:` line, and the webhook's HTTP 500 body — which leaves the host without passing the output edge |
-| `FailurePayload.reason` | the notify hook's env var and stdin JSON, and the notifier's log event — which fires with no hook configured |
+| The notify sink (`emit_event`, `ExecHookNotifier`) | the hook's env var and stdin JSON, and the notifier's log event — which fires with no hook configured. At the **sink**, so it holds for every `FailurePayload` producer, this crate's and an embedder's alike |
 | `Saga::rollback` | the `PartialRollback` reason before it is persisted, and so `state.json`, `events.jsonl` and `sync push` |
 | The IPC client's `data` fold | a remote adapter's stderr, which the fold puts into the message every sink renders |
+| `fraisier-self-upgrade`'s `download` | an artifact URL's basic-auth credentials in a fetch error, which reach a library consumer through `AbortedBeforeSwap` without passing the CLI edge |
 
 Two forms are stripped: a URL's `user:password@`, and libpq's `password=` keyword
 (bare or single-quoted). Everything an operator needs in order to act is kept —
@@ -35,6 +36,11 @@ reason that has been scrubbed into uselessness gets worked around.
 `fraisier_core::redact`. It lives in the engine crate because the engine is what
 persists and replicates a reason, and because `fraisier-core` depends on
 `fraisier-saga` and not the other way round.
+
+Two of those boundaries sit inside `fraisier-self-upgrade` rather than in the
+binary, because that crate is published and embeddable: a consumer that calls
+`apply()` or drives a `Notifier` itself never passes the CLI's output edge, so a
+guarantee placed only there would not reach them.
 
 **What this does not cover.** Only credentials, and only those two forms. Any other
 secret an adapter writes to stderr — an API token, a signing key — still travels,

@@ -6,6 +6,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **`fraisier-self-upgrade` no longer hands a library consumer an artifact URL's
+  credentials, and its notify sink redacts for every producer.** Closes
+  [#68](https://github.com/fraiseql/fraisier-core/issues/68).
+
+  `--source` and `--checksum-url` point at an artifact server, and a private one
+  reached with basic auth carries its credentials in the URL. A non-success
+  response built its error by interpolating that URL verbatim, and the text
+  becomes `ApplyOutcome::AbortedBeforeSwap`'s reason. Through the `fraisier`
+  binary that was already covered by the output edge added in beta.10, but
+  `fraisier-self-upgrade` is a published crate: an embedder calling `apply()`
+  reads the reason directly, with no such edge in the way. Every error `download`
+  builds is now redacted before it becomes an `Error::Fetch`.
+
+  Redaction also moved *into* the notify sink. `FailurePayload` and the notifiers
+  are public, so placing the guarantee on the producer made it hold for exactly
+  one producer. `emit_event`'s log line, the hook's `FRAISIER_NOTIFY_REASON` and
+  the JSON on the hook's stdin are now all redacted at the sink, from one
+  redacted copy, so the two hook channels cannot disagree.
+
 ## [1.0.0-beta.10] - 2026-09-26
 
 ### Security

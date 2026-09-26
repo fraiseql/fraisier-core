@@ -122,6 +122,13 @@ impl Source {
 }
 
 /// Download `url`, retrying on transport failure.
+///
+/// The URL is an operator-supplied artifact location, and a private artifact
+/// server reached with basic auth carries its credentials in the URL itself — so
+/// every error built here is redacted before it becomes an [`Error::Fetch`]. That
+/// error travels to `ApplyOutcome::AbortedBeforeSwap`, which a library consumer
+/// reads directly, with none of the `fraisier` binary's output redaction in the
+/// way (#68).
 async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, Error> {
     retry_on_err(DEFAULT_ATTEMPTS, DEFAULT_RETRY_DELAY, || async {
         let response = client.get(url).send().await.map_err(|e| e.to_string())?;
@@ -135,7 +142,7 @@ async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, Error>
             .map_err(|e| e.to_string())
     })
     .await
-    .map_err(Error::Fetch)
+    .map_err(|cause| Error::Fetch(fraisier_core::redact::credentials(&cause)))
 }
 
 /// Lower-case hex of a byte slice.
@@ -151,6 +158,73 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::{hex, Source};
     use crate::Error;
+
+    /// Serve `status` on an ephemeral port until `answers` requests are taken.
+    ///
+    /// `download` retries, so the fixture must answer every attempt.
+    fn refusing_server(status: &'static str, answers: usize) -> u16 {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(answers) {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                );
+            }
+        });
+        port
+    }
+
+    /// A non-success status must not echo the URL's basic-auth credentials.
+    ///
+    /// This is the branch that interpolates the URL by hand. `--source` often
+    /// points at a private artifact server, and a 401 is exactly when this fires;
+    /// the text becomes `ApplyOutcome::AbortedBeforeSwap { reason }`, which a
+    /// library consumer reads directly with none of fraisier's CLI redaction in
+    /// the way (#68).
+    #[tokio::test]
+    async fn a_rejected_fetch_never_echoes_the_urls_credentials() {
+        let port = refusing_server("401 Unauthorized", 3);
+        let source = Source::Url {
+            url: format!("http://ci:s3cr3t@127.0.0.1:{port}/fraisier.tar.gz"),
+            sha256: None,
+            checksum_url: None,
+        };
+        let Err(error) = source.fetch().await else {
+            panic!("a 401 must fail");
+        };
+        let rendered = error.to_string();
+        assert!(!rendered.contains("s3cr3t"), "password leaked: {rendered}");
+        // The actionable half survives: the status, and which host refused.
+        assert!(
+            rendered.contains("401") && rendered.contains("127.0.0.1"),
+            "the status and host must survive: {rendered}"
+        );
+    }
+
+    /// The transport-error path. reqwest redacts the URL in its own `Display`
+    /// today; this pins that, because nothing else would notice if it stopped.
+    #[tokio::test]
+    async fn a_failed_fetch_never_echoes_the_urls_credentials() {
+        let source = Source::Url {
+            url: "http://ci:s3cr3t@127.0.0.1:1/fraisier.tar.gz".to_owned(),
+            sha256: None,
+            checksum_url: None,
+        };
+        let Err(error) = source.fetch().await else {
+            panic!("a refused connection must fail");
+        };
+        let rendered = error.to_string();
+        assert!(!rendered.contains("s3cr3t"), "password leaked: {rendered}");
+        assert!(
+            !rendered.contains("ci:s3cr3t"),
+            "userinfo leaked: {rendered}"
+        );
+    }
 
     /// A well-formed (64-hex) but deliberately-wrong checksum — it is the
     /// SHA-256 of the empty input, which the test bytes never hash to.

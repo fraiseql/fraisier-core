@@ -2844,7 +2844,7 @@ mod tests {
     };
     use std::path::Path;
 
-    use crate::test_env::{block_on, ENV_LOCK};
+    use crate::test_env::block_on;
 
     /// A db-ops config naming `dsn_env` as the DSN source (no-op command adapter).
     fn db_ops_config(dsn_env: &str) -> String {
@@ -3399,7 +3399,7 @@ url = "http://127.0.0.1:8080/health"
 
         // Lock the env: `render_check_report` reads `XDG_DATA_HOME`. The whole
         // function is synchronous, so the guard is never held across an `.await`.
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::test_env::env_guard();
         let data = tempfile::tempdir().expect("tempdir");
         std::env::set_var("XDG_DATA_HOME", data.path());
 
@@ -4245,7 +4245,7 @@ current_revision = "true"
 
     #[test]
     fn db_restore_plan_shows_the_target_without_executing() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::test_env::env_guard();
         let var = "FRAISIER_DBOPS_RESTORE_PLAN";
         std::env::set_var(var, "postgresql://u:s3cret@dbhost:5432/shop");
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4274,7 +4274,7 @@ current_revision = "true"
 
     #[test]
     fn db_reset_plan_is_destructive_and_does_not_execute() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::test_env::env_guard();
         let var = "FRAISIER_DBOPS_RESET_PLAN";
         std::env::set_var(var, "postgres://app@dbhost/shop");
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4293,7 +4293,7 @@ current_revision = "true"
 
     #[test]
     fn db_backup_refuses_to_clobber_without_force() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::test_env::env_guard();
         let var = "FRAISIER_DBOPS_BACKUP_GUARD";
         std::env::set_var(var, "postgres://app@dbhost/shop");
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4311,7 +4311,7 @@ current_revision = "true"
 
     #[test]
     fn db_ops_error_when_the_dsn_env_is_unset() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::test_env::env_guard();
         let var = "FRAISIER_DBOPS_DELIBERATELY_UNSET";
         std::env::remove_var(var);
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4330,7 +4330,7 @@ current_revision = "true"
 
     #[test]
     fn db_ops_reject_a_non_postgres_dsn() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let _guard = crate::test_env::env_guard();
         let var = "FRAISIER_DBOPS_SQLITE";
         std::env::set_var(var, "sqlite:///tmp/x.db");
         let dir = tempfile::tempdir().expect("tempdir");

@@ -1,8 +1,46 @@
 # Security model & deliberate non-ports
 
-fraisier-core deliberately leaves some Python-`fraisier` surface unported, because
-a different (and usually simpler) design is already in place. This page records
-those decisions so they read as intent, not omission.
+This page records two things: the rules the engine actually enforces, and the
+Python-`fraisier` surface that is deliberately left unported because a different
+(and usually simpler) design is already in place — so those read as intent, not
+omission.
+
+## Credentials never ride a failure reason
+
+An adapter builds its error out of whatever its tool wrote to stderr, and a
+database client that cannot connect prints the DSN it tried, password included.
+That text becomes the saga's failure reason, and a reason is the most widely-copied
+string the engine produces: printed, logged to the tracing/OTel pipeline, persisted
+to the state store, replicated to a remote ledger, and sent to the
+`[schedule].notify` webhook.
+
+So the reason is redacted — at the **boundaries**, never at the places a reason is
+built. There are around twenty-five of those and one more appears with every new
+step; there are four boundaries, and they cover the steps nobody has written yet:
+
+| Boundary | Covers |
+|---|---|
+| The CLI's output edge (`rendered`) | every command's text, its `--json` payload, its `--verbose` stderr JSON |
+| A rendered anyhow chain (`error_detail`) | the CLI's `error:` line, and the webhook's HTTP 500 body — which leaves the host without passing the output edge |
+| `FailurePayload.reason` | the notify hook's env var and stdin JSON, and the notifier's log event — which fires with no hook configured |
+| `Saga::rollback` | the `PartialRollback` reason before it is persisted, and so `state.json`, `events.jsonl` and `sync push` |
+| The IPC client's `data` fold | a remote adapter's stderr, which the fold puts into the message every sink renders |
+
+Two forms are stripped: a URL's `user:password@`, and libpq's `password=` keyword
+(bare or single-quoted). Everything an operator needs in order to act is kept —
+which host could not be reached, which step failed, what the tool said — because a
+reason that has been scrubbed into uselessness gets worked around.
+
+`fraisier_saga::redact::credentials` is the one implementation, re-exported as
+`fraisier_core::redact`. It lives in the engine crate because the engine is what
+persists and replicates a reason, and because `fraisier-core` depends on
+`fraisier-saga` and not the other way round.
+
+**What this does not cover.** Only credentials, and only those two forms. Any other
+secret an adapter writes to stderr — an API token, a signing key — still travels,
+so keep secrets out of the stderr of anything fraisier runs. `AdapterError.stderr`
+also keeps its raw text on purpose: it is a structured field nothing renders today,
+and the output edge covers it if something ever does.
 
 ## Privileged operations: `systemctl` shell-out, not socket helpers
 

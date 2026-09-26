@@ -919,7 +919,7 @@ fn render(output: CommandOutput, json: bool, verbose: u8) {
 /// `AdapterError`, say), so this line carries adapter text and is redacted for the
 /// same reason [`rendered`] is.
 fn error_line(error: &anyhow::Error) -> String {
-    fraisier_core::redact::credentials(&format!("error: {error:#}"))
+    format!("error: {}", commands::error_detail(error))
 }
 
 #[cfg(test)]

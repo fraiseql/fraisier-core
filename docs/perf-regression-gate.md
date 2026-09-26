@@ -102,9 +102,15 @@ webhook — the regressed operation name and its p50 numbers, nothing else. With
 `--json` (or if the scan emits a non-report error), the gate falls back to echoing
 a **verbatim excerpt** of the scan's stderr (else stdout) into that same reason and
 webhook — the same propagation the migration `verify` hook and adapter errors use
-engine-wide. Prefer `--json`, and keep secrets (e.g. a full DSN in a connection
-error) out of the scan's stderr, since the `[schedule].notify` sink may be a
-broader-audience channel than your local logs.
+engine-wide.
+
+Credentials are the one thing that excerpt cannot carry: a URL's
+`user:password@` and libpq's `password=` are stripped before the reason is
+printed, logged, persisted or sent to the webhook, so a connection error that
+echoes a full DSN loses its password and keeps its host. Every *other* secret a
+scan writes to stderr still travels, so prefer `--json` and keep secrets out of
+the scan's stderr — the `[schedule].notify` sink may be a broader-audience channel
+than your local logs.
 
 ## Scheduled monitoring (out of scope)
 

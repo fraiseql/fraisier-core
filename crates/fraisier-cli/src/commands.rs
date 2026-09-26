@@ -52,6 +52,16 @@ impl CommandOutput {
     }
 }
 
+/// An anyhow chain rendered for something outside this process, redacted.
+///
+/// Contexts wrap adapter errors (`"applying migrations"` over a failed
+/// connection), so a rendered chain carries adapter text wherever it goes: the
+/// CLI's `error:` line, and the webhook's HTTP 500 body — which leaves the host
+/// entirely and never passes the CLI's output edge (#62).
+pub(crate) fn error_detail(error: &anyhow::Error) -> String {
+    redact::credentials(&format!("{error:#}"))
+}
+
 /// Rewrite every string leaf of `value` through [`redact::credentials`].
 fn redact_json(value: Value) -> Value {
     match value {
@@ -2321,7 +2331,7 @@ impl fraisier_webhook::WebhookHandler for DeployHandler {
             false,
         )
         .await
-        .map_err(|error| format!("{error:#}"))?;
+        .map_err(|error| error_detail(&error))?;
         let outcome = out
             .json
             .get("outcome")
@@ -2992,6 +3002,22 @@ url = "http://127.0.0.1:8080/health"
         assert!(
             recorded.contains("db.internal") && recorded.contains("migrate"),
             "the reason must still say what failed and where: {recorded}"
+        );
+    }
+
+    #[test]
+    fn an_error_detail_is_redacted_before_it_leaves_the_process() {
+        // The webhook's DeployHandler puts this string in an HTTP 500 body, which
+        // leaves the host without passing the CLI's output edge.
+        let error = anyhow::anyhow!(
+            "[execution] connection to postgresql://checkout:hunter2@db.internal/checkout failed"
+        )
+        .context("applying migrations");
+        let detail = super::error_detail(&error);
+        assert!(!detail.contains("hunter2"), "leaked: {detail}");
+        assert!(
+            detail.starts_with("applying migrations") && detail.contains("db.internal"),
+            "the context and the host survive: {detail}"
         );
     }
 

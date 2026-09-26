@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.12](https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.11...fraisier-v1.0.0-beta.12) - 2026-09-26
+
+### Fixed
+
+- *(test)* an ambient FRAISIER_* variable no longer fails seven tests
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into fix/64-ambient-env
+- release v1.0.0-beta.11
+
 ## [1.0.0-beta.11](https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.10...fraisier-v1.0.0-beta.11) - 2026-09-26
 
 ### Other

@@ -16,7 +16,7 @@ to the state store, replicated to a remote ledger, and sent to the
 
 So the reason is redacted — at the **boundaries**, never at the places a reason is
 built. There are around twenty-five of those and one more appears with every new
-step; there are four boundaries, and they cover the steps nobody has written yet:
+step; there are six boundaries, and they cover the steps nobody has written yet:
 
 | Boundary | Covers |
 |---|---|

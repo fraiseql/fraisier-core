@@ -12,6 +12,7 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use fraisier_core::adapter_axes::{AdapterCtx, AdapterError, AdapterErrorKind};
+use fraisier_core::redact;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt as _, BufReader};
 
@@ -318,9 +319,17 @@ impl IpcClient {
         }
 
         if let Some(err) = response.error {
+            // The server carries the remote adapter's stderr in `data`, and folding
+            // it into the message is deliberate: `Display` renders `message` and not
+            // `stderr`, so without the fold an operator would never see what the
+            // remote tool said. It does mean a remote stderr reaches every sink that
+            // prints an error, so credentials are stripped at the fold rather than
+            // at each of them (#62). `stderr` keeps the raw text: it is a structured
+            // field no sink renders today, and the CLI's output edge covers it if
+            // one ever does.
             let message = err.data.map_or_else(
                 || err.message.clone(),
-                |data| format!("{} (data: {data})", err.message),
+                |data| redact::credentials(&format!("{} (data: {data})", err.message)),
             );
             return Err(AdapterError {
                 adapter: Some(self.name.clone()),

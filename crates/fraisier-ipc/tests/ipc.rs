@@ -127,3 +127,38 @@ async fn verify_reads_was_skipped_when_sent_and_defaults_it_when_not() {
         assert_eq!(report.was_skipped, skipped, "{body}");
     }
 }
+
+#[tokio::test]
+async fn a_remote_errors_data_is_redacted_where_it_is_folded_into_the_message() {
+    // The server puts an adapter's stderr into the JSON-RPC error's `data`
+    // (protocol.rs), and the client folds `data` into the message so an operator
+    // sees what the remote tool actually said. `Display` renders `message` and not
+    // `stderr`, so this fold is what puts a remote adapter's stderr in front of
+    // every sink downstream — and a database client that cannot connect prints the
+    // DSN it tried (#62).
+    let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32010,"message":"up failed","data":"psycopg.OperationalError: connection to postgresql://checkout:hunter2@db.internal:5432/checkout failed"}}"#;
+    let adapter = IpcMigrationAdapter::new("sh", "fixture")
+        .with_args(["-c", FIXTURE_SCRIPT])
+        .with_env("FIXTURE_BODY", body);
+
+    let err = adapter
+        .current_revision(&AdapterCtx::new("checkout", "production"))
+        .await
+        .expect_err("remote error surfaces as Err");
+
+    assert!(
+        !err.message.contains("hunter2"),
+        "the folded data leaked the password: {}",
+        err.message
+    );
+    // Everything actionable survives: the remote message, and which host failed.
+    assert!(
+        err.message.contains("up failed") && err.message.contains("db.internal"),
+        "got: {}",
+        err.message
+    );
+    assert!(
+        !err.to_string().contains("hunter2"),
+        "Display is what every sink renders: {err}"
+    );
+}

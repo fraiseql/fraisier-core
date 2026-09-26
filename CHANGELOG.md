@@ -6,6 +6,41 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **Credentials no longer ride a failure reason off the host.** Adapters build
+  their errors out of whatever their tool wrote to stderr, and a database client
+  that cannot connect prints the DSN it tried — password included. That text
+  became the saga's rollback reason, and the reason was printed, logged,
+  persisted and sent to the failure webhook unchanged. Closes
+  [#62](https://github.com/fraiseql/fraisier-core/issues/62).
+
+  Redaction now happens at four boundaries rather than at the places a reason is
+  built, so it covers every present and future contributor to one:
+
+  - the CLI's output edge, which is every command's text, its `--json` payload
+    and its `--verbose` stderr JSON — so `deploy`, `rollback`, `status`, `list`,
+    `health`, `bootstrap`, `provider-test` and the `db` operations are all
+    covered, including `status`/`list`, whose `Debug` rendering of a
+    `PartialRollback` state showed a payload the `Display` one omits;
+  - the `[schedule].notify` payload, which reaches the hook as
+    `FRAISIER_NOTIFY_REASON`, as JSON on its stdin, and as the notifier's own
+    log event — that event fires whether or not a hook is configured;
+  - the `PartialRollback` reason the engine persists, before it is written to
+    `state.json`, appended to `events.jsonl`, or pushed to a remote ledger by
+    `sync push`;
+  - the IPC client's fold of a remote adapter's stderr into the error message;
+  - a rendered anyhow chain, which is both the CLI's `error:` line and the
+    webhook server's HTTP 500 body — that body leaves the host over the network
+    and never passes the output edge.
+
+  Stripped are a URL's `user:password@` and libpq's `password=` keyword form.
+  What an operator needs in order to act is kept: which host could not be
+  reached, which step failed, and what the tool said.
+
+  `fraisier_saga::redact::credentials` is the single implementation, re-exported
+  as `fraisier_core::redact`.
+
 ### Changed
 
 - A failed post-migration verify now names its failing checks in the rollback

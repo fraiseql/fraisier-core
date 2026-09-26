@@ -24,6 +24,7 @@
 //! [`SagaState`]: crate::events::SagaState
 
 pub mod events;
+pub mod redact;
 pub mod saga;
 pub mod state_store;
 

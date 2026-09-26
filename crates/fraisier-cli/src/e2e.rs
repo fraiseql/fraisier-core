@@ -348,3 +348,96 @@ async fn command_health_regression_rolls_back_naming_the_detail() {
         "rollback re-activated the prior release",
     );
 }
+
+/// Issue #62 end-to-end: a health command that fails the way a database client
+/// really fails prints the DSN it tried, and that text becomes the rollback
+/// reason. The reason itself stays faithful — the boundaries redact, not the ~25
+/// places a step failure is built — so this pins both halves: the leak genuinely
+/// reaches the reason through real adapters, and the real output edge strips it.
+#[tokio::test]
+async fn a_dsn_in_a_real_adapter_failure_never_reaches_the_rendered_output() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let staging = root.join("staging");
+    let active = root.join("current");
+    let log = root.join("calls.log");
+    let revfile = root.join("revision");
+    let state_dir = root.join("state");
+
+    let sha = sha256_hex(ARTIFACT_BODY, root);
+    let addr = spawn_fixture(sha, Arc::new(AtomicU16::new(200)));
+    let systemctl = write_fake_systemctl(root, &log);
+    let store = FilesystemStateStore::new(&state_dir).expect("store");
+
+    // What psql writes when it cannot authenticate: the conninfo, in full, on
+    // stderr. `CommandHealth` folds a trimmed stderr excerpt into
+    // `HealthStatus.detail`, which the saga interpolates into the step failure.
+    let psql_failure = "printf 'psql: error: connection to \
+                        postgresql://checkout:hunter2@db.internal:5432/checkout?sslmode=require \
+                        failed\\npsql: detail: FATAL: password authentication failed for user \
+                        \"checkout\"\\n' >&2; exit 1";
+
+    // Deploy #1 commits so the second has a prior release to roll back to.
+    let mut ctx = deploy_ctx("v1", addr, &staging, &active);
+    ctx.settings.insert("command".to_owned(), json!("true"));
+    let outcome = run_deploy(
+        "v1",
+        ctx,
+        Arc::new(CommandHealth::new()),
+        &log,
+        &revfile,
+        &systemctl,
+        store.clone(),
+    )
+    .await;
+    assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+
+    let mut ctx = deploy_ctx("v2", addr, &staging, &active);
+    ctx.settings
+        .insert("command".to_owned(), json!(psql_failure));
+    let outcome = run_deploy(
+        "v2",
+        ctx,
+        Arc::new(CommandHealth::new()),
+        &log,
+        &revfile,
+        &systemctl,
+        store,
+    )
+    .await;
+
+    let SagaOutcome::RolledBack { reason, .. } = &outcome else {
+        panic!("expected a rollback, got {outcome:?}");
+    };
+    assert!(
+        reason.contains("checkout:hunter2@db.internal"),
+        "premise: a real adapter failure puts the DSN in the reason: {reason}",
+    );
+
+    // The edge every command's output passes through, in the mode that prints
+    // both renderings.
+    let (out, err) = crate::rendered(
+        crate::commands::CommandOutput {
+            exit_code: 1,
+            pretty: format!("deploy of fraiseql/production rolled_back ({reason})\n"),
+            json: json!({ "outcome": "rolled_back", "detail": reason }),
+        },
+        false,
+        1,
+    );
+    assert!(
+        !out.contains("hunter2") && !err.contains("hunter2"),
+        "the password reached the operator\nstdout: {out}\nstderr: {err}",
+    );
+    // Everything an operator needs to act survives the redaction.
+    for expected in [
+        "db.internal",
+        "sslmode=require",
+        "password authentication failed",
+    ] {
+        assert!(
+            out.contains(expected),
+            "redaction ate the actionable half ({expected}): {out}",
+        );
+    }
+}

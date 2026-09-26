@@ -34,6 +34,9 @@ struct ScriptedStep {
     trail: Trail,
     fail_forward: bool,
     fail_compensate: bool,
+    /// What the failed compensation reports. `None` is the generic message; a
+    /// `Some` carries text the engine did not author, such as adapter stderr.
+    compensate_message: Option<String>,
 }
 
 #[async_trait]
@@ -64,7 +67,10 @@ impl Step for ScriptedStep {
         if self.fail_compensate {
             return Err(SagaError::StepFailed {
                 step: self.name.clone(),
-                message: "forced compensation failure".to_owned(),
+                message: self
+                    .compensate_message
+                    .clone()
+                    .unwrap_or_else(|| "forced compensation failure".to_owned()),
             });
         }
         Ok(())
@@ -77,6 +83,18 @@ fn step(name: &str, trail: &Trail, fail_forward: bool, fail_compensate: bool) ->
         trail: trail.clone(),
         fail_forward,
         fail_compensate,
+        compensate_message: None,
+    })
+}
+
+/// A step that completes, then fails its compensation reporting `message`.
+fn step_failing_compensation_with(name: &str, trail: &Trail, message: &str) -> Box<dyn Step> {
+    Box::new(ScriptedStep {
+        name: name.to_owned(),
+        trail: trail.clone(),
+        fail_forward: false,
+        fail_compensate: true,
+        compensate_message: Some(message.to_owned()),
     })
 }
 
@@ -205,5 +223,54 @@ async fn failed_compensation_yields_partial_rollback_with_diagnostics() {
     assert!(
         matches!(current_state(&store).await, SagaState::PartialRollback(_)),
         "the engine surfaces PartialRollback rather than pretending success"
+    );
+}
+
+#[tokio::test]
+async fn a_partial_rollback_reason_is_redacted_before_it_is_persisted() {
+    // A compensation failure is the one reason the engine keeps: `RolledBack`
+    // records the payload-free state, `PartialRollback` records the text. That text
+    // is written to state.json, appended to events.jsonl, and — through
+    // `sync push`, which serializes `current_state` — committed to a git ref and
+    // pushed off the host. An adapter's compensation error carries whatever its
+    // tool wrote to stderr, so a DSN must not survive the trip (#62).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = FilesystemStateStore::new(dir.path()).expect("store");
+    let trail = Trail::default();
+
+    let saga = Saga::new(store.clone(), "checkout", "production")
+        .with_step(step_failing_compensation_with(
+            "migrate",
+            &trail,
+            "pg_restore: error: connection to \
+             postgresql://checkout:hunter2@db.internal:5432/checkout failed",
+        ))
+        .with_step(step("restart", &trail, true, false));
+
+    let returned = match saga.run().await.expect("run completes") {
+        SagaOutcome::PartialRollback { reason } => reason,
+        other => panic!("expected PartialRollback, got {other:?}"),
+    };
+
+    assert!(
+        !returned.contains("hunter2"),
+        "the returned reason leaks the password: {returned}"
+    );
+    // Which host could not be restored is the actionable half, and survives.
+    assert!(
+        returned.contains("db.internal") && returned.contains("migrate"),
+        "the reason must still say what failed and where: {returned}"
+    );
+
+    let SagaState::PartialRollback(persisted) = current_state(&store).await else {
+        panic!("expected a persisted PartialRollback state");
+    };
+    assert!(
+        !persisted.contains("hunter2"),
+        "the password was written to the state store: {persisted}"
+    );
+    assert_eq!(
+        persisted, returned,
+        "the persisted reason and the returned one must be the same string"
     );
 }

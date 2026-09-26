@@ -11,6 +11,7 @@ use anyhow::{Context as _, Result};
 use fraisier_config::{DeployConfig, Severity, ValidationReport};
 use fraisier_core::multi_host::MultiHostDeploy;
 use fraisier_core::policy::Baseline;
+use fraisier_core::redact;
 use fraisier_core::single_host::{DeployRecord, SingleHostDeploy};
 use fraisier_saga::saga::SagaOutcome;
 use fraisier_saga::state_store::{FilesystemStateStore, FraiseKey, StateStore};
@@ -27,6 +28,54 @@ pub(crate) struct CommandOutput {
     pub pretty: String,
     /// The machine-readable rendering (printed under `--json`).
     pub json: Value,
+}
+
+impl CommandOutput {
+    /// The same output with credentials stripped out of every string it carries.
+    ///
+    /// Commands build their output from whatever their adapter reported, and an
+    /// adapter folds its tool's stderr into the error it returns — where a
+    /// database client that could not connect prints the DSN in full. Redacting at
+    /// the one place output is printed covers every command that exists and every
+    /// command added later, which is what redacting at each of the ~50 sites that
+    /// build a `CommandOutput` does not (#62).
+    ///
+    /// Only string *values* in [`Self::json`] are rewritten — never keys, and
+    /// never the serialized document — so the payload cannot stop being valid JSON
+    /// and a consumer's key lookups are unaffected.
+    pub(crate) fn redacted(self) -> Self {
+        Self {
+            exit_code: self.exit_code,
+            pretty: redact::credentials(&self.pretty),
+            json: redact_json(self.json),
+        }
+    }
+}
+
+/// An anyhow chain rendered for something outside this process, redacted.
+///
+/// Contexts wrap adapter errors (`"applying migrations"` over a failed
+/// connection), so a rendered chain carries adapter text wherever it goes: the
+/// CLI's `error:` line, and the webhook's HTTP 500 body — which leaves the host
+/// entirely and never passes the CLI's output edge (#62).
+pub(crate) fn error_detail(error: &anyhow::Error) -> String {
+    redact::credentials(&format!("{error:#}"))
+}
+
+/// Rewrite every string leaf of `value` through [`redact::credentials`].
+fn redact_json(value: Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(redact::credentials(&text)),
+        Value::Array(items) => Value::Array(items.into_iter().map(redact_json).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, field)| (key, redact_json(field)))
+                .collect(),
+        ),
+        // Numbers, booleans and null cannot carry a credential.
+        scalar => scalar,
+    }
 }
 
 fn load(config_path: &Path) -> Result<DeployConfig> {
@@ -1570,7 +1619,7 @@ async fn preview_schema(
         Err(error) => {
             return uninspected(Unavailable::new(
                 Unavailable::ADAPTER_UNAVAILABLE,
-                preview::redact_credentials(&format!(
+                redact::credentials(&format!(
                     "the migration adapter could not be built: {error:#}"
                 )),
             ))
@@ -2282,7 +2331,7 @@ impl fraisier_webhook::WebhookHandler for DeployHandler {
             false,
         )
         .await
-        .map_err(|error| format!("{error:#}"))?;
+        .map_err(|error| error_detail(&error))?;
         let outcome = out
             .json
             .get("outcome")
@@ -2762,7 +2811,13 @@ async fn notify_deploy_failure(
         },
         failed: Some(format!("{fraise}/{environment}")),
         restored: None,
-        reason: format!("{label}{detail}").trim().to_owned(),
+        // This payload leaves the host: exported to the hook as
+        // FRAISIER_NOTIFY_REASON, written to its stdin as JSON, and logged by the
+        // notifier's own `tracing::error!` — which fires whether or not a hook is
+        // configured. The reason is built from adapter stderr, so it is redacted
+        // here rather than at the CLI's output edge, which this path never
+        // reaches (#62).
+        reason: redact::credentials(format!("{label}{detail}").trim()),
     };
     fraisier_self_upgrade::ExecHookNotifier::new(command)
         .with_context("FRAISIER_NOTIFY_FRAISE", fraise)
@@ -2908,6 +2963,91 @@ url = "http://127.0.0.1:8080/health"
             recorded.contains("perf regression: order/UPDATE p50 +42%"),
             "the webhook reason names the regression: {recorded}",
         );
+    }
+
+    #[test]
+    fn notify_deploy_failure_redacts_the_dsn_out_of_the_webhook_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("payload.txt");
+        let notify = format!(
+            "notify = 'printf \"%s\" \"$FRAISIER_NOTIFY_REASON\" > {}'",
+            out.display()
+        );
+        let toml = format!("{VALID}\n[schedule]\n{notify}\n");
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+
+        // Issue #62: the confiture adapter folds the first line of stderr into
+        // AdapterError.message, and a client that cannot connect prints the DSN in
+        // full. Unattended, this payload goes to a chat or paging service.
+        let outcome = SagaOutcome::RolledBack {
+            failed_step: "migrate".to_owned(),
+            reason: "[execution] connection to \
+                     postgresql://checkout:hunter2@db.internal:5432/checkout failed"
+                .to_owned(),
+        };
+        block_on(notify_deploy_failure(
+            &config, "checkout", "staging", &outcome,
+        ));
+
+        let recorded = std::fs::read_to_string(&out).expect("notify wrote the payload");
+        assert!(
+            !recorded.contains("hunter2"),
+            "the password reached the webhook: {recorded}"
+        );
+        assert!(
+            !recorded.contains("checkout:hunter2"),
+            "the userinfo reached the webhook: {recorded}"
+        );
+        // The actionable half survives: which database, and which step failed.
+        assert!(
+            recorded.contains("db.internal") && recorded.contains("migrate"),
+            "the reason must still say what failed and where: {recorded}"
+        );
+    }
+
+    #[test]
+    fn an_error_detail_is_redacted_before_it_leaves_the_process() {
+        // The webhook's DeployHandler puts this string in an HTTP 500 body, which
+        // leaves the host without passing the CLI's output edge.
+        let error = anyhow::anyhow!(
+            "[execution] connection to postgresql://checkout:hunter2@db.internal/checkout failed"
+        )
+        .context("applying migrations");
+        let detail = super::error_detail(&error);
+        assert!(!detail.contains("hunter2"), "leaked: {detail}");
+        assert!(
+            detail.starts_with("applying migrations") && detail.contains("db.internal"),
+            "the context and the host survive: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_policy_refusal_is_still_classified_after_redaction() {
+        // The event kind is decided by looking for policy::REFUSED in the detail.
+        // Redaction must not disturb that marker — a policy-blocked deploy is not
+        // "the deploy broke", and an operator triaging the alert reads the event.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("event.txt");
+        let notify = format!(
+            "notify = 'printf \"%s\" \"$FRAISIER_NOTIFY_EVENT\" > {}'",
+            out.display()
+        );
+        let toml = format!("{VALID}\n[schedule]\n{notify}\n");
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+
+        let outcome = SagaOutcome::RolledBack {
+            failed_step: "preflight".to_owned(),
+            reason: format!(
+                "{} drop_table public.tb_legacy at postgresql://u:pw@db.internal/app",
+                fraisier_core::policy::REFUSED
+            ),
+        };
+        block_on(notify_deploy_failure(
+            &config, "checkout", "staging", &outcome,
+        ));
+
+        let recorded = std::fs::read_to_string(&out).expect("notify wrote the event");
+        assert_eq!(recorded, "policy-blocked");
     }
 
     #[test]

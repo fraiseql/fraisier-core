@@ -224,7 +224,17 @@ impl<S: StateStore, R: Send> Saga<S, R> {
             let to = SagaState::Compensating(step.name().to_owned());
             self.transition(&from, &to).await?;
             if let Err(comp_err) = step.compensate(ctx, state).await {
-                let reason = format!("compensation for '{}' failed: {comp_err}", step.name());
+                // This is the one reason the engine keeps: `RolledBack` persists a
+                // payload-free state, `PartialRollback` persists its text — to
+                // `state.json`, to `events.jsonl`, and through a remote ledger off
+                // the host entirely. A step's compensation error carries whatever
+                // its tool wrote to stderr, so credentials are stripped here,
+                // before the reason is either stored or returned, and both get the
+                // same string (#62).
+                let reason = crate::redact::credentials(&format!(
+                    "compensation for '{}' failed: {comp_err}",
+                    step.name()
+                ));
                 self.transition(&to, &SagaState::PartialRollback(reason.clone()))
                     .await?;
                 return Ok(SagaOutcome::PartialRollback { reason });

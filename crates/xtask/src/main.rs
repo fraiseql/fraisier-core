@@ -3,13 +3,14 @@
 //! `cargo xtask ci` runs the exact checks CI runs, so "green locally" and "green
 //! in CI" are the *same command* rather than two lists that drift apart. CI
 //! invokes `cargo xtask ci` too, which makes the parity structural. Each check is
-//! also runnable on its own (`cargo xtask fmt` / `lint` / `test` / `deny` /
-//! `shellcheck`), and `cargo xtask dist` cross-builds the static musl binary.
+//! also runnable on its own (`cargo xtask fmt` / `lint` / `doc` / `test` / `deny`
+//! / `shellcheck`), and `cargo xtask dist` cross-builds the static musl binary.
 //!
 //! This crate deliberately has **zero dependencies** (std only): the task runner
 //! that guards the supply chain must not add to it, and a dependency-free tool
 //! never breaks because of upstream churn.
 
+use std::fmt::Write as _;
 use std::process::{Command, ExitCode, Stdio};
 
 fn main() -> ExitCode {
@@ -23,6 +24,7 @@ fn main() -> ExitCode {
         "ci" => ci(),
         "fmt" => fmt(),
         "lint" => lint(),
+        "doc" => doc(),
         "test" => test(),
         "deny" => deny(),
         "shellcheck" => shellcheck(),
@@ -49,6 +51,7 @@ fn main() -> ExitCode {
 fn ci() -> Result<(), String> {
     fmt()?;
     lint()?;
+    doc()?;
     test()?;
     run("cargo", &["build", "--release"])?;
     deny()?;
@@ -72,6 +75,26 @@ fn lint() -> Result<(), String> {
             "-D",
             "warnings",
         ],
+    )
+}
+
+/// Rustdoc must be warning-free.
+///
+/// A broken intra-doc link is invisible while writing and ships as a dead link on
+/// docs.rs — the only documentation an embedder of these crates ever reads.
+/// Nothing ran rustdoc before this step existed, which is precisely how nine of
+/// them accumulated across six crates.
+///
+/// `--all-features` matches `lint` and `test`, so feature-gated items are
+/// documented rather than skipped. It does **not** catch a link that resolves
+/// only when a feature is on: these crates set no docs.rs `all-features`
+/// metadata, so docs.rs builds them with default features, and a feature-gated
+/// path must therefore not be an intra-doc link at all.
+fn doc() -> Result<(), String> {
+    run_with_env(
+        "cargo",
+        &["doc", "--workspace", "--no-deps", "--all-features"],
+        &[("RUSTDOCFLAGS", "-D warnings")],
     )
 }
 
@@ -139,9 +162,25 @@ fn dist(_args: &[String]) -> Result<(), String> {
 
 /// Run a command, streaming its output, and turn a non-zero exit into an error.
 fn run(program: &str, args: &[&str]) -> Result<(), String> {
-    println!("\x1b[1;36m$ {program} {}\x1b[0m", args.join(" "));
-    let status = Command::new(program)
-        .args(args)
+    run_with_env(program, args, &[])
+}
+
+/// Run `program`, echoing the command, with `envs` set for the child.
+///
+/// The echoed line includes the variables, so a failing gate step can be copied
+/// out of the log and re-run verbatim.
+fn run_with_env(program: &str, args: &[&str], envs: &[(&str, &str)]) -> Result<(), String> {
+    let mut shown = String::new();
+    for (key, value) in envs {
+        let _ = write!(shown, "{key}=\"{value}\" ");
+    }
+    println!("\x1b[1;36m$ {shown}{program} {}\x1b[0m", args.join(" "));
+    let mut command = Command::new(program);
+    command.args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let status = command
         .status()
         .map_err(|error| format!("could not launch `{program}`: {error}"))?;
     if status.success() {
@@ -190,9 +229,9 @@ fn usage() {
     println!(
         "cargo xtask <task>\n\n\
          tasks:\n  \
-         ci          the full gate: fmt + clippy + test + release build + deny + shellcheck\n  \
+         ci          the full gate: fmt + clippy + doc + test + release build + deny + shellcheck\n  \
          fmt         cargo fmt --all -- --check\n  \
-         lint        cargo clippy --all-targets --all-features -- -D warnings\n  \
+         lint        cargo clippy --all-targets --all-features -- -D warnings\n           doc         RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --all-features\n  \
          test        cargo test --workspace --all-features\n  \
          deny        cargo deny check\n  \
          shellcheck  shellcheck scripts/*.sh\n  \

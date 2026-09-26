@@ -83,7 +83,7 @@ pub enum SagaEvent {
 /// Hold it (via [`tracing::Instrument`]) for the whole run so every
 /// state-transition span nests beneath it and the run exports as a **single
 /// trace per deploy** rather than one disconnected trace per transition. When the
-/// `otel` feature is enabled and a pipeline is installed via [`crate::otel`], the
+/// `otel` feature is enabled and a pipeline is installed via `crate::otel`, the
 /// span is exported; otherwise it is a cheap no-op unless another subscriber is set.
 #[must_use]
 pub fn instrument_deploy_run(fraise: &str, environment: &str) -> tracing::Span {
@@ -99,7 +99,7 @@ pub fn instrument_deploy_run(fraise: &str, environment: &str) -> tracing::Span {
 /// Uses the `deploy.*` OTel attribute convention (see the module docs) and nests
 /// under the current [`instrument_deploy_run`] span, so it appears within that
 /// deploy's trace. When the `otel` feature is enabled and a pipeline is installed
-/// via [`crate::otel`], the span is exported; otherwise it is a cheap no-op unless
+/// via `crate::otel`, the span is exported; otherwise it is a cheap no-op unless
 /// another subscriber is set.
 #[must_use]
 pub fn instrument_state_transition(

@@ -1,7 +1,7 @@
 //! Version management and the release workflow for the `fraisier` CLI.
 //!
 //! This crate backs `fraisier version show` / `version bump` and (the
-//! [`ship`](crate::ship) workflow) `fraisier ship`. The version logic understands
+//! [`ship`] workflow) `fraisier ship`. The version logic understands
 //! both Rust (`Cargo.toml`) and Python (`pyproject.toml`) projects, editing the
 //! file in place with `toml_edit` so formatting and comments survive a bump.
 

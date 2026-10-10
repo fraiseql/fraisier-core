@@ -16,34 +16,34 @@
 # a bump without a regeneration fails, and a regeneration without a bump fails too.
 # Regenerate this list with:
 #
-#     uv venv --python 3.11 /tmp/confiture
+#     uv venv --python 3.14 /tmp/confiture
 #     uv pip install --python /tmp/confiture/bin/python fraiseql-confiture==<version>
 #     uv pip freeze --python /tmp/confiture/bin/python
 #
-# Keep the interpreter at 3.11: it is confiture's own floor (`Requires-Python >=3.11`) and
-# the interpreter this transitive set was resolved on. fraiseql's wrapper carries the same
-# pin for its `integration (postgres)` leg (`tools/confiture-requirements.txt` there), and
-# the two are kept on the same confiture so the stack is measured against one release.
+# Keep the interpreter at 3.14: it is confiture's own floor since 1.30.0 (`Requires-Python
+# >=3.14`) and the interpreter this transitive set was resolved on. fraiseql's wrapper pins
+# confiture separately for its `integration (postgres)` leg (`tools/confiture-requirements.txt`
+# there); the two are not kept in lockstep, so check that file before assuming they agree.
 #
 # The CLI reference this pin was checked against is confiture's docs/reference/exit-codes.md
-# at tag v1.19.0 (github.com/fraiseql/confiture).
+# at tag v1.33.0 (github.com/fraiseql/confiture).
 
 annotated-doc==0.0.5
 annotated-types==0.8.0
-fraiseql-confiture==1.19.0
+fraiseql-confiture==1.33.0
 markdown-it-py==4.2.0
 mdurl==0.1.2
-pglast==8.4
+pglast==8.5
 psycopg==3.3.6
 psycopg-binary==3.3.6
 psycopg-pool==3.3.3
-pydantic==2.13.5
-pydantic-core==2.46.5
+pydantic==2.14.0
+pydantic-core==2.50.0
 pygments==2.21.0
 pyyaml==6.0.3
 rich==15.0.0
 shellingham==1.5.4
-sqlglot==30.19.0
-typer==0.27.2
+sqlglot==30.22.0
+typer==0.27.3
 typing-extensions==4.16.0
 typing-inspection==0.4.4

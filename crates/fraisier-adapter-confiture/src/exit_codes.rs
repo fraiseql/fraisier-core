@@ -21,7 +21,7 @@
 //! release in one commit — the freshness test fails on either half alone:
 //!
 //! ```sh
-//! uv venv --python 3.11 /tmp/confiture
+//! uv venv --python 3.14 /tmp/confiture
 //! uv pip install --python /tmp/confiture/bin/python -r tools/confiture-requirements.txt
 //! /tmp/confiture/bin/confiture --exit-codes-json \
 //!   > crates/fraisier-adapter-confiture/src/exit_codes.vendored.json
@@ -456,7 +456,7 @@ mod tests {
     fn install_hint(pin: &str) -> String {
         format!(
             "the exit-code contract is measured against confiture {pin}. Install it:\n  \
-             uv venv --python 3.11 /tmp/confiture\n  \
+             uv venv --python 3.14 /tmp/confiture\n  \
              uv pip install --python /tmp/confiture/bin/python -r \
              tools/confiture-requirements.txt\n  \
              PATH=/tmp/confiture/bin:$PATH cargo xtask ci\n\

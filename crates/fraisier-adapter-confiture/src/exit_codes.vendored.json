@@ -16,6 +16,7 @@
       "meaning": "Success (including success-with-signal: already applied, nothing pending, advisories)",
       "symbolic_codes": [
         "DIFFER_402",
+        "DIFFER_404",
         "MIGR_101",
         "SCHEMA_206",
         "SEED_002",
@@ -79,8 +80,10 @@
         "CONFIG_011",
         "CONFIG_012",
         "CONFIG_013",
+        "CONFIG_014",
         "DIFFER_400",
         "DIFFER_401",
+        "DIFFER_403",
         "DIFF_001",
         "PRECON_1000",
         "RESTORE_001",
@@ -88,6 +91,13 @@
         "SYNC_001",
         "VALID_001",
         "VALID_002",
+        "VALID_003",
+        "VALID_004",
+        "VALID_005",
+        "VALID_006",
+        "VALID_007",
+        "VALID_008",
+        "VALID_009",
         "VERIFY_001"
       ]
     },

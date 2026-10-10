@@ -27,13 +27,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   installed no confiture, so it had never run. It is replaced by a test that compares
   the whole document and fails, rather than skipping, when confiture is missing or is
   not the pinned release — with the drifted fields named one per line. The pin is
-  `tools/confiture-requirements.txt` (exact and transitive, on confiture's own 3.11
-  floor, the same release fraiseql's migrate wrapper carries), and the CI gate installs
-  it and puts it on `PATH` before `cargo xtask ci` — on `PATH` rather than in
-  `FRAISIER_CONFITURE_BIN`, because an ambient `FRAISIER_*` variable fails the approval
-  hook test and poisons six more
-  ([#64](https://github.com/fraiseql/fraisier-core/issues/64), found here, not fixed here).
-  Closes [#63](https://github.com/fraiseql/fraisier-core/issues/63).
+  `tools/confiture-requirements.txt` (exact and transitive, on confiture's own 3.14
+  floor), and the CI gate installs it and puts it on `PATH` before `cargo xtask ci` — on
+  `PATH` rather than in `FRAISIER_CONFITURE_BIN`, because an ambient `FRAISIER_*` variable
+  fails the approval hook test and poisons six more
+  ([#64](https://github.com/fraiseql/fraisier-core/issues/64)).
+
+  The pin is confiture **1.33.0**, the release fraisier pins. Since 1.19.0 exit 0 has
+  gained `DIFFER_404` and exit 5 `CONFIG_014`, `DIFFER_403` and `VALID_003`–`VALID_009`;
+  no exit integer changed class, so `classify` and the `AdapterErrorKind` projection are
+  unchanged. Closes [#63](https://github.com/fraiseql/fraisier-core/issues/63).
 
 ### Changed
 

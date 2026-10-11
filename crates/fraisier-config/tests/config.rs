@@ -1016,7 +1016,7 @@ fn a_checks_only_config_validates_via_validate_checks_only() {
 #[test]
 fn an_absent_checks_list_is_not_an_error() {
     let cfg = DeployConfig::from_toml_str(PRD_7_1).expect("parses");
-    assert!(cfg.checks.is_empty());
+    assert_eq!(cfg.checks, Vec::new());
     assert!(cfg.validate_checks_only().ok());
 }
 

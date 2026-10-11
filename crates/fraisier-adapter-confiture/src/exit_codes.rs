@@ -44,13 +44,15 @@ pub const NO_LEDGER_ERROR_CODE: &str = "PRECON_1001";
 pub enum ExitClass {
     /// Exit 0 — success. Present so the table is total; never an error.
     Ok,
-    /// Exit 1 — generic / unclassified failure: SQL or hook execution,
+    /// Exit 1 — generic / unclassified failure: SQL or hook execution, a failed
+    /// migration (`MIGR_*`, `GEN_001`; exit 3 until confiture 1.36.0),
     /// `status: pending`, or the `INTERNAL_ERROR` envelope confiture emits for an
     /// unexpected non-`ConfiturError` exception.
     InternalError,
     /// Exit 2 — reachable-but-uninitialised database (`PRECON_1001`, no ledger).
     PreconditionFailed,
-    /// Exit 3 — database connection failed (host / auth / network unreachable).
+    /// Exit 3 — database connection failed (host / auth / network unreachable):
+    /// `CONFIG_006` alone, from confiture 1.36.0.
     DbUnreachable,
     /// Exit 4 — schema / DDL / build error.
     SchemaError,

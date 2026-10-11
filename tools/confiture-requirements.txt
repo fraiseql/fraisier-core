@@ -26,19 +26,19 @@
 # there); the two are not kept in lockstep, so check that file before assuming they agree.
 #
 # The CLI reference this pin was checked against is confiture's docs/reference/exit-codes.md
-# at tag v1.35.0 (github.com/fraiseql/confiture).
+# at tag v1.36.0 (github.com/fraiseql/confiture).
 
 annotated-doc==0.0.5
 annotated-types==0.8.0
-fraiseql-confiture==1.35.0
+fraiseql-confiture==1.36.0
 markdown-it-py==4.2.0
 mdurl==0.1.2
 pglast==8.5
 psycopg==3.3.6
 psycopg-binary==3.3.6
 psycopg-pool==3.3.3
-pydantic==2.14.0
-pydantic-core==2.50.0
+pydantic==2.14.1
+pydantic-core==2.50.1
 pygments==2.21.0
 pyyaml==6.0.3
 rich==15.0.0

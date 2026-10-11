@@ -1284,7 +1284,7 @@ mod tests {
 
         // A confiture that implements the contract and found nothing to change.
         let classified = parse_change_set(&fixture("v1-empty")).expect("v1-empty is classified");
-        assert!(classified.changes.is_empty());
+        assert_eq!(classified.changes, Vec::new());
         assert_eq!(classified.contract_version, 1);
     }
 
@@ -1406,7 +1406,7 @@ mod tests {
             &serde_json::json!({ "contract_version": 1 }),
         ))
         .expect("an absent `changes` is an empty one");
-        assert!(absent.changes.is_empty());
+        assert_eq!(absent.changes, Vec::new());
     }
 
     /// A version from the future is *not* swallowed here. The adapter's job is

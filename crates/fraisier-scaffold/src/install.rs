@@ -349,7 +349,10 @@ upstream = "checkout_upstream"
         let files = scheduled_files();
 
         // Nothing installed yet.
-        assert!(list_installed(root.path()).expect("list").is_empty());
+        assert_eq!(
+            list_installed(root.path()).expect("list"),
+            Vec::<std::path::PathBuf>::new()
+        );
 
         install(&files, root.path()).expect("install");
         let listed = list_installed(root.path()).expect("list");

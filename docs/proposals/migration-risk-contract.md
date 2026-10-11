@@ -15,6 +15,7 @@ implemented by `fraisier-adapter-confiture` (consumer) and by confiture's
 [e963]: https://github.com/fraiseql/fraiseql/issues/963
 [i964]: https://github.com/fraiseql/fraiseql/issues/964
 [c154]: https://github.com/fraiseql/confiture/issues/154
+[c684]: https://github.com/fraiseql/confiture/issues/684
 
 ---
 
@@ -166,6 +167,14 @@ Stated here so they are not re-litigated per pull request:
 - **A change qualifying for two tiers takes the more severe one.** A
   non-concurrent `CREATE INDEX` on a table being rewritten is `lock_risky`; a
   `DROP COLUMN` that also takes a long lock is `irreversible`.
+- **A `VALIDATE CONSTRAINT` in the transaction that adds the constraint is
+  `lock_risky`; alone it is `reversible`.** A `.up.sql` runs as one transaction,
+  so `ADD … NOT VALID; VALIDATE` in one file scans every row while still holding
+  the `ADD`'s lock: writes on both tables wait for a foreign key, reads too for a
+  check. A validation in a later migration takes only `SHARE UPDATE EXCLUSIVE` and
+  blocks nothing. A generated foreign key is written the first way, so it is
+  `lock_risky`, and a policy that asks for approval at `lock_risky` asks for it.
+  Producer since confiture 1.35.0 ([fraiseql/confiture#684][c684]).
 - **A tier the consumer does not recognise is unclassified**, never a
   nearest match. A future `"quantum"` tier parses to "no tier", which denies;
   it never rounds down to `destructive` because the strings look similar.

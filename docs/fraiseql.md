@@ -10,8 +10,9 @@ the restarted server. The proof refuses to start when the server binary reports
 a version other than the pin.
 
 FraiseQL 2.18 needs **PostgreSQL 18 or newer**. It refuses to boot on an older
-server ("FraiseQL requires PostgreSQL 18 or newer"). Declare that floor so the
-deploy refuses an older server before changing anything:
+server ("FraiseQL requires PostgreSQL 18 or newer"). With the database-readiness
+preflight (#92), declare that floor, and the deploy will refuse an older server
+before changing anything:
 
 ```toml
 [database.requires]

@@ -42,6 +42,22 @@ A tier listed in **neither** list is denied. That is deliberate: a tier added to
 the taxonomy in a later release must not silently auto-apply on a config written
 today.
 
+### Only the pending migrations are judged
+
+The gate judges the migrations this deploy will apply, not the ones the
+database has already run. With the confiture adapter that needs **confiture ≥
+1.35.0**, the first release that accepts `migrate preflight --scope pending`;
+the adapter then advertises `pending_scope` and passes the flag. The pending set
+comes from the ledger of the database the preflight reads: the live one, or the
+throwaway under deep classification, whose ledger is a copy of it.
+
+Below 1.35.0 the change-set covers **every** migration file, applied ones
+included. One `DROP COLUMN` that was approved and applied long ago is then
+judged again on every later deploy, and refuses each of them. The plan says so
+(`judged every migration file, applied ones included`) and its JSON carries
+`scope = "all"`; with a new enough confiture it carries `scope = "pending"`.
+`fraisier doctor` warns about any confiture below 1.35.0 for this reason.
+
 ### Absence is never safety
 
 Every way of not knowing is a refusal, and the refusal says which one it was:

@@ -268,7 +268,10 @@ hook that fails, times out, or cannot be spawned is a **refusal**. Blue-green's
 window-safety rule applies with or without the section.
 
 With the confiture adapter this needs **confiture ≥ 0.44.0** — the same floor as
-the `window_safe` verdict above, because both rest on the same classifier.
+the `window_safe` verdict above, because both rest on the same classifier — and
+**confiture ≥ 1.35.0** for the gate to judge only the migrations a deploy will
+apply. Below 1.35.0 it judges applied ones too, so one approved `DROP COLUMN`
+refuses every later deploy.
 Below it fraisier withholds the capability, so a `[policy]` section classifies
 nothing and refuses everything; `fraisier doctor` reports the installed version
 against the floor. One case survives the upgrade by design: an

@@ -93,6 +93,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The policy gate judges only the migrations a deploy will apply.** The
+  confiture adapter passed no `--scope`, so confiture judged every migration
+  file, applied ones included: one approved and applied `DROP COLUMN` refused
+  every later deploy. With **confiture ≥ 1.35.0** the adapter now passes
+  `--scope pending` and advertises `pending_scope`. Older releases reject the
+  flag, so they keep judging every migration; `deploy --dry-run` then says so
+  (`scope = "all"` in the JSON), and `fraisier doctor` now warns below 1.35.0.
+
 - **A scheduled backup no longer fails from its second run on.** The generated
   unit runs `fraisier backup --config …` from `/`, which wrote
   `/<fraise>-<environment>.pgdump` once and then refused to overwrite it on every

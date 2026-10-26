@@ -16,18 +16,17 @@ use serde_json::json;
 
 use crate::commands::CommandOutput;
 
-/// The confiture version floor the in-process adapter needs for both of its
-/// version-gated capabilities — the window-safe verdict and the risk-tiered
-/// change-set.
+/// The confiture version floor the in-process adapter needs for every one of
+/// its version-gated capabilities.
 ///
 /// Tracks the highest floor in `fraisier-adapter-confiture`'s
-/// `CAPABILITY_FLOORS`, and is pinned to it by test. Both sit on 0.44.0, for the
-/// same underlying reason: through 0.43.0 confiture's classifier reads only part
-/// of the statement matrix (fraiseql/confiture#206), so a `DROP TABLE` reports
-/// `window_safe: true` — and a classifier that cannot be trusted about the
-/// window cannot be trusted about the tier either. A floor below 0.44 would pass
-/// exactly the versions a deploy denies.
-const CONFITURE_FLOOR: (u32, u32) = (0, 44);
+/// `CAPABILITY_FLOORS`, and is pinned to it by test. Today that is
+/// `pending_scope` at 1.35.0, the first release that accepts `--scope pending`:
+/// below it the policy gate judges applied migrations too. The window-safe
+/// verdict, the risk-tiered change-set and deep classification sit lower, on
+/// 0.44.0. A floor below the highest would certify a binary a deploy treats as
+/// less capable than the check says.
+const CONFITURE_FLOOR: (u32, u32) = (1, 35);
 
 /// A single doctor check outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,12 +128,7 @@ fn check_confiture(config: &DeployConfig) -> Check {
                 Some(version) => Check {
                     name: "confiture",
                     status: Status::Warn,
-                    detail: format!(
-                        "{}.{} is below the {}.{} floor; neither its window-safety verdict nor \
-                         its risk classification is trusted (confiture#206), so a blue-green \
-                         deploy is refused and a configured `[policy]` classifies nothing",
-                        version.0, version.1, CONFITURE_FLOOR.0, CONFITURE_FLOOR.1
-                    ),
+                    detail: below_floor(version),
                 },
                 None => Check {
                     name: "confiture",
@@ -148,6 +142,35 @@ fn check_confiture(config: &DeployConfig) -> Check {
             status: Status::Warn,
             detail: format!("`{program}` not found on PATH (set FRAISIER_CONFITURE_BIN)"),
         },
+    }
+}
+
+/// The warning for a confiture below [`CONFITURE_FLOOR`]: every capability the
+/// adapter withholds from `version`, and what each costs a deploy.
+fn below_floor(version: (u32, u32)) -> String {
+    let withheld: Vec<String> = fraisier_adapter_confiture::CAPABILITY_FLOORS
+        .iter()
+        .filter(|(_, floor)| floor.is_none_or(|floor| (floor.0, floor.1) > version))
+        .map(|(capability, _)| format!("`{capability}` ({})", without(capability)))
+        .collect();
+    format!(
+        "{}.{} is below the {}.{} floor; the adapter withholds {}",
+        version.0,
+        version.1,
+        CONFITURE_FLOOR.0,
+        CONFITURE_FLOOR.1,
+        withheld.join(", ")
+    )
+}
+
+/// What a deploy loses when the adapter withholds `capability`.
+fn without(capability: &str) -> &'static str {
+    match capability {
+        "window_safe" => "a blue-green deploy is refused",
+        "risk_tier" => "a configured `[policy]` classifies nothing",
+        "deep_classification" => "a restore rehearsal classifies statically",
+        "pending_scope" => "the policy gate judges applied migrations too",
+        _ => "not available",
     }
 }
 
@@ -403,7 +426,9 @@ pub(crate) fn env_check(config_path: &Path, subcommand: &str) -> CommandOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_throwaways, doctor, env_check, parse_version, Status, CONFITURE_FLOOR};
+    use super::{
+        below_floor, check_throwaways, doctor, env_check, parse_version, Status, CONFITURE_FLOOR,
+    };
     use std::io::Write as _;
 
     fn write_config(body: &str) -> tempfile::NamedTempFile {
@@ -535,6 +560,24 @@ url = "http://127.0.0.1/health"
     }
 
     #[test]
+    fn below_the_floor_names_each_withheld_capability() {
+        let current = below_floor((1, 19));
+        assert!(current.contains("`pending_scope`"), "{current}");
+        assert!(current.contains("judges applied migrations"), "{current}");
+        assert!(!current.contains("`window_safe`"), "{current}");
+
+        let ancient = below_floor((0, 43));
+        for capability in [
+            "window_safe",
+            "risk_tier",
+            "deep_classification",
+            "pending_scope",
+        ] {
+            assert!(ancient.contains(&format!("`{capability}`")), "{ancient}");
+        }
+    }
+
+    #[test]
     fn parse_version_reads_major_minor() {
         assert_eq!(parse_version("confiture 0.31.0"), Some((0, 31)));
         assert_eq!(parse_version("v1.2.3"), Some((1, 2)));
@@ -546,9 +589,8 @@ url = "http://127.0.0.1/health"
     /// will be refused.
     ///
     /// Read off the adapter's own constants rather than restated, so the two
-    /// cannot drift apart silently. Both of its version-gated capabilities sit
-    /// on 0.44.0 today; if one ever moves, `doctor` must follow the **higher**
-    /// of them. Certifying a binary that a deploy refuses is the failure this
+    /// cannot drift apart silently. Its version-gated capabilities sit on
+    /// different floors today, and `doctor` follows the **highest** of them. Certifying a binary that a deploy refuses is the failure this
     /// check exists to prevent, and it is a failure in either direction: too low
     /// passes versions that will be denied, too high sends an operator chasing
     /// an upgrade nothing requires.

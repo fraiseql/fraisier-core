@@ -73,7 +73,14 @@
 //! DSN. A keyword-form DSN is refused rather than echoed. Every other subcommand
 //! ignores the secret.
 //!
-//! Both are **advertised conditionally**, on the version the installed binary
+//! The **`pending_scope`** capability (≥ **1.35.0**, the first release that
+//! accepts the flag) makes `preflight` pass `--scope pending`, so the change-set
+//! covers only the migrations the database's ledger has not applied. Below it
+//! the change-set covers every migration file, applied ones included, and an
+//! applied destructive migration is judged again on every deploy. 1.34.0 rejects
+//! the flag outright, which is why it is gated rather than always passed.
+//!
+//! All of them are **advertised conditionally**, on the version the installed binary
 //! reports: claiming `risk_tier` against a confiture that cannot classify would
 //! make fraisier's policy gate expect a change-set and deny every deploy.
 //! Withholding it says *"I do not classify"*, and a deploy with no risk policy
@@ -106,6 +113,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use fraisier_core::adapter_axes::{
@@ -113,6 +121,7 @@ use fraisier_core::adapter_axes::{
     MigrationOutcome, PreflightIssue, PreflightReport, Revision, SchemaChange, Severity,
     VerifyCheck, VerifyReport,
 };
+use fraisier_core::policy::PENDING_SCOPE;
 use fraisier_core::restore_rehearsal::{AGAINST_DATABASE_URL_SECRET, DEEP_CLASSIFICATION};
 use serde_json::Value;
 
@@ -217,6 +226,17 @@ const RISK_TIER_MIN_CONFITURE: Option<(u32, u32, u32)> = Some((0, 44, 0));
 /// captures are in `tests/fixtures/against/`.
 const DEEP_CLASSIFICATION_MIN_CONFITURE: (u32, u32, u32) = (0, 44, 0);
 
+/// The first confiture whose `migrate preflight` accepts `--scope pending`, and
+/// so judges only the migrations the database's ledger has not applied.
+///
+/// **Observed, not read off a changelog.** On one database with `001`–`002`
+/// applied (`002` a `DROP COLUMN`) and `003` pending: 1.34.0 exits 2 on the flag
+/// (`No such option: --scope`) and writes no report, so passing it below the
+/// floor would break every preflight; 1.35.0 and 1.36.0 report `scope:
+/// "pending"` and a change-set holding `003` alone. With no ledger, every
+/// migration is pending. The captures are in `tests/fixtures/scope/`.
+const PENDING_SCOPE_MIN_CONFITURE: (u32, u32, u32) = (1, 35, 0);
+
 /// Every version-gated capability this adapter has, with the confiture release
 /// it starts trusting for it. `None` means the capability is withheld from every
 /// version.
@@ -235,6 +255,7 @@ pub const CAPABILITY_FLOORS: &[CapabilityFloor] = &[
     (WINDOW_SAFE_CAPABILITY, Some(WINDOW_SAFE_MIN_CONFITURE)),
     (RISK_TIER_CAPABILITY, RISK_TIER_MIN_CONFITURE),
     (DEEP_CLASSIFICATION, Some(DEEP_CLASSIFICATION_MIN_CONFITURE)),
+    (PENDING_SCOPE, Some(PENDING_SCOPE_MIN_CONFITURE)),
 ];
 
 /// One row of [`CAPABILITY_FLOORS`]: the capability's advertised name, and the
@@ -269,6 +290,9 @@ static OUTPUT_SEQ: AtomicU64 = AtomicU64::new(0);
 /// ```
 pub struct ConfitureMigration {
     program: OsString,
+    /// The version the binary reported to `describe`, kept so `preflight`
+    /// knows which flags it accepts without asking again.
+    version: OnceLock<String>,
 }
 
 impl Default for ConfitureMigration {
@@ -287,7 +311,7 @@ impl ConfitureMigration {
         let program = std::env::var_os(PROGRAM_ENV)
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| OsString::from("confiture"));
-        Self { program }
+        Self::with_program(program)
     }
 
     /// Create an adapter that spawns the binary at `program`.
@@ -295,7 +319,17 @@ impl ConfitureMigration {
     pub fn with_program(program: impl Into<OsString>) -> Self {
         Self {
             program: program.into(),
+            version: OnceLock::new(),
         }
+    }
+
+    /// The installed binary's version: the one `describe` read, or a fresh
+    /// `describe` when it has not run on this adapter yet.
+    async fn installed_version(&self) -> Result<String, AdapterError> {
+        if let Some(version) = self.version.get() {
+            return Ok(version.clone());
+        }
+        Ok(self.describe().await?.version)
     }
 
     /// Spawn a `migrate` subcommand, returning the captured outcome.
@@ -1019,7 +1053,24 @@ fn capabilities_for(version: &str) -> Vec<String> {
     if version_at_or_above(version, DEEP_CLASSIFICATION_MIN_CONFITURE) {
         capabilities.push(DEEP_CLASSIFICATION.to_owned());
     }
+    if version_at_or_above(version, PENDING_SCOPE_MIN_CONFITURE) {
+        capabilities.push(PENDING_SCOPE.to_owned());
+    }
     capabilities
+}
+
+/// The `--scope` arguments for a preflight by the confiture at `version`.
+///
+/// `--scope pending` from [`PENDING_SCOPE_MIN_CONFITURE`], so the gate judges
+/// only what this deploy will apply. Nothing below it: an older binary rejects
+/// the flag, and judging every migration refuses more than it should but never
+/// less.
+fn preflight_scope(version: &str) -> Vec<OsString> {
+    if version_at_or_above(version, PENDING_SCOPE_MIN_CONFITURE) {
+        vec![OsString::from("--scope"), OsString::from("pending")]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Whether the confiture at `version` emits a window-safety verdict that covers
@@ -1086,6 +1137,7 @@ impl MigrationAdapter for ConfitureMigration {
             .into_error("describe"));
         }
         let version = parse_version(&String::from_utf8_lossy(&output.stdout));
+        let _ = self.version.set(version.clone());
         // The capability list describes the binary that just answered, not this
         // crate: `risk_tier` is withheld unless that binary can classify.
         let capabilities = capabilities_for(&version);
@@ -1176,7 +1228,13 @@ impl MigrationAdapter for ConfitureMigration {
     }
 
     async fn preflight(&self, ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {
-        let output = self.run("preflight", ctx, &[]).await?;
+        let output = self
+            .run(
+                "preflight",
+                ctx,
+                &preflight_scope(&self.installed_version().await?),
+            )
+            .await?;
         // Same envelope rule as `verify`. An envelope would at least parse to
         // `ok = false` here (it carries a top-level `"ok"`), so this is not the
         // silent-pass bug — but it would report a *clean* refusal: no issues and

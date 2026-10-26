@@ -35,7 +35,8 @@ use fraisier_core::adapter_axes::{
     PreflightReport, RiskTier, SchemaChange,
 };
 use fraisier_core::policy::{
-    self, Baseline, Capabilities, Inspection, PolicyDecision, PolicyGate, PolicyReason,
+    self, judges_pending_only, Baseline, Capabilities, Inspection, PolicyDecision, PolicyGate,
+    PolicyReason, PENDING_SCOPE,
 };
 use fraisier_core::redact;
 use fraisier_core::restore_rehearsal::{self, BackupSource, RehearsalDb, DEEP_CLASSIFICATION};
@@ -64,6 +65,21 @@ pub struct SchemaPreview {
     /// against a fresh copy of the live data, or statically and why.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification: Option<Classification>,
+    /// Which migrations the change-set covers, when a preflight ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Scope>,
+}
+
+/// Which migrations a preflight judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    /// Only those the database has not applied: what this deploy will apply.
+    Pending,
+    /// Every migration file, applied ones included, because the adapter does
+    /// not advertise [`PENDING_SCOPE`]. A change that already ran is judged
+    /// again.
+    All,
 }
 
 /// How a restore-rehearsal preview classified the pending changes.
@@ -261,14 +277,28 @@ fn from_inspection(
         }
     };
     let change_set = classify(&inspection);
-    assemble(
-        change_set,
-        gate,
-        approval_command,
-        baseline,
-        inspection.capabilities,
-        inspection.report.as_ref(),
-    )
+    let scope = inspection
+        .report
+        .as_ref()
+        .and(inspection.adapter.as_ref())
+        .map(|described| {
+            if judges_pending_only(described) {
+                Scope::Pending
+            } else {
+                Scope::All
+            }
+        });
+    SchemaPreview {
+        scope,
+        ..assemble(
+            change_set,
+            gate,
+            approval_command,
+            baseline,
+            inspection.capabilities,
+            inspection.report.as_ref(),
+        )
+    }
 }
 
 /// The plan for an inspection that could not run, for the redacted `reason`.
@@ -490,6 +520,7 @@ fn assemble(
             _ => None,
         },
         classification: None,
+        scope: None,
     }
 }
 
@@ -581,6 +612,15 @@ pub fn render(preview: &SchemaPreview) -> String {
             )));
         }
         (None, _) => {}
+    }
+    if let (Some(Scope::All), Some(change_set)) = (preview.scope, &preview.change_set) {
+        if !change_set.changes.is_empty() {
+            lines.extend(wrap(&format!(
+                "judged every migration file, applied ones included: {} {} does not advertise \
+                 `{PENDING_SCOPE}`, so a change that already ran is judged again",
+                change_set.adapter, change_set.adapter_version
+            )));
+        }
     }
     if let Some(classification) = &preview.classification {
         lines.extend(wrap(&classification.detail));
@@ -748,8 +788,8 @@ fn wrap(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        gather, gather_rehearsed, render, ChangeSetPreview, ClassificationKind, PolicyPreview,
-        SchemaPreview, Unavailable, Verdict,
+        gather, gather_rehearsed, not_inspected, render, ChangeSetPreview, ClassificationKind,
+        PolicyPreview, SchemaPreview, Unavailable, Verdict,
     };
     use async_trait::async_trait;
     use fraisier_core::adapter_axes::{
@@ -1903,5 +1943,66 @@ mod tests {
         let json = serde_json::to_value(&looked).expect("serialize");
         assert_eq!(json["change_set"]["changes"], serde_json::json!([]));
         assert_eq!(json["change_set_unavailable"], serde_json::Value::Null);
+    }
+
+    fn added_column() -> SchemaChange {
+        change("add_column", "public.tb_order.placed_at").with_tier(RiskTier::Additive)
+    }
+
+    /// Below confiture 1.35.0 the change-set covers every migration file, so
+    /// the plan says it judged applied ones too rather than let an operator
+    /// read the list as this deploy's.
+    #[tokio::test]
+    async fn below_the_pending_scope_floor_the_plan_says_every_migration_was_judged() {
+        let migration = FakeMigration::classifying(vec![added_column()]).reporting("1.34.0");
+        let preview = gather(
+            &migration,
+            &ctx(),
+            &PolicyGate::new(Policy::default()),
+            None,
+            Baseline::None,
+        )
+        .await;
+
+        let json = serde_json::to_value(&preview).expect("serialize");
+        assert_eq!(json["scope"], "all", "{json}");
+        let rendered = render(&preview);
+        assert!(
+            rendered.contains("applied ones included"),
+            "the plan must say what was judged:\n{rendered}"
+        );
+    }
+
+    /// An adapter that judges only pending migrations says so in the machine
+    /// form, and the human plan stays as it was.
+    #[tokio::test]
+    async fn an_adapter_that_judges_pending_migrations_says_so() {
+        let mut migration = FakeMigration::classifying(vec![added_column()]).reporting("1.35.0");
+        migration.capabilities.push("pending_scope".to_owned());
+        let preview = gather(
+            &migration,
+            &ctx(),
+            &PolicyGate::new(Policy::default()),
+            None,
+            Baseline::None,
+        )
+        .await;
+
+        let json = serde_json::to_value(&preview).expect("serialize");
+        assert_eq!(json["scope"], "pending", "{json}");
+        assert!(!render(&preview).contains("applied ones included"));
+    }
+
+    /// A plan that inspected nothing judged nothing, so it states no scope.
+    #[test]
+    fn a_plan_that_inspected_nothing_states_no_scope() {
+        let preview = not_inspected(
+            Unavailable::new(Unavailable::SKIPPED, "skipped"),
+            &PolicyGate::default(),
+            None,
+            Baseline::None,
+        );
+        let json = serde_json::to_value(&preview).expect("serialize");
+        assert_eq!(json["scope"], serde_json::Value::Null, "{json}");
     }
 }

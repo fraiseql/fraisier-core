@@ -7,6 +7,7 @@ doc-valid-idents = [
     "SpecQL",
     "FraiseQL",
     "PostgreSQL",
+    "pg_tviews",
     "SQLite",
     "JSON-RPC",
     "GitHub",

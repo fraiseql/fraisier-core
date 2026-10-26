@@ -34,6 +34,7 @@ use fraisier_saga::state_store::StateStore;
 use crate::adapter_axes::{AdapterCtx, MigrationAdapter, TrafficDirector, TrafficTarget};
 use crate::connection_budget::{self, BudgetVerdict, ConnectionBudget};
 use crate::policy::{self, Baseline, PolicyGate};
+use crate::readiness::{self, DatabaseReadiness};
 
 /// Operations on the blue/green fleets the flow drives.
 ///
@@ -75,6 +76,7 @@ pub trait FleetOps: Send + Sync {
 }
 
 /// The immutable per-run state shared by every step.
+#[derive(Clone)]
 struct BgShared {
     ctx: AdapterCtx,
     green: TrafficTarget,
@@ -92,6 +94,8 @@ struct BgShared {
     /// or without a `[policy]` section — blue-green's shared hold window is not
     /// something a config can switch off.
     policy: PolicyGate,
+    /// Optional database-readiness probe, run first in preflight.
+    database_readiness: Option<Arc<dyn DatabaseReadiness>>,
 }
 
 /// The mutable run state threaded to every step by the saga engine.
@@ -154,6 +158,9 @@ impl BgShared {
     /// (D3). The window rule is the [`Baseline::WindowSafety`] half and applies
     /// unconditionally; the tier policy is the opt-in half.
     async fn run_preflight(&self) -> Result<(), SagaError> {
+        if let Some(probe) = &self.database_readiness {
+            readiness::check(probe.as_ref(), &self.ctx).await?;
+        }
         let inspection = policy::inspect(&*self.migration, &self.ctx)
             .await
             .map_err(|e| {
@@ -370,8 +377,18 @@ impl BlueGreenDeploy {
                 fleet,
                 budget,
                 policy: params.policy,
+                database_readiness: None,
             }),
         }
+    }
+
+    /// Check the shared database against what the deployable declared it needs
+    /// (`[database.requires]`) as the first thing preflight does, before any
+    /// instance or traffic change. See [`crate::readiness`].
+    #[must_use]
+    pub fn database_readiness(mut self, probe: Arc<dyn DatabaseReadiness>) -> Self {
+        Arc::make_mut(&mut self.shared).database_readiness = Some(probe);
+        self
     }
 
     /// Run the blue-green flow over `store`. A clean rollback (e.g. a failed
@@ -655,6 +672,65 @@ mod tests {
             "one swap, to green"
         );
         assert!(fleet.log().contains(&"reap_blue".to_owned()), "blue reaped");
+    }
+
+    /// A readiness probe answering `reasons`.
+    struct FakeReadiness(Vec<String>);
+
+    #[async_trait]
+    impl crate::readiness::DatabaseReadiness for FakeReadiness {
+        async fn unready(&self, _live_dsn: &str) -> Result<Vec<String>, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn with_dsn() -> BlueGreenParams {
+        BlueGreenParams {
+            ctx: AdapterCtx::new("checkout", "production")
+                .with_resolved_secret("DATABASE_URL", "postgres://u:pw@h/app"),
+            ..params()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unready_database_fails_preflight_before_the_migration_is_asked() {
+        let traffic = FakeTraffic::blue();
+        let fleet = FakeFleet::new(true, true);
+        let migration = FakeMigration::window_safe();
+        let bg = BlueGreenDeploy::new(
+            with_dsn(),
+            Arc::clone(&migration) as Arc<dyn MigrationAdapter>,
+            Arc::clone(&traffic) as Arc<dyn TrafficDirector>,
+            Arc::clone(&fleet) as Arc<dyn FleetOps>,
+            None,
+        )
+        .database_readiness(Arc::new(FakeReadiness(vec![
+            "pg_tviews is not preloaded".to_owned()
+        ])));
+        let outcome = bg.run(MemoryStateStore::new()).await.expect("run");
+        let reason = refusal(&outcome, "preflight");
+        assert!(reason.contains("pg_tviews is not preloaded"), "{reason}");
+        assert!(
+            migration.calls.lock().unwrap().is_empty(),
+            "the migration was never asked"
+        );
+        assert!(traffic.swaps().is_empty(), "traffic never moved");
+    }
+
+    #[tokio::test]
+    async fn a_ready_database_lets_the_blue_green_commit() {
+        let traffic = FakeTraffic::blue();
+        let fleet = FakeFleet::new(true, true);
+        let bg = BlueGreenDeploy::new(
+            with_dsn(),
+            FakeMigration::window_safe(),
+            Arc::clone(&traffic) as Arc<dyn TrafficDirector>,
+            Arc::clone(&fleet) as Arc<dyn FleetOps>,
+            None,
+        )
+        .database_readiness(Arc::new(FakeReadiness(Vec::new())));
+        let outcome = bg.run(MemoryStateStore::new()).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "{outcome:?}");
     }
 
     #[tokio::test]

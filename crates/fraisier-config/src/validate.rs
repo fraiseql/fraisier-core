@@ -132,6 +132,7 @@ impl DeployConfig {
         validate_lb(self, &mut report);
         validate_webhook(self, &mut report);
         validate_schedule(self, &mut report);
+        validate_database(self, &mut report);
         validate_sync(self, &mut report);
         validate_blue_green(self, &mut report);
         validate_checks(self, &mut report);
@@ -706,6 +707,35 @@ fn validate_schedule(cfg: &DeployConfig, report: &mut ValidationReport) {
             }
         }
         Some(_) => {}
+    }
+}
+
+fn validate_database(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(requires) = cfg.database.as_ref().and_then(|d| d.requires.as_ref()) else {
+        return; // optional
+    };
+    if requires.postgres_major.is_none() && requires.pg_tviews != Some(true) {
+        report.error(
+            "database.requires",
+            "[database.requires] declares nothing: set postgres_major and/or pg_tviews = true",
+        );
+    }
+    if let Some(major) = requires.postgres_major.filter(|major| *major < 10) {
+        report.error(
+            "database.requires.postgres_major",
+            format!("postgres_major = {major} is not a PostgreSQL major version fraisier checks (10 or later)"),
+        );
+    }
+    let has_dsn = cfg
+        .migration
+        .as_ref()
+        .is_some_and(|m| is_set(m.database_url_env.as_ref()));
+    if !has_dsn {
+        report.error(
+            "migration.database_url_env",
+            "[database.requires] is checked against the database, so it needs \
+             [migration].database_url_env (the env var holding the DSN)",
+        );
     }
 }
 

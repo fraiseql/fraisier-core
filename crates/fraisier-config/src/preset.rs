@@ -115,6 +115,7 @@ impl SpecqlPreset {
             ssh: None,
             webhook: None,
             schedule: None,
+            database: None,
             sync: None,
             blue_green: None,
             // The preset emits no checks; an author-supplied [[checks]] wins.
@@ -320,6 +321,8 @@ impl DeployConfig {
             webhook: prefer(base.webhook, self.webhook),
             // The preset never emits [schedule]; an author-supplied one wins.
             schedule: prefer(base.schedule, self.schedule),
+            // The preset never emits [database]; an author-supplied one wins.
+            database: prefer(base.database, self.database),
             // The preset never emits [sync]; an author-supplied one wins.
             sync: prefer(base.sync, self.sync),
             // The preset never emits [blue_green]; an author-supplied one wins.

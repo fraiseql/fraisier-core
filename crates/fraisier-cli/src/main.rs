@@ -18,6 +18,7 @@ mod doctor;
 #[cfg(test)]
 mod e2e;
 mod factory;
+mod pg_readiness;
 mod pg_rehearsal;
 mod preview;
 #[cfg(test)]
@@ -817,7 +818,7 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::ScaffoldInstall(args) => {
             commands::scaffold_install(&args.config, &args.root, args.prune, args.yes, args.dry_run)
         }
-        Command::Doctor(args) => Ok(doctor::doctor(&args.config, &args.checks)),
+        Command::Doctor(args) => Ok(doctor::doctor(&args.config, &args.checks).await),
         Command::EnvCheck(args) => Ok(doctor::env_check(&args.config, &args.subcommand)),
     }
 }

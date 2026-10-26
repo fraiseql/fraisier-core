@@ -100,6 +100,40 @@ pub(crate) fn referenced_secrets(config: &DeployConfig) -> Vec<(String, String)>
     out
 }
 
+/// Probe the database against `[database.requires]`, when the section declares
+/// anything. Absent otherwise: a config that requires nothing has nothing to check.
+async fn check_database_ready(config: &DeployConfig) -> Option<Check> {
+    let probe = crate::pg_readiness::probe(config)?;
+    let fail = |detail: String| Check {
+        name: "database_ready",
+        status: Status::Fail,
+        detail,
+    };
+    let Some(source) = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.database_url_env.as_deref())
+    else {
+        return Some(fail(
+            "cannot check [database.requires]: [migration].database_url_env is not set".to_owned(),
+        ));
+    };
+    let Ok(dsn) = std::env::var(source) else {
+        return Some(fail(format!(
+            "cannot check [database.requires]: ${source} is not set"
+        )));
+    };
+    Some(match probe.unready(&dsn).await {
+        Ok(unready) if unready.is_empty() => Check {
+            name: "database_ready",
+            status: Status::Pass,
+            detail: "the database meets [database.requires]".to_owned(),
+        },
+        Ok(unready) => fail(unready.join("; ")),
+        Err(error) => fail(format!("could not check [database.requires]: {error}")),
+    })
+}
+
 /// Run `confiture --version` and compare to the floor.
 fn check_confiture(config: &DeployConfig) -> Check {
     let uses_confiture =
@@ -167,7 +201,7 @@ fn parse_version(text: &str) -> Option<(u32, u32)> {
 
 /// Run the doctor checks against `config_path`, optionally filtered to `only`.
 #[must_use]
-pub(crate) fn doctor(config_path: &Path, only: &[String]) -> CommandOutput {
+pub(crate) async fn doctor(config_path: &Path, only: &[String]) -> CommandOutput {
     let mut checks: Vec<Check> = Vec::new();
 
     match load(config_path) {
@@ -211,6 +245,9 @@ pub(crate) fn doctor(config_path: &Path, only: &[String]) -> CommandOutput {
                 });
             }
             checks.push(check_confiture(&config));
+            if let Some(check) = check_database_ready(&config).await {
+                checks.push(check);
+            }
         }
     }
 
@@ -393,10 +430,10 @@ url = "http://127.0.0.1/health"
         );
     }
 
-    #[test]
-    fn doctor_passes_on_a_valid_secret_free_config() {
+    #[tokio::test]
+    async fn doctor_passes_on_a_valid_secret_free_config() {
         let file = write_config(VALID);
-        let out = doctor(file.path(), &[]);
+        let out = doctor(file.path(), &[]).await;
         // No hard failure (0 = clean, 2 = warnings only); no FAIL check.
         assert_ne!(out.exit_code, 1, "no check should fail: {}", out.pretty);
         assert!(!out.pretty.contains("[FAIL]"), "pretty: {}", out.pretty);
@@ -404,15 +441,15 @@ url = "http://127.0.0.1/health"
         assert!(out.pretty.contains("config_valid"));
     }
 
-    #[test]
-    fn doctor_fails_when_a_referenced_secret_is_unset() {
+    #[tokio::test]
+    async fn doctor_fails_when_a_referenced_secret_is_unset() {
         // A uniquely-named env var that is never set in the test environment.
         let cfg = VALID.replace(
             "adapter = \"command\"\n[migration.settings]\nup = \"true\"\n",
             "adapter = \"confiture\"\ndatabase_url_env = \"DOCTOR_TEST_NEVER_SET_DSN\"\n",
         );
         let file = write_config(&cfg);
-        let out = doctor(file.path(), &[]);
+        let out = doctor(file.path(), &[]).await;
         assert_eq!(
             out.exit_code, 1,
             "an unset referenced secret fails: {}",
@@ -422,9 +459,42 @@ url = "http://127.0.0.1/health"
     }
 
     #[test]
-    fn doctor_reports_a_parse_failure_as_a_single_fail() {
+    fn doctor_checks_database_requires_and_fails_closed_when_it_cannot() {
+        // Port 1 refuses connections, so the probe cannot run: that is a FAIL,
+        // never a pass or a skip.
+        let _guard = crate::test_env::env_guard();
+        let var = "DOCTOR_TEST_UNREACHABLE_DSN";
+        std::env::set_var(var, "postgres://app:s3cret@127.0.0.1:1/shop");
+        let cfg = VALID.replace(
+            "adapter = \"command\"\n[migration.settings]\nup = \"true\"\n",
+            &format!(
+                "adapter = \"command\"\ndatabase_url_env = \"{var}\"\n[migration.settings]\n\
+                 up = \"true\"\n[database.requires]\npg_tviews = true\n"
+            ),
+        );
+        let file = write_config(&cfg);
+        let out = crate::test_env::block_on(doctor(file.path(), &[]));
+        std::env::remove_var(var);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(
+            out.pretty.contains("[FAIL] database_ready"),
+            "{}",
+            out.pretty
+        );
+        assert!(!out.pretty.contains("s3cret"), "{}", out.pretty);
+    }
+
+    #[tokio::test]
+    async fn doctor_has_no_database_check_without_database_requires() {
+        let file = write_config(VALID);
+        let out = doctor(file.path(), &[]).await;
+        assert!(!out.pretty.contains("database_ready"), "{}", out.pretty);
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_a_parse_failure_as_a_single_fail() {
         let file = write_config("this is not toml = = =");
-        let out = doctor(file.path(), &[]);
+        let out = doctor(file.path(), &[]).await;
         assert_eq!(out.exit_code, 1);
         assert!(out.pretty.contains("config_loads"));
     }

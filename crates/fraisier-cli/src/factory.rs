@@ -25,6 +25,7 @@ use fraisier_core::adapter_axes::{
 };
 use fraisier_core::multi_host::{MultiHostPlan, RolloutStrategy};
 use fraisier_core::policy::{ApprovalHook, PolicyGate};
+use fraisier_core::readiness::DatabaseReadiness;
 use fraisier_core::restore_rehearsal::{BackupSource, RehearsalDb};
 use fraisier_core::single_host::PreflightMode;
 use fraisier_ipc::{Launcher, SshLauncher};
@@ -200,6 +201,9 @@ pub struct ResolvedDeploy {
     /// the given [`RehearsalDb`]) seeded from [`BackupSource`] and rehearses the
     /// pending migrations there. Populated when `preflight_mode = "restore_rehearsal"`.
     pub restore_rehearsal: Option<RestoreRehearsalPlan>,
+    /// The `[database.requires]` probe, run first in preflight. `None` when the
+    /// section declares nothing.
+    pub database_readiness: Option<Arc<dyn DatabaseReadiness>>,
     /// The artifact adapter.
     pub artifact: Arc<dyn ArtifactAdapter>,
     /// The migration adapter (in-process or IPC).
@@ -555,6 +559,7 @@ pub fn build(
         forward_compatible_lint,
         policy: build_policy_gate(config),
         restore_rehearsal,
+        database_readiness: crate::pg_readiness::probe(config),
         artifact,
         migration,
         service,
@@ -576,6 +581,9 @@ pub struct ResolvedMultiHost {
     pub forward_compatible_lint: bool,
     /// The schema policy gate resolved from `[policy]` (default: no tier gate).
     pub policy: PolicyGate,
+    /// The `[database.requires]` probe, run first in preflight. `None` when the
+    /// section declares nothing.
+    pub database_readiness: Option<Arc<dyn DatabaseReadiness>>,
     /// The artifact adapter.
     pub artifact: Arc<dyn ArtifactAdapter>,
     /// The migration adapter (run once on the orchestrator).
@@ -656,6 +664,7 @@ pub fn build_multi_host(
         ctx,
         forward_compatible_lint,
         policy: build_policy_gate(config),
+        database_readiness: crate::pg_readiness::probe(config),
         artifact,
         migration,
         service,
@@ -1383,7 +1392,11 @@ pub fn build_blue_green(
     Ok(ResolvedBlueGreen {
         fraise,
         environment,
-        deploy: BlueGreenDeploy::new(params, migration, traffic, fleet, budget),
+        deploy: match crate::pg_readiness::probe(config) {
+            Some(probe) => BlueGreenDeploy::new(params, migration, traffic, fleet, budget)
+                .database_readiness(probe),
+            None => BlueGreenDeploy::new(params, migration, traffic, fleet, budget),
+        },
     })
 }
 

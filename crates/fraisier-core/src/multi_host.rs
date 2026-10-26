@@ -64,6 +64,7 @@ use fraisier_saga::state_store::{FraiseKey, StateStore, StateStoreError};
 use serde_json::Value;
 
 use crate::policy::{self, Baseline, Inspection, PolicyGate};
+use crate::readiness::{self, DatabaseReadiness};
 
 use crate::adapter_axes::{
     AdapterCtx, AdapterError, ArtifactAdapter, HealthAdapter, HostId, LbAdapter, LbMembership,
@@ -276,6 +277,7 @@ pub struct MultiHostDeploy {
     /// gate switched off — multi-host rolls one version at a time against the
     /// database, so it has no always-on baseline rule either.
     policy: PolicyGate,
+    database_readiness: Option<Arc<dyn DatabaseReadiness>>,
     artifact: Arc<dyn ArtifactAdapter>,
     migration: Arc<dyn MigrationAdapter>,
     service: Arc<dyn ServiceAdapter>,
@@ -383,6 +385,7 @@ pub struct MultiHostDeployBuilder {
     target: Option<Revision>,
     forward_compatible_lint: bool,
     policy: PolicyGate,
+    database_readiness: Option<Arc<dyn DatabaseReadiness>>,
     artifact: Option<Arc<dyn ArtifactAdapter>>,
     migration: Option<Arc<dyn MigrationAdapter>>,
     service: Option<Arc<dyn ServiceAdapter>>,
@@ -402,6 +405,7 @@ impl MultiHostDeployBuilder {
             // advertises it, unless the operator opts out (PRD G11 / Decision 4).
             forward_compatible_lint: true,
             policy: PolicyGate::default(),
+            database_readiness: None,
             artifact: None,
             migration: None,
             service: None,
@@ -442,6 +446,15 @@ impl MultiHostDeployBuilder {
     #[must_use]
     pub fn policy(mut self, gate: PolicyGate) -> Self {
         self.policy = gate;
+        self
+    }
+
+    /// Check the shared database against what the deployable declared it needs
+    /// (`[database.requires]`) as the first thing preflight does, before any host
+    /// is probed. See [`crate::readiness`].
+    #[must_use]
+    pub fn database_readiness(mut self, probe: Arc<dyn DatabaseReadiness>) -> Self {
+        self.database_readiness = Some(probe);
         self
     }
 
@@ -513,6 +526,7 @@ impl MultiHostDeployBuilder {
             target: self.target,
             forward_compatible_lint: self.forward_compatible_lint,
             policy: self.policy,
+            database_readiness: self.database_readiness,
         })
     }
 }
@@ -527,6 +541,7 @@ struct RolloutShared {
     target: Option<Revision>,
     forward_compatible_lint: bool,
     policy: PolicyGate,
+    database_readiness: Option<Arc<dyn DatabaseReadiness>>,
     artifact: Arc<dyn ArtifactAdapter>,
     migration: Arc<dyn MigrationAdapter>,
     service: Arc<dyn ServiceAdapter>,
@@ -635,6 +650,7 @@ impl RolloutShared {
             target: deploy.target.clone(),
             forward_compatible_lint: deploy.forward_compatible_lint,
             policy: deploy.policy.clone(),
+            database_readiness: deploy.database_readiness.clone(),
             artifact: Arc::clone(&deploy.artifact),
             migration: Arc::clone(&deploy.migration),
             service: Arc::clone(&deploy.service),
@@ -754,6 +770,9 @@ impl RolloutShared {
     /// the policy will not allow should not first be told about lint findings, or
     /// about unreachable hosts, for a change the operator may not make anyway.
     async fn run_preflight(&self) -> Result<(), SagaError> {
+        if let Some(probe) = &self.database_readiness {
+            readiness::check(probe.as_ref(), &self.ctx).await?;
+        }
         let inspection = self.inspect().await?;
         self.run_policy_gate(&inspection).await?;
         Self::run_forward_compat_lint(&inspection)?;
@@ -2176,6 +2195,73 @@ mod tests {
         assert!(reason.contains(REFUSED), "{reason}");
         assert!(reason.contains("public.tb_user.legacy_flag"), "{reason}");
         assert_eq!(drain_trail(&trail), vec!["describe", "preflight"]);
+    }
+
+    /// A readiness probe that logs to the trail and answers `reasons`.
+    struct FakeReadiness {
+        trail: Trail,
+        reasons: Vec<String>,
+    }
+
+    #[async_trait]
+    impl crate::readiness::DatabaseReadiness for FakeReadiness {
+        async fn unready(&self, _live_dsn: &str) -> Result<Vec<String>, String> {
+            log(&self.trail, "readiness");
+            Ok(self.reasons.clone())
+        }
+    }
+
+    fn with_readiness(trail: &Trail, reasons: Vec<String>) -> MultiHostDeploy {
+        builder(
+            trail,
+            &Arc::new(Faults::default()),
+            RolloutStrategy::Rolling(1),
+        )
+        .context(
+            AdapterCtx::new("checkout", "production")
+                .with_resolved_secret("DATABASE_URL", "postgres://u:pw@h/app"),
+        )
+        .database_readiness(Arc::new(FakeReadiness {
+            trail: trail.clone(),
+            reasons,
+        }))
+        .build()
+        .expect("all adapters provided")
+    }
+
+    #[tokio::test]
+    async fn an_unready_database_fails_the_rollout_before_any_host_is_probed() {
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let outcome = with_readiness(&trail, vec!["pg_tviews is not preloaded".to_owned()])
+            .run(store)
+            .await
+            .expect("run");
+        let SagaOutcome::RolledBack {
+            failed_step,
+            reason,
+        } = &outcome
+        else {
+            panic!("expected a rollback at preflight, got {outcome:?}");
+        };
+        assert_eq!(failed_step, "preflight");
+        assert!(reason.contains("pg_tviews is not preloaded"), "{reason}");
+        assert_eq!(drain_trail(&trail), vec!["readiness"]);
+    }
+
+    #[tokio::test]
+    async fn a_ready_database_is_checked_first_and_the_rollout_commits() {
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let outcome = with_readiness(&trail, Vec::new())
+            .run(store)
+            .await
+            .expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+        assert_eq!(
+            drain_trail(&trail).first().map(String::as_str),
+            Some("readiness")
+        );
     }
 
     #[tokio::test]

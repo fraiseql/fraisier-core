@@ -244,7 +244,11 @@ $SERVICE_USER
 adapter = "http"
 url = "http://127.0.0.1:$HEALTH_PORT/health"
 expected_status = 200
+
+[metrics]
+textfile_dir = "$WORK/textfile"
 EOF
+mkdir -p "$WORK/textfile"
 
 cat > "$WORK/migrations/0001_create_widgets.up.sql" <<'SQL'
 CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
@@ -264,6 +268,10 @@ deploy() { # <app-version>
       --app-version "$1"
 }
 active_release() { basename "$(readlink "$WORK/current")"; }
+# The value of one gauge in the deploy's textfile metrics.
+deploy_gauge() { # <metric-name>
+  sed -n "s/^$1{fraise=\"fraiseql\",environment=\"checkpoint\"} //p" "$WORK/textfile/fraisier_deploy.prom"
+}
 health_code() { curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HEALTH_PORT/health"; }
 # Poll for the expected health code: a just-restarted unit needs a moment to
 # re-bind its socket (the deploy's own probe retries; this mirrors that).
@@ -284,6 +292,8 @@ echo "$out" | grep -q '"outcome": *"committed"' || die "deploy #1 did not commit
 [ "$(active_release)" = "v1" ] || die "v1 is not the active release"
 wait_health 200 || die "the v1 app is not serving healthy"
 ok "v1 committed, live, and healthy"
+[ "$(deploy_gauge fraisier_deploy_last_success)" = "1" ] || die "the deploy metrics do not record v1's commit"
+ok "fraisier_deploy.prom records the commit"
 
 # --------------------------------------------------------------------------
 # Deploy #2 — v2 adds a migration and a release whose app is unhealthy → rollback
@@ -302,6 +312,11 @@ echo "$out" | grep -q '"outcome": *"rolled_back"' || die "deploy #2 did not roll
 [ "$(active_release)" = "v1" ] || die "rollback did not re-activate v1 (got $(active_release))"
 wait_health 200 || die "v1 is not healthy again after rollback"
 ok "v2 rolled back: v1 re-activated and healthy"
+if [ "$(deploy_gauge fraisier_deploy_last_success)" != "0" ] \
+  || [ "$(deploy_gauge fraisier_deploy_last_rolled_back)" != "1" ]; then
+  die "the deploy metrics do not record v2's rollback"
+fi
+ok "fraisier_deploy.prom records the rollback"
 
 # DB-level check (best effort; down_to over IPC is also covered by the
 # e2e_ipc_sqlx integration test). After rollback only migration 1 is applied.

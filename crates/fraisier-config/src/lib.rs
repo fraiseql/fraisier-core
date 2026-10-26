@@ -74,8 +74,8 @@ pub use error::ConfigError;
 pub use preset::SpecqlPreset;
 pub use schema::{
     ArtifactSection, BackupSection, BlueGreenSection, CheckSection, DeployConfig, DeploySection,
-    DrillSection, HealthSection, HostSpec, HostsSection, LbSection, MigrationSection,
-    PolicySection, RetainEntry, ScheduleSection, ServiceSection, SshSection,
+    DrillSection, HealthSection, HostSpec, HostsSection, LbSection, MetricsSection,
+    MigrationSection, PolicySection, RetainEntry, ScheduleSection, ServiceSection, SshSection,
     DEFAULT_APPROVAL_TIMEOUT_SECS, UNCLASSIFIED_ACTIONS,
 };
 pub use validate::{ValidationIssue, ValidationReport};

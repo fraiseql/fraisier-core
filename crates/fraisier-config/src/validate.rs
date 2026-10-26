@@ -134,6 +134,7 @@ impl DeployConfig {
         validate_schedule(self, &mut report);
         validate_backup(self, &mut report);
         validate_drill(self, &mut report);
+        validate_metrics(self, &mut report);
         validate_sync(self, &mut report);
         validate_blue_green(self, &mut report);
         validate_checks(self, &mut report);
@@ -153,6 +154,7 @@ impl DeployConfig {
         let mut report = ValidationReport::default();
         validate_deploy(self, &mut report);
         validate_migration(self, &mut report);
+        validate_metrics(self, &mut report);
         report
     }
 
@@ -167,6 +169,7 @@ impl DeployConfig {
         validate_deploy(self, &mut report);
         validate_backup(self, &mut report);
         validate_drill(self, &mut report);
+        validate_metrics(self, &mut report);
         report
     }
 
@@ -813,6 +816,27 @@ fn validate_drill(cfg: &DeployConfig, report: &mut ValidationReport) {
                 format!("data_dir must be an absolute path, not '{}'", dir.display()),
             );
         }
+    }
+}
+
+fn validate_metrics(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(metrics) = cfg.metrics.as_ref() else {
+        return;
+    };
+    match metrics.textfile_dir.as_deref() {
+        None => report.error(
+            "metrics.textfile_dir",
+            "a [metrics] section needs textfile_dir: the directory node_exporter's textfile \
+             collector reads",
+        ),
+        Some(dir) if !dir.is_absolute() => report.error(
+            "metrics.textfile_dir",
+            format!(
+                "textfile_dir must be an absolute path, not '{}'",
+                dir.display()
+            ),
+        ),
+        Some(_) => {}
     }
 }
 

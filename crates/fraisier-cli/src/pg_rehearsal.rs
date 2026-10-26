@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use fraisier_core::drill::{DrillDb, THROWAWAY_MARKER};
 use fraisier_core::restore_rehearsal::{BackupSource, RehearsalDb, RehearsalError, ThrowawayDb};
 use fraisier_db::{
     backup_command, create_database_command, drop_database_command, restore_command, run, PgConn,
@@ -108,8 +109,29 @@ async fn restore_into(throwaway: &PgConn, archive: &Path) -> Result<(), Rehearsa
     Ok(())
 }
 
+/// Run `sql` and return its single value.
+pub(crate) async fn scalar(conn: &PgConn, sql: &str) -> Result<String, String> {
+    let mut query = fraisier_db::psql_command(conn, sql);
+    query.arg("-tA");
+    let outcome = run(query).await.map_err(|e| e.to_string())?;
+    if outcome.succeeded() {
+        Ok(outcome.stdout.trim().to_owned())
+    } else {
+        Err(outcome.stderr.trim().to_owned())
+    }
+}
+
 /// Drop the throwaway database `name`, connecting via a maintenance database.
+///
+/// A name without [`THROWAWAY_MARKER`] is refused before anything runs: `DROP
+/// DATABASE … WITH (FORCE)` drops any name that is a valid identifier.
 async fn teardown_named(throwaway: &PgConn, name: &str) -> Result<(), String> {
+    if !name.contains(THROWAWAY_MARKER) {
+        return Err(format!(
+            "refusing to drop '{name}': it does not carry the throwaway marker \
+             '{THROWAWAY_MARKER}'"
+        ));
+    }
     let maintenance = throwaway.with_database("postgres");
     let drop = drop_database_command(&maintenance, name).map_err(|e| e.to_string())?;
     let dropped = run(drop).await.map_err(|e| e.to_string())?;
@@ -156,10 +178,65 @@ fn temp_archive_path() -> PathBuf {
     std::env::temp_dir().join(format!("fraisier-rehearsal-{pid}-{nanos:x}.dump"))
 }
 
+#[async_trait]
+impl DrillDb for PgRehearsalDb {
+    fn live_database(&self, live_dsn: &str) -> Result<String, String> {
+        PgConn::parse(live_dsn)
+            .map(|live| live.database().to_owned())
+            .map_err(|e| format!("invalid database DSN: {e}"))
+    }
+
+    async fn table_count(&self, db: &ThrowawayDb) -> Result<u64, String> {
+        let throwaway = PgConn::parse(&db.dsn).map_err(|e| e.to_string())?;
+        let count = scalar(
+            &throwaway,
+            "SELECT count(*) FROM pg_catalog.pg_tables \
+             WHERE schemaname NOT IN ('pg_catalog', 'information_schema')",
+        )
+        .await?;
+        count
+            .parse()
+            .map_err(|_| format!("the table count was not a number: {count:?}"))
+    }
+}
+
+#[async_trait]
+impl crate::commands::DrillServer for PgRehearsalDb {
+    async fn live_bytes(&self, live_dsn: &str) -> Result<u64, String> {
+        let live = PgConn::parse(live_dsn).map_err(|e| format!("invalid database DSN: {e}"))?;
+        let size = scalar(&live, "SELECT pg_database_size(current_database())").await?;
+        size.parse()
+            .map_err(|_| format!("the database size was not a number: {size:?}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{throwaway_name, PgRehearsalDb};
-    use fraisier_core::restore_rehearsal::{BackupSource, RehearsalDb};
+    use fraisier_core::drill::DrillDb;
+    use fraisier_core::restore_rehearsal::{BackupSource, RehearsalDb, ThrowawayDb};
+
+    #[test]
+    fn the_live_database_is_the_one_its_dsn_names() {
+        assert_eq!(
+            PgRehearsalDb.live_database("postgres://app:pw@db.internal:5432/shop?sslmode=require"),
+            Ok("shop".to_owned())
+        );
+        assert!(PgRehearsalDb.live_database("not a dsn").is_err());
+    }
+
+    #[tokio::test]
+    async fn teardown_refuses_a_name_without_the_throwaway_marker() {
+        // No server is reachable here: refusing must not need one.
+        let refused = PgRehearsalDb
+            .teardown(&ThrowawayDb {
+                dsn: "postgres://app:pw@127.0.0.1:1/shop".to_owned(),
+                name: "shop".to_owned(),
+            })
+            .await
+            .expect_err("an unmarked name is never dropped");
+        assert!(refused.contains("_fraisier_rh_"), "{refused}");
+    }
 
     #[test]
     fn throwaway_name_is_a_valid_bounded_identifier() {

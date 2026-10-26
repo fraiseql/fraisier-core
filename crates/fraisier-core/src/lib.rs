@@ -38,6 +38,7 @@
 pub mod adapter_axes;
 pub mod blue_green;
 pub mod connection_budget;
+pub mod drill;
 pub mod multi_host;
 pub mod policy;
 pub mod restore_rehearsal;

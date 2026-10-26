@@ -96,6 +96,10 @@ pub struct DeployConfig {
     /// Absent keeps the single `<fraise>-<environment>.pgdump` output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<BackupSection>,
+    /// The `[drill]` section: the restore drill `fraisier backup drill` runs
+    /// against the newest archive in `[backup].dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drill: Option<DrillSection>,
     /// The `[sync]` section: the git remote the deploy ledger is shared through
     /// (experimental). Absent when state is not shared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -564,6 +568,37 @@ pub struct BackupSection {
     /// pruned on its own schedule by `fraisier backup prune`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retain: Vec<RetainEntry>,
+}
+
+/// The `[drill]` section: how `fraisier backup drill` judges the newest archive.
+///
+/// The drill restores the newest archive in `[backup].dir` into a throwaway
+/// database, migrates it, checks it, and drops it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DrillSection {
+    /// The newest archive must be younger than this. Defaults to 48.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_hours: Option<u32>,
+    /// The restored, migrated copy must hold at least this many tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_tables: Option<u64>,
+    /// The database server's data directory, when it is on this host. With it,
+    /// the drill refuses to restore unless the filesystem holding it has room
+    /// for another copy of the live database plus 2 GB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<PathBuf>,
+}
+
+impl DrillSection {
+    /// The age limit when `max_age_hours` is not declared.
+    pub const DEFAULT_MAX_AGE_HOURS: u32 = 48;
+
+    /// The declared age limit, or [`Self::DEFAULT_MAX_AGE_HOURS`].
+    #[must_use]
+    pub fn max_age_hours(&self) -> u32 {
+        self.max_age_hours.unwrap_or(Self::DEFAULT_MAX_AGE_HOURS)
+    }
 }
 
 /// One `[[backup.retain]]` entry: which archives in a directory are kept.

@@ -7,6 +7,7 @@
 //! that subcommand would read and which are unset, exiting `0`/`1`/`2` =
 //! all-set/some-unset/invalid-subcommand.
 
+use std::fmt::Write as _;
 use std::path::Path;
 use std::process::Command;
 
@@ -165,6 +166,85 @@ fn parse_version(text: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
+/// Lists the throwaway databases on the server a DSN names.
+type ListThrowaways<'a> = &'a dyn Fn(&str) -> Result<Vec<String>, String>;
+
+/// List the throwaway databases a crashed drill or restore rehearsal left behind.
+///
+/// Only a config that creates throwaways (a `[drill]`, or `preflight_mode =
+/// "restore_rehearsal"`) reaches the database for this. The check prints the
+/// command that drops each one and never runs it: a throwaway may belong to a
+/// drill or deploy that is still running.
+fn check_throwaways(config: &DeployConfig, list: ListThrowaways<'_>) -> Option<Check> {
+    use fraisier_core::single_host::PreflightMode;
+
+    let migration = config.migration.as_ref();
+    let rehearses =
+        migration.is_some_and(|m| m.effective_preflight_mode() == PreflightMode::RestoreRehearsal);
+    if config.drill.is_none() && !rehearses {
+        return None;
+    }
+    let warn = |detail: String| {
+        Some(Check {
+            name: "leftover_throwaways",
+            status: Status::Warn,
+            detail,
+        })
+    };
+    let Some(source) = migration.and_then(|m| m.database_url_env.as_deref()) else {
+        return warn("cannot list them: [migration].database_url_env is not set".to_owned());
+    };
+    let Some(dsn) = std::env::var(source).ok().filter(|dsn| !dsn.is_empty()) else {
+        return warn(format!("cannot list them: ${source} is not set"));
+    };
+    match list(&dsn) {
+        Err(error) => warn(format!(
+            "cannot list them: {}",
+            fraisier_saga::redact::credentials(&error)
+        )),
+        Ok(names) if names.is_empty() => Some(Check {
+            name: "leftover_throwaways",
+            status: Status::Pass,
+            detail: "none".to_owned(),
+        }),
+        Ok(names) => {
+            let mut detail = format!(
+                "{} throwaway database(s) left behind. Unless a drill or deploy is running, \
+                 drop each with:",
+                names.len()
+            );
+            for name in &names {
+                let _ = write!(detail, "\n    DROP DATABASE \"{name}\" WITH (FORCE);");
+            }
+            warn(detail)
+        }
+    }
+}
+
+/// The databases carrying the throwaway marker on the server `dsn` names.
+fn list_throwaways(dsn: &str) -> Result<Vec<String>, String> {
+    let conn = fraisier_db::PgConn::parse(dsn).map_err(|e| format!("invalid database DSN: {e}"))?;
+    // `_` is a LIKE wildcard, so the marker's underscores are escaped.
+    let pattern = fraisier_core::drill::THROWAWAY_MARKER.replace('_', "\\_");
+    let mut query = fraisier_db::psql_command(
+        &conn,
+        &format!("SELECT datname FROM pg_database WHERE datname LIKE '%{pattern}%' ORDER BY 1"),
+    );
+    query.arg("-tA");
+    let output = query
+        .output()
+        .map_err(|e| format!("could not run psql: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
 /// Run the doctor checks against `config_path`, optionally filtered to `only`.
 #[must_use]
 pub(crate) fn doctor(config_path: &Path, only: &[String]) -> CommandOutput {
@@ -211,6 +291,7 @@ pub(crate) fn doctor(config_path: &Path, only: &[String]) -> CommandOutput {
                 });
             }
             checks.push(check_confiture(&config));
+            checks.extend(check_throwaways(&config, &list_throwaways));
         }
     }
 
@@ -322,7 +403,7 @@ pub(crate) fn env_check(config_path: &Path, subcommand: &str) -> CommandOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{doctor, env_check, parse_version, CONFITURE_FLOOR};
+    use super::{check_throwaways, doctor, env_check, parse_version, Status, CONFITURE_FLOOR};
     use std::io::Write as _;
 
     fn write_config(body: &str) -> tempfile::NamedTempFile {
@@ -349,6 +430,109 @@ unit = "app.service"
 adapter = "http"
 url = "http://127.0.0.1/health"
 "#;
+
+    fn throwaway_config(extra: &str) -> fraisier_config::DeployConfig {
+        fraisier_config::DeployConfig::from_toml_str(&format!(
+            "[deploy]\nname = \"app\"\nenvironment = \"prod\"\n\
+             [migration]\nadapter = \"command\"\ndatabase_url_env = \"FRAISIER_DOCTOR_DSN\"\n\
+             {extra}"
+        ))
+        .expect("config")
+    }
+
+    fn with_dsn<T>(dsn: Option<&str>, run: impl FnOnce() -> T) -> T {
+        let _guard = crate::test_env::env_guard();
+        match dsn {
+            Some(dsn) => std::env::set_var("FRAISIER_DOCTOR_DSN", dsn),
+            None => std::env::remove_var("FRAISIER_DOCTOR_DSN"),
+        }
+        let out = run();
+        std::env::remove_var("FRAISIER_DOCTOR_DSN");
+        out
+    }
+
+    const DRILL: &str = "[backup]\ndir = \"/var/backups/app\"\n[drill]\n";
+
+    #[test]
+    fn a_config_that_creates_no_throwaways_never_reaches_the_database() {
+        let reached = std::cell::Cell::new(false);
+        let check = with_dsn(Some("postgres://app@db/shop"), || {
+            check_throwaways(&throwaway_config(""), &|_| {
+                reached.set(true);
+                Ok(vec![])
+            })
+        });
+        assert!(check.is_none());
+        assert!(!reached.get());
+    }
+
+    #[test]
+    fn no_leftover_throwaway_passes() {
+        let check = with_dsn(Some("postgres://app@db/shop"), || {
+            check_throwaways(&throwaway_config(DRILL), &|_| Ok(vec![]))
+        })
+        .expect("a check");
+        assert_eq!(check.status, Status::Pass, "{}", check.detail);
+    }
+
+    #[test]
+    fn a_leftover_throwaway_warns_with_the_command_that_drops_it() {
+        let name = "shop_fraisier_rh_41_1a2b";
+        let check = with_dsn(Some("postgres://app:s3cret@db/shop"), || {
+            check_throwaways(&throwaway_config(DRILL), &|_| Ok(vec![name.to_owned()]))
+        })
+        .expect("a check");
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check
+                .detail
+                .contains(&format!("DROP DATABASE \"{name}\" WITH (FORCE);")),
+            "{}",
+            check.detail
+        );
+        assert!(!check.detail.contains("s3cret"), "{}", check.detail);
+    }
+
+    #[test]
+    fn a_restore_rehearsal_preflight_is_checked_too() {
+        let config = fraisier_config::DeployConfig::from_toml_str(
+            "[deploy]\nname = \"app\"\nenvironment = \"prod\"\n\
+             [migration]\nadapter = \"command\"\ndatabase_url_env = \"FRAISIER_DOCTOR_DSN\"\n\
+             preflight_mode = \"restore_rehearsal\"\n",
+        )
+        .expect("config");
+        let check = with_dsn(Some("postgres://app@db/shop"), || {
+            check_throwaways(&config, &|_| Ok(vec![]))
+        });
+        assert!(check.is_some());
+    }
+
+    #[test]
+    fn an_unset_dsn_or_a_failed_listing_warns() {
+        let unset = with_dsn(None, || {
+            check_throwaways(&throwaway_config(DRILL), &|_| Ok(vec![]))
+        })
+        .expect("a check");
+        assert_eq!(unset.status, Status::Warn);
+        assert!(
+            unset.detail.contains("FRAISIER_DOCTOR_DSN"),
+            "{}",
+            unset.detail
+        );
+
+        let failed = with_dsn(Some("postgres://app@db/shop"), || {
+            check_throwaways(&throwaway_config(DRILL), &|_| {
+                Err("connection refused".to_owned())
+            })
+        })
+        .expect("a check");
+        assert_eq!(failed.status, Status::Warn);
+        assert!(
+            failed.detail.contains("connection refused"),
+            "{}",
+            failed.detail
+        );
+    }
 
     #[test]
     fn parse_version_reads_major_minor() {

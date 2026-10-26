@@ -96,3 +96,66 @@ A prune **warns** on stderr and still exits 0 when:
 
 Exiting non-zero here would stop the pruning, which is the one thing that might
 still help.
+
+## Restore drills
+
+An archive that has never been restored is not yet a backup. `fraisier backup
+drill` restores the newest archive in `[backup].dir` into a throwaway database,
+runs your migrations forward on it, counts its tables, and drops it:
+
+```toml
+[backup]
+dir = "/var/backups/checkout"
+
+[drill]
+max_age_hours = 48
+min_tables = 20
+data_dir = "/var/lib/postgresql"
+```
+
+| Key | Meaning |
+|---|---|
+| `max_age_hours` | Fail when the newest archive is older than this. Default 48, at least 1. A drill on a stale archive proves nothing about tonight's. |
+| `min_tables` | Fail when the restored copy holds fewer tables than this. Optional, at least 1. |
+| `data_dir` | The Postgres data directory. When set, the drill refuses unless its filesystem has room for another copy of the live database plus 2 GB. Must be absolute. |
+
+The throwaway is created on the live database's server and named
+`<database>_fraisier_rh_<pid>_<time>`.
+
+### What makes a drill fail
+
+Before anything is created, a drill fails when:
+
+- the config is invalid, or `[backup].dir` is unset;
+- there is no archive of this deployable in the directory;
+- the newest archive does not read back with `pg_restore --list`;
+- the newest archive is older than `max_age_hours`;
+- `data_dir` is set, and its filesystem lacks the room, or the room could not
+  be measured.
+
+After restoring, a drill fails when the migrations fail on the copy, or when it
+holds fewer than `min_tables` tables. The copy is dropped either way.
+
+### The teardown guard
+
+A drill drops only a database whose name carries `_fraisier_rh_` and differs
+from the live database's name. If either check fails, the drill stops before
+migrating and leaves the database in place.
+
+If the drop itself fails, the drill reports a warning naming the database.
+`fraisier doctor` then lists it among any other leftover `_fraisier_rh_*`
+databases. Doctor prints the command that drops each one and never runs it,
+because a database it lists may belong to a drill or deploy that is still
+running. Doctor connects to the database for this only when the config has a
+`[drill]` or `preflight_mode = "restore_rehearsal"`.
+
+### The receipt
+
+Every drill that gets past loading the config writes
+`<state-dir>/drills/<fraise>-<environment>.json`, replacing the previous one.
+It records:
+
+- the archive and when it was taken;
+- `ok`;
+- on success, the throwaway's name, the migrations applied, and the table count;
+- on failure, the failed step and the error, with any credentials redacted.

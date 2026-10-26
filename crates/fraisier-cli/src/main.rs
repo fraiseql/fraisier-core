@@ -489,6 +489,20 @@ enum BackupCommand {
     /// Remove archives by each `[[backup.retain]]` policy. A dry run unless
     /// `--apply` is given.
     Prune(BackupPruneArgs),
+    /// Restore the newest archive into a throwaway database, migrate it, check
+    /// it, and drop it.
+    Drill(BackupDrillArgs),
+}
+
+#[derive(Debug, Args)]
+struct BackupDrillArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// The state store directory; the drill's receipt goes in its `drills/`.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -805,6 +819,10 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
             }
             Ok(run.output)
         }
+        Command::Backup(BackupCli {
+            command: Some(BackupCommand::Drill(args)),
+            ..
+        }) => commands::backup_drill(&args.config, &args.state_dir).await,
         Command::Backup(BackupCli {
             command: None,
             backup: args,

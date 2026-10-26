@@ -848,6 +848,9 @@ impl RolloutShared {
 
     /// Roll the single shared-database migration back to the pre-deploy revision.
     async fn undo_migrate(&self, runtime: &RolloutRuntime) -> Result<(), SagaError> {
+        if !self.migration.owns_database() {
+            return Ok(());
+        }
         match runtime.previous_revision.clone() {
             Some(target) => self
                 .migration

@@ -24,6 +24,7 @@ use fraisier_core::adapter_axes::{
     AdapterCtx, ArtifactAdapter, HealthAdapter, HostId, LbAdapter, MigrationAdapter, ServiceAdapter,
 };
 use fraisier_core::multi_host::{MultiHostPlan, RolloutStrategy};
+use fraisier_core::no_database::NoDatabase;
 use fraisier_core::policy::{ApprovalHook, PolicyGate};
 use fraisier_core::restore_rehearsal::{BackupSource, RehearsalDb};
 use fraisier_core::single_host::PreflightMode;
@@ -460,6 +461,7 @@ fn put_path(map: &mut BTreeMap<String, Value>, key: &str, value: Option<&std::pa
 
 fn render_migration(config: &DeployConfig) -> String {
     match config.migration.as_ref().and_then(|m| m.adapter.as_deref()) {
+        Some(fraisier_core::no_database::ADAPTER_NAME) => "none (no database)".to_owned(),
         Some(name @ ("confiture" | "command")) => format!("{name} (in-process)"),
         Some(name) => format!("{name} (IPC: fraisier-adapter-{name})"),
         None => "<none>".to_owned(),
@@ -1067,6 +1069,7 @@ fn build_migration(
         .and_then(|m| m.adapter.as_deref())
         .context("[migration].adapter is required")?;
     match name {
+        fraisier_core::no_database::ADAPTER_NAME => Ok(Arc::new(NoDatabase)),
         "confiture" => {
             // In-process: map the logical secret to its source env var name.
             if let Some(source) = database_url_env {
@@ -1459,6 +1462,19 @@ mod tests {
              [service]\nadapter = \"systemd\"\nunit = \"app.service\"\n\n\
              [health]\nadapter = \"http\"\nurl = \"http://127.0.0.1/health\"\n"
         )
+    }
+
+    #[test]
+    fn a_database_less_axis_builds_the_no_database_adapter() {
+        let toml = single_host_with_migration("").replace(
+            "adapter = \"confiture\"\ndatabase_url_env = \"APP_DATABASE_URL\"",
+            "adapter = \"none\"",
+        );
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+        let resolved = build(&config, None, None).expect("builds");
+        assert!(!resolved.migration.owns_database());
+        let summary = summarize(&config, None, None).expect("summarize");
+        assert_eq!(summary.migration, "none (no database)");
     }
 
     #[test]

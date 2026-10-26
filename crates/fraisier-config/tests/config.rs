@@ -788,12 +788,55 @@ fn has_error(report: &fraisier_config::ValidationReport, path: &str) -> bool {
 
 #[test]
 fn schedule_backup_with_native_calendar_validates_clean() {
+    let toml = format!(
+        "{SCHEDULE_BASE}\n[backup]\ndir = \"/var/backups/checkout\"\n\
+         [schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(report.ok(), "backup + native calendar is valid: {report}");
+}
+
+#[test]
+fn a_scheduled_backup_requires_a_backup_dir() {
+    // Without one, every run writes the same file in the unit's working
+    // directory and fails from the second run on (#87).
     let toml =
         format!("{SCHEDULE_BASE}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
     let report = DeployConfig::from_toml_str(&toml)
         .expect("parses")
         .validate();
-    assert!(report.ok(), "backup + native calendar is valid: {report}");
+    assert!(has_error(&report, "backup.dir"), "{report}");
+}
+
+#[test]
+fn the_backup_dir_must_be_absolute() {
+    let toml = format!("{SCHEDULE_BASE}\n[backup]\ndir = \"backups\"\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "backup.dir"), "{report}");
+}
+
+#[test]
+fn a_backup_section_without_a_dir_is_an_error() {
+    let toml = format!("{SCHEDULE_BASE}\n[backup]\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "backup.dir"), "{report}");
+}
+
+#[test]
+fn an_absolute_backup_dir_validates_clean() {
+    let toml = format!("{SCHEDULE_BASE}\n[backup]\ndir = \"/var/backups/checkout\"\n");
+    let config = DeployConfig::from_toml_str(&toml).expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    assert_eq!(
+        config.backup.and_then(|backup| backup.dir),
+        Some(std::path::PathBuf::from("/var/backups/checkout"))
+    );
 }
 
 #[test]
@@ -1353,4 +1396,55 @@ fn no_policy_section_means_no_policy_at_all() {
     let cfg = DeployConfig::from_toml_str(PRD_7_1).expect("parses");
     assert!(cfg.policy.is_none());
     assert!(cfg.validate().ok(), "{}", cfg.validate());
+}
+
+fn database_less(extra: &str) -> String {
+    format!(
+        r#"
+[deploy]
+name = "gateway"
+environment = "production"
+[artifact]
+source = "local"
+path = "/srv/gateway"
+[migration]
+adapter = "none"
+{extra}
+[service]
+adapter = "systemd"
+unit = "gateway.service"
+[health]
+adapter = "http"
+url = "http://127.0.0.1/readiness"
+"#
+    )
+}
+
+/// `adapter = "none"` declares a deployable that owns no database.
+#[test]
+fn a_database_less_migration_axis_validates() {
+    let cfg = DeployConfig::from_toml_str(&database_less("")).expect("parses");
+    let report = cfg.validate();
+    assert!(report.ok(), "got {:?}", report.issues);
+}
+
+/// A database-less axis takes no DSN and no settings: either one means the
+/// config believes there is a database after all.
+#[test]
+fn a_database_less_axis_refuses_a_dsn_or_settings() {
+    for (extra, path) in [
+        ("database_url_env = \"X_DB\"", "migration.database_url_env"),
+        ("[migration.settings]\nup = \"true\"", "migration.settings"),
+    ] {
+        let cfg = DeployConfig::from_toml_str(&database_less(extra)).expect("parses");
+        let report = cfg.validate();
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.path == path && i.severity == Severity::Error),
+            "expected an error at {path}, got {:?}",
+            report.issues
+        );
+    }
 }

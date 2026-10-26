@@ -1,6 +1,8 @@
 [toolchain]
-# "stable" is 1.95.0 in this environment and already installed; the MSRV floor is
-# enforced separately via `rust-version` in the workspace manifest.
-channel = "stable"
+# Pinned to an exact release so a new stable cannot turn an untouched tree red.
+# The workspace `rust-version` is this pin's X.Y (the MSRV is the version the gate
+# builds with); `cargo xtask toolchain` enforces both. To bump: change both in one
+# PR that also carries any new lint fixes, and run `cargo xtask ci`.
+channel = "1.99.0"
 components = ["clippy", "rustfmt"]
 profile = "minimal"

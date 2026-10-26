@@ -2,7 +2,7 @@
 name = "fraisier-training-app"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.95"
+rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 publish = false
 description = "Tiny DB-backed app used to exercise the real fraisier deploy pipeline (Confiture + Postgres) end-to-end. Test scaffolding, not shipped."

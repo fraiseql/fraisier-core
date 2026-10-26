@@ -3,8 +3,9 @@
 //! `cargo xtask ci` runs the exact checks CI runs, so "green locally" and "green
 //! in CI" are the *same command* rather than two lists that drift apart. CI
 //! invokes `cargo xtask ci` too, which makes the parity structural. Each check is
-//! also runnable on its own (`cargo xtask fmt` / `lint` / `doc` / `test` / `deny`
-//! / `shellcheck`), and `cargo xtask dist` cross-builds the static musl binary.
+//! also runnable on its own (`cargo xtask toolchain` / `fmt` / `lint` / `doc` /
+//! `test` / `deny` / `shellcheck`), and `cargo xtask dist` cross-builds the static
+//! musl binary.
 //!
 //! This crate deliberately has **zero dependencies** (std only): the task runner
 //! that guards the supply chain must not add to it, and a dependency-free tool
@@ -22,6 +23,7 @@ fn main() -> ExitCode {
 
     let result = match task.as_str() {
         "ci" => ci(),
+        "toolchain" => toolchain(),
         "fmt" => fmt(),
         "lint" => lint(),
         "doc" => doc(),
@@ -49,6 +51,7 @@ fn main() -> ExitCode {
 
 /// The full gate, in the order CI runs it. Fails fast on the first broken check.
 fn ci() -> Result<(), String> {
+    toolchain()?;
     fmt()?;
     lint()?;
     doc()?;
@@ -58,6 +61,66 @@ fn ci() -> Result<(), String> {
     shellcheck()?;
     println!("\n\x1b[1;32m✓ all gate checks passed\x1b[0m");
     Ok(())
+}
+
+/// The toolchain is pinned to an exact release, and the MSRV is that release.
+///
+/// A floating `channel = "stable"` let Rust 1.99's new clippy lints turn an
+/// untouched `main` red (#80). An exact pin moves only in a commit that carries
+/// its own lint fixes. The MSRV is the pinned version because that is the only
+/// version the gate ever builds with: a lower `rust-version` would be a claim
+/// nothing tests.
+fn toolchain() -> Result<(), String> {
+    let read = |path: &str| {
+        std::fs::read_to_string(path).map_err(|error| format!("reading {path}: {error}"))
+    };
+    let channel = toml_string(&read("rust-toolchain.toml")?, "channel")
+        .ok_or("rust-toolchain.toml has no `channel = \"…\"` line")?;
+    let rust_version = toml_string(&read("Cargo.toml")?, "rust-version")
+        .ok_or("Cargo.toml has no `rust-version = \"…\"` line")?;
+    check_toolchain(&channel, &rust_version)?;
+    println!("\x1b[1;36m$ toolchain pinned to {channel}, rust-version {rust_version}\x1b[0m");
+    Ok(())
+}
+
+/// `channel` must be an exact `X.Y.Z`, and `rust-version` must be its `X.Y`.
+fn check_toolchain(channel: &str, rust_version: &str) -> Result<(), String> {
+    let parts: Vec<&str> = channel.split('.').collect();
+    let exact = parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    if !exact {
+        return Err(format!(
+            "rust-toolchain.toml pins `channel = \"{channel}\"`, which floats; pin an exact \
+             release such as \"1.99.0\""
+        ));
+    }
+    let floor = format!("{}.{}", parts[0], parts[1]);
+    if rust_version != floor {
+        return Err(format!(
+            "Cargo.toml declares `rust-version = \"{rust_version}\"` but the toolchain is \
+             {channel}; bump them together (`rust-version = \"{floor}\"`)"
+        ));
+    }
+    Ok(())
+}
+
+/// The quoted value of the first `key = "value"` line, ignoring comments.
+///
+/// A line scan rather than a TOML parser keeps this crate dependency-free; both
+/// files hold the key once, on its own line.
+fn toml_string(text: &str, key: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let (name, value) = line.split_once('=')?;
+        if name.trim() != key {
+            return None;
+        }
+        let value = value.trim();
+        let inner = value.strip_prefix('"')?;
+        let end = inner.find('"')?;
+        Some(inner[..end].to_owned())
+    })
 }
 
 fn fmt() -> Result<(), String> {
@@ -229,12 +292,58 @@ fn usage() {
     println!(
         "cargo xtask <task>\n\n\
          tasks:\n  \
-         ci          the full gate: fmt + clippy + doc + test + release build + deny + shellcheck\n  \
+         ci          the full gate: toolchain + fmt + clippy + doc + test + release build + deny + shellcheck\n  \
+         toolchain   rust-toolchain.toml pins an exact X.Y.Z; rust-version is its X.Y\n  \
          fmt         cargo fmt --all -- --check\n  \
-         lint        cargo clippy --all-targets --all-features -- -D warnings\n           doc         RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --all-features\n  \
+         lint        cargo clippy --all-targets --all-features -- -D warnings\n  \
+         doc         RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --all-features\n  \
          test        cargo test --workspace --all-features\n  \
          deny        cargo deny check\n  \
          shellcheck  shellcheck scripts/*.sh\n  \
          dist        cross-build the static musl `fraisier` binary (cargo-zigbuild)"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_toolchain, toml_string};
+
+    #[test]
+    fn a_floating_channel_is_refused() {
+        assert!(check_toolchain("stable", "1.99").is_err());
+    }
+
+    #[test]
+    fn a_minor_only_channel_is_refused() {
+        assert!(check_toolchain("1.99", "1.99").is_err());
+    }
+
+    #[test]
+    fn a_dated_nightly_is_refused() {
+        assert!(check_toolchain("nightly-2026-09-25", "1.99").is_err());
+    }
+
+    #[test]
+    fn an_exact_channel_matching_rust_version_is_accepted() {
+        assert_eq!(check_toolchain("1.99.0", "1.99"), Ok(()));
+    }
+
+    #[test]
+    fn a_rust_version_below_the_pin_is_refused() {
+        assert!(check_toolchain("1.99.0", "1.95").is_err());
+    }
+
+    #[test]
+    fn the_value_is_read_past_comments_and_spacing() {
+        let text = "[toolchain]\n# channel = \"stable\"\nchannel   =  \"1.99.0\" # pinned\n";
+        assert_eq!(toml_string(text, "channel").as_deref(), Some("1.99.0"));
+    }
+
+    #[test]
+    fn a_similarly_named_key_does_not_match() {
+        assert_eq!(
+            toml_string("rust-version-x = \"1\"\n", "rust-version"),
+            None
+        );
+    }
 }

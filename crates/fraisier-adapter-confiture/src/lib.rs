@@ -890,11 +890,17 @@ fn preflight_issue_from(issue: &Value) -> PreflightIssue {
     }
 }
 
-/// Parse the version out of `confiture --version` output (`confiture version X`).
+/// Parse the version out of `confiture --version` output: the token after
+/// `confiture version` on its own line.
+///
+/// Since 0.50.0 the output has more lines after that one (`parser: …`, then
+/// `native extension: …`), so the last token is not the version. Output with no
+/// such line reads as `unknown`, which no capability floor admits.
 fn parse_version(output: &str) -> String {
     output
-        .split_whitespace()
-        .last()
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("confiture version "))
+        .and_then(|rest| rest.split_whitespace().next())
         .unwrap_or("unknown")
         .to_owned()
 }
@@ -1284,7 +1290,7 @@ mod tests {
 
         // A confiture that implements the contract and found nothing to change.
         let classified = parse_change_set(&fixture("v1-empty")).expect("v1-empty is classified");
-        assert!(classified.changes.is_empty());
+        assert_eq!(classified.changes, Vec::new());
         assert_eq!(classified.contract_version, 1);
     }
 
@@ -1406,7 +1412,7 @@ mod tests {
             &serde_json::json!({ "contract_version": 1 }),
         ))
         .expect("an absent `changes` is an empty one");
-        assert!(absent.changes.is_empty());
+        assert_eq!(absent.changes, Vec::new());
     }
 
     /// A version from the future is *not* swallowed here. The adapter's job is
@@ -2322,9 +2328,31 @@ mod tests {
     }
 
     #[test]
-    fn version_is_the_last_token() {
+    fn version_is_read_off_the_confiture_version_line() {
         assert_eq!(parse_version("confiture version 0.20.0"), "0.20.0");
         assert_eq!(parse_version("confiture version 0.20.0\n"), "0.20.0");
+    }
+
+    /// `confiture --version` has printed more than one line since 0.50.0
+    /// (`parser:`), and since 0.53.0 it ends `native extension: yes`. Reading
+    /// the last token made every such binary version `yes`, so `window_safe`,
+    /// `risk_tier` and `deep_classification` were withheld from all of them.
+    #[test]
+    fn a_multi_line_version_reports_the_release() {
+        // Verbatim from confiture 1.36.0.
+        let current = "confiture version 1.36.0\nparser: pglast 8.5 (PostgreSQL 18 grammar)\n\
+                       native extension: yes\n";
+        assert_eq!(parse_version(current), "1.36.0");
+        assert!(supports_risk_tier(&parse_version(current)));
+        // The two-line shape 0.50.0 introduced (`parser_line()` at that tag).
+        let first = "confiture version 0.50.0\nparser: pglast 7.2 (PostgreSQL 17 grammar)\n";
+        assert_eq!(parse_version(first), "0.50.0");
+    }
+
+    #[test]
+    fn output_without_a_version_line_reads_as_unknown() {
+        assert_eq!(parse_version("native extension: yes"), "unknown");
+        assert_eq!(parse_version(""), "unknown");
     }
 
     #[test]

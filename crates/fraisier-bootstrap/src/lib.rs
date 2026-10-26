@@ -110,8 +110,8 @@ mod tests {
 
     #[test]
     fn deploy_dirs_is_empty_when_nothing_is_configured() {
-        assert!(deploy_dirs(None, None).is_empty());
-        assert!(deploy_dirs(Some(""), Some("")).is_empty());
+        assert_eq!(deploy_dirs(None, None), Vec::<String>::new());
+        assert_eq!(deploy_dirs(Some(""), Some("")), Vec::<String>::new());
     }
 
     #[test]

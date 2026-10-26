@@ -690,6 +690,9 @@ impl DeployShared {
     }
 
     async fn undo_migrate(&self, runtime: &DeployRuntime) -> Result<(), SagaError> {
+        if !self.migration.owns_database() {
+            return Ok(());
+        }
         let Some(previous) = runtime.previous_revision.clone() else {
             return Err(SagaError::StepFailed {
                 step: "migrate".to_owned(),
@@ -1938,6 +1941,53 @@ mod tests {
         assert!(
             matches!(outcome, SagaOutcome::PartialRollback { .. }),
             "a first-deploy rollback with no prior release is a PartialRollback, got {outcome:?}"
+        );
+    }
+
+    fn database_less(trail: &Trail, healthy: bool) -> SingleHostDeploy {
+        SingleHostDeploy::builder("checkout", "production", HostId::new("localhost"))
+            .artifact(Arc::new(FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            }))
+            .migration(Arc::new(crate::no_database::NoDatabase))
+            .service(Arc::new(FakeService {
+                trail: trail.clone(),
+                fail_restarts: Arc::new(Mutex::new(0)),
+            }))
+            .health(Arc::new(FakeHealth {
+                trail: trail.clone(),
+                healthy,
+            }))
+            .build()
+            .expect("all adapters provided")
+    }
+
+    #[tokio::test]
+    async fn a_database_less_deploy_commits() {
+        let (_dir, store) = store();
+        seed_prior(&store).await;
+        let outcome = database_less(&Trail::default(), true)
+            .run(store)
+            .await
+            .expect("run completes");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_database_less_deploy_rolls_back_without_a_revision() {
+        // `adapter = "none"`: nothing was migrated, so the failed health check
+        // re-activates the prior release and the saga ends RolledBack, not
+        // PartialRollback for want of a revision to return to.
+        let (_dir, store) = store();
+        seed_prior(&store).await;
+        let outcome = database_less(&Trail::default(), false)
+            .run(store)
+            .await
+            .expect("run completes");
+        assert!(
+            matches!(&outcome, SagaOutcome::RolledBack { failed_step, .. } if failed_step == "health"),
+            "got {outcome:?}"
         );
     }
 

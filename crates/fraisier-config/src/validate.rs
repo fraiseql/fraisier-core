@@ -133,6 +133,7 @@ impl DeployConfig {
         validate_webhook(self, &mut report);
         validate_schedule(self, &mut report);
         validate_database(self, &mut report);
+        validate_backup(self, &mut report);
         validate_sync(self, &mut report);
         validate_blue_green(self, &mut report);
         validate_checks(self, &mut report);
@@ -414,6 +415,22 @@ fn validate_migration(cfg: &DeployConfig, report: &mut ValidationReport) {
              (the name of the env var holding the database DSN)",
         );
     }
+    // `none` declares a deployable that owns no database; a DSN or settings
+    // beside it contradict that.
+    if adapter == Some("none") {
+        if is_set(migration.database_url_env.as_ref()) {
+            report.error(
+                "migration.database_url_env",
+                "adapter = \"none\" declares no database; remove database_url_env",
+            );
+        }
+        if !migration.settings.is_empty() {
+            report.error(
+                "migration.settings",
+                "adapter = \"none\" takes no settings; remove [migration.settings]",
+            );
+        }
+    }
     if migration.forward_compatible_lint == Some(true) && adapter == Some("command") {
         report.warn(
             "migration.forward_compatible_lint",
@@ -511,6 +528,9 @@ fn validate_health(cfg: &DeployConfig, report: &mut ValidationReport) {
             );
         }
     }
+    if let Some(required) = &health.require_capabilities {
+        validate_require_capabilities(health.adapter.as_deref(), required, report);
+    }
     if let Some(provider) = &health.token_provider {
         // A token provider only makes sense injecting a header into the http probe.
         if health.adapter.as_deref() != Some("http") {
@@ -527,6 +547,38 @@ fn validate_health(cfg: &DeployConfig, report: &mut ValidationReport) {
             provider.validate_against_headers(health.headers.keys().map(String::as_str))
         {
             report.error("health.token_provider.header", error.to_string());
+        }
+    }
+}
+
+fn validate_require_capabilities(
+    adapter: Option<&str>,
+    required: &[String],
+    report: &mut ValidationReport,
+) {
+    const PATH: &str = "health.require_capabilities";
+    if adapter != Some("http") {
+        report.error(
+            PATH,
+            "require_capabilities applies only to the http adapter (it reads the \
+             /health body)",
+        );
+    }
+    if required.is_empty() {
+        report.error(
+            PATH,
+            "require_capabilities is empty; list a capability or remove the key",
+        );
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for name in required {
+        if name.trim().is_empty() {
+            report.error(PATH, "require_capabilities contains a blank name");
+        } else if !seen.insert(name.as_str()) {
+            report.error(
+                PATH,
+                format!("require_capabilities lists '{name}' more than once"),
+            );
         }
     }
 }
@@ -805,6 +857,34 @@ fn validate_tviews_gate(database: &crate::DatabaseSection, report: &mut Validati
                 ),
             );
         }
+    }
+}
+
+fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let dir = cfg.backup.as_ref().and_then(|backup| backup.dir.as_deref());
+    let scheduled = cfg
+        .schedule
+        .as_ref()
+        .is_some_and(|schedule| schedule.command.as_deref() == Some("backup"));
+    match dir {
+        Some(dir) if !dir.is_absolute() => report.error(
+            "backup.dir",
+            format!(
+                "backup.dir must be an absolute path, not '{}' (a scheduled unit runs \
+                 from /, so a relative one moves with the working directory)",
+                dir.display()
+            ),
+        ),
+        None if cfg.backup.is_some() => report.error(
+            "backup.dir",
+            "the [backup] section requires dir (the directory archives are written to)",
+        ),
+        None if scheduled => report.error(
+            "backup.dir",
+            "a scheduled backup requires [backup].dir: without it every run writes the \
+             same file and fails from the second run on",
+        ),
+        _ => {}
     }
 }
 

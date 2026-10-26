@@ -2032,12 +2032,33 @@ fn db_config_error(error: &anyhow::Error) -> CommandOutput {
 
 /// `backup`: dump the database to a custom-format archive with `pg_dump -Fc`.
 ///
-/// Non-destructive, but refuses to clobber an existing archive unless `force` is
-/// set. The output path defaults to `<fraise>-<environment>.pgdump`.
+/// With `[backup].dir` set and no `output`, each run writes a new timestamped
+/// archive into that directory, atomically and after checking it (see
+/// [`fraisier_db::archive::write_archive`]); nothing there is ever overwritten.
+/// Otherwise it writes `output`, defaulting to `<fraise>-<environment>.pgdump`,
+/// and refuses to clobber an existing file unless `force` is set.
 pub(crate) async fn db_backup(
     config_path: &Path,
     output: Option<&Path>,
     force: bool,
+) -> Result<CommandOutput> {
+    db_backup_with(
+        config_path,
+        output,
+        force,
+        &fraisier_db::archive::ArchiveTools::default(),
+        std::time::SystemTime::now(),
+    )
+    .await
+}
+
+/// [`db_backup`] with the database tools and the clock supplied by the caller.
+async fn db_backup_with(
+    config_path: &Path,
+    output: Option<&Path>,
+    force: bool,
+    tools: &fraisier_db::archive::ArchiveTools,
+    now: std::time::SystemTime,
 ) -> Result<CommandOutput> {
     let config = load(config_path)?;
     if let Some(refusal) = refuse_invalid_db_config(&config, "back up") {
@@ -2051,6 +2072,21 @@ pub(crate) async fn db_backup(
     let deploy = config.deploy.as_ref().context("[deploy] section")?;
     let fraise = deploy.name.clone().unwrap_or_default();
     let environment = deploy.environment.clone().unwrap_or_default();
+    if output.is_none() {
+        if let Some(dir) = config.backup.as_ref().and_then(|b| b.dir.as_deref()) {
+            let stamp = fraisier_db::archive::UtcStamp::from_system_time(now);
+            let written = fraisier_db::archive::write_archive(
+                &conn,
+                dir,
+                &fraise,
+                &environment,
+                &stamp,
+                tools,
+            )
+            .await;
+            return Ok(archive_backup_output(&conn, written));
+        }
+    }
     let default_path = PathBuf::from(format!("{fraise}-{environment}.pgdump"));
     let out_path: &Path = output.unwrap_or(&default_path);
 
@@ -2080,6 +2116,41 @@ pub(crate) async fn db_backup(
             pretty: format!("pg_dump failed:\n{}\n", outcome.stderr.trim()),
             json: json!({ "ok": false, "stderr": outcome.stderr.trim() }),
         })
+    }
+}
+
+/// The [`CommandOutput`] for a backup into `[backup].dir`.
+fn archive_backup_output(
+    conn: &fraisier_db::PgConn,
+    written: Result<fraisier_db::archive::WrittenArchive, fraisier_db::archive::ArchiveError>,
+) -> CommandOutput {
+    match written {
+        Ok(written) => {
+            let path = written.archive.path.display().to_string();
+            let mut pretty = format!(
+                "backed up {} → {path} ({} bytes)\n",
+                conn.redacted(),
+                written.bytes
+            );
+            for warning in &written.warnings {
+                let _ = writeln!(pretty, "warning: {warning}");
+            }
+            CommandOutput {
+                exit_code: 0,
+                pretty,
+                json: json!({
+                    "ok": true,
+                    "output": path,
+                    "bytes": written.bytes,
+                    "warnings": written.warnings,
+                }),
+            }
+        }
+        Err(error) => CommandOutput {
+            exit_code: 1,
+            pretty: format!("backup failed: {error}\n"),
+            json: json!({ "ok": false, "wrote": false, "error": error.to_string() }),
+        },
     }
 }
 
@@ -4519,6 +4590,155 @@ current_revision = "true"
         assert_eq!(std::fs::read(&existing).expect("read"), b"old archive");
     }
 
+    /// A fake `pg_dump` (writes 1000 bytes to the `-f` path, or exits 1 when a
+    /// `fail` file sits beside the backup directory) and a fake `pg_restore`
+    /// that lists any archive. Written once per process, never rewritten, so no
+    /// sibling fork can hold them open for writing when they are exec'd.
+    fn fake_pg_tools() -> &'static fraisier_db::archive::ArchiveTools {
+        use std::os::unix::fs::PermissionsExt;
+        static TOOLS: std::sync::OnceLock<fraisier_db::archive::ArchiveTools> =
+            std::sync::OnceLock::new();
+        TOOLS.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("fraisier-cli-pg-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let write = |name: &str, body: &str| {
+                let path = dir.join(name);
+                // `--probe` (the burn-in below) exits before the body touches any file.
+                std::fs::write(&path, format!("#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\n{body}"))
+                    .expect("write fake");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+                for _ in 0..200 {
+                    match std::process::Command::new(&path).arg("--probe").output() {
+                        Ok(_) => return path,
+                        Err(error) if error.raw_os_error() == Some(26) => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("fake is not executable: {error}"),
+                    }
+                }
+                panic!("fake stayed ETXTBSY");
+            };
+            fraisier_db::archive::ArchiveTools {
+                pg_dump: write(
+                    "pg_dump",
+                    "head -c 1000 /dev/zero > \"$4\"\n\
+                     [ -e \"$(dirname \"$4\")/../fail\" ] && { echo 'pg_dump: boom' >&2; exit 1; }\n\
+                     exit 0\n",
+                ),
+                pg_restore: write("pg_restore", "exit 0\n"),
+            }
+        })
+    }
+
+    /// A db-ops config whose `[backup].dir` is `<dir>/backups`.
+    fn db_backup_dir_config(dir: &Path, dsn_env: &str) -> std::path::PathBuf {
+        let backups = dir.join("backups");
+        std::fs::create_dir(&backups).expect("mkdir backups");
+        write(
+            dir,
+            "fraisier.toml",
+            &format!(
+                "{}\n[backup]\ndir = \"{}\"\n",
+                db_ops_config(dsn_env),
+                backups.display()
+            ),
+        )
+    }
+
+    fn archive_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .into_string()
+                    .expect("utf-8")
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_backup_with_a_backup_dir_succeeds_on_every_run() {
+        // #87: the scheduled unit passes no --output and no --force, and must
+        // succeed on its second run as on its first.
+        let _guard = crate::test_env::env_guard();
+        let var = "FRAISIER_DBOPS_BACKUP_DIR";
+        std::env::set_var(var, "postgres://app:s3cret@dbhost/shop");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = db_backup_dir_config(dir.path(), var);
+        let day = std::time::Duration::from_hours(24);
+        let first = std::time::UNIX_EPOCH + std::time::Duration::from_mins(29_883_075);
+        let runs: Vec<super::CommandOutput> = [first, first + day]
+            .into_iter()
+            .map(|now| {
+                block_on(super::db_backup_with(
+                    &config,
+                    None,
+                    false,
+                    fake_pg_tools(),
+                    now,
+                ))
+                .expect("run")
+            })
+            .collect();
+        std::env::remove_var(var);
+
+        for out in &runs {
+            assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+            assert!(!out.pretty.contains("s3cret"), "{}", out.pretty);
+        }
+        assert_eq!(
+            archive_names(&dir.path().join("backups")),
+            [
+                "demo-test-20261026T031500Z.pgdump",
+                "demo-test-20261027T031500Z.pgdump"
+            ]
+        );
+        assert_eq!(
+            runs[1].json["output"],
+            serde_json::json!(dir
+                .path()
+                .join("backups/demo-test-20261027T031500Z.pgdump")
+                .display()
+                .to_string())
+        );
+    }
+
+    #[test]
+    fn a_failed_backup_into_a_backup_dir_exits_1_and_keeps_the_earlier_archive() {
+        let _guard = crate::test_env::env_guard();
+        let var = "FRAISIER_DBOPS_BACKUP_DIR_FAIL";
+        std::env::set_var(var, "postgres://app@dbhost/shop");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = db_backup_dir_config(dir.path(), var);
+        let earlier = dir.path().join("backups/demo-test-20261025T031500Z.pgdump");
+        std::fs::write(&earlier, vec![b'g'; 1_000]).expect("seed");
+        std::fs::write(dir.path().join("fail"), b"").expect("arm failure");
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_mins(29_883_075);
+        let out = block_on(super::db_backup_with(
+            &config,
+            None,
+            false,
+            fake_pg_tools(),
+            now,
+        ))
+        .expect("run");
+        std::env::remove_var(var);
+
+        assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
+        assert_eq!(out.json["ok"], serde_json::json!(false));
+        assert!(out.pretty.contains("boom"), "{}", out.pretty);
+        assert_eq!(
+            archive_names(&dir.path().join("backups")),
+            ["demo-test-20261025T031500Z.pgdump"]
+        );
+        assert_eq!(std::fs::read(&earlier).expect("read"), vec![b'g'; 1_000]);
+    }
+
     #[test]
     fn db_ops_error_when_the_dsn_env_is_unset() {
         let _guard = crate::test_env::env_guard();
@@ -4849,7 +5069,7 @@ current_revision = "true"
     fn scheduled_install_plans_then_installs_a_timer_and_service() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg =
-            format!("{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+            format!("{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
 
@@ -4906,7 +5126,7 @@ current_revision = "true"
     fn scheduled_install_list_uninstall_round_trips_clean() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg =
-            format!("{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+            format!("{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
 
@@ -4933,7 +5153,7 @@ current_revision = "true"
     fn scheduled_install_fails_closed_on_drift_then_force_overwrites() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg =
-            format!("{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+            format!("{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
         scheduled_install(&config, &root, true, false, false, false).expect("install");
@@ -4962,7 +5182,7 @@ current_revision = "true"
     fn scheduled_install_prune_removes_orphan_marker_units() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg =
-            format!("{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+            format!("{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
         scheduled_install(&config, &root, true, false, false, false).expect("install");

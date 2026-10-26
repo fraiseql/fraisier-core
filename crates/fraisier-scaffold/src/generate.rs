@@ -134,6 +134,23 @@ pub fn generate_scheduled(config: &DeployConfig) -> Result<Vec<GeneratedFile>, S
         "command",
     )?;
     let on_calendar = resolve_on_calendar(schedule)?;
+    let notes = if command == "backup" {
+        let dir = config
+            .backup
+            .as_ref()
+            .and_then(|backup| backup.dir.as_deref())
+            .ok_or(ScaffoldError::MissingField {
+                section: "backup",
+                field: "dir",
+            })?;
+        format!(
+            "# Each run writes a new timestamped archive into [backup].dir\n\
+             # ({}), so no run overwrites an earlier one.\n",
+            dir.display()
+        )
+    } else {
+        String::new()
+    };
     let config_path = schedule.and_then(|s| s.config_path.as_deref()).map_or_else(
         || format!("/etc/fraisier/{name}.toml"),
         |p| p.display().to_string(),
@@ -150,7 +167,8 @@ pub fn generate_scheduled(config: &DeployConfig) -> Result<Vec<GeneratedFile>, S
             .replace("{environment}", &environment)
             .replace("{command}", &command)
             .replace("{config_path}", &config_path)
-            .replace("{env_file}", &env_file),
+            .replace("{env_file}", &env_file)
+            .replace("{notes}", &notes),
     );
     let timer = with_header(
         &SCHEDULED_TIMER
@@ -360,7 +378,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 # Runs fraisier on the host; edit --config / add flags as needed.
-ExecStart=fraisier {command} --config {config_path}
+{notes}ExecStart=fraisier {command} --config {config_path}
 EnvironmentFile=-{env_file}
 ";
 
@@ -549,8 +567,9 @@ upstream = "checkout_upstream"
     #[test]
     fn generate_scheduled_produces_a_timer_and_oneshot_service() {
         // Native `calendar` is translated to OnCalendar=; `command` is explicit.
-        let toml =
-            format!("{MULTI}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+        let toml = format!(
+            "{MULTI}{BACKUP_DIR}[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n"
+        );
         let cfg = DeployConfig::from_toml_str(&toml).expect("parse");
         let files = generate_scheduled(&cfg).expect("generate");
         assert_eq!(files.len(), 2, "timer + service: {files:?}");
@@ -587,6 +606,47 @@ upstream = "checkout_upstream"
         );
     }
 
+    /// The `[backup]` section a scheduled backup needs.
+    const BACKUP_DIR: &str = "\n[backup]\ndir = \"/var/backups/checkout\"\n\n";
+
+    #[test]
+    fn a_scheduled_backup_service_is_exactly_this_unit() {
+        let toml = format!(
+            "{MULTI}{BACKUP_DIR}[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n"
+        );
+        let cfg = DeployConfig::from_toml_str(&toml).expect("parse");
+        let files = generate_scheduled(&cfg).expect("generate");
+        let service = find(&files, "scheduled.service");
+        assert_eq!(
+            service.contents,
+            format!(
+                "# {MARKER}\n\
+                 [Unit]\n\
+                 Description=fraisier scheduled backup for checkout (production)\n\
+                 After=network-online.target\n\
+                 Wants=network-online.target\n\
+                 \n\
+                 [Service]\n\
+                 Type=oneshot\n\
+                 # Runs fraisier on the host; edit --config / add flags as needed.\n\
+                 # Each run writes a new timestamped archive into [backup].dir\n\
+                 # (/var/backups/checkout), so no run overwrites an earlier one.\n\
+                 ExecStart=fraisier backup --config /etc/fraisier/checkout.toml\n\
+                 EnvironmentFile=-/etc/checkout/production.env\n"
+            )
+        );
+    }
+
+    #[test]
+    fn a_scheduled_backup_without_a_backup_dir_is_refused() {
+        let toml =
+            format!("{MULTI}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+        let cfg = DeployConfig::from_toml_str(&toml).expect("parse");
+        let error = generate_scheduled(&cfg).expect_err("no [backup].dir");
+        assert!(error.to_string().contains("backup"), "{error}");
+        assert!(error.to_string().contains("dir"), "{error}");
+    }
+
     #[test]
     fn generate_scheduled_requires_a_calendar_and_command() {
         // MULTI has no [schedule] section.
@@ -597,7 +657,7 @@ upstream = "checkout_upstream"
     #[test]
     fn generate_scheduled_accepts_the_raw_escape_hatch() {
         let toml = format!(
-            "{MULTI}\n[schedule]\non_calendar_raw = \"Mon *-*-* 04:00:00\"\ncommand = \"backup\"\n"
+            "{MULTI}{BACKUP_DIR}[schedule]\non_calendar_raw = \"Mon *-*-* 04:00:00\"\ncommand = \"backup\"\n"
         );
         let cfg = DeployConfig::from_toml_str(&toml).expect("parse");
         let files = generate_scheduled(&cfg).expect("generate");

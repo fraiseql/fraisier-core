@@ -18,6 +18,8 @@
 pub mod readiness;
 pub mod tviews;
 
+pub mod archive;
+
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::Path;

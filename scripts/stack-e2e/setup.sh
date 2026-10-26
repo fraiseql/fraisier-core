@@ -96,6 +96,10 @@ unit = "erp-$1.service"
 [health]
 adapter = "http"
 url = "http://127.0.0.1:$2/health"
+
+# The stack's SDL check asks this endpoint, with the [health] headers.
+[federation]
+graphql_url = "http://127.0.0.1:$2/graphql"
 TOML
 }
 member users 8101
@@ -140,12 +144,10 @@ router = "gateway"
 [[stack.member]]
 config = "users.staging.toml"
 sdl = "sdl/users.graphql"
-graphql_url = "http://127.0.0.1:8101/graphql"
 
 [[stack.member]]
 config = "orders.staging.toml"
 sdl = "sdl/orders.graphql"
-graphql_url = "http://127.0.0.1:8102/graphql"
 
 [[stack.member]]
 config = "gateway.staging.toml"

@@ -8,10 +8,11 @@ them. A federated query then answers from both. Then the checks below run.
 
 | Step | What it proves |
 |---|---|
-| 1 | One `stack deploy` deploys `orders`, `users`, then `gateway`, and both SDLs match the router's release. |
+| 1 | One `stack deploy` stages the gateway's release, then deploys `orders`, `users`, then `gateway`; both SDLs match the staged release. |
 | 2 | `{ users { … } orders { … } }` through the router answers from both subgraphs. |
 | 3 | `stack status` (text and `--json`) shows every member healthy at its version, and one ready row for the shared database. |
 | 4 | A subgraph redeployed alone with a new schema, under the old supergraph, makes `stack status` fail with `sdl users: DIFFERS`, naming the new field. |
+| 4b | A stack deploy of that subgraph without recomposing fails its health step on the SDL: it rolls itself back, the gateway is skipped and still serves v1. |
 | 5 | Recomposed, the stack deploys again, the SDLs match, and the new field answers through the router. |
 | 6 | A stopped subgraph makes `stack status` exit 1, naming it. |
 | 7 | A failing migration stops the stack at that member. The members after it are skipped, and the stack still answers. |

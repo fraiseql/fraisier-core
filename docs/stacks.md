@@ -22,13 +22,10 @@ router = "gateway"            # optional: enables the SDL check
 [[stack.member]]
 config = "management.staging.toml"
 sdl = "federation/sdl/management.graphql"
-graphql_url = "http://127.0.0.1:8042/graphql"
-sdl_headers = { "x-api-key" = "MANAGEMENT_SERVICE_TOKEN" }
 
 [[stack.member]]
 config = "billing.staging.toml"
 sdl = "federation/sdl/billing.graphql"
-graphql_url = "http://127.0.0.1:8043/graphql"
 
 [[stack.member]]
 config = "gateway.staging.toml"
@@ -38,16 +35,30 @@ depends_on = ["management", "billing"]
 | Key | Meaning |
 |---|---|
 | `[stack].name`, `environment` | Required. Every member config's `[deploy].environment` must equal `environment`, so a production config cannot sit in a staging stack. |
-| `[stack].router` | The member that is the router. Its `[artifact].active_path` is the release every `sdl` path is read from. |
+| `[stack].router` | The member that is the router. Its release holds every `sdl` path. It needs `[artifact].active_path`, and it must deploy after every member with `sdl` (list them in its `depends_on`). |
 | `config` | The member's config, relative to the stack file. The member's name is that config's `[deploy].name`; the stack file never restates it. |
 | `depends_on` | Members (by name) that deploy first. |
-| `sdl` | The member's SDL as the router's release holds it: a relative path inside that release. Needs `router` and `graphql_url`. |
-| `graphql_url` | The member's GraphQL endpoint, asked for `{ _service { sdl } }`. |
-| `sdl_headers` | Headers for that query. Each value names the environment variable that holds it, so a credential never sits in the file. |
+| `sdl` | The member's SDL as the router's release holds it: a relative path inside that release. Needs `router`, and `[federation].graphql_url` in the member's config. |
+
+The stack file never restates a member's properties. A member's GraphQL
+endpoint is in its own config:
+
+```toml
+# management.staging.toml
+[federation]
+graphql_url = "http://127.0.0.1:8042/graphql"   # asked for { _service { sdl } }
+```
+
+The query sends that member's `[health]` headers and the header its
+`[health].token_provider` resolves, so a subgraph's credentials are configured
+once. A stack file that still sets `graphql_url` or `sdl_headers` is refused,
+with a pointer to where each went.
 
 These are errors, all reported together: a cycle, a `depends_on` naming no
 member, two members with the same name, a member config that cannot be read,
-and any `sdl` setting that is missing what it needs.
+any `sdl` setting that is missing what it needs, a router that deploys before
+a member with `sdl`, and a member with `sdl` that deploys blue-green (its
+health step probes the green fleet, which the SDL check does not gate).
 
 ## The router is a member
 
@@ -66,9 +77,10 @@ path = "/srv/erp/_src/erp"                # holds federation/supergraph.graphql
 active_path = "/srv/erp/gateway/current"
 staging_dir = "/srv/erp/gateway/releases"
 
-# The router owns no database; the migration axis is a no-op. It still prints
-# a constant revision: one that prints none makes every failed router deploy a
-# partial_rollback, because migrate cannot undo an "initial" migration.
+# The router owns no database. Until `adapter = "none"` arrives (PR #106), the
+# migration axis is a no-op command that prints a constant revision: one that
+# prints none makes every failed router deploy a partial_rollback, because
+# migrate cannot undo an "initial" migration.
 [migration]
 adapter = "command"
 preflight_mode = "off"
@@ -89,8 +101,13 @@ adapter = "http"
 url = "http://127.0.0.1:4000/readiness"
 ```
 
-Probe `/readiness`: a router release whose supergraph does not load then fails
-its health step, and the deploy rolls back to the previous release.
+Two rules for the router member:
+
+- **Probe `/readiness`, not `/health`.** A router release whose supergraph does
+  not load then fails its health step, and the deploy rolls back to the
+  previous release.
+- **Declare that it owns no database: `[migration] adapter = "none"`.** This
+  arrives with PR #106; until then, use the constant-revision no-op above.
 
 ## `fraisier stack deploy`
 
@@ -113,8 +130,10 @@ The first member that fails stops the stack:
 The report names each member as `deployed`, `failed` or `skipped`, and the
 command exits 1.
 
-Once every member has deployed, the SDL check runs (below). A difference exits
-1, but nothing is rolled back: each deploy succeeded on its own terms.
+With a router, the router's candidate release is staged first, and each
+subgraph's health step checks its SDL against it (below). A subgraph that
+differs fails like any unhealthy release, so the router is never deployed
+over it.
 
 ## `fraisier stack status`
 
@@ -146,7 +165,8 @@ Below the members:
   gets one row per distinct DSN. The row is probed against every declaring
   member's requirements, the same probe a deploy's preflight runs (see
   [database-requirements.md](database-requirements.md)).
-- **SDL.** With a router, each subgraph's SDL check is listed.
+- **SDL.** With a router, each subgraph's SDL is checked against the router's
+  active release and listed.
 
 The command exits 1 when a member is unhealthy, a database is not ready or an
 SDL differs. The last deploy is reported and never judged. `--json` gives the
@@ -155,21 +175,40 @@ same as an object.
 ## The SDL check
 
 A subgraph deployed with a new schema, under a router that still serves the old
-supergraph, is a silent break. For every member with `sdl`, fraisier:
+supergraph, is a silent break. `stack deploy` prevents it:
 
-1. reads the file at `<router active_path>/<sdl>`;
-2. asks the member's `graphql_url` for `{ _service { sdl } }`, with
-   `sdl_headers`;
-3. compares the two exactly, except that trailing newlines are not a
-   difference.
+1. Before any member deploys, it stages the router's release at its
+   `--app-version`, through the router's own artifact adapter, without
+   activating it. This is the *candidate* release. If it cannot be staged,
+   nothing deploys.
+2. Each member with `sdl` deploys as usual. Once its own health probe passes,
+   its health step:
+   - reads `<candidate>/<sdl>`;
+   - asks the member's `[federation].graphql_url` for `{ _service { sdl } }`,
+     with its `[health]` headers and token;
+   - compares the two exactly, except that trailing newlines are not a
+     difference.
+3. A difference (`DIFFERS`), or a check that cannot run (`UNCHECKED`: the file
+   is missing, the token provider fails, the query fails), fails that health
+   step. The member's saga rolls it back, the stack stops, and the router is
+   never deployed.
+4. The router deploys last and stages the same release again.
 
-A difference (`DIFFERS`) names the first line where the two differ. To fix it,
-recapture the subgraph's SDL, recompose, and deploy the router. A member that
-cannot be checked (`UNCHECKED`) is a failure too: the file is missing, a
-header's variable is unset, or the query fails. Header values never appear in
-output.
+A difference names the first line where the two differ. To fix it, recapture
+the subgraph's SDL, recompose, and deploy the stack. Header values never appear
+in output.
 
-The check reads the router's release on the host fraisier runs on.
+`stack deploy --dry-run` stages nothing and asks no SDL; it reports
+`sdl <member>: not checked (dry run)`.
+
+The candidate is read on the host fraisier runs on. When the router deploys
+through `[hosts]`, its releases are on its hosts, so nothing is staged locally:
+each checked member deploys unchecked, is reported `UNCHECKED` with that
+reason, and the command exits 1. A router whose artifact stages as a file, not
+a directory, is reported the same way.
+
+`stack status` runs the same comparison after the fact, against the router's
+*active* release: it detects a subgraph deployed on its own, outside the stack.
 
 ## The target
 

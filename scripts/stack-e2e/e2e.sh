@@ -31,7 +31,7 @@ say "1. one stack deploy: orders, users, then the gateway"
 SD --app-version users=v1 --app-version orders=v1 --app-version gateway=v1 > "$O" 2>&1; rc=$?; cat "$O"
 if [ $rc = 0 ]; then pass "stack deploy exits 0"; else fail "stack deploy rc=$rc"; fi
 if [ "$(awk '$1 == "deployed" {print $2}' "$O" | tr '\n' ' ')" = "orders users gateway " ]; then pass "deploy order: orders, users, gateway"; else fail "order"; fi
-if grep -q 'sdl users: matches' "$O" && grep -q 'sdl orders: matches' "$O"; then pass "both SDLs match the router's release"; else fail "sdl after deploy"; fi
+if grep -q 'sdl users: matches' "$O" && grep -q 'sdl orders: matches' "$O"; then pass "both SDLs match the router's candidate release"; else fail "sdl after deploy"; fi
 if systemctl is-active -q erp-users erp-orders erp-gateway; then pass "all three units running"; else fail "units"; fi
 
 say "2. a federated query through Hive Router answers from both subgraphs"
@@ -57,6 +57,12 @@ if [ $rc = 0 ]; then pass "users v2 deployed alone"; else fail "users v2 rc=$rc"
 ST > "$O" 2>&1; rc=$?; cat "$O"
 if [ $rc = 1 ] && grep -q 'sdl users: DIFFERS' "$O" && grep -q nickname "$O"; then pass "status fails naming users' SDL and the new field"; else fail "drift rc=$rc"; fi
 if grep -q 'sdl orders: matches' "$O"; then pass "orders still matches"; else fail "orders sdl"; fi
+
+say "4b. not recomposed: the stack deploy refuses users v2 in its health step; the router never deploys"
+SD --app-version users=v2a --app-version orders=v2a --app-version gateway=v2a > "$O" 2>&1; rc=$?; cat "$O"
+if [ $rc = 1 ] && grep -Eq 'failed +users: .*rolled_back' "$O" && grep -Eq 'skipped +gateway' "$O"; then pass "users rolled itself back; gateway skipped"; else fail "prevent rc=$rc"; fi
+if grep -q 'sdl users: DIFFERS' "$O" && grep -q nickname "$O"; then pass "the report names users' SDL and the new field"; else fail "prevent sdl"; fi
+if [ "$(readlink $E/gateway/current)" = "$E/gateway/releases/v1" ]; then pass "the gateway still serves v1"; else fail "gateway moved"; fi
 
 say "5. recomposed: the stack deploys the new router release and matches again"
 cp "$W"/out/users-v2.graphql $E/src/gateway/sdl/users.graphql

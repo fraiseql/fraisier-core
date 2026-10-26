@@ -92,6 +92,10 @@ pub struct DeployConfig {
     /// calendar schedule. Absent when nothing is scheduled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ScheduleSection>,
+    /// The `[database]` section: what the database server must offer. Absent
+    /// leaves the server unchecked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<DatabaseSection>,
     /// The `[backup]` section: where `fraisier backup` keeps its archives.
     /// Absent keeps the single `<fraise>-<environment>.pgdump` output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -554,6 +558,31 @@ pub struct ScheduleSection {
     /// deploy rolls back — the required sink for `command = "deploy"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify: Option<String>,
+}
+
+/// The `[database]` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseSection {
+    /// `[database.requires]`: what the server must offer before fraisier deploys
+    /// onto it. fraisier checks and refuses; it never installs what is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires: Option<DatabaseRequires>,
+}
+
+/// `[database.requires]`: checked first in every deploy's preflight, and by
+/// `fraisier doctor`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseRequires {
+    /// The lowest PostgreSQL major version the server may run (`18` admits 18.x
+    /// and later).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgres_major: Option<u32>,
+    /// Whether pg_tviews must be preloaded (`shared_preload_libraries`),
+    /// installed in the database, and on the read contract this fraisier speaks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pg_tviews: Option<bool>,
 }
 
 /// The `[backup]` section: where `fraisier backup` keeps its archives.

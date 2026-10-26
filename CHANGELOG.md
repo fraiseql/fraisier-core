@@ -8,6 +8,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`[database.requires]`: declare what the database server must offer, and
+  fraisier refuses a server that does not.** `postgres_major` sets a PostgreSQL
+  major-version floor, and `pg_tviews = true` requires pg_tviews to be in
+  `shared_preload_libraries`, installed, and on read contract 2. The check runs
+  first in every deploy's preflight (single-host, multi-host and blue-green) and
+  in `fraisier doctor` (`database_ready`). It fails closed, and each refusal
+  names the expected and actual value and the fix. fraisier never installs
+  either; see `docs/database-requirements.md`. Without the section nothing
+  changes. Part of [#83](https://github.com/fraiseql/fraisier-core/issues/83).
+
+### Added
+
 - **FraiseQL 2.18.0 is the supported, proven version, pinned in
   `tools/fraiseql-version`.**
   - **The proof.** Criterion-1 now deploys a 2.18.0 `fraiseql-server` three

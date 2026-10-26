@@ -1398,6 +1398,88 @@ fn no_policy_section_means_no_policy_at_all() {
     assert!(cfg.validate().ok(), "{}", cfg.validate());
 }
 
+/// A base whose `[migration]` names the DSN env var the readiness probe reads.
+const REQUIRES_BASE: &str = r#"
+[deploy]
+name = "checkout"
+environment = "production"
+
+[artifact]
+source = "local"
+path = "/srv/checkout/build"
+active_path = "/srv/checkout/current"
+
+[migration]
+adapter = "confiture"
+database_url_env = "CHECKOUT_DATABASE_URL"
+
+[service]
+adapter = "systemd"
+unit = "checkout.service"
+
+[health]
+adapter = "http"
+url = "http://127.0.0.1:8080/health"
+"#;
+
+#[test]
+fn database_requires_parses_and_validates_clean() {
+    let toml =
+        format!("{REQUIRES_BASE}\n[database.requires]\npostgres_major = 18\npg_tviews = true\n");
+    let config = DeployConfig::from_toml_str(&toml).expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    let requires = config
+        .database
+        .and_then(|database| database.requires)
+        .expect("requires");
+    assert_eq!(
+        (requires.postgres_major, requires.pg_tviews),
+        (Some(18), Some(true))
+    );
+}
+
+#[test]
+fn an_empty_database_requires_is_an_error() {
+    let toml = format!("{REQUIRES_BASE}\n[database.requires]\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "database.requires"), "{report}");
+}
+
+#[test]
+fn a_postgres_major_below_10_is_an_error() {
+    // server_version_num's two-part numbering starts at 10; 9.6 is "906xx".
+    let toml = format!("{REQUIRES_BASE}\n[database.requires]\npostgres_major = 9\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(
+        has_error(&report, "database.requires.postgres_major"),
+        "{report}"
+    );
+}
+
+#[test]
+fn database_requires_needs_the_dsn_env_var() {
+    let toml = format!(
+        "{}\n[database.requires]\npg_tviews = true\n",
+        REQUIRES_BASE
+            .replace("database_url_env = \"CHECKOUT_DATABASE_URL\"\n", "")
+            .replace("adapter = \"confiture\"", "adapter = \"command\"")
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "migration.database_url_env"), "{report}");
+}
+
+#[test]
+fn an_unknown_requirement_is_a_parse_error() {
+    let toml = format!("{REQUIRES_BASE}\n[database.requires]\npostgis = true\n");
+    assert!(DeployConfig::from_toml_str(&toml).is_err());
+}
+
 fn database_less(extra: &str) -> String {
     format!(
         r#"

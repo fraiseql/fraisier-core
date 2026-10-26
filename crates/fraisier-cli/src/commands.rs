@@ -1726,6 +1726,9 @@ pub(crate) async fn deploy(
         if let Some((db, backup)) = resolved.restore_rehearsal {
             builder = builder.restore_rehearsal(db, backup);
         }
+        if let Some(probe) = resolved.database_readiness {
+            builder = builder.database_readiness(probe);
+        }
     }
     let plan = builder.build()?;
 
@@ -1752,7 +1755,7 @@ async fn run_multi_host(
     report: &ValidationReport,
 ) -> Result<CommandOutput> {
     let resolved = factory::build_multi_host(config, app_version)?;
-    let deploy = MultiHostDeploy::builder(
+    let mut builder = MultiHostDeploy::builder(
         resolved.fraise.clone(),
         resolved.environment.clone(),
         resolved.plan,
@@ -1764,8 +1767,11 @@ async fn run_multi_host(
     .migration(resolved.migration)
     .service(resolved.service)
     .health(resolved.health)
-    .lb(resolved.lb)
-    .build()?;
+    .lb(resolved.lb);
+    if let Some(probe) = resolved.database_readiness {
+        builder = builder.database_readiness(probe);
+    }
+    let deploy = builder.build()?;
 
     let outcome = deploy.run(store).await?;
     notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;

@@ -1997,6 +1997,28 @@ fn resolve_pg_conn(config: &DeployConfig) -> Result<fraisier_db::PgConn> {
     fraisier_db::PgConn::parse(&dsn).context("parsing the database DSN")
 }
 
+/// Resolve the restore identity, `[database].admin_url_env`, when one is
+/// configured. A configured identity whose env var is unset is an error, never
+/// a silent fall back to the app DSN: the operator asked for the restore to run
+/// as that identity.
+///
+/// # Errors
+/// The named env var is unset, or its DSN is not a parseable `postgres://` URL.
+pub(crate) fn resolve_admin_conn(config: &DeployConfig) -> Result<Option<fraisier_db::PgConn>> {
+    let Some(source) = config
+        .database
+        .as_ref()
+        .and_then(|d| d.admin_url_env.as_deref())
+    else {
+        return Ok(None);
+    };
+    let dsn = std::env::var(source)
+        .with_context(|| format!("the configured admin_url_env '{source}' is not set"))?;
+    fraisier_db::PgConn::parse(&dsn)
+        .map(Some)
+        .context("parsing the admin DSN")
+}
+
 /// A clean exit-1 [`CommandOutput`] for an expected db-op configuration error
 /// (missing/unset DSN, non-postgres DSN), so `--json` still renders.
 fn db_config_error(error: &anyhow::Error) -> CommandOutput {
@@ -4930,6 +4952,44 @@ current_revision = "true"
             out.pretty.contains("secret_env"),
             "names the missing field: {}",
             out.pretty
+        );
+    }
+
+    #[test]
+    fn no_admin_identity_resolves_to_none() {
+        let config = DeployConfig::from_toml_str("[deploy]\nname = \"a\"\nenvironment = \"b\"\n")
+            .expect("parses");
+        assert!(super::resolve_admin_conn(&config)
+            .expect("resolves")
+            .is_none());
+    }
+
+    #[test]
+    fn a_configured_admin_identity_is_read_from_its_env_var() {
+        let _env = crate::test_env::env_guard();
+        let toml = "[deploy]\nname = \"a\"\nenvironment = \"b\"\n\n[database]\n\
+                    admin_url_env = \"FRAISIER_TEST_ADMIN_URL\"\n";
+        let config = DeployConfig::from_toml_str(toml).expect("parses");
+        std::env::set_var(
+            "FRAISIER_TEST_ADMIN_URL",
+            "postgresql:///postgres?host=/var/run/postgresql",
+        );
+        let admin = super::resolve_admin_conn(&config).expect("resolves");
+        std::env::remove_var("FRAISIER_TEST_ADMIN_URL");
+        assert_eq!(admin.expect("an identity").database(), "postgres");
+    }
+
+    #[test]
+    fn an_unset_admin_env_var_is_an_error_not_a_fallback() {
+        let _env = crate::test_env::env_guard();
+        std::env::remove_var("FRAISIER_TEST_ADMIN_UNSET");
+        let toml = "[deploy]\nname = \"a\"\nenvironment = \"b\"\n\n[database]\n\
+                    admin_url_env = \"FRAISIER_TEST_ADMIN_UNSET\"\n";
+        let config = DeployConfig::from_toml_str(toml).expect("parses");
+        let error = super::resolve_admin_conn(&config).expect_err("unset");
+        assert!(
+            error.to_string().contains("FRAISIER_TEST_ADMIN_UNSET"),
+            "{error}"
         );
     }
 }

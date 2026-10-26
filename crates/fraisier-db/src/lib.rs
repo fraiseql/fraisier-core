@@ -16,6 +16,7 @@
 //! `pg_restore` needs as its target) ever appear as arguments.
 
 pub mod readiness;
+pub mod tviews;
 
 use std::ffi::OsString;
 use std::fmt::Write as _;

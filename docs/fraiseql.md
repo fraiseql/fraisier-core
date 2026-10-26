@@ -49,4 +49,35 @@ are in
 [`crates/fraisier-adapter-http/tests/fixtures/fraiseql-2.18.0/`](../crates/fraisier-adapter-http/tests/fixtures/fraiseql-2.18.0/README.md).
 
 A status-code check therefore proves the server is up, not that every capability
-you configured is running. Requiring named capabilities in `verify` is planned.
+you configured is running. To make the health step check the body as well, name
+the capabilities the deployment needs:
+
+```toml
+[health]
+adapter = "http"
+url = "http://127.0.0.1:8080/health"
+require_capabilities = ["observers"]
+```
+
+A required capability passes when FraiseQL reports it `compiled_in`, `started`
+is `true`, and `healthy` is not `false`. A missing `healthy` means the capability
+cannot tell, so it passes. `serving` is ignored, because the observer runtime
+never sets it. The probe is unhealthy, and retried within `attempts` like a wrong
+status code, when:
+
+- a required capability failed to start (`started = false`) or reports
+  `healthy = false`;
+- it is compiled in but not configured (no `started` key);
+- it is not compiled into the server;
+- the server does not list it, or the body has no `capabilities` object (FraiseQL
+  before 2.18) or is not JSON.
+
+The final health detail names every failing capability with the fields the
+server reported. A failed health step re-activates the prior release, as for any
+unhealthy probe. Capabilities you do not list are not checked, so a top-level
+`status: degraded` caused by one of them does not fail the deploy.
+
+Capability names are not validated against a fixed list: FraiseQL owns that
+registry, and a name the server does not report fails at probe time.
+`require_capabilities` applies only to the `http` adapter, and an empty or
+duplicated list is a config error.

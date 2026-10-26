@@ -261,6 +261,8 @@ pub(crate) async fn stack_deploy_with(
     let mut members = Vec::new();
     for (name, outcome) in &report {
         let (tag, detail) = match outcome {
+            // A dry run deploys nothing: a member that passed it is planned.
+            MemberOutcome::Deployed if dry_run => ("planned", None),
             MemberOutcome::Deployed => ("deployed", None),
             MemberOutcome::Failed(why) => ("failed", Some(fraisier_saga::redact::credentials(why))),
             MemberOutcome::Skipped => ("skipped", None),
@@ -274,7 +276,7 @@ pub(crate) async fn stack_deploy_with(
     }
     if let Some(why) = &stopped {
         let _ = writeln!(pretty, "  {why}");
-    } else if !all_deployed {
+    } else if !all_deployed && !dry_run {
         pretty.push_str(
             "  members before the failure stay deployed; the failed member rolled itself back\n",
         );
@@ -698,6 +700,13 @@ mod tests {
             out.pretty
         );
         assert_eq!(out.json["sdl"][0]["skipped"], serde_json::json!("dry run"));
+        // A dry run deploys nothing, so no member may be reported as deployed.
+        assert!(!out.pretty.contains("deployed"), "{}", out.pretty);
+        assert!(out.pretty.contains("  planned   billing"), "{}", out.pretty);
+        assert_eq!(
+            out.json["members"][0]["outcome"],
+            serde_json::json!("planned")
+        );
     }
 
     #[test]

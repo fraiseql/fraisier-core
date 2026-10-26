@@ -199,7 +199,8 @@ the subgraph's SDL, recompose, and deploy the stack. Header values never appear
 in output.
 
 `stack deploy --dry-run` stages nothing and asks no SDL; it reports
-`sdl <member>: not checked (dry run)`.
+`sdl <member>: not checked (dry run)`. A member whose own dry run passed is
+listed as `planned`, never `deployed`.
 
 The candidate is read on the host fraisier runs on. When the router deploys
 through `[hosts]`, its releases are on its hosts, so nothing is staged locally:

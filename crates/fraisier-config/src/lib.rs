@@ -68,6 +68,7 @@ pub mod calendar;
 mod error;
 mod preset;
 mod schema;
+pub mod stack;
 mod validate;
 
 pub use error::ConfigError;

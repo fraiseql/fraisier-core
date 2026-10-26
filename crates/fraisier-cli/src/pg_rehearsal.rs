@@ -14,12 +14,36 @@ use async_trait::async_trait;
 use fraisier_core::drill::{DrillDb, THROWAWAY_MARKER};
 use fraisier_core::restore_rehearsal::{BackupSource, RehearsalDb, RehearsalError, ThrowawayDb};
 use fraisier_db::{
-    backup_command, create_database_command, drop_database_command, restore_command, run, PgConn,
+    backup_command, create_database_command, create_database_owned_command, drop_database_command,
+    restore_command, run, PgConn,
 };
 
 /// A throwaway-DB lifecycle backed by `pg_dump`/`pg_restore`/`psql` over the live
-/// server. Stateless — every operation is derived from the DSNs it is handed.
-pub(crate) struct PgRehearsalDb;
+/// server. Every operation is derived from the DSNs it is handed, plus the
+/// restore identity when `[database].admin_url_env` names one.
+///
+/// With an admin identity, the throwaway is created (owned by the app role),
+/// restored into, and dropped as that identity: a pg_tviews archive restores
+/// only as a superuser. The rehearsal's migrations still run as the app role,
+/// through the returned DSN.
+pub(crate) struct PgRehearsalDb {
+    /// The env var holding the admin DSN, read when a throwaway is provisioned.
+    pub(crate) admin_url_env: Option<String>,
+}
+
+impl PgRehearsalDb {
+    /// The admin connection, when one is configured.
+    fn admin(&self) -> Result<Option<PgConn>, String> {
+        let Some(env) = self.admin_url_env.as_deref() else {
+            return Ok(None);
+        };
+        let dsn = std::env::var(env)
+            .map_err(|_| format!("the configured admin_url_env '{env}' is not set"))?;
+        PgConn::parse(&dsn)
+            .map(Some)
+            .map_err(|e| format!("invalid admin DSN in {env}: {e}"))
+    }
+}
 
 fn provision_error(msg: impl Into<String>) -> RehearsalError {
     RehearsalError::Provision(msg.into())
@@ -35,10 +59,22 @@ impl RehearsalDb for PgRehearsalDb {
         let live = PgConn::parse(live_dsn)
             .map_err(|e| provision_error(format!("invalid database DSN: {e}")))?;
         let name = throwaway_name(live.database());
-        let maintenance = live.with_database("postgres");
-
-        let create = create_database_command(&maintenance, &name)
-            .map_err(|e| provision_error(e.to_string()))?;
+        let admin = self.admin().map_err(provision_error)?;
+        let create = match &admin {
+            None => create_database_command(&live.with_database("postgres"), &name),
+            Some(admin) => {
+                // The app role owns what the admin creates for it.
+                let owner = fraisier_db::tviews::query(
+                    std::path::Path::new("psql"),
+                    &live,
+                    "SELECT current_user",
+                )
+                .await
+                .map_err(|e| provision_error(format!("could not read the app role: {e}")))?;
+                create_database_owned_command(&admin.with_database("postgres"), &name, owner.trim())
+            }
+        }
+        .map_err(|e| provision_error(e.to_string()))?;
         let created = run(create)
             .await
             .map_err(|e| provision_error(e.to_string()))?;
@@ -50,9 +86,13 @@ impl RehearsalDb for PgRehearsalDb {
         }
 
         let throwaway = live.with_database(name.clone());
-        if let Err(error) = seed(&live, &throwaway, backup).await {
+        let restorer = admin.as_ref().map_or_else(
+            || throwaway.clone(),
+            |admin| admin.with_database(name.clone()),
+        );
+        if let Err(error) = seed(&live, &restorer, backup).await {
             // Best-effort cleanup of the half-provisioned database.
-            let _ = teardown_named(&throwaway, &name).await;
+            let _ = teardown_named(&restorer, &name).await;
             return Err(error);
         }
         Ok(ThrowawayDb {
@@ -63,7 +103,8 @@ impl RehearsalDb for PgRehearsalDb {
 
     async fn teardown(&self, db: &ThrowawayDb) -> Result<(), String> {
         let throwaway = PgConn::parse(&db.dsn).map_err(|e| e.to_string())?;
-        teardown_named(&throwaway, &db.name).await
+        let dropper = self.admin()?.unwrap_or(throwaway);
+        teardown_named(&dropper, &db.name).await
     }
 }
 
@@ -216,19 +257,23 @@ mod tests {
     use fraisier_core::drill::DrillDb;
     use fraisier_core::restore_rehearsal::{BackupSource, RehearsalDb, ThrowawayDb};
 
+    const NO_ADMIN: PgRehearsalDb = PgRehearsalDb {
+        admin_url_env: None,
+    };
+
     #[test]
     fn the_live_database_is_the_one_its_dsn_names() {
         assert_eq!(
-            PgRehearsalDb.live_database("postgres://app:pw@db.internal:5432/shop?sslmode=require"),
+            NO_ADMIN.live_database("postgres://app:pw@db.internal:5432/shop?sslmode=require"),
             Ok("shop".to_owned())
         );
-        assert!(PgRehearsalDb.live_database("not a dsn").is_err());
+        assert!(NO_ADMIN.live_database("not a dsn").is_err());
     }
 
     #[tokio::test]
     async fn teardown_refuses_a_name_without_the_throwaway_marker() {
         // No server is reachable here: refusing must not need one.
-        let refused = PgRehearsalDb
+        let refused = NO_ADMIN
             .teardown(&ThrowawayDb {
                 dsn: "postgres://app:pw@127.0.0.1:1/shop".to_owned(),
                 name: "shop".to_owned(),
@@ -274,7 +319,9 @@ mod tests {
             eprintln!("skipped: set FRAISIER_REHEARSAL_TEST_DSN to a postgres DSN");
             return;
         };
-        let db = PgRehearsalDb;
+        let db = PgRehearsalDb {
+            admin_url_env: None,
+        };
         let throwaway = db
             .provision(&dsn, &BackupSource::FreshDump)
             .await

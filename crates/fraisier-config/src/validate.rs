@@ -413,6 +413,22 @@ fn validate_migration(cfg: &DeployConfig, report: &mut ValidationReport) {
              (the name of the env var holding the database DSN)",
         );
     }
+    // `none` declares a deployable that owns no database; a DSN or settings
+    // beside it contradict that.
+    if adapter == Some("none") {
+        if is_set(migration.database_url_env.as_ref()) {
+            report.error(
+                "migration.database_url_env",
+                "adapter = \"none\" declares no database; remove database_url_env",
+            );
+        }
+        if !migration.settings.is_empty() {
+            report.error(
+                "migration.settings",
+                "adapter = \"none\" takes no settings; remove [migration.settings]",
+            );
+        }
+    }
     if migration.forward_compatible_lint == Some(true) && adapter == Some("command") {
         report.warn(
             "migration.forward_compatible_lint",

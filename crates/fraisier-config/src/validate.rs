@@ -152,6 +152,7 @@ impl DeployConfig {
         let mut report = ValidationReport::default();
         validate_deploy(self, &mut report);
         validate_migration(self, &mut report);
+        validate_database(self, &mut report);
         report
     }
 

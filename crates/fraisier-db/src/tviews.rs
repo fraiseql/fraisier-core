@@ -283,6 +283,83 @@ pub fn archive_creates_pg_tviews(listing: &str) -> bool {
     })
 }
 
+/// Before a restore drops anything: refuse one that cannot finish.
+///
+/// An archive that creates pg_tviews restores only as a superuser (`CREATE
+/// EXTENSION` of a C-language extension); a non-superuser `pg_restore` loads
+/// the tables, fails on the extension, and leaves a database with no TVIEW
+/// machinery. The post-restore rebuild then needs `EXECUTE` on
+/// `pg_tviews_rebuild_all`. `admin_env` is the `[database].admin_url_env` the
+/// refusal points at, when one is configured.
+///
+/// # Errors
+/// A sentence saying why the restore is refused and what fixes it.
+pub fn restore_precheck(
+    listing: &str,
+    restorer: &Identity,
+    rebuild_problem: Option<&str>,
+    admin_env: Option<&str>,
+) -> Result<(), String> {
+    if !archive_creates_pg_tviews(listing) {
+        return Ok(());
+    }
+    if !restorer.superuser {
+        let setting = admin_env.map_or_else(
+            || {
+                "set [database].admin_url_env to a superuser DSN (peer auth over the \
+                Unix socket)"
+                    .to_owned()
+            },
+            |env| format!("set {env} ([database].admin_url_env) to a superuser DSN"),
+        );
+        return Err(format!(
+            "this archive creates the pg_tviews extension, which only a superuser can \
+             restore, and role '{}' is not one: a restore would load the tables and leave \
+             the database without pg_tviews. Nothing was changed. To restore it, {setting}",
+            restorer.user
+        ));
+    }
+    if let Some(problem) = rebuild_problem {
+        return Err(format!(
+            "the post-restore TVIEW rebuild would fail, so nothing was changed: {problem}"
+        ));
+    }
+    Ok(())
+}
+
+/// The schema pg_tviews is installed in, when it speaks the read contract this
+/// fraisier reads; `None` when the database has no pg_tviews.
+///
+/// # Errors
+/// The probe failed, or pg_tviews offers another contract (or none fraisier can
+/// read): answering from it would be guessing.
+pub async fn usable_schema(psql: &Path, conn: &PgConn) -> Result<Option<String>, String> {
+    let observed = crate::readiness::observe(psql, conn).await?;
+    let Some(schema) = observed.tviews_schema else {
+        return Ok(None);
+    };
+    match observed.tviews_contract {
+        Some(Ok(contract)) if contract == crate::readiness::TVIEWS_CONTRACT => Ok(Some(schema)),
+        Some(Ok(contract)) => Err(format!(
+            "pg_tviews here offers read contract {contract}; this fraisier reads {}",
+            crate::readiness::TVIEWS_CONTRACT
+        )),
+        Some(Err(error)) => Err(format!(
+            "pg_tviews here has no readable contract_version() ({error}); upgrade it"
+        )),
+        None => Err("pg_tviews' contract was not read".to_owned()),
+    }
+}
+
+/// `pg_restore --list <archive>`: the archive's table of contents. Needs no
+/// connection.
+#[must_use]
+pub fn list_command(archive: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("pg_restore");
+    command.arg("--list").arg(archive);
+    command
+}
+
 /// Run `sql` and return its bare output, or the first line of psql's error.
 ///
 /// # Errors
@@ -481,6 +558,57 @@ mod tests {
         );
         assert_eq!(parse_rebuild("[]"), Ok(Vec::new()));
         assert!(parse_rebuild(r#"[{"entity":"item"}]"#).is_err());
+    }
+
+    fn identity(superuser: bool) -> super::Identity {
+        super::Identity {
+            user: "app".to_owned(),
+            superuser,
+            recovery: false,
+            system_identifier: "7700958424225614334".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_pg_tviews_archive_is_refused_for_a_non_superuser_naming_the_setting() {
+        let refusal =
+            super::restore_precheck(LISTING, &identity(false), None, None).expect_err("refused");
+        assert!(refusal.contains("superuser"), "{refusal}");
+        assert!(refusal.contains("[database].admin_url_env"), "{refusal}");
+        // With the setting configured, the refusal names its env var.
+        let refusal =
+            super::restore_precheck(LISTING, &identity(false), None, Some("SHOP_ADMIN_URL"))
+                .expect_err("refused");
+        assert!(refusal.contains("SHOP_ADMIN_URL"), "{refusal}");
+    }
+
+    #[test]
+    fn a_pg_tviews_archive_restores_as_a_superuser() {
+        assert_eq!(
+            super::restore_precheck(LISTING, &identity(true), None, None),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_restorer_that_cannot_rebuild_is_refused_with_the_grant() {
+        let refusal = super::restore_precheck(
+            LISTING,
+            &identity(true),
+            Some("role 'x' cannot execute …. Fix: GRANT EXECUTE ON FUNCTION …"),
+            None,
+        )
+        .expect_err("refused");
+        assert!(refusal.contains("GRANT EXECUTE"), "{refusal}");
+    }
+
+    #[test]
+    fn an_archive_without_pg_tviews_needs_nothing() {
+        let plain = "232; 1259 16555 TABLE public tb_item app\n";
+        assert_eq!(
+            super::restore_precheck(plain, &identity(false), Some("ignored"), None),
+            Ok(())
+        );
     }
 
     /// `pg_restore --list` of a pg_tviews database (captured on PG 18.6,

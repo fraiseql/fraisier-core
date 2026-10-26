@@ -78,7 +78,7 @@ fn redact_json(value: Value) -> Value {
     }
 }
 
-fn load(config_path: &Path) -> Result<DeployConfig> {
+pub(crate) fn load(config_path: &Path) -> Result<DeployConfig> {
     let toml = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading config {}", config_path.display()))?;
     DeployConfig::from_toml_str(&toml)

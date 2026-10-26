@@ -113,9 +113,11 @@ pub fn generate(config: &DeployConfig) -> Result<Vec<GeneratedFile>, ScaffoldErr
 ///   `calendar` vocabulary (translated) or the `on_calendar_raw` escape hatch.
 /// - each `[[backup.retain]]` entry: `…-retain-<entry>.{service,timer}`,
 ///   running `fraisier backup prune --name <entry> --apply`;
-/// - a `[drill]` with a `schedule`: `…-drill.{service,timer}`.
+/// - a `[drill]` with a `schedule`: `…-drill.{service,timer}`;
+/// - a `[refresh]` with a `schedule`: `…-refresh.{service,timer}`, running
+///   `fraisier db refresh --yes --skip-if-locked`.
 ///
-/// A scheduled backup, a prune and a drill each name
+/// A scheduled backup, a prune, a drill and a refresh each name
 /// `fraisier-<name>-<environment>-alert@.service` in `OnFailure=` and run with
 /// `--failure-record %n`; that alert template is generated with them, because
 /// an `OnFailure=` naming a missing unit fails silently. A scheduled deploy
@@ -144,7 +146,16 @@ pub fn generate_scheduled(config: &DeployConfig) -> Result<Vec<GeneratedFile>, S
         .as_ref()
         .and_then(|drill| drill.schedule.as_deref())
         .filter(|spec| !spec.trim().is_empty());
-    if schedule.is_none() && retain.is_empty() && drill_schedule.is_none() {
+    let refresh_schedule = config
+        .refresh
+        .as_ref()
+        .and_then(|refresh| refresh.schedule.as_deref())
+        .filter(|spec| !spec.trim().is_empty());
+    if schedule.is_none()
+        && retain.is_empty()
+        && drill_schedule.is_none()
+        && refresh_schedule.is_none()
+    {
         return Err(ScaffoldError::MissingField {
             section: "schedule",
             field: "calendar",
@@ -191,6 +202,26 @@ pub fn generate_scheduled(config: &DeployConfig) -> Result<Vec<GeneratedFile>, S
                 "drill.timer",
                 &units
                     .fill(DRILL_TIMER)
+                    .replace("{on_calendar}", &on_calendar),
+            ),
+        );
+        alerting = true;
+    }
+    if let Some(spec) = refresh_schedule {
+        let on_calendar = translate(spec, "refresh", "schedule")?;
+        files.push(
+            units.unit(
+                "refresh.service",
+                &units
+                    .fill(REFRESH_SERVICE)
+                    .replace("{failure}", FAILURE_RECORD),
+            ),
+        );
+        files.push(
+            units.unit(
+                "refresh.timer",
+                &units
+                    .fill(REFRESH_TIMER)
                     .replace("{on_calendar}", &on_calendar),
             ),
         );
@@ -582,6 +613,33 @@ EnvironmentFile=-{env_file}
 
 const DRILL_TIMER: &str = "[Unit]
 Description=fraisier restore drill timer for {name} ({environment})
+
+[Timer]
+# Exactly one OnCalendar=: systemd adds every non-empty assignment as
+# another trigger rather than replacing the last.
+OnCalendar={on_calendar}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+";
+
+const REFRESH_SERVICE: &str = "[Unit]
+Description=fraisier staging refresh of {name} ({environment})
+After=network-online.target
+Wants=network-online.target
+OnFailure=fraisier-{name}-{environment}-alert@%n.service
+
+[Service]
+Type=oneshot
+# --skip-if-locked: a deploy of this environment holds the same lock, so
+# a collision skips this firing instead of failing it.
+ExecStart=fraisier db refresh --config {config_path} --yes --skip-if-locked --failure-record %n
+EnvironmentFile=-{env_file}
+{failure}";
+
+const REFRESH_TIMER: &str = "[Unit]
+Description=fraisier staging refresh timer for {name} ({environment})
 
 [Timer]
 # Exactly one OnCalendar=: systemd adds every non-empty assignment as

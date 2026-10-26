@@ -1,4 +1,4 @@
-//! The scheduled backup, prune and drill units, and the alert unit their
+//! The scheduled backup, prune, drill and refresh units, and the alert unit their
 //! `OnFailure=` names. Golden files: each test pins one unit byte for byte.
 
 use fraisier_config::DeployConfig;
@@ -284,4 +284,73 @@ fn a_custom_config_path_reaches_every_unit() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn a_scheduled_refresh_gets_a_service_and_timer() {
+    let config = DeployConfig::from_toml_str(
+        "[deploy]\nname = \"checkout\"\nenvironment = \"staging\"\n\n\
+         [refresh]\nsource_dir = \"/var/backups/checkout\"\nsource_environment = \"production\"\n\
+         schedule = \"daily 04:30\"\n",
+    )
+    .expect("parses");
+    let files = generate_scheduled(&config).expect("generates");
+    assert_eq!(
+        names(&files),
+        vec![
+            "fraisier-checkout-staging-alert@.service".to_owned(),
+            "fraisier-checkout-staging-refresh.service".to_owned(),
+            "fraisier-checkout-staging-refresh.timer".to_owned(),
+        ]
+    );
+    assert_eq!(
+        unit(&files, "fraisier-checkout-staging-refresh.service").contents,
+        format!(
+            "# {MARKER}\n\
+             [Unit]\n\
+             Description=fraisier staging refresh of checkout (staging)\n\
+             After=network-online.target\n\
+             Wants=network-online.target\n\
+             OnFailure=fraisier-checkout-staging-alert@%n.service\n\
+             \n\
+             [Service]\n\
+             Type=oneshot\n\
+             # --skip-if-locked: a deploy of this environment holds the same lock, so\n\
+             # a collision skips this firing instead of failing it.\n\
+             ExecStart=fraisier db refresh --config /etc/fraisier/checkout.toml --yes --skip-if-locked --failure-record %n\n\
+             EnvironmentFile=-/etc/checkout/staging.env\n\
+             # A failed run leaves its redacted reason here for the alert unit.\n\
+             RuntimeDirectory=fraisier/failures\n\
+             RuntimeDirectoryPreserve=yes\n"
+        )
+    );
+    assert_eq!(
+        unit(&files, "fraisier-checkout-staging-refresh.timer").contents,
+        format!(
+            "# {MARKER}\n\
+             [Unit]\n\
+             Description=fraisier staging refresh timer for checkout (staging)\n\
+             \n\
+             [Timer]\n\
+             # Exactly one OnCalendar=: systemd adds every non-empty assignment as\n\
+             # another trigger rather than replacing the last.\n\
+             OnCalendar=*-*-* 04:30:00\n\
+             Persistent=true\n\
+             \n\
+             [Install]\n\
+             WantedBy=timers.target\n"
+        )
+    );
+}
+
+#[test]
+fn an_unscheduled_refresh_gets_no_unit() {
+    let files = units(&format!(
+        "{RETAIN}\n[refresh]\nsource_dir = \"/b\"\nsource_environment = \"qa\"\n"
+    ));
+    assert!(
+        !names(&files).iter().any(|n| n.contains("refresh")),
+        "{:?}",
+        names(&files)
+    );
 }

@@ -768,7 +768,7 @@ pub(crate) fn scheduled_install(
         .iter()
         .filter(|issue| {
             issue.severity == Severity::Error
-                && ["schedule", "notify", "backup", "drill"]
+                && ["schedule", "notify", "backup", "drill", "refresh"]
                     .iter()
                     .any(|section| issue.path.starts_with(section))
         })
@@ -6351,6 +6351,30 @@ current_revision = "true"
         assert_eq!(out.exit_code, 1, "{}", out.pretty);
         assert!(
             out.pretty.contains("backup.retain[0].name"),
+            "{}",
+            out.pretty
+        );
+        assert!(!root.exists(), "nothing installed");
+    }
+
+    #[test]
+    fn scheduled_install_refuses_an_invalid_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let environment = DeployConfig::from_toml_str(VALID)
+            .expect("parses")
+            .deploy
+            .and_then(|d| d.environment)
+            .expect("environment");
+        let cfg = format!(
+            "{VALID}\n[refresh]\nsource_dir = \"/var/backups/checkout\"\n\
+             source_environment = \"{environment}\"\nschedule = \"daily 04:30\"\n"
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        let out = scheduled_install(&config, &root, true, false, false, false).expect("runs");
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(
+            out.pretty.contains("refresh.source_environment"),
             "{}",
             out.pretty
         );

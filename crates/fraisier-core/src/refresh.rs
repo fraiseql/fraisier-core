@@ -12,16 +12,18 @@
 //!    the database it was taken from.
 //! 2. **The source.** The archive's environment is never the target's.
 //!
-//! A third check runs before anything changes too: every extension the archive
-//! creates must be one the connecting role can create in a fresh database. A
-//! restore that cannot recreate an extension loads the tables and fails, and
-//! the database it replaced is already gone.
+//! Two more checks run before anything changes. The role must be able to set
+//! the marker, because the refresh re-applies it to the database it re-creates;
+//! without that, it would drop a database it could not mark again. And the role
+//! must be able to create every extension the archive creates: a restore that
+//! cannot recreate one loads the tables and fails, after the database it
+//! replaced is gone.
 //!
 //! Then the service is stopped, the database dropped, created again with the
 //! marker re-applied, restored, migrated, counted, and the service restarted. A
-//! failure before the drop restarts the service. A failure after it leaves the
-//! service stopped: the database it would read is partly restored or not
-//! migrated, and serving from it is worse than serving nothing.
+//! failed drop restarts the service. A failure after the drop leaves it
+//! stopped: the database it would read is partly restored or not migrated, and
+//! serving from it is worse than serving nothing.
 
 use std::path::Path;
 
@@ -96,6 +98,13 @@ pub trait RefreshDb: Send + Sync {
         target_dsn: &str,
         extensions: &[String],
     ) -> Result<Option<String>, String>;
+
+    /// Why the connecting role could not set [`MARKER_SETTING`], which the
+    /// refresh re-applies to the database it re-creates; `None` when it can.
+    ///
+    /// # Errors
+    /// The server could not be asked.
+    async fn remark_problem(&self, target_dsn: &str) -> Result<Option<String>, String>;
 
     /// Drop the target database, ending the sessions connected to it.
     ///
@@ -176,6 +185,10 @@ pub enum RefreshError {
     /// The archive is of the target's own environment. Nothing was changed.
     #[error("{0}. Nothing was changed")]
     SameEnvironment(String),
+    /// The role could not re-apply the marker to the database it re-creates.
+    /// Nothing was changed.
+    #[error("{0}. Nothing was changed")]
+    Remark(String),
     /// The archive creates an extension the role could not create. Nothing was
     /// changed.
     #[error("{0}. Nothing was changed")]
@@ -228,7 +241,7 @@ impl RefreshError {
     pub const fn step(&self) -> &'static str {
         match self {
             Self::Secret(_) => "config",
-            Self::Marker(_) | Self::NotATarget(_) => "marker",
+            Self::Marker(_) | Self::NotATarget(_) | Self::Remark(_) => "marker",
             Self::SameEnvironment(_) => "source",
             Self::Extensions(_) => "extensions",
             Self::Stop(_) => "stop",
@@ -262,6 +275,11 @@ pub async fn run_refresh(
         .map_err(RefreshError::NotATarget)?;
     source_guard(plan.archive_environment, plan.environment)
         .map_err(RefreshError::SameEnvironment)?;
+    if let Some(problem) = db.remark_problem(&target).await.map_err(|error| {
+        RefreshError::Remark(format!("could not check the marker privilege: {error}"))
+    })? {
+        return Err(RefreshError::Remark(problem));
+    }
     if let Some(problem) = db
         .extensions_problem(&target, plan.extensions)
         .await
@@ -366,6 +384,7 @@ mod tests {
         fail: FailAt,
         tables: u64,
         extensions_problem: Option<String>,
+        remark_problem: Option<String>,
     }
 
     impl Fake {
@@ -376,6 +395,7 @@ mod tests {
                 fail: FailAt::Nothing,
                 tables: 12,
                 extensions_problem: None,
+                remark_problem: None,
             }
         }
     }
@@ -402,6 +422,10 @@ mod tests {
         ) -> Result<Option<String>, String> {
             push(&self.log, format!("extensions:{}", extensions.join(",")));
             Ok(self.extensions_problem.clone())
+        }
+        async fn remark_problem(&self, _target_dsn: &str) -> Result<Option<String>, String> {
+            push(&self.log, "remark?");
+            Ok(self.remark_problem.clone())
         }
         async fn drop_target(&self, _target_dsn: &str) -> Result<(), String> {
             push(&self.log, "drop");
@@ -608,6 +632,7 @@ mod tests {
             run.log,
             vec![
                 format!("marker:{TARGET_DSN}"),
+                "remark?".to_owned(),
                 "extensions:".to_owned(),
                 "service:stop".to_owned(),
                 "drop".to_owned(),
@@ -662,6 +687,20 @@ mod tests {
         .await;
         assert!(matches!(run.result, Err(RefreshError::SameEnvironment(_))));
         assert!(!run.log.iter().any(|s| s == "drop" || s == "service:stop"));
+    }
+
+    #[tokio::test]
+    async fn a_role_that_cannot_re_mark_the_database_changes_nothing() {
+        let log = Log::default();
+        let mut fake = Fake::marked(&log);
+        fake.remark_problem = Some("GRANT SET ON PARAMETER".to_owned());
+        let run = refresh(fake, Some(service(&log)), false).await;
+        assert!(matches!(run.result, Err(RefreshError::Remark(_))));
+        assert!(
+            !run.log.iter().any(|s| s == "drop" || s == "service:stop"),
+            "{:?}",
+            run.log
+        );
     }
 
     #[tokio::test]

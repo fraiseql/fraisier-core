@@ -21,8 +21,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `<fraise>-<source_environment>-*` archive under `[refresh].source_dir`, then
   migrates it forward. Before anything changes, it lists the archive and checks
   its age, the free space, the deploy lock (`--skip-if-locked` skips), the
-  target's `fraisier.refresh_target` marker, the source environment, and that
-  the role can create every extension the archive does. Then it stops the
+  target's `fraisier.refresh_target` marker, the source environment, that the
+  role may set the marker again, and that the role can create every extension
+  the archive does. On PostgreSQL 15+ a non-superuser needs
+  `GRANT SET ON PARAMETER fraisier.refresh_target TO <role>` once; marking,
+  refreshing and `doctor` all name it when it is missing. Then it stops the
   service, drops and re-creates the database (re-marking it), restores with
   `--no-owner --no-acl`, migrates, checks `min_tables`, and starts the service.
   A failure after the drop leaves the service stopped. `fraisier db

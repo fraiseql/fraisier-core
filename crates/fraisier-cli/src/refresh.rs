@@ -521,18 +521,33 @@ pub(crate) async fn db_mark_refresh_target_with(
             conn.database(),
             fraisier_db::refresh::MARKER_SETTING
         ))),
-        Ok(None) => match server.set_marker(&dsn, &expected).await {
-            Ok(()) => Ok(CommandOutput {
-                exit_code: 0,
-                pretty: format!(
-                    "marked {} as the refresh target of {expected}: `fraisier db refresh` may \
-                     now replace it\n",
-                    conn.database()
-                ),
-                json: json!({ "ok": true, "marker": expected, "changed": true }),
-            }),
-            Err(error) => Ok(failed(format!("could not set the refresh marker: {error}"))),
+        Ok(None) => match server.remark_problem(&dsn).await {
+            Err(error) => Ok(failed(format!(
+                "could not check the marker privilege: {error}"
+            ))),
+            Ok(Some(problem)) => Ok(failed(format!("{problem}. Nothing was changed"))),
+            Ok(None) => set_marker(server, &dsn, &expected, conn.database(), failed).await,
         },
+    }
+}
+
+async fn set_marker(
+    server: &dyn RefreshServer,
+    dsn: &str,
+    expected: &str,
+    database: &str,
+    failed: impl Fn(String) -> CommandOutput,
+) -> Result<CommandOutput> {
+    match server.set_marker(dsn, expected).await {
+        Ok(()) => Ok(CommandOutput {
+            exit_code: 0,
+            pretty: format!(
+                "marked {database} as the refresh target of {expected}: `fraisier db \
+                     refresh` may now replace it\n"
+            ),
+            json: json!({ "ok": true, "marker": expected, "changed": true }),
+        }),
+        Err(error) => Ok(failed(format!("could not set the refresh marker: {error}"))),
     }
 }
 
@@ -567,6 +582,19 @@ impl RefreshDb for PgRefreshDb {
         let sql = fraisier_db::refresh::marker_sql(target.database()).map_err(|e| e.to_string())?;
         let stdout = psql(&target.with_database("postgres"), &sql).await?;
         Ok(fraisier_db::refresh::parse_marker(&stdout))
+    }
+
+    async fn remark_problem(
+        &self,
+        target_dsn: &str,
+    ) -> std::result::Result<Option<String>, String> {
+        let target = parse(target_dsn)?;
+        let stdout = psql(
+            &target.with_database("postgres"),
+            &fraisier_db::refresh::marker_privilege_sql(),
+        )
+        .await?;
+        fraisier_db::refresh::marker_privilege_problem(&stdout)
     }
 
     async fn extensions_problem(
@@ -676,6 +704,7 @@ mod tests {
     struct FakeServer {
         calls: Mutex<Vec<String>>,
         marker: Mutex<Option<String>>,
+        remark_problem: Option<String>,
         tables: u64,
         target_bytes: u64,
     }
@@ -701,6 +730,10 @@ mod tests {
         async fn marker(&self, _target_dsn: &str) -> Result<Option<String>, String> {
             self.record("marker");
             Ok(self.marker.lock().expect("marker").clone())
+        }
+        async fn remark_problem(&self, _target_dsn: &str) -> Result<Option<String>, String> {
+            self.record("remark?");
+            Ok(self.remark_problem.clone())
         }
         async fn extensions_problem(
             &self,
@@ -853,6 +886,7 @@ mod tests {
             server.calls(),
             vec![
                 "marker".to_owned(),
+                "remark?".to_owned(),
                 "extensions:pg_tviews".to_owned(),
                 "drop".to_owned(),
                 "create:demo/staging".to_owned(),
@@ -1059,12 +1093,39 @@ mod tests {
         assert_eq!(out.exit_code, 0, "{}", out.pretty);
         assert_eq!(
             server.calls(),
-            vec!["marker".to_owned(), "set_marker:demo/staging".to_owned()]
+            vec![
+                "marker".to_owned(),
+                "remark?".to_owned(),
+                "set_marker:demo/staging".to_owned()
+            ]
         );
         let out = mark(&config, &server);
         assert_eq!(out.exit_code, 0, "{}", out.pretty);
         assert!(out.pretty.contains("already"), "{}", out.pretty);
-        assert_eq!(server.calls().len(), 3, "a second mark sets nothing");
+        assert_eq!(server.calls().len(), 4, "a second mark sets nothing");
+    }
+
+    #[test]
+    fn marking_without_the_privilege_names_the_grant_and_sets_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = config(dir.path(), "");
+        let server = FakeServer {
+            remark_problem: Some(
+                "GRANT SET ON PARAMETER fraisier.refresh_target TO \"app\"".to_owned(),
+            ),
+            ..FakeServer::default()
+        };
+        let out = mark(&config, &server);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(
+            out.pretty.contains("GRANT SET ON PARAMETER"),
+            "{}",
+            out.pretty
+        );
+        assert_eq!(
+            server.calls(),
+            vec!["marker".to_owned(), "remark?".to_owned()]
+        );
     }
 
     #[test]

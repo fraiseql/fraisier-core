@@ -209,6 +209,19 @@ marker again right after it re-creates the database, before restoring into it.
 `fraisier doctor` reports it as `refresh_target` when the config has a
 `[refresh]`.
 
+On PostgreSQL 15 and later, only a superuser may set a custom setting like
+this one on a database, unless it is granted. A superuser runs this once per
+server, naming the role in the config's DSN:
+
+```sql
+GRANT SET ON PARAMETER fraisier.refresh_target TO app;
+```
+
+Without the grant, `mark-refresh-target` refuses and names the statement. The
+refresh refuses too, before it changes anything, since it could not mark the
+database it re-creates. `doctor` fails `refresh_target` until the grant is in
+place.
+
 The guard fails closed. A database nobody marked is never a target, so an
 environment nobody thought to list is still protected. A list of databases a
 refresh must not touch would fail open. The marker cannot travel inside an
@@ -221,9 +234,10 @@ archive either: `pg_dump` does not carry database-level settings.
    fails the run.
 2. It lists the newest source archive with `pg_restore --list`, then checks its
    age and the free space.
-3. It checks the marker, the source environment, and every extension the
-   archive creates. Each extension must be available on this server, and an
-   untrusted one (pg_tviews, for one) needs a superuser.
+3. It checks the marker, the source environment, that the role may set the
+   marker again, and every extension the archive creates. Each extension must
+   be available on this server, and an untrusted one (pg_tviews, for one) needs
+   a superuser.
 4. It stops the `[service]`. A service adapter that cannot stop refuses, and a
    config with no `[service]` skips this step.
 5. It drops the database, creates it again owned by the connecting role, and

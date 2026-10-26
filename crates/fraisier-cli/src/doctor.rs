@@ -221,8 +221,16 @@ fn check_throwaways(config: &DeployConfig, list: ListThrowaways<'_>) -> Option<C
     }
 }
 
-/// Reads the refresh marker of the database a DSN names.
-type ReadMarker<'a> = &'a dyn Fn(&str) -> Result<Option<String>, String>;
+/// What doctor reads of a refresh target: its marker, and why the role could
+/// not set the marker again, if it could not.
+#[derive(Debug, Default)]
+struct MarkerState {
+    marker: Option<String>,
+    remark_problem: Option<String>,
+}
+
+/// Reads the [`MarkerState`] of the database a DSN names.
+type ReadMarker<'a> = &'a dyn Fn(&str) -> Result<MarkerState, String>;
 
 /// Whether this config's database carries the refresh marker `db refresh`
 /// needs. Only a config with `[refresh]` reaches the database for this.
@@ -252,21 +260,31 @@ fn check_refresh_target(config: &DeployConfig, read: ReadMarker<'_>) -> Option<C
     let Some(dsn) = std::env::var(source).ok().filter(|dsn| !dsn.is_empty()) else {
         return fail(format!("cannot read the marker: ${source} is not set"));
     };
-    match read(&dsn) {
-        Err(error) => fail(format!(
-            "cannot read the marker: {}",
-            fraisier_saga::redact::credentials(&error)
-        )),
-        Ok(Some(found)) if found == expected => Some(Check {
+    let state = match read(&dsn) {
+        Ok(state) => state,
+        Err(error) => {
+            return fail(format!(
+                "cannot read the marker: {}",
+                fraisier_saga::redact::credentials(&error)
+            ))
+        }
+    };
+    if let Some(problem) = state.remark_problem {
+        return fail(format!(
+            "`db refresh` will refuse to drop the database: {problem}"
+        ));
+    }
+    match state.marker {
+        Some(found) if found == expected => Some(Check {
             name: "refresh_target",
             status: Status::Pass,
             detail: format!("the database is the refresh target of {found}"),
         }),
-        Ok(Some(found)) => fail(format!(
+        Some(found) => fail(format!(
             "the database is marked as the refresh target of '{found}', not '{expected}': \
              `db refresh` will refuse it"
         )),
-        Ok(None) => fail(format!(
+        None => fail(format!(
             "the database carries no refresh marker, so `db refresh` will refuse it; mark it \
              once with `fraisier db mark-refresh-target` ({expected})"
         )),
@@ -275,20 +293,29 @@ fn check_refresh_target(config: &DeployConfig, read: ReadMarker<'_>) -> Option<C
 
 /// The refresh marker of the database `dsn` names, read through the server's
 /// `postgres` maintenance database.
-fn read_marker(dsn: &str) -> Result<Option<String>, String> {
+fn read_marker(dsn: &str) -> Result<MarkerState, String> {
     let conn = fraisier_db::PgConn::parse(dsn).map_err(|e| format!("invalid database DSN: {e}"))?;
+    let maintenance = conn.with_database("postgres");
+    let query = |sql: &str| -> Result<String, String> {
+        let mut query = fraisier_db::psql_command(&maintenance, sql);
+        query.arg("-tA");
+        let output = query
+            .output()
+            .map_err(|e| format!("could not run psql: {e}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    };
     let sql = fraisier_db::refresh::marker_sql(conn.database()).map_err(|e| e.to_string())?;
-    let mut query = fraisier_db::psql_command(&conn.with_database("postgres"), &sql);
-    query.arg("-tA");
-    let output = query
-        .output()
-        .map_err(|e| format!("could not run psql: {e}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
-    }
-    Ok(fraisier_db::refresh::parse_marker(
-        &String::from_utf8_lossy(&output.stdout),
-    ))
+    let marker = fraisier_db::refresh::parse_marker(&query(&sql)?);
+    let remark_problem = fraisier_db::refresh::marker_privilege_problem(&query(
+        &fraisier_db::refresh::marker_privilege_sql(),
+    )?)?;
+    Ok(MarkerState {
+        marker,
+        remark_problem,
+    })
 }
 
 /// The databases carrying the throwaway marker on the server `dsn` names.
@@ -475,8 +502,8 @@ pub(crate) fn env_check(config_path: &Path, subcommand: &str) -> CommandOutput {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_refresh_target, check_throwaways, doctor, env_check, parse_version, Status,
-        CONFITURE_FLOOR,
+        check_refresh_target, check_throwaways, doctor, env_check, parse_version, MarkerState,
+        Status, CONFITURE_FLOOR,
     };
     use std::io::Write as _;
 
@@ -530,13 +557,37 @@ url = "http://127.0.0.1/health"
     const REFRESH: &str = "[refresh]\nsource_dir = \"/var/backups/app\"\n\
                            source_environment = \"staging\"\n";
 
+    fn marked(marker: &str) -> MarkerState {
+        MarkerState {
+            marker: Some(marker.to_owned()),
+            remark_problem: None,
+        }
+    }
+
+    #[test]
+    fn a_marked_target_the_role_could_not_mark_again_fails_with_the_grant() {
+        let check = with_dsn(Some("postgres://app@db/shop"), || {
+            check_refresh_target(&throwaway_config(REFRESH), &|_| {
+                Ok(MarkerState {
+                    remark_problem: Some(
+                        "GRANT SET ON PARAMETER fraisier.refresh_target TO \"app\"".to_owned(),
+                    ),
+                    ..marked("app/prod")
+                })
+            })
+        })
+        .expect("a check");
+        assert_eq!(check.status, Status::Fail, "{}", check.detail);
+        assert!(check.detail.contains("GRANT SET"), "{}", check.detail);
+    }
+
     #[test]
     fn a_config_without_refresh_never_reads_the_marker() {
         let reached = std::cell::Cell::new(false);
         let check = with_dsn(Some("postgres://app@db/shop"), || {
             check_refresh_target(&throwaway_config(""), &|_| {
                 reached.set(true);
-                Ok(None)
+                Ok(MarkerState::default())
             })
         });
         assert!(check.is_none());
@@ -546,9 +597,7 @@ url = "http://127.0.0.1/health"
     #[test]
     fn a_marked_refresh_target_passes() {
         let check = with_dsn(Some("postgres://app@db/shop"), || {
-            check_refresh_target(&throwaway_config(REFRESH), &|_| {
-                Ok(Some("app/prod".to_owned()))
-            })
+            check_refresh_target(&throwaway_config(REFRESH), &|_| Ok(marked("app/prod")))
         })
         .expect("a check");
         assert_eq!(check.status, Status::Pass, "{}", check.detail);
@@ -558,7 +607,7 @@ url = "http://127.0.0.1/health"
     #[test]
     fn an_unmarked_or_other_refresh_target_fails() {
         let check = with_dsn(Some("postgres://app@db/shop"), || {
-            check_refresh_target(&throwaway_config(REFRESH), &|_| Ok(None))
+            check_refresh_target(&throwaway_config(REFRESH), &|_| Ok(MarkerState::default()))
         })
         .expect("a check");
         assert_eq!(check.status, Status::Fail);
@@ -568,9 +617,7 @@ url = "http://127.0.0.1/health"
             check.detail
         );
         let check = with_dsn(Some("postgres://app@db/shop"), || {
-            check_refresh_target(&throwaway_config(REFRESH), &|_| {
-                Ok(Some("app/qa".to_owned()))
-            })
+            check_refresh_target(&throwaway_config(REFRESH), &|_| Ok(marked("app/qa")))
         })
         .expect("a check");
         assert_eq!(check.status, Status::Fail);

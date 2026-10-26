@@ -55,6 +55,39 @@ pub fn set_marker_command(maintenance: &PgConn, db: &str, value: &str) -> Result
     ))
 }
 
+/// The SQL asking whether the connecting role may set [`MARKER_SETTING`]
+/// (PostgreSQL 15+): one JSON object, `user` and `set`.
+#[must_use]
+pub fn marker_privilege_sql() -> String {
+    format!(
+        "SELECT json_build_object('user', current_user, 'set', \
+         has_parameter_privilege({}, 'SET'))",
+        literal(MARKER_SETTING)
+    )
+}
+
+/// Why [`marker_privilege_sql`]'s reply rules the refresh out, with the GRANT
+/// that fixes it, or `None`.
+///
+/// # Errors
+/// The reply is not the JSON object the query prints.
+pub fn marker_privilege_problem(stdout: &str) -> Result<Option<String>, String> {
+    let reply: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|error| format!("the marker privilege query did not print its JSON: {error}"))?;
+    if reply["set"].as_bool() == Some(true) {
+        return Ok(None);
+    }
+    let user = reply["user"]
+        .as_str()
+        .unwrap_or("<role>")
+        .replace('"', "\"\"");
+    Ok(Some(format!(
+        "the role \"{user}\" may not set {MARKER_SETTING}, so it could not mark a \
+         database again. A superuser runs, once: \
+         GRANT SET ON PARAMETER {MARKER_SETTING} TO \"{user}\""
+    )))
+}
+
 /// The extensions `listing` (a `pg_restore --list` table of contents) creates.
 #[must_use]
 pub fn archive_extensions(listing: &str) -> Vec<String> {
@@ -153,8 +186,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        archive_extensions, extensions_problem, extensions_sql, marker_sql, parse_marker,
-        restore_command, set_marker_command, MARKER_SETTING,
+        archive_extensions, extensions_problem, extensions_sql, marker_privilege_problem,
+        marker_privilege_sql, marker_sql, parse_marker, restore_command, set_marker_command,
+        MARKER_SETTING,
     };
     use crate::PgConn;
 
@@ -259,5 +293,30 @@ mod tests {
                 .expect("json"),
             None
         );
+    }
+
+    #[test]
+    fn the_marker_privilege_is_asked_of_the_setting() {
+        let sql = marker_privilege_sql();
+        assert!(
+            sql.contains("has_parameter_privilege('fraisier.refresh_target', 'SET')"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn a_role_that_cannot_set_the_marker_is_told_the_grant() {
+        let problem = marker_privilege_problem(r#"{"user": "app", "set": false}"#)
+            .expect("json")
+            .expect("a problem");
+        assert!(
+            problem.contains("GRANT SET ON PARAMETER fraisier.refresh_target TO \"app\""),
+            "{problem}"
+        );
+        assert_eq!(
+            marker_privilege_problem(r#"{"user": "app", "set": true}"#).expect("json"),
+            None
+        );
+        assert!(marker_privilege_problem("nope").is_err());
     }
 }

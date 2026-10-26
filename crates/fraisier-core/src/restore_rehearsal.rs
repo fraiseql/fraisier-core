@@ -36,7 +36,9 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
-use crate::adapter_axes::{AdapterCtx, AdapterError, MigrationAdapter, Revision};
+use crate::adapter_axes::{
+    AdapterCtx, AdapterDescription, AdapterError, MigrationAdapter, Revision,
+};
 
 /// The logical secret name the migration DSN is exposed under (Decision 5); the
 /// migration adapter resolves it with `ctx.secret("DATABASE_URL")`.
@@ -152,26 +154,78 @@ pub async fn run_restore_rehearsal(
     ctx: &AdapterCtx,
     backup: &BackupSource,
 ) -> Result<RehearsalReport, RehearsalError> {
-    let live_dsn = ctx
-        .secret(DATABASE_URL_SECRET)
-        .map_err(RehearsalError::Secret)?;
-    let throwaway = db.provision(&live_dsn, backup).await?;
-
-    // Redirect the migration adapter at the throwaway DB (in-process only — the
-    // value never serializes and never logs). Pending resolves from *its* tracking.
-    let rehearsal_ctx = ctx
-        .clone()
-        .with_resolved_secret(DATABASE_URL_SECRET, throwaway.dsn.clone());
-    let migrate_result = migration.up(&rehearsal_ctx, None).await;
+    let throwaway = provision(db, ctx, backup).await?;
+    let migrate_result = rehearse_on(migration, ctx, &throwaway).await;
 
     // Always tear down, whatever the migration did.
     let teardown_result = db.teardown(&throwaway).await;
 
-    let outcome = migrate_result.map_err(RehearsalError::Migrate)?;
     Ok(RehearsalReport {
-        applied: outcome.applied,
+        applied: migrate_result?,
         teardown_warning: teardown_result.err(),
     })
+}
+
+/// Provision a throwaway copy of `ctx`'s live database, seeded from `backup`.
+///
+/// The caller owns the throwaway from here and must hand it to
+/// [`RehearsalDb::teardown`] on every path.
+///
+/// # Errors
+/// [`RehearsalError::Secret`] if the live DSN cannot be resolved, or the
+/// provisioning failure.
+pub async fn provision(
+    db: &dyn RehearsalDb,
+    ctx: &AdapterCtx,
+    backup: &BackupSource,
+) -> Result<ThrowawayDb, RehearsalError> {
+    let live_dsn = ctx
+        .secret(DATABASE_URL_SECRET)
+        .map_err(RehearsalError::Secret)?;
+    db.provision(&live_dsn, backup).await
+}
+
+/// `ctx` with its database redirected (in-process only; the value never
+/// serializes and never logs) at `throwaway`, so pending migrations resolve from
+/// the throwaway's own tracking table.
+#[must_use]
+pub fn on_throwaway(ctx: &AdapterCtx, throwaway: &ThrowawayDb) -> AdapterCtx {
+    ctx.clone()
+        .with_resolved_secret(DATABASE_URL_SECRET, throwaway.dsn.clone())
+}
+
+/// [`on_throwaway`], also naming `throwaway` as the database a preflight
+/// classifies against ([`AGAINST_DATABASE_URL_SECRET`]).
+#[must_use]
+pub fn against_throwaway(ctx: &AdapterCtx, throwaway: &ThrowawayDb) -> AdapterCtx {
+    on_throwaway(ctx, throwaway)
+        .with_resolved_secret(AGAINST_DATABASE_URL_SECRET, throwaway.dsn.clone())
+}
+
+/// Whether the adapter `described` can classify against a seeded copy.
+#[must_use]
+pub fn classifies_deeply(described: &AdapterDescription) -> bool {
+    described
+        .capabilities
+        .iter()
+        .any(|capability| capability == DEEP_CLASSIFICATION)
+}
+
+/// Rehearse the pending migrations on an already-provisioned `throwaway`,
+/// returning the migrations it applied. Does not tear it down.
+///
+/// # Errors
+/// [`RehearsalError::Migrate`] if the rehearsed `migrate up` fails.
+pub async fn rehearse_on(
+    migration: &dyn MigrationAdapter,
+    ctx: &AdapterCtx,
+    throwaway: &ThrowawayDb,
+) -> Result<Vec<Revision>, RehearsalError> {
+    migration
+        .up(&on_throwaway(ctx, throwaway), None)
+        .await
+        .map(|outcome| outcome.applied)
+        .map_err(RehearsalError::Migrate)
 }
 
 #[cfg(test)]

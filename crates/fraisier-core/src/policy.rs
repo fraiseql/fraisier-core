@@ -756,6 +756,19 @@ pub async fn inspect(
     ctx: &AdapterCtx,
 ) -> Result<Inspection, AdapterError> {
     let described = migration.describe().await?;
+    inspect_described(migration, ctx, described).await
+}
+
+/// [`inspect`], for a caller that has already asked the adapter to describe
+/// itself (to decide which database to inspect against).
+///
+/// # Errors
+/// The adapter's own `preflight` [`AdapterError`], unchanged.
+pub async fn inspect_described(
+    migration: &dyn MigrationAdapter,
+    ctx: &AdapterCtx,
+    described: AdapterDescription,
+) -> Result<Inspection, AdapterError> {
     let capabilities = Capabilities::from_advertised(&described.capabilities);
     let report = if capabilities.preflight {
         Some(migration.preflight(ctx).await?)

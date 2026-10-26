@@ -130,6 +130,9 @@ pub struct PreviewTarget {
     /// Whether any preflight runs at all (`[migration].preflight_mode`). When
     /// this is false the deploy inspects nothing, and neither does its preview.
     pub forward_compatible_lint: bool,
+    /// The restore rehearsal a single-host deploy of this config runs, if any,
+    /// so its preview can classify the same way.
+    pub restore_rehearsal: Option<RestoreRehearsalPlan>,
 }
 
 /// Build just what a `--dry-run` needs to inspect the pending schema change.
@@ -174,10 +177,12 @@ pub fn build_preview(
     ctx.env_secrets = env_secrets;
     ctx.settings = settings_map(config, app_version);
 
+    let (forward_compatible_lint, restore_rehearsal) = resolve_preflight(config);
     Ok(PreviewTarget {
         migration,
         ctx,
-        forward_compatible_lint: resolve_preflight(config).0,
+        forward_compatible_lint,
+        restore_rehearsal,
     })
 }
 

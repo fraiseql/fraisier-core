@@ -1593,12 +1593,17 @@ fn render_multi_host_summary(
 /// yields a plan carrying an explicit unavailability instead of an error exit
 /// (rule 2, D8). The one thing it never does is produce a plan that reads as
 /// clean.
+///
+/// `single_host` previews a restore-rehearsal config the way its single-host
+/// deploy classifies: against a fresh copy of the live database when it can
+/// ([`preview::gather_rehearsed`]). The other strategies run no rehearsal.
 async fn preview_schema(
     config: &DeployConfig,
     host: Option<&str>,
     app_version: Option<&str>,
     baseline: Baseline,
     skip_preflight: bool,
+    single_host: bool,
 ) -> SchemaPreview {
     let (gate, approval_command) = factory::preview_gate(config);
     let approval_command = approval_command.as_deref();
@@ -1631,6 +1636,18 @@ async fn preview_schema(
             "`[migration].preflight_mode = \"off\"` turns every preflight off, so the deploy \
              itself will not inspect the pending schema changes either",
         ));
+    }
+    if let (true, Some((db, backup))) = (single_host, &target.restore_rehearsal) {
+        return preview::gather_rehearsed(
+            db.as_ref(),
+            backup,
+            target.migration.as_ref(),
+            &target.ctx,
+            &gate,
+            approval_command,
+            baseline,
+        )
+        .await;
     }
     preview::gather(
         target.migration.as_ref(),
@@ -1677,8 +1694,15 @@ pub(crate) async fn deploy(
     if dry_run {
         // Single-host and multi-host run one version at a time against the
         // database, so neither has a shared hold window to certify.
-        let schema =
-            preview_schema(&config, host, app_version, Baseline::None, skip_preflight).await;
+        let schema = preview_schema(
+            &config,
+            host,
+            app_version,
+            Baseline::None,
+            skip_preflight,
+            !multi_host,
+        )
+        .await;
         // A plan *was* produced, so the command succeeds — terraform semantics.
         // `--fail-on-block` is the pipeline's opt-in to the stricter reading.
         let exit_code = i32::from(fail_on_block && preview::would_block(&schema));
@@ -1729,16 +1753,27 @@ pub(crate) async fn deploy(
     }
     let plan = builder.build()?;
 
-    let outcome = plan.run(store).await?;
+    let run = plan.run_reporting(store).await?;
+    let outcome = run.outcome;
     notify_deploy_failure(&config, &resolved.fraise, &resolved.environment, &outcome).await;
     let (exit_code, label, detail) = outcome_result(&outcome);
+    let mut pretty = String::new();
+    for warning in &run.warnings {
+        let _ = writeln!(pretty, "  [warning] preflight: {warning}");
+    }
+    let _ = writeln!(
+        pretty,
+        "deploy of {}/{} {label}{detail}",
+        resolved.fraise, resolved.environment
+    );
+    let mut json = json!({ "outcome": label, "detail": detail.trim() });
+    if !run.warnings.is_empty() {
+        json["warnings"] = json!(run.warnings);
+    }
     Ok(CommandOutput {
         exit_code,
-        pretty: format!(
-            "deploy of {}/{} {label}{detail}\n",
-            resolved.fraise, resolved.environment
-        ),
-        json: json!({ "outcome": label, "detail": detail.trim() }),
+        pretty,
+        json,
     })
 }
 
@@ -1799,7 +1834,15 @@ async fn run_blue_green(
         // so its plan answers the question no other strategy has to ask — and
         // `--skip-preflight` is deliberately not honoured here, because the live
         // blue-green preflight does not honour it either.
-        let schema = preview_schema(config, None, app_version, Baseline::WindowSafety, false).await;
+        let schema = preview_schema(
+            config,
+            None,
+            app_version,
+            Baseline::WindowSafety,
+            false,
+            false,
+        )
+        .await;
         let mut lines = vec![format!(
             "blue-green deploy plan for {}/{}:",
             resolved.fraise, resolved.environment
@@ -2627,43 +2670,19 @@ async fn drill_steps(
 }
 
 /// Refuse a drill when the filesystem holding `data_dir` cannot take another
-/// copy of the live database plus 2 GB. A measurement that fails refuses too: a
-/// copy that fills the disk can stop the live server beside it.
+/// copy of the live database ([`fraisier_db::retention::room_for_copy`]).
 async fn drill_room(
     server: &dyn DrillServer,
     live_dsn: &str,
     data_dir: &Path,
 ) -> std::result::Result<(), (&'static str, String)> {
-    const HEADROOM: u64 = 2_000_000_000;
     let live = server.live_bytes(live_dsn).await.map_err(|error| {
         (
             "free space",
             format!("could not size the live database: {error}"),
         )
     })?;
-    let free = fraisier_db::retention::available_bytes(data_dir).map_err(|error| {
-        (
-            "free space",
-            format!(
-                "could not measure free space in {}: {error}",
-                data_dir.display()
-            ),
-        )
-    })?;
-    let needed = live.saturating_add(HEADROOM);
-    if free < needed {
-        return Err((
-            "free space",
-            format!(
-                "{} has {} GB free; a restored copy needs about {} GB (the live database's \
-                 size plus 2 GB)",
-                data_dir.display(),
-                free / 1_000_000_000,
-                needed.div_ceil(1_000_000_000)
-            ),
-        ));
-    }
-    Ok(())
+    fraisier_db::retention::room_for_copy(live, data_dir).map_err(|error| ("free space", error))
 }
 
 /// Write `receipt` to `<state_dir>/drills/<fraise>-<environment>.json`, replacing

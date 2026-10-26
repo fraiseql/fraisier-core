@@ -28,14 +28,17 @@
 //! unavailability. `--dry-run --skip-preflight` restores the pure offline plan
 //! byte-for-byte.
 
+use std::fmt::Write as _;
+
 use fraisier_core::adapter_axes::{
-    AdapterCtx, AdapterDescription, ChangeSetUnavailable, MigrationAdapter, PreflightReport,
-    RiskTier, SchemaChange,
+    AdapterCtx, AdapterDescription, AdapterError, ChangeSetUnavailable, MigrationAdapter,
+    PreflightReport, RiskTier, SchemaChange,
 };
 use fraisier_core::policy::{
     self, Baseline, Capabilities, Inspection, PolicyDecision, PolicyGate, PolicyReason,
 };
 use fraisier_core::redact;
+use fraisier_core::restore_rehearsal::{self, BackupSource, RehearsalDb, DEEP_CLASSIFICATION};
 use serde::Serialize;
 
 /// The schema half of a `--dry-run` plan.
@@ -57,6 +60,29 @@ pub struct SchemaPreview {
     /// The adapter's window-safety verdict. `None` when the strategy never asks
     /// — only blue-green holds two versions against one database.
     pub window_safe: Option<WindowSafety>,
+    /// How the change-set was classified, for a restore-rehearsal deploy only:
+    /// against a fresh copy of the live data, or statically and why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification: Option<Classification>,
+}
+
+/// How a restore-rehearsal preview classified the pending changes.
+#[derive(Debug, Clone, Serialize)]
+pub struct Classification {
+    /// Deep or static.
+    pub kind: ClassificationKind,
+    /// One line for the operator.
+    pub detail: String,
+}
+
+/// Whether a classification read the live data's current schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassificationKind {
+    /// Against a throwaway restored from a fresh dump of the live database.
+    Deep,
+    /// From the migration files alone.
+    Static,
 }
 
 /// The change-set as a plan renders it: which adapter classified it, at which
@@ -209,24 +235,28 @@ pub async fn gather(
     approval_command: Option<&str>,
     baseline: Baseline,
 ) -> SchemaPreview {
-    let inspection = match policy::inspect(migration, ctx).await {
+    let inspected = policy::inspect(migration, ctx).await;
+    from_inspection(inspected, gate, approval_command, baseline)
+}
+
+/// Fold an inspection, or the error that stopped it, into the plan.
+fn from_inspection(
+    inspected: Result<Inspection, AdapterError>,
+    gate: &PolicyGate,
+    approval_command: Option<&str>,
+    baseline: Baseline,
+) -> SchemaPreview {
+    let inspection = match inspected {
         Ok(inspection) => inspection,
         // "The check could not run" is never "the check passed". The verdict is
         // computed as though nothing had been inspected, which is exactly what
         // the deploy itself would conclude.
         Err(error) => {
-            return assemble(
-                Err(Unavailable::new(
-                    Unavailable::PREFLIGHT_FAILED,
-                    redact::credentials(&format!(
-                        "the migration adapter could not be inspected: {error}"
-                    )),
-                )),
+            return failed(
+                &format!("the migration adapter could not be inspected: {error}"),
                 gate,
                 approval_command,
                 baseline,
-                Capabilities::default(),
-                None,
             )
         }
     };
@@ -239,6 +269,122 @@ pub async fn gather(
         inspection.capabilities,
         inspection.report.as_ref(),
     )
+}
+
+/// The plan for an inspection that could not run, for the redacted `reason`.
+fn failed(
+    reason: &str,
+    gate: &PolicyGate,
+    approval_command: Option<&str>,
+    baseline: Baseline,
+) -> SchemaPreview {
+    assemble(
+        Err(Unavailable::new(
+            Unavailable::PREFLIGHT_FAILED,
+            redact::credentials(reason),
+        )),
+        gate,
+        approval_command,
+        baseline,
+        Capabilities::default(),
+        None,
+    )
+}
+
+/// [`gather`], for a single-host restore-rehearsal deploy, classifying the way
+/// that deploy will.
+///
+/// With a fresh dump and an adapter that advertises
+/// [`DEEP_CLASSIFICATION`], it provisions a throwaway exactly as the deploy's
+/// preflight does, classifies against it, and drops it. Otherwise the
+/// classification is static, and the plan says why. A throwaway that cannot be
+/// provisioned is an unavailable change-set, never a static one in its place:
+/// the deploy would stop at the same point.
+pub async fn gather_rehearsed(
+    db: &dyn RehearsalDb,
+    backup: &BackupSource,
+    migration: &dyn MigrationAdapter,
+    ctx: &AdapterCtx,
+    gate: &PolicyGate,
+    approval_command: Option<&str>,
+    baseline: Baseline,
+) -> SchemaPreview {
+    let described = match migration.describe().await {
+        Ok(described) => described,
+        Err(error) => {
+            return failed(
+                &format!("the migration adapter could not be inspected: {error}"),
+                gate,
+                approval_command,
+                baseline,
+            )
+        }
+    };
+    let static_because = if *backup != BackupSource::FreshDump {
+        Some(
+            "classified statically: an archive-mode rehearsal classifies the migration files \
+             alone, because an archive behind live has a different pending set"
+                .to_owned(),
+        )
+    } else if restore_rehearsal::classifies_deeply(&described) {
+        None
+    } else {
+        Some(format!(
+            "classified statically: {} {} does not advertise `{DEEP_CLASSIFICATION}`, so a \
+             change whose risk depends on the current schema, such as a column type change, \
+             stays unclassified",
+            described.name, described.version
+        ))
+    };
+    if let Some(detail) = static_because {
+        let inspected = policy::inspect_described(migration, ctx, described).await;
+        return with_classification(
+            from_inspection(inspected, gate, approval_command, baseline),
+            ClassificationKind::Static,
+            detail,
+        );
+    }
+
+    let throwaway = match restore_rehearsal::provision(db, ctx, backup).await {
+        Ok(throwaway) => throwaway,
+        Err(error) => {
+            return failed(
+                &format!(
+                    "the throwaway database the deploy classifies against could not be \
+                     provisioned: {error}"
+                ),
+                gate,
+                approval_command,
+                baseline,
+            )
+        }
+    };
+    let against = restore_rehearsal::against_throwaway(ctx, &throwaway);
+    let inspected = policy::inspect_described(migration, &against, described).await;
+    let mut detail = "classified against a fresh copy of the live database, as the deploy will \
+                      classify it"
+        .to_owned();
+    if let Err(error) = db.teardown(&throwaway).await {
+        let _ = write!(
+            detail,
+            "; the throwaway database '{}' was not dropped and must be removed by hand: {error}",
+            throwaway.name
+        );
+    }
+    with_classification(
+        from_inspection(inspected, gate, approval_command, baseline),
+        ClassificationKind::Deep,
+        redact::credentials(&detail),
+    )
+}
+
+fn with_classification(
+    mut preview: SchemaPreview,
+    kind: ClassificationKind,
+    detail: String,
+) -> SchemaPreview {
+    preview.classification = Some(Classification { kind, detail });
+    preview
 }
 
 /// The plan for a run that inspected nothing — preflight is off, or the adapter
@@ -343,6 +489,7 @@ fn assemble(
             // never ask — reported as `null`, distinct from "asked, no answer".
             _ => None,
         },
+        classification: None,
     }
 }
 
@@ -434,6 +581,9 @@ pub fn render(preview: &SchemaPreview) -> String {
             )));
         }
         (None, _) => {}
+    }
+    if let Some(classification) = &preview.classification {
+        lines.extend(wrap(&classification.detail));
     }
     if let Some(window) = preview.window_safe {
         if !lines.is_empty() {
@@ -597,7 +747,10 @@ fn wrap(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{gather, ChangeSetPreview, PolicyPreview, SchemaPreview, Unavailable, Verdict};
+    use super::{
+        gather, gather_rehearsed, render, ChangeSetPreview, ClassificationKind, PolicyPreview,
+        SchemaPreview, Unavailable, Verdict,
+    };
     use async_trait::async_trait;
     use fraisier_core::adapter_axes::{
         AdapterCtx, AdapterDescription, AdapterError, ChangeSet, MigrationAdapter,
@@ -606,6 +759,10 @@ mod tests {
     };
     use fraisier_core::policy::{
         ApprovalHook, ApprovalRequest, ApprovalVerdict, Baseline, Policy, PolicyGate, PolicyReason,
+    };
+    use fraisier_core::restore_rehearsal::{
+        BackupSource, RehearsalDb, RehearsalError, ThrowawayDb, AGAINST_DATABASE_URL_SECRET,
+        DEEP_CLASSIFICATION,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -618,6 +775,8 @@ mod tests {
         report: Result<PreflightReport, AdapterError>,
         describe_fails: Option<AdapterError>,
         trail: Mutex<Vec<&'static str>>,
+        /// The `AGAINST_DATABASE_URL` each `preflight` was handed.
+        against: Mutex<Vec<Option<String>>>,
     }
 
     impl FakeMigration {
@@ -630,6 +789,7 @@ mod tests {
                 report,
                 describe_fails: None,
                 trail: Mutex::new(Vec::new()),
+                against: Mutex::new(Vec::new()),
             }
         }
 
@@ -704,10 +864,211 @@ mod tests {
             unreachable!("a dry-run never verifies")
         }
 
-        async fn preflight(&self, _ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {
+        async fn preflight(&self, ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {
             self.record("preflight");
+            self.against
+                .lock()
+                .expect("against")
+                .push(ctx.secret(AGAINST_DATABASE_URL_SECRET).ok());
             self.report.clone()
         }
+    }
+
+    /// A throwaway lifecycle that records what it was asked to do.
+    struct FakeRehearsalDb {
+        trail: Mutex<Vec<&'static str>>,
+        fail_provision: bool,
+        fail_teardown: bool,
+    }
+
+    impl FakeRehearsalDb {
+        fn new() -> Self {
+            Self {
+                trail: Mutex::new(Vec::new()),
+                fail_provision: false,
+                fail_teardown: false,
+            }
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.trail.lock().expect("trail").clone()
+        }
+    }
+
+    #[async_trait]
+    impl RehearsalDb for FakeRehearsalDb {
+        async fn provision(
+            &self,
+            _live_dsn: &str,
+            _backup: &BackupSource,
+        ) -> Result<ThrowawayDb, RehearsalError> {
+            self.trail.lock().expect("trail").push("provision");
+            if self.fail_provision {
+                return Err(RehearsalError::Provision("pg_dump failed".to_owned()));
+            }
+            Ok(ThrowawayDb {
+                dsn: "postgres://u:pw@h/app_fraisier_rh_1".to_owned(),
+                name: "app_fraisier_rh_1".to_owned(),
+            })
+        }
+
+        async fn teardown(&self, db: &ThrowawayDb) -> Result<(), String> {
+            self.trail.lock().expect("trail").push("teardown");
+            if self.fail_teardown {
+                return Err(format!("DROP DATABASE {} failed", db.name));
+            }
+            Ok(())
+        }
+    }
+
+    fn live_ctx() -> AdapterCtx {
+        ctx().with_resolved_secret("DATABASE_URL", "postgres://u:pw@h/app")
+    }
+
+    fn deep_adapter(changes: Vec<SchemaChange>) -> FakeMigration {
+        let mut migration = FakeMigration::classifying(changes).reporting("0.44.0");
+        migration.capabilities.push(DEEP_CLASSIFICATION.to_owned());
+        migration
+    }
+
+    fn narrowing() -> SchemaChange {
+        change("alter_column_type", "public.tb_order.note").with_tier(RiskTier::Irreversible)
+    }
+
+    async fn rehearsed(
+        db: &FakeRehearsalDb,
+        backup: &BackupSource,
+        migration: &FakeMigration,
+    ) -> SchemaPreview {
+        gather_rehearsed(
+            db,
+            backup,
+            migration,
+            &live_ctx(),
+            &PolicyGate::new(Policy::default()),
+            None,
+            Baseline::None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_fresh_dump_rehearsal_previews_the_deep_classification() {
+        let db = FakeRehearsalDb::new();
+        let migration = deep_adapter(vec![narrowing()]);
+        let preview = rehearsed(&db, &BackupSource::FreshDump, &migration).await;
+        assert_eq!(db.calls(), ["provision", "teardown"]);
+        assert_eq!(
+            migration.against.lock().expect("against").clone(),
+            [Some("postgres://u:pw@h/app_fraisier_rh_1".to_owned())]
+        );
+        let classification = preview
+            .classification
+            .expect("a rehearsal says how it classified");
+        assert_eq!(classification.kind, ClassificationKind::Deep);
+        let policy = preview.policy.expect("a [policy] section decides");
+        assert_eq!(policy.decision, Verdict::Deny);
+        assert_eq!(policy.worst_tier, Some(RiskTier::Irreversible));
+    }
+
+    #[tokio::test]
+    async fn an_archive_rehearsal_says_its_classification_is_static() {
+        let db = FakeRehearsalDb::new();
+        let migration = deep_adapter(vec![narrowing()]);
+        let preview = rehearsed(
+            &db,
+            &BackupSource::Archive("/backups/app.dump".into()),
+            &migration,
+        )
+        .await;
+        assert!(db.calls().is_empty(), "{:?}", db.calls());
+        assert_eq!(migration.against.lock().expect("against").clone(), [None]);
+        let classification = preview.classification.expect("classification");
+        assert_eq!(classification.kind, ClassificationKind::Static);
+        assert!(
+            classification.detail.contains("archive"),
+            "{}",
+            classification.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn below_the_floor_the_preview_says_static_not_deep() {
+        let db = FakeRehearsalDb::new();
+        let migration = FakeMigration::classifying(vec![narrowing()]).reporting("0.43.0");
+        let preview = rehearsed(&db, &BackupSource::FreshDump, &migration).await;
+        assert!(db.calls().is_empty(), "{:?}", db.calls());
+        let classification = preview.classification.expect("classification");
+        assert_eq!(classification.kind, ClassificationKind::Static);
+        assert!(
+            classification.detail.contains(DEEP_CLASSIFICATION),
+            "{}",
+            classification.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn a_throwaway_that_cannot_be_provisioned_is_not_previewed_statically() {
+        let db = FakeRehearsalDb {
+            fail_provision: true,
+            ..FakeRehearsalDb::new()
+        };
+        let migration = deep_adapter(vec![narrowing()]);
+        let preview = rehearsed(&db, &BackupSource::FreshDump, &migration).await;
+        assert_eq!(
+            migration.calls(),
+            ["describe"],
+            "no static preflight stands in"
+        );
+        assert_eq!(unavailable(&preview).code, Unavailable::PREFLIGHT_FAILED);
+        assert!(
+            unavailable(&preview).detail.contains("pg_dump failed"),
+            "{}",
+            unavailable(&preview).detail
+        );
+    }
+
+    #[tokio::test]
+    async fn a_throwaway_left_behind_by_the_preview_is_named() {
+        let db = FakeRehearsalDb {
+            fail_teardown: true,
+            ..FakeRehearsalDb::new()
+        };
+        let migration = deep_adapter(vec![narrowing()]);
+        let preview = rehearsed(&db, &BackupSource::FreshDump, &migration).await;
+        let classification = preview.classification.expect("classification");
+        assert!(
+            classification.detail.contains("app_fraisier_rh_1"),
+            "{}",
+            classification.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn the_render_says_how_the_change_set_was_classified() {
+        let db = FakeRehearsalDb::new();
+        let deep = rehearsed(
+            &db,
+            &BackupSource::FreshDump,
+            &deep_adapter(vec![narrowing()]),
+        )
+        .await;
+        assert!(
+            render(&deep).contains("classified against a fresh copy"),
+            "{}",
+            render(&deep)
+        );
+        let archive = rehearsed(
+            &db,
+            &BackupSource::Archive("/backups/app.dump".into()),
+            &deep_adapter(vec![narrowing()]),
+        )
+        .await;
+        assert!(
+            render(&archive).contains("classified statically"),
+            "{}",
+            render(&archive)
+        );
     }
 
     /// An approval hook that counts the times it was asked. A dry-run must never

@@ -34,6 +34,15 @@ impl RehearsalDb for PgRehearsalDb {
     ) -> Result<ThrowawayDb, RehearsalError> {
         let live = PgConn::parse(live_dsn)
             .map_err(|e| provision_error(format!("invalid database DSN: {e}")))?;
+        if *backup == BackupSource::FreshDump {
+            // The dump lands in the temp dir; refuse before creating anything
+            // when a copy would not fit.
+            let size = crate::commands::DrillServer::live_bytes(self, live_dsn)
+                .await
+                .map_err(|e| provision_error(format!("could not size the live database: {e}")))?;
+            fraisier_db::retention::room_for_copy(size, &std::env::temp_dir())
+                .map_err(provision_error)?;
+        }
         let name = throwaway_name(live.database());
         let maintenance = live.with_database("postgres");
 

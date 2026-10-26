@@ -71,6 +71,23 @@ fraisier init
 CHECKOUT_DATABASE_URL=postgres://… fraisier deploy --app-version 1.4.2
 ```
 
+### Prebuilt binaries
+
+Each `fraisier-v*` release carries a binary per target
+(`fraisier-<target>.tar.gz`: Linux `x86_64`/`aarch64` gnu with a glibc 2.28 floor,
+static `x86_64` musl, and macOS), a CycloneDX SBOM per target
+(`fraisier-<target>.cdx.json`), and a `SHA256SUMS` file covering all of them.
+Check a download against it before installing:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+That proves the files are the ones the release lists. It does not prove who
+published the release, because the checksums come from the same place as the
+binaries. [docs/security.md](docs/security.md#offline-install) covers installing
+on a host with no network access.
+
 A minimal `fraisier.toml`:
 
 ```toml
@@ -234,6 +251,14 @@ printed, and the full stdout+stderr is written to a `0o600` log under
 `$XDG_DATA_HOME/fraisier/logs/` (falling back to `~/.local/share/...`) whose path
 is named in the report, so nothing is lost. Small failures print whole. The
 `--json` report always carries the full output regardless.
+
+### Deploying FraiseQL
+
+fraisier is proven against FraiseQL **2.18.0**, pinned in
+[`tools/fraiseql-version`](tools/fraiseql-version). On 2.18, `/health` answers 200
+even when a configured capability failed to start. See
+[`docs/fraiseql.md`](docs/fraiseql.md) for the supported versions, the
+migrate-then-restart order, and what the health check does and does not prove.
 
 ### Perf-regression rollback gate
 

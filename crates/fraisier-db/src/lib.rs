@@ -17,6 +17,8 @@
 
 pub mod readiness;
 
+pub mod archive;
+
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::Path;

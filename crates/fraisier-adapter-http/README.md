@@ -16,6 +16,7 @@ expected_status = 200                   # default 200
 attempts = 3                            # default 3
 retry_delay_ms = 500                    # default 500
 timeout_ms = 5000                       # default 5000
+require_capabilities = ["observers"]    # optional
 ```
 
 ## Healthy vs. unreachable
@@ -25,6 +26,10 @@ The adapter honours the trait's distinction between a probe *result* and a probe
 
 - response status == `expected_status` → `Ok(healthy: true)`
 - response with any other status → `Ok(healthy: false)` (a result, not an error)
+- with `require_capabilities`, the expected status but a required FraiseQL
+  capability not running (`compiled_in && started == true && healthy != false`
+  fails), or a body that does not report it → `Ok(healthy: false)`, retried like
+  a wrong status
 - transport failure (refused, timeout, DNS) after every attempt → `Err(..)`
 
 TLS uses rustls (no OpenSSL).

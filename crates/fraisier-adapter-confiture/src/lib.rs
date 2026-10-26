@@ -59,11 +59,19 @@
 //! verdict about it: both capabilities light up together, at 0.44.0.
 //!
 //! One consequence is worth stating because an operator will meet it: an
-//! `ALTER COLUMN … TYPE` arrives **unclassified**, and a configured `[policy]`
-//! therefore refuses it. Confiture will not guess whether a type change widens
-//! or narrows without the column's current type, which it gathers only when
-//! comparing against a live database — something this adapter does not ask it to
-//! do. The refusal is the contract working.
+//! `ALTER COLUMN … TYPE` arrives **unclassified** from a static preflight, and a
+//! configured `[policy]` therefore refuses it. Confiture will not guess whether a
+//! type change widens or narrows without the column's current type, which it
+//! gathers only when comparing against a database. The refusal is the contract
+//! working.
+//!
+//! The **`deep_classification`** capability (≥ 0.44.0, the same floor) is how a
+//! deploy asks for that comparison. When the context resolves the logical secret
+//! `"AGAINST_DATABASE_URL"` — fraisier sets it to a throwaway restore-rehearsal
+//! copy — `preflight` passes `--against <url>` with the password stripped and
+//! hands the password over as **`PGPASSWORD`**, so it stays off argv like the
+//! DSN. A keyword-form DSN is refused rather than echoed. Every other subcommand
+//! ignores the secret.
 //!
 //! Both are **advertised conditionally**, on the version the installed binary
 //! reports: claiming `risk_tier` against a confiture that cannot classify would

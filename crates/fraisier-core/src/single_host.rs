@@ -687,20 +687,26 @@ impl DeployShared {
         let Some(report) = inspection.report.as_ref() else {
             return Ok(());
         };
-        let blocking = report
+        let blocking: Vec<String> = report
             .issues
             .iter()
             .filter(|issue| issue.severity == Severity::Error)
-            .count();
-        if blocking > 0 {
-            return Err(SagaError::StepFailed {
-                step: "preflight".to_owned(),
-                message: format!(
-                    "forward-compatibility preflight found {blocking} blocking issue(s)"
-                ),
-            });
+            .map(|issue| match &issue.migration {
+                Some(migration) => format!("{} ({migration}): {}", issue.code, issue.message),
+                None => format!("{}: {}", issue.code, issue.message),
+            })
+            .collect();
+        if blocking.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        Err(SagaError::StepFailed {
+            step: "preflight".to_owned(),
+            message: format!(
+                "forward-compatibility preflight found {} blocking issue(s): {}",
+                blocking.len(),
+                blocking.join("; ")
+            ),
+        })
     }
 
     /// Rehearse a restore + migrate on a throwaway copy of the database before the
@@ -2156,6 +2162,26 @@ mod tests {
         assert_eq!(failed_step, "preflight");
         assert!(reason.contains("could not provision"), "{reason}");
         assert_eq!(drain(&trail), vec!["describe", "rehearsal:provision"]);
+    }
+
+    #[tokio::test]
+    async fn a_lint_failure_names_each_blocking_issue() {
+        let (_dir, store) = store();
+        let run = rehearsed(
+            |t| FakeMigration {
+                preflight_blocking: true,
+                ..FakeMigration::deep(t, vec![add_nickname()])
+            },
+            |_| PolicyGate::default(),
+            BackupSource::FreshDump,
+            false,
+        );
+        let outcome = run.plan.run(store).await.expect("run");
+        let SagaOutcome::RolledBack { reason, .. } = &outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert!(reason.contains("non_reversible (003)"), "{reason}");
+        assert!(reason.contains("migration 003 has no down"), "{reason}");
     }
 
     #[tokio::test]

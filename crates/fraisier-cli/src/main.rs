@@ -21,6 +21,7 @@ mod factory;
 mod pg_readiness;
 mod pg_rehearsal;
 mod preview;
+mod stack;
 #[cfg(test)]
 mod test_env;
 
@@ -97,6 +98,10 @@ enum Command {
     /// Database lifecycle operations (migrate / restore / reset).
     #[command(subcommand)]
     Db(DbCommand),
+
+    /// A stack: one environment's deployables, deployed in dependency order.
+    #[command(subcommand)]
+    Stack(StackCommand),
 
     /// List the adapters available to this binary, per axis (built-in + IPC).
     Providers,
@@ -434,6 +439,36 @@ enum DbCommand {
     /// pg_tviews maintenance.
     #[command(subcommand)]
     Tviews(DbTviewsCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum StackCommand {
+    /// Deploy every member in dependency order, stopping at the first failure.
+    Deploy(StackDeployArgs),
+}
+
+#[derive(Debug, Args)]
+struct StackDeployArgs {
+    /// Path to the stack file (`stack.<env>.toml`).
+    #[arg(long)]
+    stack: PathBuf,
+
+    /// The state store directory every member shares.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+
+    /// A member's version, as `<member>=<version>`. Repeatable; a member without
+    /// one deploys as `fraisier deploy` would without `--app-version`.
+    #[arg(long, value_name = "MEMBER=VERSION")]
+    app_version: Vec<String>,
+
+    /// Plan each member's deploy without executing it.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Skip each member's migration preflight.
+    #[arg(long)]
+    skip_preflight: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -787,6 +822,18 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         }
         Command::Db(DbCommand::Reset(args)) => {
             commands::db_reset(&args.config, &args.state_dir, args.yes).await
+        }
+        Command::Stack(StackCommand::Deploy(args)) => {
+            stack::stack_deploy(
+                &args.stack,
+                &args.app_version,
+                &stack::Deployer {
+                    state_dir: args.state_dir.clone(),
+                    dry_run: args.dry_run,
+                    skip_preflight: args.skip_preflight,
+                },
+            )
+            .await
         }
         Command::Providers => Ok(commands::providers()),
         Command::ProviderTest(args) => commands::provider_test(&args.name).await,

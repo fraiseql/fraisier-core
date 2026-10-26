@@ -235,6 +235,14 @@ printed, and the full stdout+stderr is written to a `0o600` log under
 is named in the report, so nothing is lost. Small failures print whole. The
 `--json` report always carries the full output regardless.
 
+### Deploying FraiseQL
+
+fraisier is proven against FraiseQL **2.18.0**, pinned in
+[`tools/fraiseql-version`](tools/fraiseql-version). On 2.18, `/health` answers 200
+even when a configured capability failed to start. See
+[`docs/fraiseql.md`](docs/fraiseql.md) for the supported versions, the
+migrate-then-restart order, and what the health check does and does not prove.
+
 ### Perf-regression rollback gate
 
 The `command` health adapter turns the saga's post-deploy `health` step into an

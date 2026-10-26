@@ -221,6 +221,76 @@ fn check_throwaways(config: &DeployConfig, list: ListThrowaways<'_>) -> Option<C
     }
 }
 
+/// Reads the refresh marker of the database a DSN names.
+type ReadMarker<'a> = &'a dyn Fn(&str) -> Result<Option<String>, String>;
+
+/// Whether this config's database carries the refresh marker `db refresh`
+/// needs. Only a config with `[refresh]` reaches the database for this.
+fn check_refresh_target(config: &DeployConfig, read: ReadMarker<'_>) -> Option<Check> {
+    config.refresh.as_ref()?;
+    let fail = |detail: String| {
+        Some(Check {
+            name: "refresh_target",
+            status: Status::Fail,
+            detail,
+        })
+    };
+    let deploy = config.deploy.as_ref();
+    let expected = fraisier_core::refresh::marker_value(
+        deploy.and_then(|d| d.name.as_deref()).unwrap_or_default(),
+        deploy
+            .and_then(|d| d.environment.as_deref())
+            .unwrap_or_default(),
+    );
+    let Some(source) = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.database_url_env.as_deref())
+    else {
+        return fail("cannot read the marker: [migration].database_url_env is not set".to_owned());
+    };
+    let Some(dsn) = std::env::var(source).ok().filter(|dsn| !dsn.is_empty()) else {
+        return fail(format!("cannot read the marker: ${source} is not set"));
+    };
+    match read(&dsn) {
+        Err(error) => fail(format!(
+            "cannot read the marker: {}",
+            fraisier_saga::redact::credentials(&error)
+        )),
+        Ok(Some(found)) if found == expected => Some(Check {
+            name: "refresh_target",
+            status: Status::Pass,
+            detail: format!("the database is the refresh target of {found}"),
+        }),
+        Ok(Some(found)) => fail(format!(
+            "the database is marked as the refresh target of '{found}', not '{expected}': \
+             `db refresh` will refuse it"
+        )),
+        Ok(None) => fail(format!(
+            "the database carries no refresh marker, so `db refresh` will refuse it; mark it \
+             once with `fraisier db mark-refresh-target` ({expected})"
+        )),
+    }
+}
+
+/// The refresh marker of the database `dsn` names, read through the server's
+/// `postgres` maintenance database.
+fn read_marker(dsn: &str) -> Result<Option<String>, String> {
+    let conn = fraisier_db::PgConn::parse(dsn).map_err(|e| format!("invalid database DSN: {e}"))?;
+    let sql = fraisier_db::refresh::marker_sql(conn.database()).map_err(|e| e.to_string())?;
+    let mut query = fraisier_db::psql_command(&conn.with_database("postgres"), &sql);
+    query.arg("-tA");
+    let output = query
+        .output()
+        .map_err(|e| format!("could not run psql: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(fraisier_db::refresh::parse_marker(
+        &String::from_utf8_lossy(&output.stdout),
+    ))
+}
+
 /// The databases carrying the throwaway marker on the server `dsn` names.
 fn list_throwaways(dsn: &str) -> Result<Vec<String>, String> {
     let conn = fraisier_db::PgConn::parse(dsn).map_err(|e| format!("invalid database DSN: {e}"))?;
@@ -292,6 +362,7 @@ pub(crate) fn doctor(config_path: &Path, only: &[String]) -> CommandOutput {
             }
             checks.push(check_confiture(&config));
             checks.extend(check_throwaways(&config, &list_throwaways));
+            checks.extend(check_refresh_target(&config, &read_marker));
         }
     }
 
@@ -403,7 +474,10 @@ pub(crate) fn env_check(config_path: &Path, subcommand: &str) -> CommandOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_throwaways, doctor, env_check, parse_version, Status, CONFITURE_FLOOR};
+    use super::{
+        check_refresh_target, check_throwaways, doctor, env_check, parse_version, Status,
+        CONFITURE_FLOOR,
+    };
     use std::io::Write as _;
 
     fn write_config(body: &str) -> tempfile::NamedTempFile {
@@ -452,6 +526,68 @@ url = "http://127.0.0.1/health"
     }
 
     const DRILL: &str = "[backup]\ndir = \"/var/backups/app\"\n[drill]\n";
+
+    const REFRESH: &str = "[refresh]\nsource_dir = \"/var/backups/app\"\n\
+                           source_environment = \"staging\"\n";
+
+    #[test]
+    fn a_config_without_refresh_never_reads_the_marker() {
+        let reached = std::cell::Cell::new(false);
+        let check = with_dsn(Some("postgres://app@db/shop"), || {
+            check_refresh_target(&throwaway_config(""), &|_| {
+                reached.set(true);
+                Ok(None)
+            })
+        });
+        assert!(check.is_none());
+        assert!(!reached.get());
+    }
+
+    #[test]
+    fn a_marked_refresh_target_passes() {
+        let check = with_dsn(Some("postgres://app@db/shop"), || {
+            check_refresh_target(&throwaway_config(REFRESH), &|_| {
+                Ok(Some("app/prod".to_owned()))
+            })
+        })
+        .expect("a check");
+        assert_eq!(check.status, Status::Pass, "{}", check.detail);
+        assert_eq!(check.name, "refresh_target");
+    }
+
+    #[test]
+    fn an_unmarked_or_other_refresh_target_fails() {
+        let check = with_dsn(Some("postgres://app@db/shop"), || {
+            check_refresh_target(&throwaway_config(REFRESH), &|_| Ok(None))
+        })
+        .expect("a check");
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.detail.contains("mark-refresh-target"),
+            "{}",
+            check.detail
+        );
+        let check = with_dsn(Some("postgres://app@db/shop"), || {
+            check_refresh_target(&throwaway_config(REFRESH), &|_| {
+                Ok(Some("app/qa".to_owned()))
+            })
+        })
+        .expect("a check");
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.contains("app/qa"), "{}", check.detail);
+    }
+
+    #[test]
+    fn an_unreadable_marker_fails_without_its_password() {
+        let check = with_dsn(Some("postgres://app:s3cret@db/shop"), || {
+            check_refresh_target(&throwaway_config(REFRESH), &|_| {
+                Err("connection to postgres://app:s3cret@db/shop refused".to_owned())
+            })
+        })
+        .expect("a check");
+        assert_eq!(check.status, Status::Fail);
+        assert!(!check.detail.contains("s3cret"), "{}", check.detail);
+    }
 
     #[test]
     fn a_config_that_creates_no_throwaways_never_reaches_the_database() {

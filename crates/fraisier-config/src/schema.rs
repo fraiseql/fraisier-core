@@ -104,6 +104,10 @@ pub struct DeployConfig {
     /// against the newest archive in `[backup].dir`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drill: Option<DrillSection>,
+    /// The `[metrics]` section: where each command writes its Prometheus
+    /// textfile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<MetricsSection>,
     /// The `[sync]` section: the git remote the deploy ledger is shared through
     /// (experimental). Absent when state is not shared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -656,6 +660,20 @@ impl DrillSection {
     pub fn max_age_hours(&self) -> u32 {
         self.max_age_hours.unwrap_or(Self::DEFAULT_MAX_AGE_HOURS)
     }
+}
+
+/// The `[metrics]` section: Prometheus textfile metrics.
+///
+/// Each command writes its own file (`fraisier_deploy.prom`,
+/// `fraisier_backup.prom`, `fraisier_drill.prom`) into `textfile_dir`, for
+/// `node_exporter`'s textfile collector to serve.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsSection {
+    /// The directory `node_exporter`'s `--collector.textfile.directory` reads.
+    /// Required, and absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub textfile_dir: Option<PathBuf>,
 }
 
 /// One `[[backup.retain]]` entry: which archives in a directory are kept.

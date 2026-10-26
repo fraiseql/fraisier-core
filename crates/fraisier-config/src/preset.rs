@@ -118,6 +118,7 @@ impl SpecqlPreset {
             database: None,
             backup: None,
             drill: None,
+            metrics: None,
             sync: None,
             blue_green: None,
             // The preset emits no checks; an author-supplied [[checks]] wins.
@@ -329,6 +330,7 @@ impl DeployConfig {
             // The preset never emits [backup]; an author-supplied one wins.
             backup: prefer(base.backup, self.backup),
             drill: prefer(base.drill, self.drill),
+            metrics: prefer(base.metrics, self.metrics),
             // The preset never emits [sync]; an author-supplied one wins.
             sync: prefer(base.sync, self.sync),
             // The preset never emits [blue_green]; an author-supplied one wins.

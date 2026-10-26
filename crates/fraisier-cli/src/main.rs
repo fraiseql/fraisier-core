@@ -18,6 +18,7 @@ mod doctor;
 #[cfg(test)]
 mod e2e;
 mod factory;
+mod metrics;
 mod pg_readiness;
 mod pg_rehearsal;
 mod preview;

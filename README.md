@@ -314,6 +314,10 @@ Every saga step is both persisted (via the state store) and exported as an
 OpenTelemetry span, so a tracing backend reconstructs exactly what happened —
 including which step failed and which compensations ran.
 
+With `[metrics].textfile_dir` set, deploy, backup and backup drill each write a
+Prometheus textfile of gauges describing their last run, for node_exporter's
+textfile collector. See [`docs/metrics.md`](docs/metrics.md).
+
 ## Security model
 
 - Webhook triggers are HMAC-SHA256 signed over `"<timestamp>.<body>"`, verified

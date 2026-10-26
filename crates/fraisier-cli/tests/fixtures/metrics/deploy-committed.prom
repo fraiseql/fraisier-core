@@ -1,0 +1,12 @@
+# HELP fraisier_deploy_last_timestamp_seconds When the last deploy finished, in Unix seconds.
+# TYPE fraisier_deploy_last_timestamp_seconds gauge
+fraisier_deploy_last_timestamp_seconds{fraise="checkout",environment="production"} 1792984500
+# HELP fraisier_deploy_last_success Whether the last deploy committed (1) or not (0).
+# TYPE fraisier_deploy_last_success gauge
+fraisier_deploy_last_success{fraise="checkout",environment="production"} 1
+# HELP fraisier_deploy_last_rolled_back Whether the last deploy rolled back, fully or partly (1), or not (0).
+# TYPE fraisier_deploy_last_rolled_back gauge
+fraisier_deploy_last_rolled_back{fraise="checkout",environment="production"} 0
+# HELP fraisier_deploy_last_duration_seconds How long the last deploy took, in seconds.
+# TYPE fraisier_deploy_last_duration_seconds gauge
+fraisier_deploy_last_duration_seconds{fraise="checkout",environment="production"} 42.5

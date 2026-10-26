@@ -8,6 +8,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`[metrics].textfile_dir`: deploy, backup and drill write Prometheus textfile
+  metrics.**
+  - **One file per command.** The files are `fraisier_deploy.prom`,
+    `fraisier_backup.prom` and `fraisier_drill.prom`, for node_exporter's
+    textfile collector. Each is renamed into place, so a scrape never reads half
+    a file, and a command never overwrites another command's file.
+  - **Gauges of the last run.** Deploy records its finish time, whether it
+    committed, whether it rolled back (fully or partly), and how long it took.
+    Backup records its success time and archive size. Drill records its
+    success time. A failed backup or drill leaves its file alone, so the last
+    success time stays true.
+  - **Labels.** Every sample carries exactly `fraise` and `environment`.
+  - **Failures.** A file that cannot be written is a warning, never a failed
+    command.
+  - **Docs.** See [docs/metrics.md](docs/metrics.md).
+
 - **`fraisier backup drill`: the newest archive is proven to restore.**
   - **What it does.** It restores the newest archive in `[backup].dir` into a
     throwaway database, runs the migrations forward on it, counts its tables,

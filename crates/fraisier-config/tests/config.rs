@@ -1095,6 +1095,42 @@ fn drill_data_dir_must_be_absolute() {
     ));
 }
 
+fn metrics_config(section: &str) -> DeployConfig {
+    DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n[metrics]\n{section}")).expect("parses")
+}
+
+#[test]
+fn a_metrics_textfile_dir_is_kept() {
+    let config = metrics_config("textfile_dir = \"/var/lib/node_exporter/textfile\"\n");
+    assert!(config.validate().ok(), "{}", config.validate());
+    assert_eq!(
+        config.metrics.expect("[metrics]").textfile_dir.as_deref(),
+        Some(std::path::Path::new("/var/lib/node_exporter/textfile"))
+    );
+}
+
+#[test]
+fn a_metrics_section_needs_a_textfile_dir() {
+    let config = metrics_config("");
+    assert!(
+        has_error(&config.validate(), "metrics.textfile_dir"),
+        "{}",
+        config.validate()
+    );
+}
+
+#[test]
+fn the_metrics_textfile_dir_must_be_absolute() {
+    let config = metrics_config("textfile_dir = \"textfile\"\n");
+    for report in [
+        config.validate(),
+        config.validate_db_ops(),
+        config.validate_backup_ops(),
+    ] {
+        assert!(has_error(&report, "metrics.textfile_dir"), "{report}");
+    }
+}
+
 #[test]
 fn schedule_requires_a_calendar_surface() {
     let toml = format!("{SCHEDULE_BASE}\n[schedule]\ncommand = \"backup\"\n");

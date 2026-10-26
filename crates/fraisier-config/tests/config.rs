@@ -1025,6 +1025,76 @@ fn a_backup_section_with_neither_dir_nor_retain_is_still_an_error() {
     assert!(has_error(&report, "backup.dir"), "{report}");
 }
 
+fn drill_report(section: &str) -> fraisier_config::ValidationReport {
+    DeployConfig::from_toml_str(&format!(
+        "{SCHEDULE_BASE}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[drill]\n{section}"
+    ))
+    .expect("parses")
+    .validate()
+}
+
+#[test]
+fn an_empty_drill_section_takes_its_defaults() {
+    let config = DeployConfig::from_toml_str(&format!(
+        "{SCHEDULE_BASE}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[drill]\n"
+    ))
+    .expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    let drill = config.drill.expect("[drill]");
+    assert_eq!(drill.max_age_hours(), 48);
+    assert_eq!(drill.min_tables, None);
+    assert_eq!(drill.data_dir, None);
+}
+
+#[test]
+fn declared_drill_fields_are_kept() {
+    let config = DeployConfig::from_toml_str(&format!(
+        "{SCHEDULE_BASE}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[drill]\n\
+         max_age_hours = 26\nmin_tables = 15\ndata_dir = \"/var/lib/postgresql/18/main\"\n"
+    ))
+    .expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    let drill = config.drill.expect("[drill]");
+    assert_eq!(drill.max_age_hours(), 26);
+    assert_eq!(drill.min_tables, Some(15));
+    assert_eq!(
+        drill.data_dir.as_deref(),
+        Some(std::path::Path::new("/var/lib/postgresql/18/main"))
+    );
+}
+
+#[test]
+fn a_drill_needs_a_backup_dir_to_take_archives_from() {
+    let report = DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n[drill]\n"))
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "drill"), "{report}");
+}
+
+#[test]
+fn drill_max_age_hours_must_be_at_least_one() {
+    assert!(has_error(
+        &drill_report("max_age_hours = 0\n"),
+        "drill.max_age_hours"
+    ));
+}
+
+#[test]
+fn drill_min_tables_must_be_at_least_one() {
+    assert!(has_error(
+        &drill_report("min_tables = 0\n"),
+        "drill.min_tables"
+    ));
+}
+
+#[test]
+fn drill_data_dir_must_be_absolute() {
+    assert!(has_error(
+        &drill_report("data_dir = \"pgdata\"\n"),
+        "drill.data_dir"
+    ));
+}
+
 #[test]
 fn schedule_requires_a_calendar_surface() {
     let toml = format!("{SCHEDULE_BASE}\n[schedule]\ncommand = \"backup\"\n");

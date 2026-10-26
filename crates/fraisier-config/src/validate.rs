@@ -134,6 +134,7 @@ impl DeployConfig {
         validate_schedule(self, &mut report);
         validate_database(self, &mut report);
         validate_backup(self, &mut report);
+        validate_drill(self, &mut report);
         validate_sync(self, &mut report);
         validate_blue_green(self, &mut report);
         validate_checks(self, &mut report);
@@ -167,6 +168,7 @@ impl DeployConfig {
         let mut report = ValidationReport::default();
         validate_deploy(self, &mut report);
         validate_backup(self, &mut report);
+        validate_drill(self, &mut report);
         report
     }
 
@@ -925,6 +927,41 @@ fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
             } else {
                 names.push((name, index));
             }
+        }
+    }
+}
+
+fn validate_drill(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(drill) = cfg.drill.as_ref() else {
+        return;
+    };
+    if cfg
+        .backup
+        .as_ref()
+        .and_then(|backup| backup.dir.as_ref())
+        .is_none()
+    {
+        report.error(
+            "drill",
+            "a [drill] restores the newest archive in [backup].dir, so it requires \
+             [backup].dir",
+        );
+    }
+    if drill.max_age_hours == Some(0) {
+        report.error("drill.max_age_hours", "max_age_hours must be at least 1");
+    }
+    if drill.min_tables == Some(0) {
+        report.error(
+            "drill.min_tables",
+            "min_tables must be at least 1 (omit it for no table check)",
+        );
+    }
+    if let Some(dir) = drill.data_dir.as_deref() {
+        if !dir.is_absolute() {
+            report.error(
+                "drill.data_dir",
+                format!("data_dir must be an absolute path, not '{}'", dir.display()),
+            );
         }
     }
 }

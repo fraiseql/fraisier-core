@@ -2445,6 +2445,276 @@ fn prune_warnings(
     warnings
 }
 
+/// The database server a drill runs against: a [`DrillDb`](fraisier_core::drill::DrillDb)
+/// that can also size the live database, for the free-space check.
+#[async_trait::async_trait]
+pub(crate) trait DrillServer: fraisier_core::drill::DrillDb {
+    /// The live database's size on disk, in bytes.
+    async fn live_bytes(&self, live_dsn: &str) -> Result<u64, String>;
+}
+
+/// `backup drill`: restore the newest archive in `[backup].dir` into a throwaway
+/// database, run the migrations forward on it, count its tables, and drop it.
+///
+/// It fails (exit 1), before creating anything, when there is no archive, when
+/// the newest one does not read back, when it is older than
+/// `[drill].max_age_hours`, or when the filesystem holding `[drill].data_dir`
+/// has no room for the copy. It fails after restoring when the migrations fail
+/// or fewer than `[drill].min_tables` tables come back. Every run that gets past
+/// loading the config writes a receipt to `<state_dir>/drills/`.
+pub(crate) async fn backup_drill(config_path: &Path, state_dir: &Path) -> Result<CommandOutput> {
+    backup_drill_with(
+        config_path,
+        state_dir,
+        // The drill restores as the app role; the restore identity is not wired here.
+        &crate::pg_rehearsal::PgRehearsalDb {
+            admin_url_env: None,
+        },
+        &fraisier_db::archive::ArchiveTools::default().pg_restore,
+        std::time::SystemTime::now(),
+    )
+    .await
+}
+
+/// [`backup_drill`] with the server, `pg_restore` and the clock supplied by the
+/// caller.
+async fn backup_drill_with(
+    config_path: &Path,
+    state_dir: &Path,
+    server: &dyn DrillServer,
+    pg_restore: &Path,
+    now: std::time::SystemTime,
+) -> Result<CommandOutput> {
+    let config = load(config_path)?;
+    if let Some(refusal) = refuse_invalid_db_config(&config, "drill") {
+        return Ok(refusal);
+    }
+    let report = config.validate_backup_ops();
+    if !report.ok() {
+        let mut pretty = render_issues(&report);
+        let _ = writeln!(pretty, "refusing to drill with an invalid config");
+        return Ok(CommandOutput {
+            exit_code: 1,
+            pretty,
+            json: json!({ "ok": false, "issues": serde_json::to_value(&report.issues).unwrap_or(Value::Null) }),
+        });
+    }
+    let Some(dir) = config.backup.as_ref().and_then(|b| b.dir.clone()) else {
+        return Ok(CommandOutput {
+            exit_code: 1,
+            pretty: "a drill restores the newest archive in [backup].dir, and none is set\n"
+                .to_owned(),
+            json: json!({ "ok": false, "error": "no [backup].dir" }),
+        });
+    };
+
+    let deploy = config.deploy.as_ref().context("[deploy] section")?;
+    let fraise = deploy.name.clone().unwrap_or_default();
+    let environment = deploy.environment.clone().unwrap_or_default();
+    let mut archive = None;
+    let outcome = drill_steps(
+        &config,
+        &dir,
+        (&fraise, &environment),
+        server,
+        pg_restore,
+        now,
+        &mut archive,
+    )
+    .await;
+
+    let mut receipt = json!({
+        "fraise": fraise,
+        "environment": environment,
+        "started_at": fraisier_db::archive::UtcStamp::from_system_time(now).as_str(),
+        "archive": archive.as_ref().map(|a: &fraisier_db::archive::Archive| a.path.display().to_string()),
+        "archive_taken_at": archive.as_ref().map(|a| a.stamp.as_str().to_owned()),
+        "ok": outcome.is_ok(),
+    });
+    let (exit_code, pretty) = match &outcome {
+        Ok(report) => {
+            receipt["throwaway"] = json!(report.throwaway);
+            receipt["applied"] = json!(report
+                .applied
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>());
+            receipt["tables"] = json!(report.tables);
+            receipt["teardown_warning"] = json!(report.teardown_warning);
+            let mut pretty = format!(
+                "drill passed: restored {} into {}, applied {} migration(s), found {} \
+                 table(s), and dropped it\n",
+                archive
+                    .as_ref()
+                    .map_or_else(String::new, |a| a.path.display().to_string()),
+                report.throwaway,
+                report.applied.len(),
+                report.tables
+            );
+            if let Some(warning) = &report.teardown_warning {
+                let _ = writeln!(
+                    pretty,
+                    "warning: {} was not dropped: {warning}; drop it by hand",
+                    report.throwaway
+                );
+            }
+            (0, pretty)
+        }
+        Err((step, message)) => {
+            receipt["failed_step"] = json!(step);
+            receipt["error"] = json!(fraisier_saga::redact::credentials(message));
+            (1, format!("drill failed at {step}: {message}\n"))
+        }
+    };
+    let written = write_drill_receipt(state_dir, &fraise, &environment, &receipt);
+    let mut pretty = pretty;
+    if let Err(error) = &written {
+        let _ = writeln!(
+            pretty,
+            "warning: the drill receipt was not written: {error}"
+        );
+    }
+    Ok(CommandOutput {
+        exit_code,
+        pretty,
+        json: receipt,
+    })
+}
+
+/// The drill's steps up to and including [`fraisier_core::drill::run_restore_drill`],
+/// failing with the step's name and why. `archive` is set once the newest archive
+/// is known.
+async fn drill_steps(
+    config: &DeployConfig,
+    dir: &Path,
+    (fraise, environment): (&str, &str),
+    server: &dyn DrillServer,
+    pg_restore: &Path,
+    now: std::time::SystemTime,
+    archive: &mut Option<fraisier_db::archive::Archive>,
+) -> std::result::Result<fraisier_core::drill::DrillReport, (&'static str, String)> {
+    use fraisier_db::retention::Verdict;
+
+    let drill = config.drill.clone().unwrap_or_default();
+    let newest = fraisier_db::archive::latest_archive(dir, fraise, environment)
+        .map_err(|error| ("listing", format!("cannot read {}: {error}", dir.display())))?
+        .ok_or_else(|| {
+            (
+                "listing",
+                format!("no archive of {fraise}/{environment} in {}", dir.display()),
+            )
+        })?;
+    let path = archive.insert(newest).path.clone();
+
+    // Before anything is created: an archive that does not read back cannot restore.
+    if let Verdict::Invalid(reason) = fraisier_db::archive::verify_archive(pg_restore, &path).await
+    {
+        return Err((
+            "verify",
+            format!("{} is not a readable archive: {reason}", path.display()),
+        ));
+    }
+    let taken_at = archive.as_ref().map_or(now, |a| a.stamp.to_system_time());
+    let max_age = std::time::Duration::from_hours(u64::from(drill.max_age_hours()));
+    if let Ok(age) = now.duration_since(taken_at) {
+        if age > max_age {
+            return Err((
+                "age",
+                format!(
+                    "the newest archive, {}, is {} hours old: older than max_age_hours = {}, \
+                     so backups have stopped arriving",
+                    path.display(),
+                    age.as_secs() / 3_600,
+                    drill.max_age_hours()
+                ),
+            ));
+        }
+    }
+
+    let resolved =
+        factory::build_migration_only(config).map_err(|error| ("config", format!("{error:#}")))?;
+    let live_dsn = resolved
+        .ctx
+        .secret(fraisier_core::restore_rehearsal::DATABASE_URL_SECRET)
+        .map_err(|error| {
+            (
+                "config",
+                format!("the database DSN is unavailable: {error}"),
+            )
+        })?;
+    if let Some(data_dir) = drill.data_dir.as_deref() {
+        drill_room(server, &live_dsn, data_dir).await?;
+    }
+
+    fraisier_core::drill::run_restore_drill(
+        server,
+        resolved.migration.as_ref(),
+        &resolved.ctx,
+        &path,
+        drill.min_tables,
+    )
+    .await
+    .map_err(|error| ("drill", error.to_string()))
+}
+
+/// Refuse a drill when the filesystem holding `data_dir` cannot take another
+/// copy of the live database plus 2 GB. A measurement that fails refuses too: a
+/// copy that fills the disk can stop the live server beside it.
+async fn drill_room(
+    server: &dyn DrillServer,
+    live_dsn: &str,
+    data_dir: &Path,
+) -> std::result::Result<(), (&'static str, String)> {
+    const HEADROOM: u64 = 2_000_000_000;
+    let live = server.live_bytes(live_dsn).await.map_err(|error| {
+        (
+            "free space",
+            format!("could not size the live database: {error}"),
+        )
+    })?;
+    let free = fraisier_db::retention::available_bytes(data_dir).map_err(|error| {
+        (
+            "free space",
+            format!(
+                "could not measure free space in {}: {error}",
+                data_dir.display()
+            ),
+        )
+    })?;
+    let needed = live.saturating_add(HEADROOM);
+    if free < needed {
+        return Err((
+            "free space",
+            format!(
+                "{} has {} GB free; a restored copy needs about {} GB (the live database's \
+                 size plus 2 GB)",
+                data_dir.display(),
+                free / 1_000_000_000,
+                needed.div_ceil(1_000_000_000)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Write `receipt` to `<state_dir>/drills/<fraise>-<environment>.json`, replacing
+/// the previous one only once the new one is complete.
+fn write_drill_receipt(
+    state_dir: &Path,
+    fraise: &str,
+    environment: &str,
+    receipt: &Value,
+) -> std::io::Result<PathBuf> {
+    let dir = state_dir.join("drills");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{fraise}-{environment}.json"));
+    let partial = dir.join(format!(".{fraise}-{environment}.json.partial"));
+    let body = serde_json::to_vec_pretty(receipt).map_err(std::io::Error::other)?;
+    std::fs::write(&partial, body)?;
+    std::fs::rename(&partial, &path)?;
+    Ok(path)
+}
+
 /// `db restore`: restore a `pg_dump -Fc` archive into the database with
 /// `pg_restore`, dropping existing objects first (`--clean --if-exists`).
 ///
@@ -5314,6 +5584,255 @@ current_revision = "true"
             "{:?}",
             run.warnings
         );
+    }
+
+    /// A database server for drills: records what it was asked, answers from its
+    /// fields.
+    #[derive(Default)]
+    struct FakeServer {
+        calls: std::sync::Mutex<Vec<String>>,
+        throwaway: Option<String>,
+        tables: u64,
+        live_bytes: u64,
+    }
+
+    impl FakeServer {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls").clone()
+        }
+        fn record(&self, call: String) {
+            self.calls.lock().expect("calls").push(call);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fraisier_core::restore_rehearsal::RehearsalDb for FakeServer {
+        async fn provision(
+            &self,
+            _live_dsn: &str,
+            backup: &fraisier_core::restore_rehearsal::BackupSource,
+        ) -> Result<
+            fraisier_core::restore_rehearsal::ThrowawayDb,
+            fraisier_core::restore_rehearsal::RehearsalError,
+        > {
+            self.record(format!("provision:{backup:?}"));
+            let name = self
+                .throwaway
+                .clone()
+                .unwrap_or_else(|| "shop_fraisier_rh_1_a".to_owned());
+            Ok(fraisier_core::restore_rehearsal::ThrowawayDb {
+                dsn: format!("postgres://app@127.0.0.1/{name}"),
+                name,
+            })
+        }
+
+        async fn teardown(
+            &self,
+            db: &fraisier_core::restore_rehearsal::ThrowawayDb,
+        ) -> Result<(), String> {
+            self.record(format!("teardown:{}", db.name));
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fraisier_core::drill::DrillDb for FakeServer {
+        fn live_database(&self, _live_dsn: &str) -> Result<String, String> {
+            Ok("shop".to_owned())
+        }
+
+        async fn table_count(
+            &self,
+            _db: &fraisier_core::restore_rehearsal::ThrowawayDb,
+        ) -> Result<u64, String> {
+            Ok(self.tables)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::DrillServer for FakeServer {
+        async fn live_bytes(&self, _live_dsn: &str) -> Result<u64, String> {
+            Ok(self.live_bytes)
+        }
+    }
+
+    /// A drill config: the command migration adapter runs `up`, and `[backup].dir`
+    /// is `<dir>/backups`.
+    fn drill_config(dir: &Path, up: &str, drill: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir.join("backups")).expect("mkdir");
+        write(
+            dir,
+            "fraisier.toml",
+            &format!(
+                "[deploy]\nname = \"demo\"\nenvironment = \"test\"\n\n\
+                 [migration]\nadapter = \"command\"\ndatabase_url_env = \"FRAISIER_DRILL_DSN\"\n\n\
+                 [migration.settings.commands]\nup = \"{up}\"\ncurrent_revision = \"true\"\n\n\
+                 [backup]\ndir = \"{}\"\n\n[drill]\n{drill}",
+                dir.join("backups").display()
+            ),
+        )
+    }
+
+    /// An archive in `<dir>/backups` taken at `stamp`, holding `body`.
+    fn drill_archive(dir: &Path, stamp: &str, body: &[u8]) -> std::path::PathBuf {
+        let path = dir.join(format!("backups/demo-test-{stamp}.pgdump"));
+        std::fs::write(&path, body).expect("write");
+        path
+    }
+
+    fn drill(dir: &Path, config: &Path, server: &FakeServer) -> super::CommandOutput {
+        let _guard = crate::test_env::env_guard();
+        std::env::set_var("FRAISIER_DRILL_DSN", "postgres://app:s3cret@127.0.0.1/shop");
+        let out = block_on(super::backup_drill_with(
+            config,
+            &dir.join("state"),
+            server,
+            &fake_pg_tools().pg_restore,
+            prune_now(),
+        ))
+        .expect("run");
+        std::env::remove_var("FRAISIER_DRILL_DSN");
+        out
+    }
+
+    fn receipt(dir: &Path) -> serde_json::Value {
+        let text =
+            std::fs::read_to_string(dir.join("state/drills/demo-test.json")).expect("a receipt");
+        serde_json::from_str(&text).expect("json")
+    }
+
+    #[test]
+    fn a_drill_restores_the_newest_archive_migrates_it_and_drops_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "min_tables = 1\n");
+        drill_archive(dir.path(), "20261025T031500Z", b"PGDMP");
+        let newest = drill_archive(dir.path(), "20261026T021500Z", b"PGDMP");
+        let server = FakeServer {
+            tables: 4,
+            ..FakeServer::default()
+        };
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 0, "{}", out.pretty);
+        assert_eq!(
+            server.calls(),
+            [
+                format!(
+                    "provision:{:?}",
+                    fraisier_core::restore_rehearsal::BackupSource::Archive(newest.clone())
+                ),
+                "teardown:shop_fraisier_rh_1_a".to_owned(),
+            ]
+        );
+        let receipt = receipt(dir.path());
+        assert_eq!(receipt["ok"], serde_json::json!(true));
+        assert_eq!(
+            receipt["archive"],
+            serde_json::json!(newest.display().to_string())
+        );
+        assert_eq!(receipt["tables"], serde_json::json!(4));
+        assert!(!out.pretty.contains("s3cret"), "{}", out.pretty);
+    }
+
+    #[test]
+    fn a_corrupt_newest_archive_fails_before_anything_is_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "");
+        drill_archive(dir.path(), "20261026T021500Z", b"BAD");
+        let server = FakeServer::default();
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(server.calls().is_empty(), "{:?}", server.calls());
+        assert!(
+            out.pretty.contains("not a readable archive"),
+            "{}",
+            out.pretty
+        );
+        assert_eq!(receipt(dir.path())["ok"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn a_stale_newest_archive_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "max_age_hours = 24\n");
+        drill_archive(dir.path(), "20261024T031500Z", b"PGDMP");
+        let server = FakeServer::default();
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(server.calls().is_empty(), "{:?}", server.calls());
+        assert!(out.pretty.contains("max_age_hours"), "{}", out.pretty);
+    }
+
+    #[test]
+    fn a_drill_with_no_archive_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "");
+        let server = FakeServer::default();
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(out.pretty.contains("no archive"), "{}", out.pretty);
+        let calls = server.calls();
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+
+    #[test]
+    fn too_little_room_beside_the_data_dir_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(
+            dir.path(),
+            "true",
+            &format!("data_dir = \"{}\"\n", dir.path().display()),
+        );
+        drill_archive(dir.path(), "20261026T021500Z", b"PGDMP");
+        let server = FakeServer {
+            live_bytes: u64::MAX / 2,
+            ..FakeServer::default()
+        };
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(out.pretty.contains("free"), "{}", out.pretty);
+        assert!(server.calls().is_empty(), "{:?}", server.calls());
+    }
+
+    #[test]
+    fn failing_migrations_fail_the_drill_and_the_copy_is_still_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "false", "");
+        drill_archive(dir.path(), "20261026T021500Z", b"PGDMP");
+        let server = FakeServer::default();
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(server
+            .calls()
+            .contains(&"teardown:shop_fraisier_rh_1_a".to_owned()));
+        assert!(out.pretty.contains("migrations failed"), "{}", out.pretty);
+    }
+
+    #[test]
+    fn too_few_tables_fail_the_drill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "min_tables = 10\n");
+        drill_archive(dir.path(), "20261026T021500Z", b"PGDMP");
+        let server = FakeServer {
+            tables: 2,
+            ..FakeServer::default()
+        };
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(out.pretty.contains("min_tables"), "{}", out.pretty);
+    }
+
+    #[test]
+    fn an_unmarked_throwaway_is_left_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "");
+        drill_archive(dir.path(), "20261026T021500Z", b"PGDMP");
+        let server = FakeServer {
+            throwaway: Some("shop".to_owned()),
+            ..FakeServer::default()
+        };
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(!server.calls().iter().any(|c| c.starts_with("teardown")));
     }
 
     #[test]

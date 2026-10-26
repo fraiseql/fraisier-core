@@ -8,6 +8,28 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`fraisier backup drill`: the newest archive is proven to restore.**
+  - **What it does.** It restores the newest archive in `[backup].dir` into a
+    throwaway database, runs the migrations forward on it, counts its tables,
+    and drops it. The drop runs whether the drill passed or failed.
+  - **Checks before anything is created.** The drill fails when there is no
+    archive, when the newest one does not read back with `pg_restore --list`,
+    or when it is older than `[drill].max_age_hours` (default 48). It also
+    fails when the filesystem holding `[drill].data_dir` cannot take another
+    copy of the live database plus 2 GB. A failed measurement refuses too.
+  - **Checks on the restored copy.** The drill fails when the migrations fail,
+    or when fewer than `[drill].min_tables` tables come back.
+  - **The teardown guard.** The throwaway is dropped only if its name carries
+    `_fraisier_rh_` and differs from the live database. Otherwise the drill
+    neither migrates nor drops it.
+  - **The receipt.** Every run writes a redacted JSON receipt to
+    `<state-dir>/drills/<fraise>-<environment>.json`, atomically.
+  - **Doctor.** `fraisier doctor` lists leftover `_fraisier_rh_*` databases and
+    prints the `DROP DATABASE` command for each. It never drops them. It
+    connects to the database for this only when the config has a `[drill]` or
+    `preflight_mode = "restore_rehearsal"`.
+  - **Docs.** See [docs/backups.md](docs/backups.md#restore-drills).
+
 - **`[[backup.retain]]` and `fraisier backup prune`: archives are pruned by
   policy, never below a floor of valid ones.**
   - **The rules.** Each entry names a `dir` and a `schedule`, plus these keys:

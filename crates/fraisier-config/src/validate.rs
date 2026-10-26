@@ -132,6 +132,7 @@ impl DeployConfig {
         validate_lb(self, &mut report);
         validate_webhook(self, &mut report);
         validate_schedule(self, &mut report);
+        validate_backup(self, &mut report);
         validate_sync(self, &mut report);
         validate_blue_green(self, &mut report);
         validate_checks(self, &mut report);
@@ -411,6 +412,22 @@ fn validate_migration(cfg: &DeployConfig, report: &mut ValidationReport) {
             "the confiture adapter requires database_url_env \
              (the name of the env var holding the database DSN)",
         );
+    }
+    // `none` declares a deployable that owns no database; a DSN or settings
+    // beside it contradict that.
+    if adapter == Some("none") {
+        if is_set(migration.database_url_env.as_ref()) {
+            report.error(
+                "migration.database_url_env",
+                "adapter = \"none\" declares no database; remove database_url_env",
+            );
+        }
+        if !migration.settings.is_empty() {
+            report.error(
+                "migration.settings",
+                "adapter = \"none\" takes no settings; remove [migration.settings]",
+            );
+        }
     }
     if migration.forward_compatible_lint == Some(true) && adapter == Some("command") {
         report.warn(
@@ -706,6 +723,34 @@ fn validate_schedule(cfg: &DeployConfig, report: &mut ValidationReport) {
             }
         }
         Some(_) => {}
+    }
+}
+
+fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let dir = cfg.backup.as_ref().and_then(|backup| backup.dir.as_deref());
+    let scheduled = cfg
+        .schedule
+        .as_ref()
+        .is_some_and(|schedule| schedule.command.as_deref() == Some("backup"));
+    match dir {
+        Some(dir) if !dir.is_absolute() => report.error(
+            "backup.dir",
+            format!(
+                "backup.dir must be an absolute path, not '{}' (a scheduled unit runs \
+                 from /, so a relative one moves with the working directory)",
+                dir.display()
+            ),
+        ),
+        None if cfg.backup.is_some() => report.error(
+            "backup.dir",
+            "the [backup] section requires dir (the directory archives are written to)",
+        ),
+        None if scheduled => report.error(
+            "backup.dir",
+            "a scheduled backup requires [backup].dir: without it every run writes the \
+             same file and fails from the second run on",
+        ),
+        _ => {}
     }
 }
 

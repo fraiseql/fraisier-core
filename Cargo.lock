@@ -697,6 +697,7 @@ name = "fraisier-db"
 version = "1.0.0-beta.11"
 dependencies = [
  "percent-encoding",
+ "tempfile",
  "thiserror",
  "tokio",
  "url",

@@ -258,7 +258,12 @@ fn resolve_preflight(config: &DeployConfig) -> (bool, Option<RestoreRehearsalPla
                 .preflight_backup_path
                 .clone()
                 .map_or(BackupSource::FreshDump, BackupSource::Archive);
-            let db: Arc<dyn RehearsalDb> = Arc::new(PgRehearsalDb);
+            let db: Arc<dyn RehearsalDb> = Arc::new(PgRehearsalDb {
+                admin_url_env: config
+                    .database
+                    .as_ref()
+                    .and_then(|d| d.admin_url_env.clone()),
+            });
             (true, Some((db, backup)))
         }
     }

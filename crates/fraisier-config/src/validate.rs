@@ -153,6 +153,7 @@ impl DeployConfig {
         let mut report = ValidationReport::default();
         validate_deploy(self, &mut report);
         validate_migration(self, &mut report);
+        validate_database(self, &mut report);
         report
     }
 
@@ -763,8 +764,13 @@ fn validate_schedule(cfg: &DeployConfig, report: &mut ValidationReport) {
 }
 
 fn validate_database(cfg: &DeployConfig, report: &mut ValidationReport) {
-    let Some(requires) = cfg.database.as_ref().and_then(|d| d.requires.as_ref()) else {
+    let Some(database) = cfg.database.as_ref() else {
         return; // optional
+    };
+    validate_admin_identity(cfg, report);
+    validate_tviews_gate(database, report);
+    let Some(requires) = database.requires.as_ref() else {
+        return;
     };
     if requires.postgres_major.is_none() && requires.pg_tviews != Some(true) {
         report.error(
@@ -788,6 +794,69 @@ fn validate_database(cfg: &DeployConfig, report: &mut ValidationReport) {
             "[database.requires] is checked against the database, so it needs \
              [migration].database_url_env (the env var holding the DSN)",
         );
+    }
+}
+
+fn validate_admin_identity(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(admin) = cfg
+        .database
+        .as_ref()
+        .and_then(|d| d.admin_url_env.as_deref())
+    else {
+        return;
+    };
+    if admin.trim().is_empty() {
+        report.error(
+            "database.admin_url_env",
+            "admin_url_env names the env var holding the restore identity's DSN; \
+             it cannot be blank",
+        );
+        return;
+    }
+    let migration = cfg
+        .migration
+        .as_ref()
+        .and_then(|m| m.database_url_env.as_deref());
+    if migration == Some(admin) {
+        report.error(
+            "database.admin_url_env",
+            format!(
+                "admin_url_env is the migration DSN's env var ({admin}); the restore \
+                 identity must be a separate, superuser role, never the app's"
+            ),
+        );
+    }
+}
+
+/// The values `[database.tviews].on_empty` takes. There is no "off": the gate is
+/// declared by `[database.requires].pg_tviews`, and only that switches it.
+const ON_EMPTY: &[&str] = &["fail", "warn"];
+
+fn validate_tviews_gate(database: &crate::DatabaseSection, report: &mut ValidationReport) {
+    let Some(tviews) = database.tviews.as_ref() else {
+        return;
+    };
+    let declared = database
+        .requires
+        .as_ref()
+        .is_some_and(|requires| requires.pg_tviews == Some(true));
+    if !declared {
+        report.error(
+            "database.tviews",
+            "[database.tviews] tunes the empty-TVIEW gate, which only \
+             [database.requires].pg_tviews = true declares",
+        );
+    }
+    if let Some(value) = tviews.on_empty.as_deref() {
+        if !ON_EMPTY.contains(&value) {
+            report.error(
+                "database.tviews.on_empty",
+                format!(
+                    "on_empty = '{value}' is not one of: fail, warn (the gate cannot be \
+                     switched off while pg_tviews is declared)"
+                ),
+            );
+        }
     }
 }
 

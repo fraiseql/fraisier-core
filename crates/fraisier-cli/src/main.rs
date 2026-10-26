@@ -430,6 +430,29 @@ enum DbCommand {
 
     /// Drop every user schema and re-apply migrations from scratch.
     Reset(DbResetArgs),
+
+    /// pg_tviews maintenance.
+    #[command(subcommand)]
+    Tviews(DbTviewsCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum DbTviewsCommand {
+    /// Refill TVIEWs from their backing views: the empty UNLOGGED ones a
+    /// restore, crash or failover reset, or with `--all` every TVIEW.
+    Rebuild(DbTviewsRebuildArgs),
+}
+
+#[derive(Debug, Args)]
+struct DbTviewsRebuildArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Rebuild every TVIEW, not only the empty UNLOGGED ones (needed for a
+    /// LOGGED TVIEW or one emptied by hand).
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Debug, Args)]
@@ -761,6 +784,9 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         }
         Command::Db(DbCommand::Restore(args)) => {
             commands::db_restore(&args.config, &args.input, args.yes).await
+        }
+        Command::Db(DbCommand::Tviews(DbTviewsCommand::Rebuild(args))) => {
+            commands::db_tviews_rebuild(&args.config, args.all).await
         }
         Command::Db(DbCommand::Reset(args)) => {
             commands::db_reset(&args.config, &args.state_dir, args.yes).await

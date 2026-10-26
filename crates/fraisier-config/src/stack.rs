@@ -355,7 +355,11 @@ fn sdl_problems(router: Option<&str>, members: &[Member]) -> Vec<String> {
         }
         // The check runs in the member's health step; a blue-green deploy
         // probes its green fleet instead, which the stack does not gate.
-        let strategy = member.config.deploy.as_ref().and_then(|d| d.strategy.as_deref());
+        let strategy = member
+            .config
+            .deploy
+            .as_ref()
+            .and_then(|d| d.strategy.as_deref());
         if member.sdl.is_some() && strategy == Some("blue-green") {
             problems.push(format!(
                 "member '{name}' has sdl, but deploys blue-green; the SDL check runs in a \

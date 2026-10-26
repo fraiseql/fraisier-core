@@ -156,7 +156,7 @@ impl HttpHealth {
 
     /// Resolve the request headers for a probe: the static `[health].headers`
     /// plus, if configured, the token provider's injected header (resolved once
-    /// per adapter via [`Self::token`]). Other requests made as the deployable,
+    /// per adapter, cached on this adapter). Other requests made as the deployable,
     /// such as a stack's SDL query, send the same headers.
     ///
     /// # Errors

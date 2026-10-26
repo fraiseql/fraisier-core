@@ -2154,6 +2154,297 @@ fn archive_backup_output(
     }
 }
 
+/// A prune's output, and the warnings it prints on stderr.
+pub(crate) struct PruneRun {
+    /// What the prune did, rendered like every other command.
+    pub output: CommandOutput,
+    /// Conditions the operator should know about that do not fail the prune.
+    pub warnings: Vec<String>,
+}
+
+/// `backup prune`: apply each `[[backup.retain]]` policy (or only the one named
+/// `name`) to its directory, removing archives only with `apply`.
+///
+/// It refuses (exit 1) an invalid config, a config with no policy, an unknown
+/// name, and any corpus while a deploy holds the deploy lock. A missing directory
+/// fails that entry and the prune, after every other entry has run. A volume
+/// below `min_free_gb`, an archive `pg_restore` rejects, a symlink out of the
+/// directory and a corpus only the floor is keeping are warnings, not failures:
+/// failing would stop the pruning that is the one thing that might still help.
+pub(crate) async fn backup_prune(
+    config_path: &Path,
+    state_dir: &Path,
+    name: Option<&str>,
+    apply: bool,
+) -> Result<PruneRun> {
+    backup_prune_with(
+        config_path,
+        state_dir,
+        name,
+        apply,
+        &fraisier_db::archive::ArchiveTools::default().pg_restore,
+        std::time::SystemTime::now(),
+    )
+    .await
+}
+
+/// [`backup_prune`] with `pg_restore` and the clock supplied by the caller.
+async fn backup_prune_with(
+    config_path: &Path,
+    state_dir: &Path,
+    name: Option<&str>,
+    apply: bool,
+    pg_restore: &Path,
+    now: std::time::SystemTime,
+) -> Result<PruneRun> {
+    let refuse = |pretty: String, json: Value| PruneRun {
+        output: CommandOutput {
+            exit_code: 1,
+            pretty,
+            json,
+        },
+        warnings: Vec::new(),
+    };
+    let config = load(config_path)?;
+    let report = config.validate_backup_ops();
+    if !report.ok() {
+        let mut pretty = render_issues(&report);
+        let _ = writeln!(pretty, "refusing to prune with an invalid config");
+        return Ok(refuse(
+            pretty,
+            json!({ "ok": false, "issues": serde_json::to_value(&report.issues).unwrap_or(Value::Null) }),
+        ));
+    }
+    let retain = config.backup.as_ref().map_or(&[][..], |b| &b.retain[..]);
+    if retain.is_empty() {
+        return Ok(refuse(
+            format!(
+                "{} declares no [[backup.retain]] policy, so there is nothing to prune\n",
+                config_path.display()
+            ),
+            json!({ "ok": false, "error": "no retention policy" }),
+        ));
+    }
+    let entries: Vec<&fraisier_config::RetainEntry> = match name {
+        None => retain.iter().collect(),
+        Some(wanted) => {
+            let chosen: Vec<_> = retain
+                .iter()
+                .filter(|entry| entry.name().as_deref() == Some(wanted))
+                .collect();
+            if chosen.is_empty() {
+                let known: Vec<String> = retain
+                    .iter()
+                    .filter_map(fraisier_config::RetainEntry::name)
+                    .collect();
+                return Ok(refuse(
+                    format!(
+                        "no retain entry is named '{wanted}' (known: {})\n",
+                        known.join(", ")
+                    ),
+                    json!({ "ok": false, "error": "unknown retain entry", "known": known }),
+                ));
+            }
+            chosen
+        }
+    };
+
+    // A deploy may be about to restore from this corpus; never prune under it.
+    let deploy = config.deploy.as_ref().context("[deploy] section")?;
+    let fraise = deploy.name.clone().unwrap_or_default();
+    let environment = deploy.environment.clone().unwrap_or_default();
+    let store = FilesystemStateStore::new(state_dir)
+        .with_context(|| format!("opening state store at {}", state_dir.display()))?;
+    let key = FraiseKey::new(&fraise, &environment);
+    let guard = match store.acquire_lock(&key).await {
+        Ok(guard) => guard,
+        Err(fraisier_saga::state_store::StateStoreError::Locked { .. }) => {
+            return Ok(refuse(
+                format!(
+                    "a deploy of {key} holds the deploy lock; refusing to prune while it runs \
+                     (try again once it finishes)\n"
+                ),
+                json!({ "ok": false, "error": "deploy lock held" }),
+            ));
+        }
+        Err(error) => return Err(error).context("taking the deploy lock"),
+    };
+
+    let mut pretty = String::new();
+    let mut warnings = Vec::new();
+    let mut reports = Vec::new();
+    let mut failed = false;
+    for entry in entries {
+        let pruned = prune_entry(entry, apply, pg_restore, now).await;
+        failed |= pruned.failed;
+        pretty.push_str(&pruned.pretty);
+        warnings.extend(pruned.warnings);
+        reports.push(pruned.json);
+    }
+    store
+        .release_lock(guard)
+        .await
+        .context("releasing the deploy lock")?;
+    if !apply {
+        pretty.push_str("dry run: nothing was removed; pass --apply to remove these\n");
+    }
+    Ok(PruneRun {
+        output: CommandOutput {
+            exit_code: i32::from(failed),
+            pretty,
+            json: json!({ "ok": !failed, "applied": apply, "entries": reports }),
+        },
+        warnings,
+    })
+}
+
+/// One retain entry's prune.
+struct EntryPrune {
+    failed: bool,
+    pretty: String,
+    warnings: Vec<String>,
+    json: Value,
+}
+
+/// Plan, and with `apply` carry out, one retain entry's prune.
+async fn prune_entry(
+    entry: &fraisier_config::RetainEntry,
+    apply: bool,
+    pg_restore: &Path,
+    now: std::time::SystemTime,
+) -> EntryPrune {
+    use fraisier_db::retention::{self, Policy};
+
+    let name = entry.name().unwrap_or_default();
+    let dir = entry.dir.clone().unwrap_or_default();
+    let failure = |message: String| EntryPrune {
+        failed: true,
+        pretty: format!("{name}: {message}\n"),
+        warnings: Vec::new(),
+        json: json!({ "name": name, "dir": dir.display().to_string(), "error": message }),
+    };
+    let policy = match Policy::new(
+        Some(std::time::Duration::from_hours(
+            u64::from(entry.retention_days.unwrap_or(1)) * 24,
+        )),
+        usize::try_from(entry.keep_minimum()).unwrap_or(usize::MAX),
+        entry
+            .keep_last
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
+    ) {
+        Ok(policy) => policy,
+        Err(error) => return failure(error.to_string()),
+    };
+    let corpus = match retention::corpus(&dir, entry.pattern()) {
+        Ok(corpus) => corpus,
+        Err(error) => {
+            return failure(format!("cannot read {}: {error}", dir.display()));
+        }
+    };
+    let plan = retention::plan(corpus.candidates, &policy, now, |archive| async move {
+        fraisier_db::archive::verify_archive(pg_restore, &archive).await
+    })
+    .await;
+
+    let warnings = prune_warnings(entry, &name, &dir, &corpus.outside, &plan);
+    let left = if apply {
+        retention::remove(&dir, &plan.remove)
+    } else {
+        Vec::new()
+    };
+    let removed: Vec<&PathBuf> = plan
+        .remove
+        .iter()
+        .filter(|archive| !left.iter().any(|(kept, _)| kept == *archive))
+        .collect();
+    let verb = if apply { "removed" } else { "would remove" };
+    let mut pretty = format!(
+        "{name} ({}): {verb} {}, kept {}, kept by the floor {}\n",
+        dir.display(),
+        removed.len(),
+        plan.keep.len(),
+        plan.exempt.len()
+    );
+    for archive in &removed {
+        let _ = writeln!(pretty, "  {verb} {}", archive.display());
+    }
+    for (archive, error) in &left {
+        let _ = writeln!(pretty, "  could not remove {}: {error}", archive.display());
+    }
+    let paths = |list: &[PathBuf]| -> Vec<String> {
+        list.iter().map(|p| p.display().to_string()).collect()
+    };
+    EntryPrune {
+        failed: !left.is_empty(),
+        pretty,
+        warnings,
+        json: json!({
+            "name": name,
+            "dir": dir.display().to_string(),
+            "removed": removed.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "kept": paths(&plan.keep),
+            "exempted_by_minimum": paths(&plan.exempt),
+            "removed_by_ceiling": paths(&plan.removed_by_ceiling),
+            "invalid": plan.invalid.iter().map(|(p, reason)| json!({
+                "path": p.display().to_string(),
+                "reason": reason,
+            })).collect::<Vec<_>>(),
+            "outside": paths(&corpus.outside),
+            "left": left.iter().map(|(p, error)| json!({
+                "path": p.display().to_string(),
+                "error": error.to_string(),
+            })).collect::<Vec<_>>(),
+        }),
+    }
+}
+
+/// What an operator should know about one entry's prune that does not fail it.
+fn prune_warnings(
+    entry: &fraisier_config::RetainEntry,
+    name: &str,
+    dir: &Path,
+    outside: &[PathBuf],
+    plan: &fraisier_db::retention::Plan,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(min_free_gb) = entry.min_free_gb {
+        // An unmeasurable volume is not a full one any more than it is an empty
+        // one, so it says nothing.
+        if let Ok(free) = fraisier_db::retention::available_bytes(dir) {
+            if free < min_free_gb.saturating_mul(1_000_000_000) {
+                warnings.push(format!(
+                    "{} has {} GB free, below the min_free_gb = {min_free_gb} declared for \
+                     {name}; retention bounds this corpus but cannot free a disk something else \
+                     filled",
+                    dir.display(),
+                    free / 1_000_000_000
+                ));
+            }
+        }
+    }
+    for (archive, reason) in &plan.invalid {
+        warnings.push(format!(
+            "{} is not a readable archive and holds no keep_minimum slot: {reason}",
+            archive.display()
+        ));
+    }
+    if plan.floor_is_load_bearing() {
+        warnings.push(format!(
+            "{name}: every archive in {} is older than retention_days; only the keep_minimum \
+             floor is keeping them, so backups have stopped arriving",
+            dir.display()
+        ));
+    }
+    for link in outside {
+        warnings.push(format!(
+            "{} is a symlink resolving outside {}; it was left alone",
+            link.display(),
+            dir.display()
+        ));
+    }
+    warnings
+}
+
 /// `db restore`: restore a `pg_dump -Fc` archive into the database with
 /// `pg_restore`, dropping existing objects first (`--clean --if-exists`).
 ///
@@ -4626,7 +4917,11 @@ current_revision = "true"
                      [ -e \"$(dirname \"$4\")/../fail\" ] && { echo 'pg_dump: boom' >&2; exit 1; }\n\
                      exit 0\n",
                 ),
-                pg_restore: write("pg_restore", "exit 0\n"),
+                pg_restore: write(
+                    "pg_restore",
+                    "grep -q BAD \"$2\" && { echo 'pg_restore: error: not an archive' >&2; exit 1; }\n\
+                     exit 0\n",
+                ),
             }
         })
     }
@@ -4737,6 +5032,288 @@ current_revision = "true"
             ["demo-test-20261025T031500Z.pgdump"]
         );
         assert_eq!(std::fs::read(&earlier).expect("read"), vec![b'g'; 1_000]);
+    }
+
+    /// 2026-10-26T03:15:00Z.
+    fn prune_now() -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_mins(29_883_075)
+    }
+
+    /// A config with one `[[backup.retain]]` entry per `(name, dir, extra)`.
+    fn prune_config(dir: &Path, entries: &[(&str, &Path, &str)]) -> std::path::PathBuf {
+        use std::fmt::Write as _;
+
+        let mut body = db_ops_config("FRAISIER_PRUNE_UNUSED_DSN");
+        for (name, corpus, extra) in entries {
+            let _ = write!(
+                body,
+                "\n[[backup.retain]]\nname = \"{name}\"\ndir = \"{}\"\n\
+                 schedule = \"daily 05:30\"\nretention_days = 1\nkeep_minimum = 2\n{extra}",
+                corpus.display()
+            );
+        }
+        write(dir, "fraisier.toml", &body)
+    }
+
+    /// A corpus dir under `root` holding an archive per `(stamp, body)`.
+    fn prune_corpus(root: &Path, archives: &[(&str, &[u8])]) -> std::path::PathBuf {
+        let corpus = root.join("backups");
+        std::fs::create_dir(&corpus).expect("mkdir");
+        for (stamp, body) in archives {
+            std::fs::write(corpus.join(format!("demo-test-{stamp}.pgdump")), body).expect("write");
+        }
+        corpus
+    }
+
+    fn prune(config: &Path, state_dir: &Path, name: Option<&str>, apply: bool) -> super::PruneRun {
+        block_on(super::backup_prune_with(
+            config,
+            state_dir,
+            name,
+            apply,
+            &fake_pg_tools().pg_restore,
+            prune_now(),
+        ))
+        .expect("run")
+    }
+
+    /// Three archives 30, 40 and 50 hours old: the floor of 2 keeps two.
+    const AGED: &[(&str, &[u8])] = &[
+        ("20261024T211500Z", b"PGDMP"),
+        ("20261024T111500Z", b"PGDMP"),
+        ("20261024T011500Z", b"PGDMP"),
+    ];
+
+    #[test]
+    fn a_dry_run_prune_removes_nothing_and_lists_the_plan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(dir.path(), AGED);
+        let config = prune_config(dir.path(), &[("nightly", &corpus, "")]);
+        let run = prune(&config, &dir.path().join("state"), None, false);
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert_eq!(archive_names(&corpus).len(), 3);
+        assert!(
+            run.output.pretty.contains("would remove"),
+            "{}",
+            run.output.pretty
+        );
+        assert!(
+            run.output
+                .pretty
+                .contains("demo-test-20261024T011500Z.pgdump"),
+            "{}",
+            run.output.pretty
+        );
+        assert_eq!(run.output.json["applied"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn an_applied_prune_removes_exactly_the_plan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(dir.path(), AGED);
+        let config = prune_config(dir.path(), &[("nightly", &corpus, "")]);
+        let run = prune(&config, &dir.path().join("state"), None, true);
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert_eq!(
+            archive_names(&corpus),
+            [
+                "demo-test-20261024T111500Z.pgdump",
+                "demo-test-20261024T211500Z.pgdump"
+            ]
+        );
+        assert_eq!(
+            run.output.json["entries"][0]["removed"],
+            serde_json::json!([corpus
+                .join("demo-test-20261024T011500Z.pgdump")
+                .display()
+                .to_string()])
+        );
+    }
+
+    #[test]
+    fn a_prune_keeps_the_floor_when_every_archive_is_old_and_warns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(
+            dir.path(),
+            &[
+                ("20261001T000000Z", b"PGDMP"),
+                ("20260901T000000Z", b"PGDMP"),
+            ],
+        );
+        let config = prune_config(dir.path(), &[("nightly", &corpus, "")]);
+        let run = prune(&config, &dir.path().join("state"), None, true);
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert_eq!(archive_names(&corpus).len(), 2);
+        assert!(
+            run.warnings
+                .iter()
+                .any(|w| w.contains("only the keep_minimum floor")),
+            "{:?}",
+            run.warnings
+        );
+    }
+
+    #[test]
+    fn no_warning_when_an_archive_is_within_retention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(dir.path(), &[("20261026T000000Z", b"PGDMP")]);
+        let config = prune_config(dir.path(), &[("nightly", &corpus, "")]);
+        let run = prune(&config, &dir.path().join("state"), None, true);
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert!(run.warnings.is_empty(), "{:?}", run.warnings);
+    }
+
+    #[test]
+    fn an_invalid_archive_is_named_in_a_warning_and_does_not_fail_the_prune() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(
+            dir.path(),
+            &[
+                ("20261024T211500Z", b"BAD"),
+                ("20261024T111500Z", b"PGDMP"),
+                ("20261024T011500Z", b"PGDMP"),
+            ],
+        );
+        let config = prune_config(dir.path(), &[("nightly", &corpus, "")]);
+        let run = prune(&config, &dir.path().join("state"), None, true);
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert!(
+            run.warnings
+                .iter()
+                .any(|w| w.contains("demo-test-20261024T211500Z.pgdump")
+                    && w.contains("not an archive")),
+            "{:?}",
+            run.warnings
+        );
+        // The invalid one gave up its slot to the oldest valid one.
+        assert_eq!(
+            archive_names(&corpus),
+            [
+                "demo-test-20261024T011500Z.pgdump",
+                "demo-test-20261024T111500Z.pgdump"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_prune_never_touches_a_symlink_out_of_its_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(dir.path(), AGED);
+        let precious = dir.path().join("precious.pgdump");
+        std::fs::write(&precious, b"PGDMP").expect("write");
+        let link = corpus.join("demo-test-20260101T000000Z.pgdump");
+        std::os::unix::fs::symlink(&precious, &link).expect("symlink");
+        let config = prune_config(dir.path(), &[("nightly", &corpus, "")]);
+        let run = prune(&config, &dir.path().join("state"), None, true);
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert!(precious.exists());
+        assert!(link.symlink_metadata().is_ok());
+        assert!(
+            run.warnings
+                .iter()
+                .any(|w| w.contains("demo-test-20260101T000000Z.pgdump")),
+            "{:?}",
+            run.warnings
+        );
+    }
+
+    #[test]
+    fn a_missing_dir_fails_the_prune_and_is_reported_for_every_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = prune_config(
+            dir.path(),
+            &[
+                ("first", &dir.path().join("absent-one"), ""),
+                ("second", &dir.path().join("absent-two"), ""),
+            ],
+        );
+        let run = prune(&config, &dir.path().join("state"), None, true);
+        assert_eq!(run.output.exit_code, 1, "{}", run.output.pretty);
+        assert!(
+            run.output.pretty.contains("absent-one"),
+            "{}",
+            run.output.pretty
+        );
+        assert!(
+            run.output.pretty.contains("absent-two"),
+            "{}",
+            run.output.pretty
+        );
+    }
+
+    #[test]
+    fn a_prune_with_no_policy_says_so_and_exits_1() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(
+            dir.path(),
+            "fraisier.toml",
+            &db_ops_config("FRAISIER_PRUNE_UNUSED_DSN"),
+        );
+        let run = prune(&config, &dir.path().join("state"), None, true);
+        assert_eq!(run.output.exit_code, 1, "{}", run.output.pretty);
+        assert!(
+            run.output.pretty.contains("[[backup.retain]]"),
+            "{}",
+            run.output.pretty
+        );
+    }
+
+    #[test]
+    fn a_name_selects_one_entry_and_an_unknown_one_lists_the_known() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(dir.path(), AGED);
+        let config = prune_config(
+            dir.path(),
+            &[
+                ("nightly", &corpus, ""),
+                ("other", &dir.path().join("absent"), ""),
+            ],
+        );
+        let run = prune(&config, &dir.path().join("state"), Some("nightly"), true);
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert_eq!(archive_names(&corpus).len(), 2);
+
+        let run = prune(&config, &dir.path().join("state"), Some("weekly"), true);
+        assert_eq!(run.output.exit_code, 1, "{}", run.output.pretty);
+        assert!(
+            run.output.pretty.contains("nightly"),
+            "{}",
+            run.output.pretty
+        );
+        assert!(run.output.pretty.contains("other"), "{}", run.output.pretty);
+    }
+
+    #[test]
+    fn a_prune_refuses_while_a_deploy_holds_the_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(dir.path(), AGED);
+        let config = prune_config(dir.path(), &[("nightly", &corpus, "")]);
+        let state_dir = dir.path().join("state");
+        let store = FilesystemStateStore::new(&state_dir).expect("store");
+        let guard = block_on(store.acquire_lock(&FraiseKey::new("demo", "test"))).expect("lock");
+        let run = prune(&config, &state_dir, None, true);
+        block_on(store.release_lock(guard)).expect("release");
+        assert_eq!(run.output.exit_code, 1, "{}", run.output.pretty);
+        assert!(run.output.pretty.contains("lock"), "{}", run.output.pretty);
+        assert_eq!(archive_names(&corpus).len(), 3);
+    }
+
+    #[test]
+    fn a_volume_below_min_free_gb_warns_and_still_prunes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(dir.path(), AGED);
+        let config = prune_config(
+            dir.path(),
+            &[("nightly", &corpus, "min_free_gb = 1000000000\n")],
+        );
+        let run = prune(&config, &dir.path().join("state"), None, true);
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert_eq!(archive_names(&corpus).len(), 2);
+        assert!(
+            run.warnings.iter().any(|w| w.contains("min_free_gb")),
+            "{:?}",
+            run.warnings
+        );
     }
 
     #[test]

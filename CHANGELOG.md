@@ -8,6 +8,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`[[backup.retain]]` and `fraisier backup prune`: archives are pruned by
+  policy, never below a floor of valid ones.**
+  - **The rules.** Each entry names a `dir` and a `schedule`, plus these keys:
+    - `retention_days`: older archives are removed;
+    - `keep_minimum`, default 3: the newest that many valid archives are always
+      kept;
+    - an optional `keep_last` cap: at most that many are kept, however young.
+      It is rejected when below the floor.
+  - **The floor comes first.** It is applied before the age rule, so a producer
+    that has stopped never ages the whole corpus out. An archive `pg_restore
+    --list` rejects gives up its floor slot. One that cannot be checked keeps
+    it, including when `pg_restore` is older than the `pg_dump` that wrote it.
+    Python fraisier counted that case as invalid, so a version skew could remove
+    good archives.
+  - **Refusals (exit 1).** The prune is a dry run unless `--apply` is given. It
+    refuses while a deploy holds the deploy lock, and with no policy or an
+    unknown `--name`. A missing `dir` fails the prune.
+  - **Warnings (stderr, exit 0).** These cases warn: only the floor is keeping
+    the corpus; an archive is unreadable; the volume is below `min_free_gb`; a
+    matching symlink resolves outside `dir`. Such a symlink is never removed.
+  - **Docs.** See [docs/backups.md](docs/backups.md).
+  - **Library.** `fraisier_db::retention` exposes the selection.
+    `fraisier_db::archive::verify_archive` is the `pg_restore --list` check that
+    both backup and prune use.
+  - **Config.** `[backup]` now needs `dir` or at least one retain entry.
+
 - **Empty pg_tviews TVIEWs refuse a deploy, and `fraisier db tviews rebuild`
   refills them.** With `[database.requires] pg_tviews = true`, preflight and
   `doctor` check every TVIEW against its backing view, after readiness passes.

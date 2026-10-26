@@ -839,6 +839,192 @@ fn an_absolute_backup_dir_validates_clean() {
     );
 }
 
+const RETAIN: &str = "[[backup.retain]]\ndir = \"/var/backups/checkout\"\n\
+                      schedule = \"daily 05:30\"\nretention_days = 3\n";
+
+fn retain_report(entry: &str) -> fraisier_config::ValidationReport {
+    DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{entry}"))
+        .expect("parses")
+        .validate()
+}
+
+#[test]
+fn a_retain_entry_parses_with_its_defaults_and_needs_no_backup_dir() {
+    let config =
+        DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{RETAIN}")).expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    let backup = config.backup.expect("[backup]");
+    let [entry] = backup.retain.as_slice() else {
+        panic!("one entry, got {:?}", backup.retain)
+    };
+    assert_eq!(
+        entry.dir.as_deref(),
+        Some(std::path::Path::new("/var/backups/checkout"))
+    );
+    assert_eq!(entry.schedule.as_deref(), Some("daily 05:30"));
+    assert_eq!(entry.retention_days, Some(3));
+    assert_eq!(entry.keep_minimum(), 3);
+    assert_eq!(entry.keep_last, None);
+    assert_eq!(entry.pattern(), "*.pgdump");
+    assert_eq!(entry.name().as_deref(), Some("checkout"));
+    assert_eq!(entry.min_free_gb, None);
+}
+
+#[test]
+fn declared_retain_fields_win_over_the_defaults() {
+    let config = DeployConfig::from_toml_str(&format!(
+        "{SCHEDULE_BASE}\n{RETAIN}keep_minimum = 5\nkeep_last = 9\n\
+         match = \"checkout-production-*.pgdump\"\nname = \"prod-full\"\nmin_free_gb = 20\n"
+    ))
+    .expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    let entry = &config.backup.expect("[backup]").retain[0];
+    assert_eq!(entry.keep_minimum(), 5);
+    assert_eq!(entry.keep_last, Some(9));
+    assert_eq!(entry.pattern(), "checkout-production-*.pgdump");
+    assert_eq!(entry.name().as_deref(), Some("prod-full"));
+    assert_eq!(entry.min_free_gb, Some(20));
+}
+
+#[test]
+fn a_retain_entry_requires_dir_schedule_and_retention_days() {
+    for (field, line) in [
+        ("dir", "dir = \"/var/backups/checkout\"\n"),
+        ("schedule", "schedule = \"daily 05:30\"\n"),
+        ("retention_days", "retention_days = 3\n"),
+    ] {
+        let report = retain_report(&RETAIN.replace(line, ""));
+        assert!(
+            has_error(&report, &format!("backup.retain[0].{field}")),
+            "{field}: {report}"
+        );
+    }
+}
+
+#[test]
+fn retention_days_must_be_at_least_one() {
+    let report = retain_report(&RETAIN.replace("retention_days = 3", "retention_days = 0"));
+    assert!(
+        has_error(&report, "backup.retain[0].retention_days"),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_retain_dir_must_be_absolute_and_plain() {
+    for bad in [
+        "backups",
+        "/backup/../etc",
+        "/backup/$(whoami)",
+        "/backup/a;rm -rf /",
+        "/backup/%H",
+        "/backup/prod\\nExecStartPost=/bin/rm",
+    ] {
+        let report = retain_report(&RETAIN.replace("/var/backups/checkout", bad));
+        assert!(
+            has_error(&report, "backup.retain[0].dir"),
+            "{bad}: {report}"
+        );
+    }
+}
+
+#[test]
+fn a_retain_match_is_confined_to_the_dir() {
+    for bad in [
+        "../staging/*.pgdump",
+        "/etc/*.pgdump",
+        "sub/*.pgdump",
+        "*%i*.pgdump",
+        "*\\n",
+    ] {
+        let report = retain_report(&format!("{RETAIN}match = \"{bad}\"\n"));
+        assert!(
+            has_error(&report, "backup.retain[0].match"),
+            "{bad}: {report}"
+        );
+    }
+}
+
+#[test]
+fn a_retain_schedule_uses_the_calendar_vocabulary() {
+    let report = retain_report(&RETAIN.replace("daily 05:30", "every tuesday"));
+    assert!(has_error(&report, "backup.retain[0].schedule"), "{report}");
+}
+
+#[test]
+fn a_retain_name_must_be_a_safe_identifier() {
+    for bad in ["prod duction", "prod/uction", "prod%n", "prod$X", ""] {
+        let report = retain_report(&format!("{RETAIN}name = \"{bad}\"\n"));
+        assert!(
+            has_error(&report, "backup.retain[0].name"),
+            "{bad}: {report}"
+        );
+    }
+}
+
+#[test]
+fn a_derived_name_must_also_be_safe() {
+    let report = retain_report(&RETAIN.replace("/var/backups/checkout", "/"));
+    assert!(has_error(&report, "backup.retain[0].name"), "{report}");
+}
+
+#[test]
+fn retain_names_are_unique() {
+    let report = retain_report(&format!("{RETAIN}{RETAIN}"));
+    assert!(has_error(&report, "backup.retain[1].name"), "{report}");
+}
+
+#[test]
+fn keep_last_below_keep_minimum_is_rejected() {
+    let report = retain_report(&format!("{RETAIN}keep_minimum = 3\nkeep_last = 2\n"));
+    assert!(has_error(&report, "backup.retain[0].keep_last"), "{report}");
+}
+
+#[test]
+fn keep_last_of_zero_is_rejected() {
+    let report = retain_report(&format!("{RETAIN}keep_minimum = 0\nkeep_last = 0\n"));
+    assert!(has_error(&report, "backup.retain[0].keep_last"), "{report}");
+}
+
+#[test]
+fn a_zero_floor_is_allowed() {
+    let report = retain_report(&format!("{RETAIN}keep_minimum = 0\n"));
+    assert!(report.ok(), "{report}");
+}
+
+#[test]
+fn min_free_gb_must_be_at_least_one() {
+    let report = retain_report(&format!("{RETAIN}min_free_gb = 0\n"));
+    assert!(
+        has_error(&report, "backup.retain[0].min_free_gb"),
+        "{report}"
+    );
+}
+
+#[test]
+fn the_documented_retain_example_validates() {
+    // An example that fails to load teaches the wrong shape, and nobody notices
+    // because nothing runs it. Taken from the real page, not retyped.
+    let page = include_str!("../../../docs/backups.md");
+    let after = page
+        .split_once("<!-- retain-example -->\n```toml\n")
+        .expect("the marked example")
+        .1;
+    let example = after.split_once("```").expect("closing fence").0;
+    let config = DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{example}"))
+        .expect("the example parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    let entry = &config.backup.expect("[backup]").retain[0];
+    assert_eq!(entry.name().as_deref(), Some("nightly"));
+    assert_eq!(entry.keep_last, Some(60));
+}
+
+#[test]
+fn a_backup_section_with_neither_dir_nor_retain_is_still_an_error() {
+    let report = retain_report("[backup]\nretain = []\n");
+    assert!(has_error(&report, "backup.dir"), "{report}");
+}
+
 #[test]
 fn schedule_requires_a_calendar_surface() {
     let toml = format!("{SCHEDULE_BASE}\n[schedule]\ncommand = \"backup\"\n");

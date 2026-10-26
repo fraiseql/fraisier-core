@@ -55,6 +55,79 @@ pub fn set_marker_command(maintenance: &PgConn, db: &str, value: &str) -> Result
     ))
 }
 
+/// The extensions `listing` (a `pg_restore --list` table of contents) creates.
+#[must_use]
+pub fn archive_extensions(listing: &str) -> Vec<String> {
+    // `<id>; <oid> <oid> EXTENSION - <name>`; comments start with `;`.
+    listing
+        .lines()
+        .filter(|line| !line.starts_with(';'))
+        .filter_map(|line| {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            (tokens.get(3..5) == Some(&["EXTENSION", "-"][..]))
+                .then(|| tokens.get(5).map(|name| (*name).to_owned()))
+                .flatten()
+        })
+        .collect()
+}
+
+/// The SQL asking whether the connecting role could create `extensions` in a
+/// fresh database. It prints one JSON object: `superuser`, `missing` (not
+/// available on the server) and `untrusted`.
+#[must_use]
+pub fn extensions_sql(extensions: &[String]) -> String {
+    let names = extensions
+        .iter()
+        .map(|name| literal(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "WITH wanted(name) AS (SELECT unnest(ARRAY[{names}]::text[])) \
+         SELECT json_build_object(\
+         'superuser', (SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user), \
+         'missing', COALESCE((SELECT json_agg(w.name) FROM wanted w WHERE NOT EXISTS \
+           (SELECT 1 FROM pg_catalog.pg_available_extensions a WHERE a.name = w.name)), '[]'), \
+         'untrusted', COALESCE((SELECT json_agg(w.name) FROM wanted w WHERE NOT EXISTS \
+           (SELECT 1 FROM pg_catalog.pg_available_extension_versions v \
+            WHERE v.name = w.name AND v.trusted)), '[]'))"
+    )
+}
+
+/// Why [`extensions_sql`]'s reply rules the restore out, or `None`.
+///
+/// # Errors
+/// The reply is not the JSON object the query prints.
+pub fn extensions_problem(stdout: &str) -> Result<Option<String>, String> {
+    let reply: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|error| format!("the extension query did not print its JSON: {error}"))?;
+    let names = |key: &str| -> Vec<String> {
+        reply[key]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .filter_map(|n| n.as_str().map(ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let missing = names("missing");
+    if !missing.is_empty() {
+        return Ok(Some(format!(
+            "the archive creates extension(s) this server does not have: {}",
+            missing.join(", ")
+        )));
+    }
+    let untrusted = names("untrusted");
+    if !untrusted.is_empty() && reply["superuser"].as_bool() != Some(true) {
+        return Ok(Some(format!(
+            "the archive creates extension(s) only a superuser can create, and this role is \
+             not one: {}. The restore would load the tables and fail without them",
+            untrusted.join(", ")
+        )));
+    }
+    Ok(None)
+}
+
 /// A `pg_restore` of another environment's `archive` into the empty database
 /// `conn` names.
 ///
@@ -79,7 +152,10 @@ pub fn restore_command(conn: &PgConn, archive: &Path) -> Command {
 mod tests {
     use std::path::Path;
 
-    use super::{marker_sql, parse_marker, restore_command, set_marker_command, MARKER_SETTING};
+    use super::{
+        archive_extensions, extensions_problem, extensions_sql, marker_sql, parse_marker,
+        restore_command, set_marker_command, MARKER_SETTING,
+    };
     use crate::PgConn;
 
     fn args(command: &std::process::Command) -> Vec<String> {
@@ -135,6 +211,53 @@ mod tests {
         assert!(
             !argv.iter().any(|a| a.contains("pw")),
             "no password on argv"
+        );
+    }
+
+    #[test]
+    fn the_listing_names_the_extensions_the_archive_creates() {
+        let listing = ";\n; Archive created at 2026-10-26\n;\n\
+                       2; 3079 16390 EXTENSION - pg_tviews \n\
+                       3; 0 0 COMMENT - EXTENSION pg_tviews \n\
+                       4; 3079 16391 EXTENSION - pgcrypto \n\
+                       220; 1259 16400 TABLE public tb_item app\n";
+        assert_eq!(archive_extensions(listing), vec!["pg_tviews", "pgcrypto"]);
+        assert_eq!(
+            archive_extensions("220; 1259 16400 TABLE public t app\n"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn the_extension_query_quotes_each_name() {
+        let sql = extensions_sql(&["pg_tviews".to_owned(), "o'dd".to_owned()]);
+        assert!(sql.contains("'pg_tviews'"), "{sql}");
+        assert!(sql.contains("'o''dd'"), "{sql}");
+        assert!(sql.contains("pg_available_extension_versions"), "{sql}");
+    }
+
+    #[test]
+    fn an_untrusted_extension_needs_a_superuser() {
+        let reply = r#"{"superuser": false, "missing": [], "untrusted": ["pg_tviews"]}"#;
+        let problem = extensions_problem(reply).expect("json").expect("a problem");
+        assert!(
+            problem.contains("pg_tviews") && problem.contains("superuser"),
+            "{problem}"
+        );
+        let reply = r#"{"superuser": true, "missing": [], "untrusted": ["pg_tviews"]}"#;
+        assert_eq!(extensions_problem(reply).expect("json"), None);
+    }
+
+    #[test]
+    fn an_extension_the_server_lacks_is_a_problem_for_anyone() {
+        let reply = r#"{"superuser": true, "missing": ["postgis"], "untrusted": []}"#;
+        let problem = extensions_problem(reply).expect("json").expect("a problem");
+        assert!(problem.contains("postgis"), "{problem}");
+        assert!(extensions_problem("not json").is_err());
+        assert_eq!(
+            extensions_problem(r#"{"superuser": false, "missing": [], "untrusted": []}"#)
+                .expect("json"),
+            None
         );
     }
 }

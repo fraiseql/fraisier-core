@@ -12,6 +12,11 @@
 //!    the database it was taken from.
 //! 2. **The source.** The archive's environment is never the target's.
 //!
+//! A third check runs before anything changes too: every extension the archive
+//! creates must be one the connecting role can create in a fresh database. A
+//! restore that cannot recreate an extension loads the tables and fails, and
+//! the database it replaced is already gone.
+//!
 //! Then the service is stopped, the database dropped, created again with the
 //! marker re-applied, restored, migrated, counted, and the service restarted. A
 //! failure before the drop restarts the service. A failure after it leaves the
@@ -80,6 +85,18 @@ pub trait RefreshDb: Send + Sync {
     /// The setting could not be read.
     async fn marker(&self, target_dsn: &str) -> Result<Option<String>, String>;
 
+    /// Why the connecting role could not create `extensions` (the ones the
+    /// archive creates) in a fresh database: one is not available on the server,
+    /// or one is untrusted and the role is not a superuser. `None` when it can.
+    ///
+    /// # Errors
+    /// The server could not be asked.
+    async fn extensions_problem(
+        &self,
+        target_dsn: &str,
+        extensions: &[String],
+    ) -> Result<Option<String>, String>;
+
     /// Drop the target database, ending the sessions connected to it.
     ///
     /// # Errors
@@ -119,6 +136,8 @@ pub struct RefreshPlan<'a> {
     pub archive_environment: &'a str,
     /// The refreshed, migrated database must hold at least this many tables.
     pub min_tables: Option<u64>,
+    /// The extensions the archive creates, read from its table of contents.
+    pub extensions: &'a [String],
 }
 
 /// The service a refresh stops and restarts, with the context it acts under.
@@ -157,6 +176,10 @@ pub enum RefreshError {
     /// The archive is of the target's own environment. Nothing was changed.
     #[error("{0}. Nothing was changed")]
     SameEnvironment(String),
+    /// The archive creates an extension the role could not create. Nothing was
+    /// changed.
+    #[error("{0}. Nothing was changed")]
+    Extensions(String),
     /// The service could not be stopped. Nothing was changed.
     #[error("the service could not be stopped: {0}. Nothing was changed")]
     Stop(#[source] AdapterError),
@@ -207,6 +230,7 @@ impl RefreshError {
             Self::Secret(_) => "config",
             Self::Marker(_) | Self::NotATarget(_) => "marker",
             Self::SameEnvironment(_) => "source",
+            Self::Extensions(_) => "extensions",
             Self::Stop(_) => "stop",
             Self::Drop { .. } => "drop",
             Self::Create(_) => "create",
@@ -238,6 +262,13 @@ pub async fn run_refresh(
         .map_err(RefreshError::NotATarget)?;
     source_guard(plan.archive_environment, plan.environment)
         .map_err(RefreshError::SameEnvironment)?;
+    if let Some(problem) = db
+        .extensions_problem(&target, plan.extensions)
+        .await
+        .map_err(|error| RefreshError::Extensions(format!("could not check extensions: {error}")))?
+    {
+        return Err(RefreshError::Extensions(problem));
+    }
 
     if let Some(service) = service {
         service
@@ -334,6 +365,7 @@ mod tests {
         marker: Option<String>,
         fail: FailAt,
         tables: u64,
+        extensions_problem: Option<String>,
     }
 
     impl Fake {
@@ -343,6 +375,7 @@ mod tests {
                 marker: Some(marker_value("checkout", "staging")),
                 fail: FailAt::Nothing,
                 tables: 12,
+                extensions_problem: None,
             }
         }
     }
@@ -361,6 +394,14 @@ mod tests {
             push(&self.log, format!("marker:{target_dsn}"));
             outcome(self.fail == FailAt::Marker, "marker")?;
             Ok(self.marker.clone())
+        }
+        async fn extensions_problem(
+            &self,
+            _target_dsn: &str,
+            extensions: &[String],
+        ) -> Result<Option<String>, String> {
+            push(&self.log, format!("extensions:{}", extensions.join(",")));
+            Ok(self.extensions_problem.clone())
         }
         async fn drop_target(&self, _target_dsn: &str) -> Result<(), String> {
             push(&self.log, "drop");
@@ -480,6 +521,7 @@ mod tests {
             archive,
             archive_environment: "production",
             min_tables: Some(10),
+            extensions: &[],
         }
     }
 
@@ -566,6 +608,7 @@ mod tests {
             run.log,
             vec![
                 format!("marker:{TARGET_DSN}"),
+                "extensions:".to_owned(),
                 "service:stop".to_owned(),
                 "drop".to_owned(),
                 "create:checkout/staging".to_owned(),
@@ -619,6 +662,20 @@ mod tests {
         .await;
         assert!(matches!(run.result, Err(RefreshError::SameEnvironment(_))));
         assert!(!run.log.iter().any(|s| s == "drop" || s == "service:stop"));
+    }
+
+    #[tokio::test]
+    async fn an_extension_the_role_cannot_create_changes_nothing() {
+        let log = Log::default();
+        let mut fake = Fake::marked(&log);
+        fake.extensions_problem = Some("pg_tviews is untrusted".to_owned());
+        let run = refresh(fake, Some(service(&log)), false).await;
+        assert!(matches!(run.result, Err(RefreshError::Extensions(_))));
+        assert!(
+            !run.log.iter().any(|s| s == "drop" || s == "service:stop"),
+            "{:?}",
+            run.log
+        );
     }
 
     #[tokio::test]

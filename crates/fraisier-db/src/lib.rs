@@ -15,6 +15,9 @@
 //! **no** connection string on argv; only non-secret values (the database name a
 //! `pg_restore` needs as its target) ever appear as arguments.
 
+pub mod readiness;
+pub mod tviews;
+
 pub mod archive;
 pub mod retention;
 
@@ -339,6 +342,28 @@ pub fn create_database_command(maintenance: &PgConn, new_db: &str) -> Result<Com
     ))
 }
 
+/// Build a `psql` command that runs `CREATE DATABASE "<new_db>" OWNER "<owner>"`.
+///
+/// A privileged identity creates the database on behalf of the app role, which
+/// then owns it. The owner is quoted as an identifier, embedded quotes doubled.
+///
+/// # Errors
+/// [`DbError::InvalidDatabaseName`] if `new_db` is not a safe identifier.
+pub fn create_database_owned_command(
+    maintenance: &PgConn,
+    new_db: &str,
+    owner: &str,
+) -> Result<Command, DbError> {
+    validate_db_name(new_db)?;
+    Ok(psql_command(
+        maintenance,
+        &format!(
+            "CREATE DATABASE \"{new_db}\" OWNER \"{}\"",
+            owner.replace('"', "\"\"")
+        ),
+    ))
+}
+
 /// Build a `psql` command that runs `DROP DATABASE IF EXISTS "<db>" WITH (FORCE)`.
 ///
 /// Runs against the `maintenance` connection (point it at a database *other* than
@@ -395,7 +420,26 @@ pub async fn run(command: Command) -> Result<Outcome, DbError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_database_command, drop_database_command, DbError, PgConn};
+    use super::{
+        create_database_command, create_database_owned_command, drop_database_command, DbError,
+        PgConn,
+    };
+
+    #[test]
+    fn an_owned_database_quotes_its_owner() {
+        let maintenance = PgConn::parse("postgres:///postgres?host=/run").expect("dsn");
+        let command =
+            create_database_owned_command(&maintenance, "shop_rh", "app\"x").expect("valid");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.contains(&"CREATE DATABASE \"shop_rh\" OWNER \"app\"\"x\"".to_owned()),
+            "{args:?}"
+        );
+        assert!(create_database_owned_command(&maintenance, "bad;name", "app").is_err());
+    }
     use std::ffi::OsString;
 
     fn env_of(conn: &PgConn) -> std::collections::BTreeMap<String, String> {

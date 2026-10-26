@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Runs ON the Hetzner host (root, pid-1 system systemd). Self-contained:
 # starts a throwaway Postgres container, sets up the systemd unit + artifact server,
-# and drives fraisier's deploy saga to deploy the real fraiseql-server v2.4.0 against
-# the confiture-migrated ecommerce schema 3x consecutively (each committed + /health 200).
+# and drives fraisier's deploy saga to deploy the real fraiseql-server, at the version
+# pinned in fraiseql-version (shipped from tools/fraiseql-version), against the
+# confiture-migrated ecommerce schema 3x consecutively (each committed + /health 200).
 # Confiture (>=0.22), docker, python3 are pre-installed by the orchestrator.
 set -uo pipefail
 BASE=/root/criterion1
@@ -11,15 +12,17 @@ SERVER=$BASE/fraiseql-server
 SCHEMA=$BASE/schema.compiled.json
 SRVCONF=$BASE/server.config.toml
 SRC_MIGR=$BASE/migrations
+FRAISEQL_VERSION="$(tr -d '[:space:]' < "$BASE/fraiseql-version")"
 HEALTH_PORT=8815
 ARTIFACT_PORT=8761
 UNIT=fraiseql-ecom.service
 UNIT_DIR=/etc/systemd/system
 PG_NAME=criterion1-pg
 PG_PORT=5432
-# Postgres image. Override to the org's ghcr mirror to skip Docker Hub (429-prone
-# on shared runner IPs), e.g. PG_IMAGE=ghcr.io/fraiseql/postgres:16 GHCR_TOKEN=$PAT
-PG_IMAGE="${PG_IMAGE:-postgres:16}"
+# Postgres image. FraiseQL 2.18 refuses to boot on PostgreSQL older than 18.
+# Override to the org's ghcr mirror to skip Docker Hub (429-prone on shared runner
+# IPs), e.g. PG_IMAGE=ghcr.io/fraiseql/postgres:18 GHCR_TOKEN=$PAT
+PG_IMAGE="${PG_IMAGE:-postgres:18}"
 
 say(){ printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok(){ printf '\033[1;32m  ✓\033[0m %s\n' "$*"; }
@@ -43,6 +46,9 @@ ghcr_login(){
 [ "$(id -u)" = 0 ] || die "must run as root"
 for f in "$FRAISIER" "$SERVER" "$SCHEMA" "$SRVCONF"; do [ -e "$f" ] || die "missing $f"; done
 chmod +x "$FRAISIER" "$SERVER"
+served="$("$SERVER" --version 2>&1 | head -1)"
+[ "$served" = "fraiseql-server ${FRAISEQL_VERSION#v}" ] \
+  || die "$SERVER reports '$served'; the pin is $FRAISEQL_VERSION"
 
 WORK="$(mktemp -d)"
 ARTIFACT_PID=""
@@ -71,11 +77,11 @@ docker exec "$PG_NAME" psql -U postgres -q -c "CREATE DATABASE ecom;" >/dev/null
 DSN="postgresql://postgres:ecompw@127.0.0.1:$PG_PORT/ecom?sslmode=disable"
 ok "Postgres ready (database ecom)"
 
-# system systemd unit: the real fraiseql-server v2.4 (fixed infra). ExecStartPost blocks
+# system systemd unit: the real fraiseql-server (fixed infra). ExecStartPost blocks
 # until /health 200 so fraisier's restart step returns only once the server is serving.
 cat > "$UNIT_DIR/$UNIT" <<EOF
 [Unit]
-Description=fraiseql-server v2.4 (criterion-1 Hetzner)
+Description=fraiseql-server $FRAISEQL_VERSION (criterion-1 Hetzner)
 
 [Service]
 Type=simple
@@ -129,15 +135,18 @@ ok "authored fraisier.toml"
 
 deploy(){ ECOM_DATABASE_URL="$DSN" "$FRAISIER" --json deploy \
   --config "$WORK/fraisier.toml" --state-dir "$WORK/state" --app-version "$1"; }
+# What the server itself said, for a deploy that failed.
+diagnose(){ systemctl status "$UNIT" --no-pager 2>&1 | tail -20
+  journalctl -u "$UNIT" -n 60 --no-pager 2>&1 | sed 's/\x1b\[[0-9;]*m//g'; }
 health_code(){ curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HEALTH_PORT/health"; }
 assert_committed(){ echo "$2" | grep -q '"outcome": *"committed"' || die "deploy $1 did not commit:
 $2"; }
 
-say "CRITERION 1 (Hetzner pid-1) — 3 consecutive production deploys of fraiseql-server v2.4.0"
-mint_release v2.4.0
+say "CRITERION 1 (Hetzner pid-1) — 3 consecutive production deploys of fraiseql-server $FRAISEQL_VERSION"
+mint_release "$FRAISEQL_VERSION"
 for i in 1 2 3; do
-  out="$(deploy v2.4.0)"; rc=$?
-  [ $rc -eq 0 ] || { echo "$out"; die "deploy $i exited $rc"; }
+  out="$(deploy "$FRAISEQL_VERSION")"; rc=$?
+  [ $rc -eq 0 ] || { echo "$out"; diagnose; die "deploy $i exited $rc"; }
   assert_committed "$i" "$out"
   [ "$(health_code)" = "200" ] || die "deploy $i: /health not 200 (got $(health_code))"
   rev="$(CONFITURE_DATABASE_URL="$DSN" confiture migrate current --no-config 2>/dev/null | tail -1)"

@@ -92,6 +92,10 @@ pub struct DeployConfig {
     /// calendar schedule. Absent when nothing is scheduled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ScheduleSection>,
+    /// The `[database]` section: what the database server must offer. Absent
+    /// leaves the server unchecked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<DatabaseSection>,
     /// The `[backup]` section: where `fraisier backup` keeps its archives.
     /// Absent keeps the single `<fraise>-<environment>.pgdump` output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -434,6 +438,13 @@ pub struct HealthSection {
     /// template `Bearer {token}`). Resolved once per deploy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_provider: Option<TokenProvider>,
+    /// `http`: FraiseQL capabilities the server must report as running in its
+    /// `/health` body (`compiled_in`, `started`, and not `healthy = false`). A
+    /// capability that is not running makes the probe unhealthy, retried like a
+    /// wrong status. Names are not checked here: FraiseQL owns its registry, and
+    /// a name the server does not report fails at probe time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_capabilities: Option<Vec<String>>,
 }
 
 /// The `[ssh]` section: the connection parameters fraisier uses to run per-host
@@ -547,6 +558,52 @@ pub struct ScheduleSection {
     /// deploy rolls back — the required sink for `command = "deploy"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify: Option<String>,
+}
+
+/// The `[database]` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseSection {
+    /// `[database.requires]`: what the server must offer before fraisier deploys
+    /// onto it. fraisier checks and refuses; it never installs what is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires: Option<DatabaseRequires>,
+    /// The env var holding a superuser DSN — meant for peer auth over the Unix
+    /// socket, with no password — that fraisier uses **only** for
+    /// restore-class operations: creating and dropping throwaway and restore
+    /// target databases, `pg_restore`, and the post-restore TVIEW rebuild.
+    /// Never for migrations or deploy steps. Absent, those use the app DSN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_url_env: Option<String>,
+    /// `[database.tviews]`: the empty-TVIEW gate's one knob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tviews: Option<DatabaseTviews>,
+}
+
+/// `[database.tviews]`: what an empty TVIEW over a populated view costs a
+/// deploy. The gate itself is declared by `[database.requires].pg_tviews`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseTviews {
+    /// `"fail"` (the default) refuses the deploy at preflight; `"warn"` reports
+    /// and continues. A probe that cannot run is treated the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_empty: Option<String>,
+}
+
+/// `[database.requires]`: checked first in every deploy's preflight, and by
+/// `fraisier doctor`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseRequires {
+    /// The lowest PostgreSQL major version the server may run (`18` admits 18.x
+    /// and later).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgres_major: Option<u32>,
+    /// Whether pg_tviews must be preloaded (`shared_preload_libraries`),
+    /// installed in the database, and on the read contract this fraisier speaks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pg_tviews: Option<bool>,
 }
 
 /// The `[backup]` section: where `fraisier backup` keeps its archives.

@@ -1466,6 +1466,15 @@ pub trait MigrationAdapter: Send + Sync {
     async fn post_migrate(&self, _ctx: &AdapterCtx) -> Result<(), AdapterError> {
         Ok(())
     }
+
+    /// Whether a database stands behind this axis.
+    ///
+    /// Defaults to `true`. Only an axis that declares it has no database answers
+    /// `false`, and the saga then has nothing to compensate when a later step
+    /// fails. An adapter that merely reports no revision is not database-less.
+    fn owns_database(&self) -> bool {
+        true
+    }
 }
 
 /// **Artifact axis** — get code/binary onto a host and activate it.

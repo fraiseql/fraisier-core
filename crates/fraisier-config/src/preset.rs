@@ -115,6 +115,7 @@ impl SpecqlPreset {
             ssh: None,
             webhook: None,
             schedule: None,
+            database: None,
             backup: None,
             sync: None,
             blue_green: None,
@@ -288,6 +289,7 @@ impl Overlay for HealthSection {
                 over.headers
             },
             token_provider: prefer(self.token_provider, over.token_provider),
+            require_capabilities: prefer(self.require_capabilities, over.require_capabilities),
         }
     }
 }
@@ -321,6 +323,8 @@ impl DeployConfig {
             webhook: prefer(base.webhook, self.webhook),
             // The preset never emits [schedule]; an author-supplied one wins.
             schedule: prefer(base.schedule, self.schedule),
+            // The preset never emits [database]; an author-supplied one wins.
+            database: prefer(base.database, self.database),
             // The preset never emits [backup]; an author-supplied one wins.
             backup: prefer(base.backup, self.backup),
             // The preset never emits [sync]; an author-supplied one wins.

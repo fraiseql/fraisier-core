@@ -11,6 +11,8 @@ use std::path::Path;
 use std::process::Command;
 
 use fraisier_config::DeployConfig;
+use fraisier_db::tviews::{self, Identity};
+use fraisier_db::PgConn;
 use serde_json::json;
 
 use crate::commands::CommandOutput;
@@ -75,6 +77,13 @@ pub(crate) fn referenced_secrets(config: &DeployConfig) -> Vec<(String, String)>
     {
         out.push(("migration database DSN".to_owned(), env));
     }
+    if let Some(env) = config
+        .database
+        .as_ref()
+        .and_then(|d| d.admin_url_env.clone())
+    {
+        out.push(("database admin DSN".to_owned(), env));
+    }
     if let Some(env) = config.webhook.as_ref().and_then(|w| w.secret_env.clone()) {
         out.push(("webhook HMAC secret".to_owned(), env));
     }
@@ -98,6 +107,112 @@ pub(crate) fn referenced_secrets(config: &DeployConfig) -> Vec<(String, String)>
         _ => {}
     }
     out
+}
+
+/// Probe the database against `[database.requires]`, when the section declares
+/// anything. Absent otherwise: a config that requires nothing has nothing to check.
+async fn check_database_ready(config: &DeployConfig) -> Option<Check> {
+    let probe = crate::pg_readiness::probe(config)?;
+    let fail = |detail: String| Check {
+        name: "database_ready",
+        status: Status::Fail,
+        detail,
+    };
+    let Some(source) = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.database_url_env.as_deref())
+    else {
+        return Some(fail(
+            "cannot check [database.requires]: [migration].database_url_env is not set".to_owned(),
+        ));
+    };
+    let Ok(dsn) = std::env::var(source) else {
+        return Some(fail(format!(
+            "cannot check [database.requires]: ${source} is not set"
+        )));
+    };
+    Some(match probe.unready(&dsn).await {
+        Ok(unready) if unready.is_empty() => Check {
+            name: "database_ready",
+            status: Status::Pass,
+            detail: "the database meets [database.requires]".to_owned(),
+        },
+        Ok(unready) => fail(unready.join("; ")),
+        Err(error) => fail(format!("could not check [database.requires]: {error}")),
+    })
+}
+
+/// Judge `[database].admin_url_env`'s identity against the app role's: it must
+/// be a superuser, and it must reach the app's cluster (the same
+/// `pg_control_system()` identifier). A side that cannot be asked fails the
+/// check: an admin nobody could confirm is not one a restore can rely on.
+fn judge_admin(admin: Result<Identity, String>, app: Result<Identity, String>) -> Check {
+    let fail = |detail: String| Check {
+        name: "database_admin",
+        status: Status::Fail,
+        detail,
+    };
+    let admin = match admin {
+        Ok(admin) => admin,
+        Err(error) => return fail(format!("cannot connect as the admin identity: {error}")),
+    };
+    if !admin.superuser {
+        return fail(format!(
+            "the admin identity `{}` is not a superuser, so it cannot restore a \
+             pg_tviews archive",
+            admin.user
+        ));
+    }
+    let app = match app {
+        Ok(app) => app,
+        Err(error) => {
+            return fail(format!(
+                "cannot confirm the admin reaches the app's cluster: the app role \
+                 could not be asked: {error}"
+            ));
+        }
+    };
+    if admin.system_identifier != app.system_identifier {
+        return fail(format!(
+            "the admin identity `{}` reaches a different cluster (system identifier {}) \
+             from the app role (system identifier {})",
+            admin.user, admin.system_identifier, app.system_identifier
+        ));
+    }
+    Check {
+        name: "database_admin",
+        status: Status::Pass,
+        detail: format!(
+            "`{}` is a superuser on the app's cluster (system identifier {})",
+            admin.user, admin.system_identifier
+        ),
+    }
+}
+
+/// Who `source`'s DSN connects as.
+async fn identity_of(source: Option<&str>) -> Result<Identity, String> {
+    let source = source.ok_or("[migration].database_url_env is not set")?;
+    let dsn = std::env::var(source).map_err(|_| format!("${source} is not set"))?;
+    let conn = PgConn::parse(&dsn).map_err(|error| error.to_string())?;
+    let stdout = tviews::query(Path::new("psql"), &conn, tviews::IDENTITY_SQL).await?;
+    tviews::parse_identity(&stdout)
+}
+
+/// Check `[database].admin_url_env`, when it is set. The DSN itself is never
+/// printed; a connection error is redacted before it is.
+async fn check_database_admin(config: &DeployConfig) -> Option<Check> {
+    let admin_env = config.database.as_ref()?.admin_url_env.as_deref()?;
+    let app_env = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.database_url_env.as_deref());
+    let mut check = judge_admin(
+        identity_of(Some(admin_env)).await,
+        identity_of(app_env).await,
+    );
+    check.detail = fraisier_saga::redact::credentials(&check.detail);
+    Some(check)
 }
 
 /// Run `confiture --version` and compare to the floor.
@@ -167,7 +282,7 @@ fn parse_version(text: &str) -> Option<(u32, u32)> {
 
 /// Run the doctor checks against `config_path`, optionally filtered to `only`.
 #[must_use]
-pub(crate) fn doctor(config_path: &Path, only: &[String]) -> CommandOutput {
+pub(crate) async fn doctor(config_path: &Path, only: &[String]) -> CommandOutput {
     let mut checks: Vec<Check> = Vec::new();
 
     match load(config_path) {
@@ -211,6 +326,12 @@ pub(crate) fn doctor(config_path: &Path, only: &[String]) -> CommandOutput {
                 });
             }
             checks.push(check_confiture(&config));
+            if let Some(check) = check_database_ready(&config).await {
+                checks.push(check);
+            }
+            if let Some(check) = check_database_admin(&config).await {
+                checks.push(check);
+            }
         }
     }
 
@@ -264,7 +385,8 @@ fn env_for_subcommand(config: &DeployConfig, subcommand: &str) -> Option<Vec<(St
         "deploy" | "trigger-deploy" | "rollback" | "ship" => {
             Some(pick(&["migration database DSN", "health token"]))
         }
-        "db" | "backup" => Some(pick(&["migration database DSN"])),
+        "db" => Some(pick(&["migration database DSN", "database admin DSN"])),
+        "backup" => Some(pick(&["migration database DSN"])),
         "webhook-server" => Some(pick(&["webhook HMAC secret"])),
         // Read-only commands that touch no secrets.
         "list" | "status" | "validate-config" | "providers" | "doctor" | "init" => Some(Vec::new()),
@@ -322,7 +444,11 @@ pub(crate) fn env_check(config_path: &Path, subcommand: &str) -> CommandOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{doctor, env_check, parse_version, CONFITURE_FLOOR};
+    use super::{
+        doctor, env_check, judge_admin, parse_version, referenced_secrets, Identity, Status,
+        CONFITURE_FLOOR,
+    };
+    use fraisier_config::DeployConfig;
     use std::io::Write as _;
 
     fn write_config(body: &str) -> tempfile::NamedTempFile {
@@ -393,10 +519,10 @@ url = "http://127.0.0.1/health"
         );
     }
 
-    #[test]
-    fn doctor_passes_on_a_valid_secret_free_config() {
+    #[tokio::test]
+    async fn doctor_passes_on_a_valid_secret_free_config() {
         let file = write_config(VALID);
-        let out = doctor(file.path(), &[]);
+        let out = doctor(file.path(), &[]).await;
         // No hard failure (0 = clean, 2 = warnings only); no FAIL check.
         assert_ne!(out.exit_code, 1, "no check should fail: {}", out.pretty);
         assert!(!out.pretty.contains("[FAIL]"), "pretty: {}", out.pretty);
@@ -404,15 +530,15 @@ url = "http://127.0.0.1/health"
         assert!(out.pretty.contains("config_valid"));
     }
 
-    #[test]
-    fn doctor_fails_when_a_referenced_secret_is_unset() {
+    #[tokio::test]
+    async fn doctor_fails_when_a_referenced_secret_is_unset() {
         // A uniquely-named env var that is never set in the test environment.
         let cfg = VALID.replace(
             "adapter = \"command\"\n[migration.settings]\nup = \"true\"\n",
             "adapter = \"confiture\"\ndatabase_url_env = \"DOCTOR_TEST_NEVER_SET_DSN\"\n",
         );
         let file = write_config(&cfg);
-        let out = doctor(file.path(), &[]);
+        let out = doctor(file.path(), &[]).await;
         assert_eq!(
             out.exit_code, 1,
             "an unset referenced secret fails: {}",
@@ -422,9 +548,132 @@ url = "http://127.0.0.1/health"
     }
 
     #[test]
-    fn doctor_reports_a_parse_failure_as_a_single_fail() {
+    fn doctor_checks_database_requires_and_fails_closed_when_it_cannot() {
+        // Port 1 refuses connections, so the probe cannot run: that is a FAIL,
+        // never a pass or a skip.
+        let _guard = crate::test_env::env_guard();
+        let var = "DOCTOR_TEST_UNREACHABLE_DSN";
+        std::env::set_var(var, "postgres://app:s3cret@127.0.0.1:1/shop");
+        let cfg = VALID.replace(
+            "adapter = \"command\"\n[migration.settings]\nup = \"true\"\n",
+            &format!(
+                "adapter = \"command\"\ndatabase_url_env = \"{var}\"\n[migration.settings]\n\
+                 up = \"true\"\n[database.requires]\npg_tviews = true\n"
+            ),
+        );
+        let file = write_config(&cfg);
+        let out = crate::test_env::block_on(doctor(file.path(), &[]));
+        std::env::remove_var(var);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(
+            out.pretty.contains("[FAIL] database_ready"),
+            "{}",
+            out.pretty
+        );
+        assert!(!out.pretty.contains("s3cret"), "{}", out.pretty);
+    }
+
+    fn identity(user: &str, superuser: bool, system_identifier: &str) -> Identity {
+        Identity {
+            user: user.to_owned(),
+            superuser,
+            recovery: false,
+            system_identifier: system_identifier.to_owned(),
+        }
+    }
+
+    #[test]
+    fn an_admin_superuser_on_the_apps_cluster_passes() {
+        let check = judge_admin(
+            Ok(identity("postgres", true, "7")),
+            Ok(identity("app", false, "7")),
+        );
+        assert_eq!(check.status, Status::Pass, "{}", check.detail);
+    }
+
+    #[test]
+    fn an_admin_that_is_not_a_superuser_fails() {
+        let check = judge_admin(
+            Ok(identity("ops", false, "7")),
+            Ok(identity("app", false, "7")),
+        );
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.contains("not a superuser"), "{}", check.detail);
+    }
+
+    #[test]
+    fn an_admin_on_another_cluster_fails() {
+        let check = judge_admin(
+            Ok(identity("postgres", true, "7")),
+            Ok(identity("app", false, "8")),
+        );
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.detail.contains("different cluster"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn an_admin_that_cannot_be_compared_with_the_app_fails() {
+        let check = judge_admin(
+            Ok(identity("postgres", true, "7")),
+            Err("connection refused".to_owned()),
+        );
+        assert_eq!(check.status, Status::Fail);
+        let check = judge_admin(
+            Err("connection refused".to_owned()),
+            Ok(identity("app", false, "7")),
+        );
+        assert_eq!(check.status, Status::Fail);
+    }
+
+    #[test]
+    fn the_admin_dsn_is_a_referenced_secret() {
+        let cfg = VALID.to_owned() + "[database]\nadmin_url_env = \"DOCTOR_ADMIN\"\n";
+        let config = DeployConfig::from_toml_str(&cfg).unwrap();
+        assert!(referenced_secrets(&config)
+            .iter()
+            .any(|(purpose, source)| purpose == "database admin DSN" && source == "DOCTOR_ADMIN"));
+    }
+
+    #[test]
+    fn doctor_fails_an_unreachable_admin_without_printing_its_dsn() {
+        let _guard = crate::test_env::env_guard();
+        let (app, admin) = ("DOCTOR_TEST_APP_DSN", "DOCTOR_TEST_ADMIN_DSN");
+        std::env::set_var(app, "postgres://app:s3cret@127.0.0.1:1/shop");
+        std::env::set_var(admin, "postgres://postgres:4dm1n@127.0.0.1:1/postgres");
+        let cfg = VALID.replace(
+            "adapter = \"command\"\n[migration.settings]\nup = \"true\"\n",
+            &format!(
+                "adapter = \"command\"\ndatabase_url_env = \"{app}\"\n[migration.settings]\n\
+                 up = \"true\"\n[database]\nadmin_url_env = \"{admin}\"\n"
+            ),
+        );
+        let file = write_config(&cfg);
+        let out = crate::test_env::block_on(doctor(file.path(), &[]));
+        std::env::remove_var(app);
+        std::env::remove_var(admin);
+        assert!(
+            out.pretty.contains("[FAIL] database_admin"),
+            "{}",
+            out.pretty
+        );
+        assert!(!out.pretty.contains("4dm1n"), "{}", out.pretty);
+    }
+
+    #[tokio::test]
+    async fn doctor_has_no_database_check_without_database_requires() {
+        let file = write_config(VALID);
+        let out = doctor(file.path(), &[]).await;
+        assert!(!out.pretty.contains("database_ready"), "{}", out.pretty);
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_a_parse_failure_as_a_single_fail() {
         let file = write_config("this is not toml = = =");
-        let out = doctor(file.path(), &[]);
+        let out = doctor(file.path(), &[]).await;
         assert_eq!(out.exit_code, 1);
         assert!(out.pretty.contains("config_loads"));
     }

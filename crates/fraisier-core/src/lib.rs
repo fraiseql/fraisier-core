@@ -41,6 +41,7 @@ pub mod connection_budget;
 pub mod drill;
 pub mod multi_host;
 pub mod policy;
+pub mod refresh;
 pub mod restore_rehearsal;
 pub mod single_host;
 pub mod token_provider;

@@ -13,7 +13,7 @@ bad DSN) always exit non-zero, so "a regression appeared" is distinguishable fro
 The first-class gate is `[health].adapter = "command"`: a health adapter that runs
 the perf scan as the saga's **`Health`** step. It works for **any** project —
 `confiture` included — and carries the scan's output into the rollback reason and
-the `[schedule].notify` failure webhook.
+the `[notify].command` failure webhook.
 
 ```toml
 [migration]
@@ -34,7 +34,7 @@ The gate passes iff the command exits 0. On a regression the scan exits 1, the
 deploy ends in `RolledBack { failed_step = "health" }`, and the saga restores the
 previously-active release and reverts the migration. With `--json`, the adapter
 parses the scan's report and names the top regressed operation in the rollback
-reason (and the failure webhook payload when `[schedule].notify` is configured) —
+reason (and the failure webhook payload when `[notify].command` is configured) —
 e.g. `perf regression: order/UPDATE p50 +42% (12ms→17ms), 3 more` — so the alert
 says *what* regressed, not just "health check failed." Drop `--json` and the gate
 still works, but the detail degrades to the scan's plain output excerpt.
@@ -97,7 +97,7 @@ environment (the adapter does not `env_clear`), exactly as the migration command
 adapter does.
 
 **Detail in the rollback reason / webhook.** On `--json`, the adapter folds only a
-**structured, secret-free** line into the reason and the `[schedule].notify`
+**structured, secret-free** line into the reason and the `[notify].command`
 webhook — the regressed operation name and its p50 numbers, nothing else. Without
 `--json` (or if the scan emits a non-report error), the gate falls back to echoing
 a **verbatim excerpt** of the scan's stderr (else stdout) into that same reason and
@@ -109,7 +109,7 @@ Credentials are the one thing that excerpt cannot carry: a URL's
 printed, logged, persisted or sent to the webhook, so a connection error that
 echoes a full DSN loses its password and keeps its host. Every *other* secret a
 scan writes to stderr still travels, so prefer `--json` and keep secrets out of
-the scan's stderr — the `[schedule].notify` sink may be a broader-audience channel
+the scan's stderr — the `[notify].command` sink may be a broader-audience channel
 than your local logs.
 
 ## Scheduled monitoring (out of scope)

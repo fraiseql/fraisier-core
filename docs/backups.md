@@ -159,3 +159,74 @@ It records:
 - `ok`;
 - on success, the throwaway's name, the migrations applied, and the table count;
 - on failure, the failed step and the error, with any credentials redacted.
+
+## Scheduling and failure alerts
+
+`fraisier scheduled install` writes a timer and a oneshot service for each
+scheduled run. It does not need a `[schedule]` section, so a host that only
+prunes gets its units too:
+
+```toml
+[backup]
+dir = "/var/backups/checkout"
+
+[[backup.retain]]
+dir = "/var/backups/checkout"
+name = "nightly"
+schedule = "daily 05:30"
+retention_days = 14
+
+[drill]
+schedule = "weekly Sun 04:00"
+
+[notify]
+command = "/usr/local/bin/page-oncall"
+```
+
+| Run | Units |
+|---|---|
+| `[schedule] command = "backup"` | `fraisier-<name>-<env>-scheduled.{service,timer}` |
+| each `[[backup.retain]]` entry | `fraisier-<name>-<env>-retain-<entry>.{service,timer}`, running `backup prune --name <entry> --apply` |
+| `[drill].schedule` | `fraisier-<name>-<env>-drill.{service,timer}` |
+
+A retain entry's name becomes part of its unit names, so it may hold only
+letters, digits, `_`, `.` and `-`.
+
+### Every failure notifies exactly once
+
+Each of those services sets
+`OnFailure=fraisier-<name>-<env>-alert@%n.service`, and `scheduled install`
+always installs that alert template with them. An `OnFailure=` that names a
+missing unit fails silently.
+
+1. The failing run starts with `--failure-record %n`. When it fails, it writes
+   a record to `/run/fraisier/failures/<INVOCATION_ID>.json`, or under
+   `$XDG_RUNTIME_DIR` for a user unit. The record holds the event, the fraise
+   and environment, the unit, the invocation ID, the time, and the reason with
+   credentials removed. It is mode 0600 and at most 4 KiB. The run itself
+   notifies nothing.
+2. systemd then starts the alert unit. Its `fraisier notify --unit %i` finds the
+   record by `$MONITOR_INVOCATION_ID` and redacts the reason again on read.
+   It runs `[notify].command` once, then deletes the record.
+3. Sometimes there is no record: the run was killed before it could write one,
+   or it ran without the flag. The alert still fires, with the reason
+   `no failure record; see journalctl _SYSTEMD_INVOCATION_ID=<id>` (or
+   `-u <unit>` when the ID is unknown).
+
+`[notify].command` runs via `sh -c`. It receives the payload as JSON on stdin,
+and in `FRAISIER_NOTIFY_EVENT`, `_REASON`, `_FAILED` (`<fraise>/<environment>`),
+`_FRAISE`, `_ENVIRONMENT`, `_UNIT` and `_INVOCATION_ID`. The events are:
+
+| Event | Run |
+|---|---|
+| `scheduled-backup-failed` | a scheduled backup |
+| `scheduled-prune-failed` | a prune |
+| `scheduled-drill-failed` | a drill |
+
+With no `[notify].command`, the alert writes the payload to stderr, and the
+journal keeps it.
+
+A scheduled **deploy** is not on this path. It notifies in-process when it rolls
+back (`scheduled-deploy-failed`, or `policy-blocked`), and its unit has no
+`OnFailure=`, so nothing is sent twice. `[notify].command` is its required sink;
+the old `[schedule].notify` key is refused with a pointer to it.

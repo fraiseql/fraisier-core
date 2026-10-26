@@ -6,7 +6,34 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: the failure sink moved from `[schedule].notify` to
+  `[notify].command`.** A host that only prunes has no `[schedule]`, yet its
+  failures need somewhere to go, so the sink now belongs to the deployable. The
+  old key is refused with a validation error that names the new one. There is
+  no alias: two spellings of one sink would drift.
+
 ### Added
+
+- **A failed scheduled backup, prune or drill notifies exactly once.**
+  - **The units.** `fraisier scheduled install` now also writes a prune timer per
+    `[[backup.retain]]` entry, and a drill timer when `[drill].schedule` is set.
+    It no longer needs a `[schedule]` section to do so. Each of those services,
+    and a scheduled backup's, sets
+    `OnFailure=fraisier-<name>-<env>-alert@%n.service`. The alert template is
+    always installed alongside.
+  - **The record.** The failing run (`--failure-record %n`) leaves a redacted
+    record keyed by its invocation ID: mode 0600, at most 4 KiB, under
+    `/run/fraisier/failures`. The run itself notifies nothing.
+  - **The alert.** `fraisier notify --unit` finds the record by
+    `$MONITOR_INVOCATION_ID`, sends it once through `[notify].command`, and
+    deletes it. Without a record, it still notifies, with a journalctl pointer.
+  - **Events.** `scheduled-backup-failed`, `scheduled-prune-failed` and
+    `scheduled-drill-failed`.
+  - **Deploys.** A scheduled deploy keeps notifying in-process and gets no
+    `OnFailure=`.
+  - **Docs.** See [docs/backups.md](docs/backups.md#scheduling-and-failure-alerts).
 
 - **`[metrics].textfile_dir`: deploy, backup and drill write Prometheus textfile
   metrics.**

@@ -273,7 +273,7 @@ Every decision is recorded:
 - **Traces/logs** — `schema policy: allowed | approved | refused`, with
   `deploy.fraise` and `deploy.environment` attributes, and the approver on an
   approval.
-- **The failure sink** — a blocked deploy fires `[schedule].notify` with the
+- **The failure sink** — a blocked deploy fires `[notify].command` with the
   event `policy-blocked` (rather than `scheduled-deploy-failed`), so an
   unattended deploy held for sign-off is distinguishable at a glance from one
   that broke.
@@ -284,7 +284,7 @@ Every decision is recorded:
 
 The hook receives the deploy's identity and the triggering changes — never the
 adapter context, so no DSN, secret name, or adapter setting can reach it. It
-does inherit the fraisier process environment, exactly as `[schedule].notify`,
+does inherit the fraisier process environment, exactly as `[notify].command`,
 `[[checks]]` and the `command` adapters do; that is the operator's own
 environment, and the same trust boundary as the rest of your `fraisier.toml`.
 

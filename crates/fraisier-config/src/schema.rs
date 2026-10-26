@@ -92,6 +92,10 @@ pub struct DeployConfig {
     /// calendar schedule. Absent when nothing is scheduled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ScheduleSection>,
+    /// The `[notify]` section: the one failure sink every unattended run
+    /// reports to. Absent, a failure is only logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<NotifySection>,
     /// The `[database]` section: what the database server must offer. Absent
     /// leaves the server unchecked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -562,10 +566,25 @@ pub struct ScheduleSection {
     /// scheduled deploy is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_unattended_deploy: Option<bool>,
-    /// A failure-notification exec hook (run via `sh -c`) fired when an unattended
-    /// deploy rolls back — the required sink for `command = "deploy"`.
+    /// No longer read: the failure sink moved to [`NotifySection::command`].
+    /// Kept only so that a config still setting it gets a validation error
+    /// saying where it went, rather than an unknown-field parse error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify: Option<String>,
+}
+
+/// The `[notify]` section: where unattended failures are reported.
+///
+/// A scheduled deploy that rolls back notifies in-process; a failed scheduled
+/// backup, prune or drill notifies through its `OnFailure=` alert unit
+/// (`fraisier notify`). Both deliver the same payload to the same command.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifySection {
+    /// The exec hook, run via `sh -c`, with the payload as JSON on stdin and in
+    /// `FRAISIER_NOTIFY_*` environment variables. Required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 /// The `[database]` section.
@@ -649,6 +668,11 @@ pub struct DrillSection {
     /// for another copy of the live database plus 2 GB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<PathBuf>,
+    /// When `scheduled install` runs the drill, in the `[schedule].calendar`
+    /// vocabulary (`daily HH:MM`, `weekly DOW HH:MM`, …). Absent, the drill runs
+    /// only when invoked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
 }
 
 impl DrillSection {

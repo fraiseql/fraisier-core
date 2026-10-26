@@ -132,6 +132,7 @@ impl DeployConfig {
         validate_lb(self, &mut report);
         validate_webhook(self, &mut report);
         validate_schedule(self, &mut report);
+        validate_notify(self, &mut report);
         validate_database(self, &mut report);
         validate_backup(self, &mut report);
         validate_drill(self, &mut report);
@@ -770,14 +771,33 @@ fn validate_schedule(cfg: &DeployConfig, report: &mut ValidationReport) {
                      (it removes the operator-is-watching protection by construction)",
                 );
             }
-            if !is_set(schedule.notify.as_ref()) {
+            if !is_set(cfg.notify.as_ref().and_then(|n| n.command.as_ref())) {
                 report.error(
-                    "schedule.notify",
-                    "an unattended scheduled deploy requires a `notify` failure sink",
+                    "notify.command",
+                    "an unattended scheduled deploy requires a failure sink: \
+                     set [notify].command",
                 );
             }
         }
         Some(_) => {}
+    }
+    if schedule.notify.is_some() {
+        report.error(
+            "schedule.notify",
+            "[schedule].notify moved to `[notify].command`, the one sink every \
+             unattended run reports to",
+        );
+    }
+}
+
+fn validate_notify(cfg: &DeployConfig, report: &mut ValidationReport) {
+    if let Some(notify) = &cfg.notify {
+        if !is_set(notify.command.as_ref()) {
+            report.error(
+                "notify.command",
+                "the [notify] section requires command (run via `sh -c` on each failure)",
+            );
+        }
     }
 }
 
@@ -919,6 +939,15 @@ fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
     for (index, entry) in retain.iter().enumerate() {
         validate_retain_entry(entry, &format!("backup.retain[{index}]"), report);
         if let Some(name) = entry.name() {
+            if !is_unit_word(&name) {
+                report.error(
+                    &format!("backup.retain[{index}].name"),
+                    format!(
+                        "retain entry name '{name}' names its systemd units, so it may hold \
+                         only letters, digits, '_', '.' and '-', and not start with '-'"
+                    ),
+                );
+            }
             if let Some((_, first)) = names.iter().find(|(seen, _)| *seen == name) {
                 report.error(
                     &format!("backup.retain[{index}].name"),
@@ -932,6 +961,18 @@ fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
             }
         }
     }
+}
+
+/// Whether `word` is safe as part of a systemd unit name and as an
+/// `ExecStart=` argument: letters, digits, `_`, `.` and `-`, not starting with
+/// `-`.
+#[must_use]
+pub fn is_unit_word(word: &str) -> bool {
+    !word.is_empty()
+        && !word.starts_with('-')
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
 fn validate_drill(cfg: &DeployConfig, report: &mut ValidationReport) {
@@ -949,6 +990,11 @@ fn validate_drill(cfg: &DeployConfig, report: &mut ValidationReport) {
             "a [drill] restores the newest archive in [backup].dir, so it requires \
              [backup].dir",
         );
+    }
+    if let Some(spec) = drill.schedule.as_deref() {
+        if let Err(message) = crate::calendar::to_on_calendar(spec) {
+            report.error("drill.schedule", message);
+        }
     }
     if drill.max_age_hours == Some(0) {
         report.error("drill.max_age_hours", "max_age_hours must be at least 1");

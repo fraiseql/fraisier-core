@@ -691,9 +691,12 @@ impl DeployShared {
             .issues
             .iter()
             .filter(|issue| issue.severity == Severity::Error)
-            .map(|issue| match &issue.migration {
-                Some(migration) => format!("{} ({migration}): {}", issue.code, issue.message),
-                None => format!("{}: {}", issue.code, issue.message),
+            .map(|issue| {
+                let place = issue
+                    .migration
+                    .as_ref()
+                    .map_or_else(String::new, |migration| format!(" ({migration})"));
+                format!("{}{place}: {}", issue.code, issue.message)
             })
             .collect();
         if blocking.is_empty() {

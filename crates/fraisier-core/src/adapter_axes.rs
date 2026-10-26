@@ -1528,6 +1528,19 @@ pub trait ServiceAdapter: Send + Sync {
     /// [`AdapterError`] if the restart fails.
     async fn restart(&self, ctx: &AdapterCtx, host: &HostId) -> Result<(), AdapterError>;
 
+    /// Stop the service on `host`, for an operation that must not run under it
+    /// (a staging refresh drops the database the service reads).
+    ///
+    /// The default refuses with [`AdapterErrorKind::MethodNotSupported`], so an
+    /// adapter that cannot stop its service is never assumed to have.
+    ///
+    /// # Errors
+    /// [`AdapterError`] if the stop fails or the adapter cannot stop.
+    async fn stop(&self, ctx: &AdapterCtx, host: &HostId) -> Result<(), AdapterError> {
+        let _ = (ctx, host);
+        Err(AdapterError::method_not_supported("stop"))
+    }
+
     /// Report the service's current status on `host`.
     ///
     /// # Errors

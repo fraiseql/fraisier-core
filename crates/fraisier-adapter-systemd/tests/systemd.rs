@@ -32,7 +32,7 @@ fn fake_systemctl() -> PathBuf {
         is-active) case \"$unit\" in *active*) printf 'active\\n'; exit 0;; \
                    *failed*) printf 'failed\\n'; exit 3;; \
                    *) printf 'inactive\\n'; exit 3;; esac;;\n\
-        restart) case \"$unit\" in *fail*) printf 'Job failed\\n' 1>&2; exit 1;; *) exit 0;; esac;;\n\
+        restart|stop) case \"$unit\" in *fail*) printf 'Job failed\\n' 1>&2; exit 1;; *) exit 0;; esac;;\n\
         *) exit 2;; esac\n";
     let mut file = std::fs::File::create(&path).expect("create fake systemctl");
     file.write_all(script.as_bytes()).expect("write script");
@@ -129,6 +129,26 @@ async fn restart_resets_failed_state_before_restarting() {
 
     let _ = std::fs::remove_file(&bin);
     let _ = std::fs::remove_file(&log);
+}
+
+#[tokio::test]
+async fn stop_succeeds_and_failure_is_error() {
+    let bin = fake_systemctl();
+    let adapter = SystemdService::with_program(&bin);
+
+    adapter
+        .stop(&ctx("fraiseql-active.service"), &host())
+        .await
+        .expect("stopping a unit succeeds");
+
+    let err = adapter
+        .stop(&ctx("fail.service"), &host())
+        .await
+        .expect_err("a failing stop is an error");
+    assert_eq!(err.kind, AdapterErrorKind::Execution);
+    assert_eq!(err.operation.as_deref(), Some("stop"));
+
+    let _ = std::fs::remove_file(&bin);
 }
 
 #[tokio::test]

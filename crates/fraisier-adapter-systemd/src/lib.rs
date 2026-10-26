@@ -169,6 +169,23 @@ impl ServiceAdapter for SystemdService {
         ))
     }
 
+    async fn stop(&self, ctx: &AdapterCtx, _host: &HostId) -> Result<(), AdapterError> {
+        let captured = self.systemctl(ctx, "stop", "stop").await?;
+        if captured.succeeded() {
+            return Ok(());
+        }
+        let code = captured
+            .code
+            .map_or_else(|| "signal".to_owned(), |code| code.to_string());
+        Err(error(
+            AdapterErrorKind::Execution,
+            ADAPTER_NAME,
+            "stop",
+            format!("`systemctl stop` exited with {code}"),
+            captured.stderr_opt(),
+        ))
+    }
+
     async fn status(
         &self,
         ctx: &AdapterCtx,

@@ -11,8 +11,9 @@ them. A federated query then answers from both. Then the checks below run.
 | 1 | One `stack deploy` stages the gateway's release, then deploys `orders`, `users`, then `gateway`; both SDLs match the staged release. |
 | 2 | `{ users { … } orders { … } }` through the router answers from both subgraphs. |
 | 3 | `stack status` (text and `--json`) shows every member healthy at its version, and one ready row for the shared database. |
+| 3b | `stack deploy --dry-run` reports each SDL `not checked (dry run)`, sends no `_service` query (an `strace` of every byte it writes, against a control that sees `stack status`'s query), stages no release, and changes no file, unit process or database schema. |
 | 4 | A subgraph redeployed alone with a new schema, under the old supergraph, makes `stack status` fail with `sdl users: DIFFERS`, naming the new field. |
-| 4b | A stack deploy of that subgraph without recomposing fails its health step on the SDL: it rolls itself back, the gateway is skipped and still serves v1. |
+| 4b | A stack deploy of that subgraph without recomposing fails its health step on the SDL: it rolls itself back to its prior release, the gateway is skipped and still serves v1, and the exit code is 1. |
 | 5 | Recomposed, the stack deploys again, the SDLs match, and the new field answers through the router. |
 | 6 | A stopped subgraph makes `stack status` exit 1, naming it. |
 | 7 | A failing migration stops the stack at that member. The members after it are skipped, and the stack still answers. |
@@ -37,7 +38,7 @@ everything in about 15 minutes.
      script runs `npm install`, so the host needs `npm`.
 
    Install `fraisier`, `fraiseql-server`, `fraiseql-cli` and `hive_router` on
-   `PATH`. The host also needs `jq` and `curl`.
+   `PATH`. The host also needs `jq`, `curl` and `strace`.
 3. **Set up.** Run `bash setup.sh`. It compiles the three subgraph schemas
    (`users` v1 and v2, `orders` v1) into `$WORK/out` and prints each one's
    `_service` SDL there. `$WORK` defaults to `/var/tmp/fraisier-stack-e2e`. The

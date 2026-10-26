@@ -50,6 +50,27 @@ if jq -e '.healthy == true and (.members | length == 3) and (.sdl | all(.matches
   pass "json healthy, three members, every SDL matches"
 else head -c 800 "$O.json"; fail "json"; fi
 
+say "3b. a dry run asks no subgraph for its SDL, stages nothing and changes nothing"
+# What a run can change: files and links under /srv/erp (state included), the
+# units' processes, and the database schema.
+snap(){ find $E -printf '%p %y %s %T@ %l\n' | sort
+  systemctl show -p MainPID --value erp-users erp-orders erp-gateway
+  # A fixed key: pg_dump 18 otherwise writes a random \restrict key per run.
+  runuser -u postgres -- pg_dump -s --restrict-key=fraisiere2e erp | md5sum; }
+# Every byte fraisier sends, from every process it spawns. The control proves
+# the trace sees the SDL query when one is made.
+TR(){ strace -f -qq -e trace=write,writev,sendto,sendmsg -s 4096 -o "$1" "${@:2}"; }
+(cd $E/conf && TR "$W"/o.strace.control fraisier stack status --stack stack.staging.toml --state-dir $E/state) >/dev/null 2>&1
+if grep -q '_service' "$W"/o.strace.control; then pass "control: the trace sees stack status's SDL query"; else fail "control trace"; fi
+snap > "$W"/o.snap.before
+(cd $E/conf && TR "$W"/o.strace.dry fraisier stack deploy --stack stack.staging.toml --state-dir $E/state \
+  --app-version users=dry --app-version orders=dry --app-version gateway=dry --dry-run) > "$O" 2>&1; rc=$?; cat "$O"
+snap > "$W"/o.snap.after
+if [ $rc = 0 ] && grep -q 'sdl users: not checked (dry run)' "$O" && grep -q 'sdl orders: not checked (dry run)' "$O"; then pass "dry run exits 0 and reports each SDL not checked (dry run)"; else fail "dry run rc=$rc"; fi
+if grep -q '_service' "$W"/o.strace.dry; then fail "the dry run sent an SDL query"; else pass "the dry run sent no SDL query"; fi
+if diff "$W"/o.snap.before "$W"/o.snap.after; then pass "nothing changed: files, state, processes, schema"; else fail "the dry run changed the host"; fi
+if ls -d $E/*/releases/dry 2>/dev/null; then fail "a dry release was staged"; else pass "no release staged"; fi
+
 say "4. a subgraph redeployed with a new schema under the old supergraph: status catches it"
 release $E/src/users users-v2
 (cd $E/conf && fraisier deploy --config users.staging.toml --state-dir $E/state --app-version v2) > "$O" 2>&1; rc=$?; tail -2 "$O"
@@ -63,6 +84,8 @@ SD --app-version users=v2a --app-version orders=v2a --app-version gateway=v2a > 
 if [ $rc = 1 ] && grep -Eq 'failed +users: .*rolled_back' "$O" && grep -Eq 'skipped +gateway' "$O"; then pass "users rolled itself back; gateway skipped"; else fail "prevent rc=$rc"; fi
 if grep -q 'sdl users: DIFFERS' "$O" && grep -q nickname "$O"; then pass "the report names users' SDL and the new field"; else fail "prevent sdl"; fi
 if [ "$(readlink $E/gateway/current)" = "$E/gateway/releases/v1" ]; then pass "the gateway still serves v1"; else fail "gateway moved"; fi
+if [ "$(readlink $E/users/current)" = "$E/users/releases/v2" ] && systemctl is-active -q erp-users; then pass "users' prior release (v2) is active and running again"; else fail "users after rollback: $(readlink $E/users/current)"; fi
+if r=$(Q '{ users { name } }'); J "$r" '.data.users | length == 2'; then pass "the stack still answers through the v1 router"; else fail "after prevent: $r"; fi
 
 say "5. recomposed: the stack deploys the new router release and matches again"
 cp "$W"/out/users-v2.graphql $E/src/gateway/sdl/users.graphql

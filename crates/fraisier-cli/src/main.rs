@@ -316,6 +316,10 @@ struct InitArgs {
     force: bool,
 }
 
+// Reason: independent deploy flags (--dry-run / --skip-preflight /
+// --fail-on-block / --deep); clap reads them as switches, and `deploy` takes
+// the dry-run pair as one `Option<Depth>`.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args)]
 struct DeployArgs {
     /// Path to the `fraisier.toml`.
@@ -779,14 +783,13 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
                 &args.state_dir,
                 args.host.as_deref(),
                 args.app_version.as_deref(),
-                args.dry_run,
-                args.skip_preflight,
-                args.fail_on_block,
-                if args.deep {
+                args.dry_run.then_some(if args.deep {
                     preview::Depth::Deep
                 } else {
                     preview::Depth::Static
-                },
+                }),
+                args.skip_preflight,
+                args.fail_on_block,
             )
             .await
         }

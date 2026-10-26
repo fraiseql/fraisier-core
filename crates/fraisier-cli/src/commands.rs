@@ -265,10 +265,9 @@ pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
         args.state_dir,
         args.host,
         Some(&report.new_version),
+        None,
         false,
         false,
-        false,
-        Depth::Static,
     )
     .await?;
     pretty.push_str(&deploy_out.pretty);
@@ -1669,10 +1668,9 @@ pub(crate) async fn deploy(
     state_dir: &Path,
     host: Option<&str>,
     app_version: Option<&str>,
-    dry_run: bool,
+    dry_run: Option<Depth>,
     skip_preflight: bool,
     fail_on_block: bool,
-    depth: Depth,
 ) -> Result<CommandOutput> {
     let config = load(config_path)?;
     let report = config.validate();
@@ -1688,14 +1686,21 @@ pub(crate) async fn deploy(
 
     // `[deploy].strategy = "blue-green"` selects the HTTP-tier traffic-swap flow.
     if config.deploy.as_ref().and_then(|d| d.strategy.as_deref()) == Some("blue-green") {
-        return run_blue_green(&config, app_version, state_dir, dry_run, fail_on_block).await;
+        return run_blue_green(
+            &config,
+            app_version,
+            state_dir,
+            dry_run.is_some(),
+            fail_on_block,
+        )
+        .await;
     }
 
     // A config with [hosts] runs the multi-host rollout — unless an explicit
     // --host override pins it to a single host (the existing single-host path).
     let multi_host = config.hosts.is_some() && host.is_none();
 
-    if dry_run {
+    if let Some(depth) = dry_run {
         // Single-host and multi-host run one version at a time against the
         // database, so neither has a shared hold window to certify.
         let schema = preview_schema(
@@ -2980,10 +2985,9 @@ impl fraisier_webhook::WebhookHandler for DeployHandler {
             &self.state_dir,
             None,
             version.as_deref(),
+            None,
             false,
             false,
-            false,
-            Depth::Static,
         )
         .await
         .map_err(|error| error_detail(&error))?;
@@ -4204,10 +4208,9 @@ url = "http://127.0.0.1:8080/health"
             &state,
             Some("127.0.0.1"),
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             false,
-            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4237,10 +4240,9 @@ url = "http://127.0.0.1:8080/health"
             &dir.path().join("state"),
             Some("127.0.0.1"),
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             true,
             false,
-            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4282,10 +4284,9 @@ url = "http://127.0.0.1:8080/health"
             &dir.path().join("state"),
             Some("127.0.0.1"),
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             false,
-            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4303,10 +4304,9 @@ url = "http://127.0.0.1:8080/health"
             &dir.path().join("state"),
             Some("127.0.0.1"),
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             true,
-            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4326,10 +4326,9 @@ url = "http://127.0.0.1:8080/health"
             &dir.path().join("state"),
             Some("127.0.0.1"),
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             true,
-            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4356,10 +4355,9 @@ url = "http://127.0.0.1:8080/health"
             &dir.path().join("state"),
             Some("127.0.0.1"),
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             false,
-            Depth::Static,
         )
         .await
         .expect("a plan was produced");
@@ -4400,10 +4398,9 @@ url = "http://127.0.0.1:8080/health"
             &state,
             None,
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             false,
-            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4446,10 +4443,9 @@ url = "http://127.0.0.1:8080/health"
             &dir.path().join("state"),
             None,
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             false,
-            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4482,10 +4478,9 @@ url = "http://127.0.0.1:8080/health"
             &dir.path().join("state"),
             None,
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             false,
-            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4508,10 +4503,9 @@ url = "http://127.0.0.1:8080/health"
             &dir.path().join("state"),
             None,
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             true,
-            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4524,18 +4518,9 @@ url = "http://127.0.0.1:8080/health"
         let bad = VALID.replace("database_url_env = \"CHECKOUT_DATABASE_URL\"\n", "");
         let config = write(dir.path(), "fraisier.toml", &bad);
         let state = dir.path().join("state");
-        let out = deploy(
-            &config,
-            &state,
-            None,
-            None,
-            false,
-            false,
-            false,
-            Depth::Static,
-        )
-        .await
-        .expect("run");
+        let out = deploy(&config, &state, None, None, None, false, false)
+            .await
+            .expect("run");
         assert_eq!(out.exit_code, 1);
         assert_eq!(out.json["ok"], serde_json::json!(false));
     }
@@ -4815,10 +4800,9 @@ upstream = "checkout_upstream"
             &state,
             None,
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             false,
-            Depth::Static,
         )
         .await
         .expect("multi-host dry run");
@@ -4854,10 +4838,9 @@ upstream = "checkout_upstream"
             &state,
             Some("web1.internal"),
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             false,
-            Depth::Static,
         )
         .await
         .expect("single-host dry run");
@@ -4878,10 +4861,9 @@ upstream = "checkout_upstream"
             &state,
             None,
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             false,
-            Depth::Static,
         )
         .await
         .expect("multi-host pull dry run");
@@ -6214,18 +6196,9 @@ current_revision = "true"
         let config = write(dir.path(), "fraisier.toml", &toml);
         let state = dir.path().join("state");
 
-        let out = deploy(
-            &config,
-            &state,
-            None,
-            Some("1.2.3"),
-            false,
-            false,
-            false,
-            Depth::Static,
-        )
-        .await
-        .expect("the deploy runs and is refused");
+        let out = deploy(&config, &state, None, Some("1.2.3"), None, false, false)
+            .await
+            .expect("the deploy runs and is refused");
         assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
         assert!(out.pretty.contains("policy refused"), "{}", out.pretty);
         assert!(

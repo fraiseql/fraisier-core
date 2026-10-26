@@ -109,10 +109,16 @@ varchar(20)` is `irreversible`.
 What it costs, and what it does not change:
 
 - The dump happens **before** the gate, so a deploy the gate refuses still pays
-  for one. A `--dry-run` of such a config provisions and drops a throwaway too,
-  because it previews the classification the deploy will make. The plan says
-  which kind it made (`classified against a fresh copy of the live database`)
-  and the JSON carries `classification.kind = "deep"`.
+  for one.
+- A plain `--dry-run` of such a config **does not dump the live database**. It
+  classifies statically and says so (`classified statically: a dry run does not
+  dump the live database`), with `classification.kind = "static"` in the JSON.
+  A column type change may then show as unclassified although the deploy would
+  tier it.
+- `--dry-run --deep` previews the classification the deploy will make: it
+  provisions and drops a throwaway, the plan says `classified against a fresh
+  copy of the live database`, and the JSON carries `classification.kind =
+  "deep"`. `--deep` is refused without `--dry-run`.
 - The live role's password reaches confiture through `PGPASSWORD`, never argv:
   `--against` gets the throwaway's URL without it.
 - It needs a confiture that advertises `deep_classification` (≥ 0.44.0, the

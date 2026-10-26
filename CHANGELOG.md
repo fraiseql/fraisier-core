@@ -8,6 +8,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`deploy --dry-run --deep`: the deep classification is previewed only on
+  request.** Under a fresh-dump restore rehearsal, a plain `--dry-run`
+  classifies statically and says so; it never dumps the live database.
+  `--deep` previews the classification the deploy will make, against a
+  throwaway restored from a fresh dump. See
+  [docs/schema-risk-policy.md](docs/schema-risk-policy.md#deep-classification-under-restore-rehearsal).
+
 - **`fraisier backup drill`: the newest archive is proven to restore.**
   - **What it does.** It restores the newest archive in `[backup].dir` into a
     throwaway database, runs the migrations forward on it, counts its tables,

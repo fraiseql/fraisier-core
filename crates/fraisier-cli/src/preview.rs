@@ -331,15 +331,19 @@ fn failed(
     )
 }
 
-/// [`gather`], for a single-host restore-rehearsal deploy, classifying the way
-/// that deploy will.
+/// [`gather`], for a single-host restore-rehearsal deploy.
 ///
-/// With a fresh dump and an adapter that advertises
-/// [`DEEP_CLASSIFICATION`], it provisions a throwaway exactly as the deploy's
-/// preflight does, classifies against it, and drops it. Otherwise the
-/// classification is static, and the plan says why. A throwaway that cannot be
-/// provisioned is an unavailable change-set, never a static one in its place:
-/// the deploy would stop at the same point.
+/// At [`Depth::Deep`] (`--dry-run --deep`), with a fresh dump and an adapter
+/// that advertises [`DEEP_CLASSIFICATION`], it provisions a throwaway exactly
+/// as the deploy's preflight does, classifies against it, and drops it.
+/// Otherwise the classification is static, and the plan says why. A plain dry
+/// run stays static so that it never dumps the live database. A throwaway that
+/// cannot be provisioned is an unavailable change-set, never a static one in
+/// its place: the deploy would stop at the same point.
+// Reason: `gather`'s three gate inputs plus the rehearsal's own (the throwaway
+// lifecycle, its backup source, the depth); a struct built once per call would
+// only rename them.
+#[allow(clippy::too_many_arguments)]
 pub async fn gather_rehearsed(
     db: &dyn RehearsalDb,
     backup: &BackupSource,
@@ -348,7 +352,7 @@ pub async fn gather_rehearsed(
     gate: &PolicyGate,
     approval_command: Option<&str>,
     baseline: Baseline,
-    _depth: Depth,
+    depth: Depth,
 ) -> SchemaPreview {
     let described = match migration.describe().await {
         Ok(described) => described,
@@ -367,15 +371,21 @@ pub async fn gather_rehearsed(
              alone, because an archive behind live has a different pending set"
                 .to_owned(),
         )
-    } else if restore_rehearsal::classifies_deeply(&described) {
-        None
-    } else {
+    } else if !restore_rehearsal::classifies_deeply(&described) {
         Some(format!(
             "classified statically: {} {} does not advertise `{DEEP_CLASSIFICATION}`, so a \
              change whose risk depends on the current schema, such as a column type change, \
              stays unclassified",
             described.name, described.version
         ))
+    } else if depth == Depth::Static {
+        Some(
+            "classified statically: a dry run does not dump the live database. The deploy will \
+             classify against a fresh copy of it; add `--deep` to preview that classification"
+                .to_owned(),
+        )
+    } else {
+        None
     };
     if let Some(detail) = static_because {
         let inspected = policy::inspect_described(migration, ctx, described).await;

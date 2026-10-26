@@ -155,6 +155,19 @@ impl DeployConfig {
         report
     }
 
+    /// Validate only the sections a backup-corpus operation needs.
+    ///
+    /// `backup prune` touches files alone, so it requires `[deploy]` (the
+    /// identity whose deploy lock it honours) and `[backup]`, but neither a DSN
+    /// nor the deploy axes.
+    #[must_use]
+    pub fn validate_backup_ops(&self) -> ValidationReport {
+        let mut report = ValidationReport::default();
+        validate_deploy(self, &mut report);
+        validate_backup(self, &mut report);
+        report
+    }
+
     /// Validate only the `[[checks]]` section.
     ///
     /// `fraisier check` runs the project checks and does not need a full, valid

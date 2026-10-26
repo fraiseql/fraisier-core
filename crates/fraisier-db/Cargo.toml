@@ -16,6 +16,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+nix = { version = "0.31.3", features = ["fs"] }
 percent-encoding = "2.3.2"
 thiserror = "2.0.17"
 tokio = { version = "1.52.3", features = ["process"] }

@@ -23,8 +23,10 @@
 //! floor is full.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+use crate::archive::UtcStamp;
 
 /// A retention policy, valid by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +195,165 @@ where
         plan.remove.push(path);
     }
     plan
+}
+
+/// The archives in a directory that a retention entry applies to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Corpus {
+    /// The archives a policy may act on.
+    pub candidates: Vec<Candidate>,
+    /// Matching symlinks that resolve outside the directory (or nowhere). They
+    /// are never candidates, so nothing ever removes them.
+    pub outside: Vec<PathBuf>,
+}
+
+/// Whether `name` matches the file-name glob `pattern` (`*` is any run of
+/// characters, `?` any one character, everything else is literal).
+#[must_use]
+pub fn matches(pattern: &str, name: &str) -> bool {
+    let (pattern, name) = (pattern.as_bytes(), name.as_bytes());
+    let (mut p, mut n) = (0, 0);
+    // Where the last `*` was, and how much of `name` it has swallowed so far.
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        match pattern.get(p) {
+            Some(b'*') => {
+                star = Some((p, n));
+                p += 1;
+            }
+            Some(&byte) if byte == b'?' || byte == name[n] => {
+                p += 1;
+                n += 1;
+            }
+            _ => match star {
+                Some((star_p, star_n)) => {
+                    p = star_p + 1;
+                    n = star_n + 1;
+                    star = Some((star_p, star_n + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    pattern[p..].iter().all(|&byte| byte == b'*')
+}
+
+/// The files in `dir` whose names match `pattern`.
+///
+/// Hidden files (an in-progress `.<name>.partial` among them) and directories
+/// are never part of a corpus. An archive is dated by the
+/// `-yyyymmddThhmmssZ` stamp before its extension when it has one, and by its
+/// mtime otherwise.
+///
+/// # Errors
+/// Reading `dir` fails, including when it does not exist.
+pub fn corpus(dir: &Path, pattern: &str) -> std::io::Result<Corpus> {
+    let root = dir.canonicalize()?;
+    let mut found = Corpus::default();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name.starts_with('.') || !matches(pattern, &name) {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            match path.canonicalize() {
+                Ok(target) if !target.starts_with(&root) => {
+                    found.outside.push(path);
+                    continue;
+                }
+                Ok(target) if !target.is_file() => continue,
+                Ok(_) => {}
+                Err(_) => {
+                    found.outside.push(path);
+                    continue;
+                }
+            }
+        } else if !file_type.is_file() {
+            continue;
+        }
+        let taken_at = match stamp_in_name(&name) {
+            Some(stamp) => stamp.to_system_time(),
+            None => path.metadata()?.modified()?,
+        };
+        found.candidates.push(Candidate { path, taken_at });
+    }
+    Ok(found)
+}
+
+/// The `-yyyymmddThhmmssZ` stamp just before the extension of `name`, if any.
+fn stamp_in_name(name: &str) -> Option<UtcStamp> {
+    let (stem, _extension) = name.rsplit_once('.')?;
+    let (_, stamp) = stem.rsplit_once('-')?;
+    UtcStamp::parse(stamp)
+}
+
+/// The bytes an unprivileged writer can still use on the filesystem holding
+/// `path`.
+///
+/// # Errors
+/// The filesystem could not be queried (for example, `path` does not exist).
+pub fn available_bytes(path: &Path) -> std::io::Result<u64> {
+    let stats = nix::sys::statvfs::statvfs(path).map_err(std::io::Error::from)?;
+    // Reason: both are `u64` on Linux but 32-bit on macOS, a release target.
+    #[allow(clippy::useless_conversion)]
+    let (blocks, fragment) = (
+        u64::from(stats.blocks_available()),
+        u64::from(stats.fragment_size()),
+    );
+    Ok(blocks.saturating_mul(fragment))
+}
+
+/// Remove `archives` from `dir`, each only if it is still a file directly in
+/// `dir` that resolves inside it. Returns the ones left in place, with why.
+#[must_use]
+pub fn remove(dir: &Path, archives: &[PathBuf]) -> Vec<(PathBuf, std::io::Error)> {
+    let root = match dir.canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            return archives
+                .iter()
+                .map(|archive| {
+                    (
+                        archive.clone(),
+                        std::io::Error::new(error.kind(), error.to_string()),
+                    )
+                })
+                .collect();
+        }
+    };
+    let mut left = Vec::new();
+    for archive in archives {
+        // `remove_file` on a symlink removes the link, never its target, and the
+        // path itself is always directly in `dir`: a link re-pointed after the
+        // check can only cost that one link, never a file outside.
+        let removed = if archive.parent() == Some(dir) {
+            archive.canonicalize().and_then(|target| {
+                if target.starts_with(&root) {
+                    std::fs::remove_file(archive)
+                } else {
+                    Err(std::io::Error::other(format!(
+                        "it resolves to {}, outside {}",
+                        target.display(),
+                        dir.display()
+                    )))
+                }
+            })
+        } else {
+            Err(std::io::Error::other(format!(
+                "it is not directly in {}",
+                dir.display()
+            )))
+        };
+        if let Err(error) = removed {
+            left.push((archive.clone(), error));
+        }
+    }
+    left
 }
 
 #[cfg(test)]
@@ -506,5 +667,198 @@ mod tests {
             Policy::new(None, 0, Some(0)),
             Err(PolicyError::KeepLastZero)
         );
+    }
+
+    mod files {
+        use std::path::{Path, PathBuf};
+        use std::time::{Duration, SystemTime};
+
+        use super::super::{available_bytes, corpus, matches, remove, Candidate};
+
+        #[test]
+        fn a_real_directory_has_some_space_available() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            assert!(available_bytes(dir.path()).expect("statvfs") > 0);
+        }
+
+        #[test]
+        fn a_missing_path_has_no_measurable_space() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            assert!(available_bytes(&dir.path().join("absent")).is_err());
+        }
+
+        fn touch(dir: &Path, name: &str) -> PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, b"PGDMP").expect("write");
+            path
+        }
+
+        fn names(candidates: &[Candidate]) -> Vec<String> {
+            let mut names: Vec<String> = candidates
+                .iter()
+                .map(|c| {
+                    c.path
+                        .file_name()
+                        .expect("name")
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+            names
+        }
+
+        #[test]
+        fn the_glob_matches_stars_and_question_marks_literally_otherwise() {
+            assert!(matches(
+                "*.pgdump",
+                "shop-production-20261026T030000Z.pgdump"
+            ));
+            assert!(matches(
+                "shop-*-2026????T*Z.pgdump",
+                "shop-production-20261026T030000Z.pgdump"
+            ));
+            assert!(matches("*", "anything"));
+            assert!(matches("a*b*c", "abc"));
+            assert!(!matches("*.pgdump", "shop.pgdump.partial"));
+            assert!(!matches("*.pgdump", "shop.dump"));
+            assert!(!matches("?.pgdump", "ab.pgdump"));
+            assert!(!matches("a*b", "acb-"));
+        }
+
+        #[test]
+        fn a_corpus_is_the_matching_plain_files() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            touch(dir.path(), "a.pgdump");
+            touch(dir.path(), "b.pgdump");
+            touch(dir.path(), "notes.txt");
+            touch(dir.path(), ".c.pgdump");
+            std::fs::create_dir(dir.path().join("d.pgdump")).expect("mkdir");
+            let found = corpus(dir.path(), "*.pgdump").expect("corpus");
+            assert_eq!(names(&found.candidates), ["a.pgdump", "b.pgdump"]);
+            assert!(found.outside.is_empty(), "{:?}", found.outside);
+        }
+
+        #[test]
+        fn an_in_progress_partial_is_never_part_of_a_corpus() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            touch(
+                dir.path(),
+                ".shop-production-20261026T030000Z.pgdump.partial",
+            );
+            let found = corpus(dir.path(), "*").expect("corpus");
+            assert!(found.candidates.is_empty(), "{:?}", found.candidates);
+        }
+
+        #[test]
+        fn the_stamp_in_the_name_dates_an_archive_over_its_mtime() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            touch(dir.path(), "shop-production-20261026T030000Z.pgdump");
+            let found = corpus(dir.path(), "*.pgdump").expect("corpus");
+            // 2026-10-26T03:00:00Z.
+            assert_eq!(
+                found.candidates[0].taken_at,
+                SystemTime::UNIX_EPOCH + Duration::from_hours(498_051)
+            );
+        }
+
+        #[test]
+        fn an_archive_without_a_stamp_is_dated_by_its_mtime() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = touch(dir.path(), "legacy.pgdump");
+            let then = SystemTime::UNIX_EPOCH + Duration::from_hours(400_000);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(then))
+                .expect("set mtime");
+            let found = corpus(dir.path(), "*.pgdump").expect("corpus");
+            assert_eq!(found.candidates[0].taken_at, then);
+        }
+
+        #[test]
+        fn a_symlink_inside_the_dir_is_a_candidate() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            touch(dir.path(), "real.pgdump");
+            std::os::unix::fs::symlink(
+                dir.path().join("real.pgdump"),
+                dir.path().join("link.pgdump"),
+            )
+            .expect("symlink");
+            let found = corpus(dir.path(), "*.pgdump").expect("corpus");
+            assert_eq!(names(&found.candidates), ["link.pgdump", "real.pgdump"]);
+        }
+
+        #[test]
+        fn a_symlink_out_of_the_dir_or_nowhere_is_set_aside() {
+            let outside = tempfile::tempdir().expect("tempdir");
+            let target = touch(outside.path(), "precious.pgdump");
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::os::unix::fs::symlink(&target, dir.path().join("escape.pgdump")).expect("symlink");
+            std::os::unix::fs::symlink(dir.path().join("gone"), dir.path().join("dangling.pgdump"))
+                .expect("symlink");
+            let found = corpus(dir.path(), "*.pgdump").expect("corpus");
+            assert!(found.candidates.is_empty(), "{:?}", found.candidates);
+            let mut outside_names: Vec<_> = found
+                .outside
+                .iter()
+                .map(|p| p.file_name().expect("name").to_string_lossy().into_owned())
+                .collect();
+            outside_names.sort();
+            assert_eq!(outside_names, ["dangling.pgdump", "escape.pgdump"]);
+        }
+
+        #[test]
+        fn a_missing_dir_is_an_error() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let error = corpus(&dir.path().join("absent"), "*.pgdump").expect_err("missing");
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        }
+
+        #[test]
+        fn remove_deletes_exactly_the_archives_given() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let gone = touch(dir.path(), "a.pgdump");
+            let stays = touch(dir.path(), "b.pgdump");
+            let left = remove(dir.path(), std::slice::from_ref(&gone));
+            assert!(left.is_empty(), "{left:?}");
+            assert!(!gone.exists());
+            assert!(stays.exists());
+        }
+
+        #[test]
+        fn remove_leaves_a_path_outside_the_dir_in_place() {
+            let outside = tempfile::tempdir().expect("tempdir");
+            let precious = touch(outside.path(), "precious.pgdump");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let left = remove(dir.path(), std::slice::from_ref(&precious));
+            assert_eq!(left.len(), 1, "{left:?}");
+            assert!(precious.exists());
+        }
+
+        #[test]
+        fn remove_leaves_a_link_repointed_outside_since_listing_and_its_target() {
+            let outside = tempfile::tempdir().expect("tempdir");
+            let precious = touch(outside.path(), "precious.pgdump");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let link = dir.path().join("link.pgdump");
+            std::os::unix::fs::symlink(&precious, &link).expect("symlink");
+            let left = remove(dir.path(), std::slice::from_ref(&link));
+            assert_eq!(left.len(), 1, "{left:?}");
+            assert!(precious.exists());
+            assert!(link.symlink_metadata().is_ok());
+        }
+
+        #[test]
+        fn remove_unlinks_a_link_inside_the_dir_but_not_its_target() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let real = touch(dir.path(), "real.pgdump");
+            let link = dir.path().join("link.pgdump");
+            std::os::unix::fs::symlink(&real, &link).expect("symlink");
+            let left = remove(dir.path(), std::slice::from_ref(&link));
+            assert!(left.is_empty(), "{left:?}");
+            assert!(link.symlink_metadata().is_err());
+            assert!(real.exists());
+        }
     }
 }

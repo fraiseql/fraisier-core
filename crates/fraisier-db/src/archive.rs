@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::retention::Verdict;
 use crate::{DbError, PgConn};
 
 /// The extension every archive carries.
@@ -72,6 +73,18 @@ impl UtcStamp {
             && minute < 60
             && second < 60;
         real.then(|| Self(text.to_owned()))
+    }
+
+    /// The instant the stamp names.
+    #[must_use]
+    pub fn to_system_time(&self) -> SystemTime {
+        let number =
+            |range: std::ops::Range<usize>| -> i64 { self.0[range].parse().unwrap_or_default() };
+        let days = days_from_civil(number(0..4), number(4..6), number(6..8));
+        let seconds = days * 86_400 + number(9..11) * 3_600 + number(11..13) * 60 + number(13..15);
+        u64::try_from(seconds).map_or(UNIX_EPOCH, |seconds| {
+            UNIX_EPOCH + std::time::Duration::from_secs(seconds)
+        })
     }
 
     /// The rendered `yyyymmddThhmmssZ` form.
@@ -280,17 +293,11 @@ pub async fn write_archive(
     }
 
     let mut warnings = Vec::new();
-    let mut list = Command::new(&tools.pg_restore);
-    list.arg("--list").arg(partial.path());
-    match crate::run(list).await {
-        Ok(outcome) if outcome.succeeded() => {}
-        Ok(outcome) => {
-            return Err(ArchiveError::Unreadable {
-                stderr: outcome.stderr.trim().to_owned(),
-            })
-        }
-        Err(error) => warnings.push(format!(
-            "the archive was not verified with `pg_restore --list`: {error}"
+    match verify_archive(&tools.pg_restore, partial.path()).await {
+        Verdict::Valid => {}
+        Verdict::Invalid(stderr) => return Err(ArchiveError::Unreadable { stderr }),
+        Verdict::Unverifiable(reason) => warnings.push(format!(
+            "the archive was not verified with `pg_restore --list`: {reason}"
         )),
     }
 
@@ -321,6 +328,34 @@ pub async fn write_archive(
         bytes,
         warnings,
     })
+}
+
+/// Whether `pg_restore --list` reads `archive`.
+///
+/// Only a rejection of the archive itself is [`Verdict::Invalid`]. These are
+/// [`Verdict::Unverifiable`], because they say nothing about the archive:
+/// - no `pg_restore`;
+/// - no file to check;
+/// - a `pg_restore` older than the `pg_dump` that wrote the archive, which
+///   reports an unsupported header version.
+pub async fn verify_archive(pg_restore: &Path, archive: &Path) -> Verdict {
+    if !archive.is_file() {
+        return Verdict::Unverifiable(format!("{} is not there to check", archive.display()));
+    }
+    let mut list = Command::new(pg_restore);
+    list.arg("--list").arg(archive);
+    match crate::run(list).await {
+        Ok(outcome) if outcome.succeeded() => Verdict::Valid,
+        Ok(outcome) if outcome.stderr.contains("unsupported version") => {
+            Verdict::Unverifiable(format!(
+                "{} is older than the pg_dump that wrote this archive: {}",
+                pg_restore.display(),
+                outcome.stderr.trim()
+            ))
+        }
+        Ok(outcome) => Verdict::Invalid(outcome.stderr.trim().to_owned()),
+        Err(error) => Verdict::Unverifiable(error.to_string()),
+    }
 }
 
 /// A partial file this run created, removed on drop unless persisted.
@@ -435,6 +470,19 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     )
 }
 
+/// The days since 1970-01-01 of the proleptic-Gregorian `year-month-day`.
+///
+/// Howard Hinnant's `days_from_civil`, the inverse of [`civil_from_days`].
+const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -442,9 +490,10 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     use super::{
-        archive_file_name, latest_archive, list_archives, parse_archive_file_name, write_archive,
-        ArchiveError, ArchiveTools, UtcStamp,
+        archive_file_name, latest_archive, list_archives, parse_archive_file_name, verify_archive,
+        write_archive, ArchiveError, ArchiveTools, UtcStamp,
     };
+    use crate::retention::Verdict;
     use crate::PgConn;
 
     fn stamp(text: &str) -> UtcStamp {
@@ -477,6 +526,18 @@ mod tests {
             UtcStamp::from_system_time(UNIX_EPOCH).as_str(),
             "19700101T000000Z"
         );
+    }
+
+    #[test]
+    fn a_stamp_names_the_instant_it_was_rendered_from() {
+        for seconds in [0, 1_792_984_542, 1_835_395_200, 4_102_444_799] {
+            let time = UNIX_EPOCH + Duration::from_secs(seconds);
+            assert_eq!(
+                UtcStamp::from_system_time(time).to_system_time(),
+                time,
+                "{seconds}"
+            );
+        }
     }
 
     #[test]
@@ -584,6 +645,62 @@ mod tests {
         assert!(list_archives(&dir.path().join("absent"), "app", "prod").is_err());
     }
 
+    #[tokio::test]
+    async fn an_archive_pg_restore_reads_is_valid() {
+        let scene = Scene::new(0, 0, 0);
+        let archive = scene.dir().join("a.pgdump");
+        std::fs::write(&archive, b"PGDMP").expect("write");
+        assert_eq!(
+            verify_archive(&fakes().pg_restore, &archive).await,
+            Verdict::Valid
+        );
+    }
+
+    #[tokio::test]
+    async fn an_archive_pg_restore_rejects_is_invalid_with_its_reason() {
+        let scene = Scene::new(0, 0, 1);
+        let archive = scene.dir().join("a.pgdump");
+        std::fs::write(&archive, b"PGDMP").expect("write");
+        assert_eq!(
+            verify_archive(&fakes().pg_restore, &archive).await,
+            Verdict::Invalid("pg_restore: error: not a valid archive".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_archive_newer_than_pg_restore_is_unverifiable_not_invalid() {
+        // An older pg_restore cannot judge a newer pg_dump's archive. Calling it
+        // invalid would let prune remove a good archive from under the floor.
+        let scene = Scene::new(0, 0, 1);
+        std::fs::write(
+            scene.root.path().join("scenario/list_stderr"),
+            "pg_restore: error: unsupported version (1.16) in file header\n",
+        )
+        .expect("write");
+        let archive = scene.dir().join("a.pgdump");
+        std::fs::write(&archive, b"PGDMP").expect("write");
+        let verdict = verify_archive(&fakes().pg_restore, &archive).await;
+        assert!(matches!(verdict, Verdict::Unverifiable(_)), "{verdict:?}");
+    }
+
+    #[tokio::test]
+    async fn an_archive_that_is_gone_is_unverifiable() {
+        let scene = Scene::new(0, 0, 0);
+        let verdict = verify_archive(&fakes().pg_restore, &scene.dir().join("gone.pgdump")).await;
+        assert!(matches!(verdict, Verdict::Unverifiable(_)), "{verdict:?}");
+    }
+
+    #[tokio::test]
+    async fn without_pg_restore_an_archive_is_unverifiable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let verdict = verify_archive(
+            &dir.path().join("no-pg_restore"),
+            &dir.path().join("a.pgdump"),
+        )
+        .await;
+        assert!(matches!(verdict, Verdict::Unverifiable(_)), "{verdict:?}");
+    }
+
     /// Linux's `ETXTBSY`: exec'ing a file some process still holds open for
     /// writing.
     const ETXTBSY: i32 = 26;
@@ -610,12 +727,16 @@ mod tests {
                  echo 'pg_dump: error: connection lost' >&2\n\
                  exit \"$(cat \"$scenario/dump_exit\")\"\n",
             );
-            // pg_restore --list <archive>: exit ./list_exit.
+            // pg_restore --list <archive>: exit ./list_exit, saying ./list_stderr
+            // (or a generic rejection) when it fails.
             let pg_restore = write_fake(
                 &dir.join("pg_restore"),
                 "scenario=\"$(dirname \"$2\")/../scenario\"\n\
                  code=\"$(cat \"$scenario/list_exit\")\"\n\
-                 [ \"$code\" = 0 ] || echo 'pg_restore: error: not a valid archive' >&2\n\
+                 if [ \"$code\" != 0 ]; then\n\
+                 if [ -e \"$scenario/list_stderr\" ]; then cat \"$scenario/list_stderr\" >&2;\n\
+                 else echo 'pg_restore: error: not a valid archive' >&2; fi\n\
+                 fi\n\
                  exit \"$code\"\n",
             );
             ArchiveTools {

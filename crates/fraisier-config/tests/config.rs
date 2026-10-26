@@ -1002,6 +1002,24 @@ fn min_free_gb_must_be_at_least_one() {
 }
 
 #[test]
+fn the_documented_retain_example_validates() {
+    // An example that fails to load teaches the wrong shape, and nobody notices
+    // because nothing runs it. Taken from the real page, not retyped.
+    let page = include_str!("../../../docs/backups.md");
+    let after = page
+        .split_once("<!-- retain-example -->\n```toml\n")
+        .expect("the marked example")
+        .1;
+    let example = after.split_once("```").expect("closing fence").0;
+    let config = DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{example}"))
+        .expect("the example parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    let entry = &config.backup.expect("[backup]").retain[0];
+    assert_eq!(entry.name().as_deref(), Some("nightly"));
+    assert_eq!(entry.keep_last, Some(60));
+}
+
+#[test]
 fn a_backup_section_with_neither_dir_nor_retain_is_still_an_error() {
     let report = retain_report("[backup]\nretain = []\n");
     assert!(has_error(&report, "backup.dir"), "{report}");

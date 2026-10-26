@@ -8,6 +8,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`scripts/provision-pg18-tviews.sh`: a documented way to get a Debian host
+  ready for `[database.requires] postgres_major = 18, pg_tviews = true`.**
+  - **What it does.** It installs PostgreSQL 18 from PGDG, after checking the
+    archive key's fingerprint. It builds pg_tviews at a pinned commit
+    (v0.1.0-beta.32) with the pgrx it pins, adds it to
+    `shared_preload_libraries`, and restarts PostgreSQL only when that changed.
+    It creates the database and the extension when they are absent.
+  - **Idempotent.** Every step checks before acting, and the last line counts
+    the changes. A second run reports `0 change(s)` and does not restart
+    PostgreSQL.
+  - **Acceptance.** `scripts/hetzner-pg18-tviews.sh` runs on a fresh Debian 12
+    VPS. It provisions twice, runs fraisier's `database_ready` check, proves a
+    TVIEW registers, and checks that dropping the extension and removing the
+    preload each fail the check with the right reason until a re-run repairs
+    it.
+  - **Docs.** See `docs/database-requirements.md`.
+
 - **`[database.requires]`: declare what the database server must offer, and
   fraisier refuses a server that does not.** `postgres_major` sets a PostgreSQL
   major-version floor, and `pg_tviews = true` requires pg_tviews to be in

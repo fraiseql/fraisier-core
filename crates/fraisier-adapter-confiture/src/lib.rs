@@ -105,6 +105,7 @@ use fraisier_core::adapter_axes::{
     MigrationOutcome, PreflightIssue, PreflightReport, Revision, SchemaChange, Severity,
     VerifyCheck, VerifyReport,
 };
+use fraisier_core::restore_rehearsal::{AGAINST_DATABASE_URL_SECRET, DEEP_CLASSIFICATION};
 use serde_json::Value;
 
 mod exit_codes;
@@ -197,6 +198,17 @@ const RISK_TIER_CAPABILITY: &str = "risk_tier";
 /// number the floor holds, which is why the two were split apart to begin with.
 const RISK_TIER_MIN_CONFITURE: Option<(u32, u32, u32)> = Some((0, 44, 0));
 
+/// The first confiture whose `migrate preflight --against` tiers a column type
+/// change from the target database's current types (fraiseql/confiture#199).
+///
+/// **Observed, not read off a changelog.** Against one throwaway seeded from a
+/// live database, with that throwaway as both the env DSN and `--against`:
+/// 0.43.0 emitted `ALTER COLUMN … TYPE` with no `tier`; 0.44.0 tiered the same
+/// migrations `lock_risky` (`integer → bigint`, widening) and `irreversible`
+/// (`varchar(200) → varchar(20)`, narrowing). 1.36.0 answers the same. The
+/// captures are in `tests/fixtures/against/`.
+const DEEP_CLASSIFICATION_MIN_CONFITURE: (u32, u32, u32) = (0, 44, 0);
+
 /// Every version-gated capability this adapter has, with the confiture release
 /// it starts trusting for it. `None` means the capability is withheld from every
 /// version.
@@ -214,6 +226,7 @@ const RISK_TIER_MIN_CONFITURE: Option<(u32, u32, u32)> = Some((0, 44, 0));
 pub const CAPABILITY_FLOORS: &[CapabilityFloor] = &[
     (WINDOW_SAFE_CAPABILITY, Some(WINDOW_SAFE_MIN_CONFITURE)),
     (RISK_TIER_CAPABILITY, RISK_TIER_MIN_CONFITURE),
+    (DEEP_CLASSIFICATION, Some(DEEP_CLASSIFICATION_MIN_CONFITURE)),
 ];
 
 /// One row of [`CAPABILITY_FLOORS`]: the capability's advertised name, and the
@@ -291,6 +304,7 @@ impl ConfitureMigration {
         command
             .args(&plan.args)
             .env(CONFITURE_DSN_ENV, &plan.database_url)
+            .envs(plan.env.iter().map(|(key, value)| (key, value)))
             .current_dir(&ctx.workdir);
 
         let result = command.output().await;
@@ -361,8 +375,78 @@ fn plan(
             args.push(migrations_path.as_os_str().to_owned());
         }
     }
+    let mut env = Vec::new();
+    if subcommand == "preflight" {
+        if let Ok(target) = ctx.secret(AGAINST_DATABASE_URL_SECRET) {
+            let (url, password) = split_password(&target)?;
+            args.push(OsString::from("--against"));
+            args.push(OsString::from(url));
+            if let Some(password) = password {
+                env.push((OsString::from("PGPASSWORD"), OsString::from(password)));
+            }
+        }
+    }
 
-    Ok(PlannedInvocation { args, database_url })
+    Ok(PlannedInvocation {
+        args,
+        database_url,
+        env,
+    })
+}
+
+/// Split a `postgres://` URL into the URL without its password and the
+/// (percent-decoded) password, so the password can travel in `PGPASSWORD`
+/// rather than on argv. libpq reads `PGPASSWORD` when the URL carries none.
+///
+/// A keyword DSN (`host=… password=…`) is refused rather than parsed: it cannot
+/// go on argv whole, and a best-effort split is how a password ends up there.
+fn split_password(dsn: &str) -> Result<(String, Option<String>), AdapterError> {
+    let refuse = || {
+        AdapterError::new(
+            AdapterErrorKind::InvalidConfig,
+            "the deep-classification target is not a postgres:// URL, so its password cannot be \
+             kept off argv"
+                .to_owned(),
+        )
+        .with_adapter(ADAPTER_NAME)
+    };
+    let (scheme, rest) = dsn.split_once("://").ok_or_else(refuse)?;
+    if scheme != "postgres" && scheme != "postgresql" {
+        return Err(refuse());
+    }
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let Some((userinfo, host)) = authority.rsplit_once('@') else {
+        return Ok((dsn.to_owned(), None));
+    };
+    let Some((user, password)) = userinfo.split_once(':') else {
+        return Ok((dsn.to_owned(), None));
+    };
+    Ok((
+        format!("{scheme}://{user}@{host}{tail}"),
+        Some(percent_decode(password)),
+    ))
+}
+
+/// Decode `%XX` escapes (RFC 3986), lossily for non-UTF-8 bytes.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escaped = (bytes[index] == b'%')
+            .then(|| text.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        if let Some(byte) = escaped {
+            out.push(byte);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Whether a `migrate` subcommand accepts `--migrations-dir`.
@@ -379,6 +463,8 @@ fn subcommand_takes_migrations_dir(subcommand: &str) -> bool {
 struct PlannedInvocation {
     args: Vec<OsString>,
     database_url: String,
+    /// Extra child environment (a deep target's `PGPASSWORD`). Carries a secret.
+    env: Vec<(OsString, OsString)>,
 }
 
 // Manual, redacting `Debug` so the resolved DSN can never reach a log or panic
@@ -388,6 +474,7 @@ impl std::fmt::Debug for PlannedInvocation {
         f.debug_struct("PlannedInvocation")
             .field("args", &self.args)
             .field("database_url", &"<redacted>")
+            .field("env", &"<redacted>")
             .finish()
     }
 }
@@ -915,6 +1002,9 @@ fn capabilities_for(version: &str) -> Vec<String> {
     if supports_risk_tier(version) {
         capabilities.push(RISK_TIER_CAPABILITY.to_owned());
     }
+    if version_at_or_above(version, DEEP_CLASSIFICATION_MIN_CONFITURE) {
+        capabilities.push(DEEP_CLASSIFICATION.to_owned());
+    }
     capabilities
 }
 
@@ -1107,6 +1197,9 @@ mod tests {
     use fraisier_core::adapter_axes::{
         AdapterCtx, AdapterErrorKind, ChangeSetUnavailable, PreflightReport, Revision, RiskTier,
         Severity, RISK_CONTRACT_VERSION,
+    };
+    use fraisier_core::restore_rehearsal::{
+        AGAINST_DATABASE_URL_SECRET, DATABASE_URL_SECRET, DEEP_CLASSIFICATION,
     };
     use serde_json::Value;
     use std::ffi::{OsStr, OsString};
@@ -1942,6 +2035,216 @@ mod tests {
             "current must not receive --migrations-dir: {:?}",
             plan.args
         );
+    }
+
+    /// The throwaway's DSN as `PgConn::dsn` renders it: the password is
+    /// percent-encoded (`p@ss:w0rd`).
+    const THROWAWAY_DSN: &str = "postgres://app:p%40ss%3Aw0rd@127.0.0.1:55432/shop_fraisier_rh_1";
+
+    fn deep_ctx(source_var: &str) -> AdapterCtx {
+        ctx_with_secret(source_var)
+            .with_resolved_secret(DATABASE_URL_SECRET, THROWAWAY_DSN)
+            .with_resolved_secret(AGAINST_DATABASE_URL_SECRET, THROWAWAY_DSN)
+    }
+
+    fn arg_after<'a>(args: &'a [OsString], flag: &str) -> Option<&'a OsStr> {
+        args.iter()
+            .position(|arg| arg == OsStr::new(flag))
+            .and_then(|at| args.get(at + 1))
+            .map(OsString::as_os_str)
+    }
+
+    #[test]
+    fn deep_preflight_passes_against_without_the_password() {
+        let plan = plan(
+            "preflight",
+            &deep_ctx("UNSET"),
+            &[],
+            &PathBuf::from("/tmp/r.json"),
+        )
+        .expect("plan");
+        assert_eq!(
+            arg_after(&plan.args, "--against"),
+            Some(OsStr::new(
+                "postgres://app@127.0.0.1:55432/shop_fraisier_rh_1"
+            )),
+            "{:?}",
+            plan.args
+        );
+        // The env DSN names the same throwaway, so pending resolves from its ledger.
+        assert_eq!(plan.database_url, THROWAWAY_DSN);
+    }
+
+    #[test]
+    fn deep_preflight_hands_the_password_over_in_the_environment() {
+        let plan = plan(
+            "preflight",
+            &deep_ctx("UNSET"),
+            &[],
+            &PathBuf::from("/tmp/r.json"),
+        )
+        .expect("plan");
+        assert_eq!(
+            plan.env,
+            vec![(OsString::from("PGPASSWORD"), OsString::from("p@ss:w0rd"))]
+        );
+    }
+
+    #[test]
+    fn no_deep_preflight_argument_carries_the_password() {
+        let plan = plan(
+            "preflight",
+            &deep_ctx("UNSET"),
+            &[],
+            &PathBuf::from("/tmp/r.json"),
+        )
+        .expect("plan");
+        for arg in &plan.args {
+            let arg = arg.to_string_lossy();
+            for secret in ["p@ss", "p%40ss", "w0rd"] {
+                assert!(!arg.contains(secret), "argv leaks the password: {arg}");
+            }
+        }
+    }
+
+    #[test]
+    fn preflight_without_a_deep_target_is_unchanged() {
+        let _guard = env_guard();
+        let source = "FRAISIER_CONF_TEST_DSN_DEEP_A";
+        std::env::set_var(source, SECRET_DSN);
+        let plan = plan(
+            "preflight",
+            &ctx_with_secret(source),
+            &[],
+            &PathBuf::from("/tmp/r.json"),
+        )
+        .expect("plan");
+        std::env::remove_var(source);
+        let golden: Vec<OsString> = [
+            "migrate",
+            "preflight",
+            "--no-config",
+            "--format",
+            "json",
+            "--output",
+            "/tmp/r.json",
+            "--migrations-dir",
+            "/srv/app/db/migrations",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(plan.args, golden);
+        assert_eq!(plan.env, Vec::new());
+    }
+
+    #[test]
+    fn only_preflight_classifies_against_the_deep_target() {
+        let plan =
+            plan("up", &deep_ctx("UNSET"), &[], &PathBuf::from("/tmp/r.json")).expect("plan");
+        assert!(!args_contain(&plan.args, "--against"), "{:?}", plan.args);
+        assert_eq!(plan.env, Vec::new());
+    }
+
+    #[test]
+    fn a_deep_target_without_a_password_sets_no_pgpassword() {
+        let dsn = "postgres://app@/shop_fraisier_rh_1?host=%2Frun%2Fpostgresql";
+        let ctx = ctx_with_secret("UNSET")
+            .with_resolved_secret(DATABASE_URL_SECRET, dsn)
+            .with_resolved_secret(AGAINST_DATABASE_URL_SECRET, dsn);
+        let plan = plan("preflight", &ctx, &[], &PathBuf::from("/tmp/r.json")).expect("plan");
+        assert_eq!(arg_after(&plan.args, "--against"), Some(OsStr::new(dsn)));
+        assert_eq!(plan.env, Vec::new());
+    }
+
+    #[test]
+    fn a_deep_target_that_is_not_a_url_is_refused_without_echoing_it() {
+        let dsn = "host=127.0.0.1 user=app password=hunter2 dbname=shop";
+        let ctx = ctx_with_secret("UNSET")
+            .with_resolved_secret(DATABASE_URL_SECRET, dsn)
+            .with_resolved_secret(AGAINST_DATABASE_URL_SECRET, dsn);
+        let err = plan("preflight", &ctx, &[], &PathBuf::from("/tmp/r.json"))
+            .expect_err("a keyword DSN cannot be split safely");
+        assert_eq!(err.kind, AdapterErrorKind::InvalidConfig);
+        assert!(!err.message.contains("hunter2"), "{}", err.message);
+    }
+
+    /// The `--against` captures (Phase 05 Cycle 1), each read as the adapter
+    /// reads a preflight report. See `tests/fixtures/against/README.md`.
+    fn against_capture(name: &str) -> Value {
+        let bytes = match name {
+            "0.43.0" => include_str!("../tests/fixtures/against/0.43.0.json"),
+            "0.44.0" => include_str!("../tests/fixtures/against/0.44.0.json"),
+            "1.36.0" => include_str!("../tests/fixtures/against/1.36.0.json"),
+            "replay-failed" => include_str!("../tests/fixtures/against/replay-failed-1.36.0.json"),
+            other => panic!("no --against capture named {other}"),
+        };
+        serde_json::from_str(bytes).expect("a capture is JSON")
+    }
+
+    fn type_change_tiers(json: &Value) -> Vec<(Option<String>, Option<RiskTier>)> {
+        parse_change_set(json)
+            .expect("classified")
+            .changes
+            .into_iter()
+            .filter(|change| change.kind == "alter_column_type")
+            .map(|change| (change.migration, change.tier))
+            .collect()
+    }
+
+    #[test]
+    fn against_a_seeded_copy_type_changes_arrive_tiered() {
+        for version in ["0.44.0", "1.36.0"] {
+            assert_eq!(
+                type_change_tiers(&against_capture(version)),
+                vec![
+                    (Some("002".to_owned()), Some(RiskTier::LockRisky)),
+                    (Some("003".to_owned()), Some(RiskTier::Irreversible)),
+                ],
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn below_the_floor_type_changes_stay_untiered_even_against_a_copy() {
+        assert_eq!(
+            type_change_tiers(&against_capture("0.43.0")),
+            vec![
+                (Some("002".to_owned()), None),
+                (Some("003".to_owned()), None)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_replay_is_an_error_level_finding() {
+        let report = parse_preflight_report(&against_capture("replay-failed"));
+        assert!(!report.ok);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.code == "PFLIGHT_REPLAY_FAILED"
+                    && issue.severity == Severity::Error),
+            "{:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn deep_classification_is_advertised_from_0_44_0() {
+        // Observed (Phase 05 Cycle 1): 0.43.0 leaves `ALTER COLUMN … TYPE`
+        // untiered under `--against`; 0.44.0 tiers it from the target's schema.
+        for (version, deep) in [("0.43.0", false), ("0.44.0", true), ("1.36.0", true)] {
+            assert_eq!(
+                capabilities_for(version)
+                    .iter()
+                    .any(|c| c == DEEP_CLASSIFICATION),
+                deep,
+                "{version}"
+            );
+        }
     }
 
     #[test]

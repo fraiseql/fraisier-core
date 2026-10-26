@@ -1,0 +1,77 @@
+{
+  "ok": true,
+  "window_safe": false,
+  "summary": {
+    "errors": 0,
+    "warnings": 2,
+    "info": 0,
+    "migrations_checked": 2,
+    "db_consumed": false
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_CHANGE_TYPE",
+      "message": "readers on the old type break when the column type changes Multi-step fix: add a new column \u2192 backfill \u2192 swap readers \u2192 drop the old column.",
+      "migration": "tb_order",
+      "file": "002_widen_qty.up.sql",
+      "line": null,
+      "actionable": "add a new column \u2192 backfill \u2192 swap readers \u2192 drop the old column",
+      "details": {
+        "operation": "ChangeColumnType"
+      }
+    },
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_CHANGE_TYPE",
+      "message": "readers on the old type break when the column type changes Multi-step fix: add a new column \u2192 backfill \u2192 swap readers \u2192 drop the old column.",
+      "migration": "tb_order",
+      "file": "003_narrow_note.up.sql",
+      "line": null,
+      "actionable": "add a new column \u2192 backfill \u2192 swap readers \u2192 drop the old column",
+      "details": {
+        "operation": "ChangeColumnType"
+      }
+    }
+  ],
+  "change_set": {
+    "contract_version": 1,
+    "changes": [
+      {
+        "kind": "create_table",
+        "object": "public.tb_order",
+        "migration": "001",
+        "tier": "additive",
+        "detail": "CREATE TABLE"
+      },
+      {
+        "kind": "insert",
+        "object": "public.tb_order",
+        "migration": "001",
+        "tier": "additive",
+        "detail": "INSERT"
+      },
+      {
+        "kind": "alter_column_type",
+        "object": "public.tb_order.qty",
+        "migration": "002",
+        "tier": "lock_risky",
+        "detail": "ALTER COLUMN qty TYPE integer \u2192 bigint \u2014 widening, rewrites the table"
+      },
+      {
+        "kind": "alter_column_type",
+        "object": "public.tb_order.note",
+        "migration": "003",
+        "tier": "irreversible",
+        "detail": "ALTER COLUMN note TYPE character varying(200) \u2192 varchar(20) \u2014 narrowing, rewrites the table"
+      }
+    ]
+  },
+  "scope": "all",
+  "large_tables": [],
+  "command": "migrate preflight",
+  "parser": {
+    "pglast": "8.5",
+    "pg_major": 18
+  }
+}

@@ -42,6 +42,20 @@ use crate::adapter_axes::{AdapterCtx, AdapterError, MigrationAdapter, Revision};
 /// migration adapter resolves it with `ctx.secret("DATABASE_URL")`.
 pub const DATABASE_URL_SECRET: &str = "DATABASE_URL";
 
+/// The logical secret naming the database a preflight classifies **against**.
+///
+/// It is the provisioned throwaway, seeded from the live database (deep
+/// classification). Resolved in-process only, for the one preflight that runs
+/// against the throwaway; an adapter that does not advertise
+/// [`DEEP_CLASSIFICATION`] never sees it.
+pub const AGAINST_DATABASE_URL_SECRET: &str = "AGAINST_DATABASE_URL";
+
+/// The capability of a preflight that can classify against a seeded copy.
+///
+/// Given [`AGAINST_DATABASE_URL_SECRET`], such an adapter tiers a change whose
+/// risk depends on the current schema, such as a column type change.
+pub const DEEP_CLASSIFICATION: &str = "deep_classification";
+
 /// Where the rehearsal's seed data comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackupSource {

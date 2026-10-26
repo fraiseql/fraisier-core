@@ -794,6 +794,25 @@ fn build_artifact(
     }
 }
 
+/// The service a staging refresh stops and restarts, on the single host the
+/// config targets; `None` without a `[service]`.
+///
+/// # Errors
+/// The config declares `[hosts]` (a refresh is single-host), or its service
+/// adapter is unsupported.
+pub fn build_refresh_service(
+    config: &DeployConfig,
+) -> Result<Option<(Arc<dyn ServiceAdapter>, HostId)>> {
+    if config.service.is_none() {
+        return Ok(None);
+    }
+    let host = resolve_host(config, None)?;
+    Ok(Some((
+        build_service(config, &build_transport(config))?,
+        host,
+    )))
+}
+
 fn build_service(config: &DeployConfig, transport: &Transport) -> Result<Arc<dyn ServiceAdapter>> {
     match config.service.as_ref().and_then(|s| s.adapter.as_deref()) {
         Some("systemd") => Ok(Arc::new(

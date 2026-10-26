@@ -1873,7 +1873,7 @@ async fn run_blue_green(
 
 /// Refuse a database operation whose `[deploy]`/`[migration]` config is invalid,
 /// returning the rendered issues. `Ok(None)` means the config is acceptable.
-fn refuse_invalid_db_config(config: &DeployConfig, verb: &str) -> Option<CommandOutput> {
+pub(crate) fn refuse_invalid_db_config(config: &DeployConfig, verb: &str) -> Option<CommandOutput> {
     let report = config.validate_db_ops();
     if report.ok() {
         return None;
@@ -2013,7 +2013,7 @@ async fn record_ledger_revision(
 /// # Errors
 /// If `database_url_env` is unset in the config, the named env var is not set in
 /// the environment, or the DSN is not a parseable `postgres://` URL.
-fn resolve_pg_conn(config: &DeployConfig) -> Result<fraisier_db::PgConn> {
+pub(crate) fn resolve_pg_conn(config: &DeployConfig) -> Result<fraisier_db::PgConn> {
     let source = config
         .migration
         .as_ref()
@@ -2029,7 +2029,7 @@ fn resolve_pg_conn(config: &DeployConfig) -> Result<fraisier_db::PgConn> {
 
 /// A clean exit-1 [`CommandOutput`] for an expected db-op configuration error
 /// (missing/unset DSN, non-postgres DSN), so `--json` still renders.
-fn db_config_error(error: &anyhow::Error) -> CommandOutput {
+pub(crate) fn db_config_error(error: &anyhow::Error) -> CommandOutput {
     let message = format!("{error:#}");
     CommandOutput {
         exit_code: 1,

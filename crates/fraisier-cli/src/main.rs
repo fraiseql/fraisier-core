@@ -23,6 +23,7 @@ mod failure_record;
 mod metrics;
 mod pg_rehearsal;
 mod preview;
+mod refresh;
 #[cfg(test)]
 mod test_env;
 
@@ -437,6 +438,48 @@ enum DbCommand {
 
     /// Drop every user schema and re-apply migrations from scratch.
     Reset(DbResetArgs),
+
+    /// Replace this environment's database with the newest archive of
+    /// `[refresh].source_environment`, then migrate it (a staging refresh).
+    Refresh(DbRefreshArgs),
+
+    /// Mark this config's database as its refresh target, once, so `db
+    /// refresh` may replace it.
+    MarkRefreshTarget(DbMarkRefreshTargetArgs),
+}
+
+#[derive(Debug, Args)]
+struct DbRefreshArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// The state store directory: the deploy lock, and the receipt in its
+    /// `refreshes/`.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+
+    /// Execute the refresh (without this, only the plan is shown). Destructive.
+    #[arg(long)]
+    yes: bool,
+
+    /// Exit 0 instead of failing when a deploy holds the lock (for a timer, where
+    /// a skipped refresh is a non-event).
+    #[arg(long)]
+    skip_if_locked: bool,
+
+    /// Run by a systemd unit: on failure, leave a redacted record for the
+    /// unit's `OnFailure=` alert, keyed by `$INVOCATION_ID`. The value is the
+    /// unit's name (`%n`).
+    #[arg(long, value_name = "UNIT")]
+    failure_record: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct DbMarkRefreshTargetArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -899,6 +942,23 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         }
         Command::Db(DbCommand::Reset(args)) => {
             commands::db_reset(&args.config, &args.state_dir, args.yes).await
+        }
+        Command::Db(DbCommand::Refresh(args)) => recorded(
+            refresh::db_refresh(
+                &args.config,
+                &args.state_dir,
+                refresh::RefreshOptions {
+                    execute: args.yes,
+                    skip_if_locked: args.skip_if_locked,
+                },
+            )
+            .await,
+            &args.config,
+            alert::ScheduledRun::Refresh,
+            args.failure_record.as_deref(),
+        ),
+        Command::Db(DbCommand::MarkRefreshTarget(args)) => {
+            refresh::db_mark_refresh_target(&args.config).await
         }
         Command::Providers => Ok(commands::providers()),
         Command::ProviderTest(args) => commands::provider_test(&args.name).await,

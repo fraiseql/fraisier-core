@@ -1,0 +1,67 @@
+{
+  "ok": true,
+  "window_safe": false,
+  "summary": {
+    "errors": 0,
+    "warnings": 1,
+    "info": 0,
+    "migrations_checked": 3
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_DROP_COLUMN",
+      "message": "readers on the old schema still SELECT the column Multi-step fix: deprecate (stop using) \u2192 wait one release \u2192 drop the column.",
+      "migration": "tb_order",
+      "file": "002_drop_note.up.sql",
+      "line": null,
+      "actionable": "deprecate (stop using) \u2192 wait one release \u2192 drop the column",
+      "details": {
+        "operation": "DropColumn"
+      }
+    }
+  ],
+  "change_set": {
+    "contract_version": 1,
+    "changes": [
+      {
+        "kind": "create_table",
+        "object": "public.tb_order",
+        "migration": "001",
+        "tier": "additive",
+        "detail": "CREATE TABLE"
+      },
+      {
+        "kind": "insert",
+        "object": "public.tb_order",
+        "migration": "001",
+        "tier": "additive",
+        "detail": "INSERT"
+      },
+      {
+        "kind": "drop_column",
+        "object": "public.tb_order.note",
+        "migration": "002",
+        "tier": "irreversible",
+        "detail": "DROP COLUMN note"
+      },
+      {
+        "kind": "add_column",
+        "object": "public.tb_order.placed_at",
+        "migration": "003",
+        "tier": "additive",
+        "detail": "ADD COLUMN placed_at NULL"
+      }
+    ]
+  },
+  "scope": "pending",
+  "ledger": {
+    "table": "tb_confiture",
+    "exists": false
+  },
+  "command": "migrate preflight",
+  "parser": {
+    "pglast": "8.7",
+    "pg_major": 18
+  }
+}

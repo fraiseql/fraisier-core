@@ -16,6 +16,7 @@
 //! `pg_restore` needs as its target) ever appear as arguments.
 
 pub mod archive;
+pub mod refresh;
 pub mod retention;
 
 use std::ffi::OsString;
@@ -311,7 +312,7 @@ pub fn psql_command(conn: &PgConn, sql: &str) -> Command {
 /// Whether `name` is a safe, unquoted-ish PostgreSQL database identifier: 1–63
 /// characters of `[A-Za-z0-9_]` starting with a letter or underscore. Names that
 /// pass can be double-quoted into DDL without any injection risk.
-fn validate_db_name(name: &str) -> Result<(), DbError> {
+pub(crate) fn validate_db_name(name: &str) -> Result<(), DbError> {
     let mut chars = name.chars();
     let head_ok = chars
         .next()

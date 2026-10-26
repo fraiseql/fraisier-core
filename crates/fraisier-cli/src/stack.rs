@@ -5,6 +5,10 @@
 //! own config, saga and rollback. There is no rollback across members: a member
 //! that fails rolls itself back, the members after it never start, and the
 //! members before it stay deployed. The report says which is which.
+//!
+//! Once every member deployed, each subgraph's live SDL is checked against
+//! the one its router serves (see [`crate::stack_sdl`]); a difference fails the
+//! command, though everything stays deployed.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -99,7 +103,14 @@ pub(crate) async fn stack_deploy(
     versions: &[String],
     deployer: &Deployer,
 ) -> Result<CommandOutput> {
-    stack_deploy_with(stack_path, versions, deployer).await
+    stack_deploy_with(
+        stack_path,
+        versions,
+        deployer,
+        &crate::stack_sdl::LiveSdl,
+        &|name| std::env::var(name).ok(),
+    )
+    .await
 }
 
 fn refused(message: &str) -> CommandOutput {
@@ -115,6 +126,8 @@ pub(crate) async fn stack_deploy_with(
     stack_path: &Path,
     versions: &[String],
     deployer: &dyn MemberDeployer,
+    sdl: &dyn crate::stack_sdl::SdlSource,
+    env: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> Result<CommandOutput> {
     let stack = match Stack::load(stack_path) {
         Ok(stack) => stack,
@@ -125,9 +138,17 @@ pub(crate) async fn stack_deploy_with(
         Err(message) => return Ok(refused(&message)),
     };
     let report = deploy_members(&stack, &versions, deployer).await;
-    let ok = report
+    let all_deployed = report
         .iter()
         .all(|(_, outcome)| *outcome == MemberOutcome::Deployed);
+    // Once, at the end: mid-stack, a subgraph ahead of its router is expected.
+    let findings = if all_deployed {
+        crate::stack_sdl::check(&stack, sdl, env).await
+    } else {
+        Vec::new()
+    };
+    let (sdl_pretty, sdl_ok) = crate::stack_sdl::render(&findings);
+    let ok = all_deployed && sdl_ok;
     let mut pretty = format!("stack {} ({}):\n", stack.name, stack.environment);
     let mut members = Vec::new();
     for (name, outcome) in &report {
@@ -143,11 +164,12 @@ pub(crate) async fn stack_deploy_with(
         pretty.push('\n');
         members.push(json!({ "name": name, "outcome": tag, "detail": detail }));
     }
-    if !ok {
+    if !all_deployed {
         pretty.push_str(
             "  members before the failure stay deployed; the failed member rolled itself back\n",
         );
     }
+    pretty.push_str(&sdl_pretty);
     Ok(CommandOutput {
         exit_code: i32::from(!ok),
         pretty,
@@ -156,6 +178,7 @@ pub(crate) async fn stack_deploy_with(
             "environment": stack.environment,
             "ok": ok,
             "members": members,
+            "sdl": crate::stack_sdl::to_json(&findings),
         }),
     })
 }
@@ -308,6 +331,103 @@ mod tests {
         );
     }
 
+    /// Answers every SDL query: the live SDL differs when `.0` is set.
+    struct Sdl(bool);
+
+    #[async_trait]
+    impl crate::stack_sdl::SdlSource for Sdl {
+        async fn live_sdl(&self, _: &str, _: &[(String, String)]) -> Result<String, String> {
+            Ok(if self.0 {
+                "type Query { b: Int }"
+            } else {
+                "type Query { a: Int }"
+            }
+            .to_owned())
+        }
+        fn served_sdl(&self, _: &Path) -> Result<String, String> {
+            Ok("type Query { a: Int }".to_owned())
+        }
+    }
+
+    /// [`stack_dir`], with `router` as the router and `management` checked.
+    fn routed_stack_dir(dir: &Path) -> std::path::PathBuf {
+        let path = stack_dir(dir);
+        std::fs::write(
+            dir.join("router.toml"),
+            format!(
+                "{}[artifact]\nsource = \"local\"\nactive_path = \"/srv/router/current\"\n",
+                member_toml("router")
+            ),
+        )
+        .expect("write");
+        std::fs::write(
+            &path,
+            STACK
+                .replace(
+                    "environment = \"staging\"\n",
+                    "environment = \"staging\"\nrouter = \"router\"\n",
+                )
+                .replace(
+                    "config = \"management.toml\"\n",
+                    "config = \"management.toml\"\nsdl = \"sdl/management.graphql\"\n\
+                     graphql_url = \"http://management/graphql\"\n",
+                ),
+        )
+        .expect("write");
+        path
+    }
+
+    #[test]
+    fn the_sdl_is_checked_once_every_member_deployed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = routed_stack_dir(dir.path());
+        let out = block_on(stack_deploy_with(
+            &path,
+            &[],
+            &Fake::default(),
+            &Sdl(true),
+            &|_| None,
+        ))
+        .expect("runs");
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(
+            out.pretty.contains("  sdl management: DIFFERS"),
+            "{}",
+            out.pretty
+        );
+        assert_eq!(out.json["ok"], serde_json::json!(false));
+        assert_eq!(out.json["sdl"][0]["matches"], serde_json::json!(false));
+
+        let out = block_on(stack_deploy_with(
+            &path,
+            &[],
+            &Fake::default(),
+            &Sdl(false),
+            &|_| None,
+        ))
+        .expect("runs");
+        assert_eq!(out.exit_code, 0, "{}", out.pretty);
+        assert!(
+            out.pretty.contains("  sdl management: matches"),
+            "{}",
+            out.pretty
+        );
+    }
+
+    #[test]
+    fn a_failed_stack_deploy_checks_no_sdl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = routed_stack_dir(dir.path());
+        let fake = Fake {
+            fail: vec!["billing"],
+            ..Fake::default()
+        };
+        let out =
+            block_on(stack_deploy_with(&path, &[], &fake, &Sdl(true), &|_| None)).expect("runs");
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(!out.pretty.contains("sdl"), "{}", out.pretty);
+    }
+
     fn stack_dir(dir: &Path) -> std::path::PathBuf {
         for name in ["router", "management", "billing"] {
             std::fs::write(dir.join(format!("{name}.toml")), member_toml(name)).expect("write");
@@ -325,7 +445,8 @@ mod tests {
             fail: vec!["management"],
             ..Fake::default()
         };
-        let out = block_on(stack_deploy_with(&path, &[], &fake)).expect("runs");
+        let out =
+            block_on(stack_deploy_with(&path, &[], &fake, &Sdl(false), &|_| None)).expect("runs");
         assert_eq!(out.exit_code, 1, "{}", out.pretty);
         assert!(out.pretty.contains("deployed  billing"), "{}", out.pretty);
         assert!(
@@ -342,7 +463,14 @@ mod tests {
         );
         assert!(!out.json.to_string().contains("hunter2"));
 
-        let out = block_on(stack_deploy_with(&path, &[], &Fake::default())).expect("runs");
+        let out = block_on(stack_deploy_with(
+            &path,
+            &[],
+            &Fake::default(),
+            &Sdl(false),
+            &|_| None,
+        ))
+        .expect("runs");
         assert_eq!(out.exit_code, 0, "{}", out.pretty);
     }
 
@@ -352,7 +480,8 @@ mod tests {
         let path = stack_dir(dir.path());
         std::fs::remove_file(dir.path().join("billing.toml")).expect("rm");
         let fake = Fake::default();
-        let out = block_on(stack_deploy_with(&path, &[], &fake)).expect("runs");
+        let out =
+            block_on(stack_deploy_with(&path, &[], &fake, &Sdl(false), &|_| None)).expect("runs");
         assert_eq!(out.exit_code, 1, "{}", out.pretty);
         assert!(out.pretty.contains("billing.toml"), "{}", out.pretty);
         assert!(fake.deployed.lock().expect("log").is_empty());

@@ -487,6 +487,7 @@ dependencies = [
  "fraisier-ship",
  "fraisier-sync",
  "fraisier-webhook",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

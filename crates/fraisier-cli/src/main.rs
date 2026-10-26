@@ -22,6 +22,7 @@ mod pg_readiness;
 mod pg_rehearsal;
 mod preview;
 mod stack;
+mod stack_sdl;
 mod stack_status;
 #[cfg(test)]
 mod test_env;

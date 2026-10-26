@@ -4,8 +4,10 @@
 //!
 //! A member's health is its own `[health]` check, the one `fraisier health`
 //! runs. A database is probed once per distinct DSN, against every member's
-//! requirements. The command exits non-zero when a member is unhealthy or a
-//! database is not ready; the last deploy is reported, never judged.
+//! requirements. With a router, each subgraph's live SDL is checked against
+//! the router's release (see [`crate::stack_sdl`]). The command exits non-zero
+//! when a member is unhealthy, a database is not ready or an SDL differs; the
+//! last deploy is reported, never judged.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -17,6 +19,7 @@ use fraisier_saga::state_store::{FilesystemStateStore, FraiseKey, StateStore};
 use serde_json::{json, Value};
 
 use crate::commands::CommandOutput;
+use crate::stack_sdl::SdlSource;
 
 /// What `stack status` asks of the live system.
 #[async_trait]
@@ -232,6 +235,7 @@ fn to_json(
 pub(crate) async fn stack_status_with(
     stack_path: &Path,
     probe: &dyn StackProbe,
+    sdl: &dyn SdlSource,
     env: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> Result<CommandOutput> {
     let stack = match Stack::load(stack_path) {
@@ -258,12 +262,17 @@ pub(crate) async fn stack_status_with(
         });
     }
     let databases = databases(&stack, probe, env).await;
-    let healthy = members.iter().all(|row| row.unhealthy.is_none())
+    let findings = crate::stack_sdl::check(&stack, sdl, env).await;
+    let (sdl_pretty, sdl_ok) = crate::stack_sdl::render(&findings);
+    let healthy = sdl_ok
+        && members.iter().all(|row| row.unhealthy.is_none())
         && databases.iter().all(|row| row.problems.is_empty());
+    let mut json = to_json(&stack, &members, &databases, healthy);
+    json["sdl"] = crate::stack_sdl::to_json(&findings);
     Ok(CommandOutput {
         exit_code: i32::from(!healthy),
-        pretty: render(&stack, &members, &databases, healthy),
-        json: to_json(&stack, &members, &databases, healthy),
+        pretty: render(&stack, &members, &databases, healthy) + &sdl_pretty,
+        json,
     })
 }
 
@@ -276,7 +285,10 @@ pub(crate) struct LiveProbe {
 
 /// `stack status` against the live system.
 pub(crate) async fn stack_status(stack_path: &Path, probe: &LiveProbe) -> Result<CommandOutput> {
-    stack_status_with(stack_path, probe, &|name| std::env::var(name).ok()).await
+    stack_status_with(stack_path, probe, &crate::stack_sdl::LiveSdl, &|name| {
+        std::env::var(name).ok()
+    })
+    .await
 }
 
 #[async_trait]
@@ -382,6 +394,89 @@ mod tests {
         }
     }
 
+    /// A stack without a router never asks for an SDL.
+    struct NoSdl;
+
+    #[async_trait]
+    impl crate::stack_sdl::SdlSource for NoSdl {
+        async fn live_sdl(&self, url: &str, _: &[(String, String)]) -> Result<String, String> {
+            panic!("asked {url} for its SDL")
+        }
+        fn served_sdl(&self, path: &Path) -> Result<String, String> {
+            panic!("read {}", path.display())
+        }
+    }
+
+    /// Every SDL matches but billing's.
+    struct BillingDiffers;
+
+    #[async_trait]
+    impl crate::stack_sdl::SdlSource for BillingDiffers {
+        async fn live_sdl(&self, url: &str, _: &[(String, String)]) -> Result<String, String> {
+            Ok(if url.contains("billing") {
+                "type Query { invoices: Int }".to_owned()
+            } else {
+                "type Query { orders: Int }".to_owned()
+            })
+        }
+        fn served_sdl(&self, _: &Path) -> Result<String, String> {
+            Ok("type Query { orders: Int }".to_owned())
+        }
+    }
+
+    #[test]
+    fn an_sdl_the_router_does_not_serve_fails_the_status_naming_the_member() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = stack_dir(dir.path());
+        std::fs::write(
+            dir.path().join("router.toml"),
+            "[deploy]\nname = \"router\"\nenvironment = \"staging\"\n\
+             [artifact]\nsource = \"local\"\nactive_path = \"/srv/router/current\"\n",
+        )
+        .expect("write");
+        std::fs::write(
+            &path,
+            STACK
+                .replace(
+                    "environment = \"staging\"\n",
+                    "environment = \"staging\"\nrouter = \"router\"\n",
+                )
+                .replace(
+                    "config = \"billing.toml\"\n",
+                    "config = \"billing.toml\"\nsdl = \"sdl/billing.graphql\"\n\
+                 graphql_url = \"http://billing/graphql\"\n",
+                )
+                .replace(
+                    "config = \"management.toml\"\n",
+                    "config = \"management.toml\"\nsdl = \"sdl/management.graphql\"\n\
+                 graphql_url = \"http://management/graphql\"\n",
+                ),
+        )
+        .expect("write");
+        let out = block_on(stack_status_with(
+            &path,
+            &Fake::default(),
+            &BillingDiffers,
+            &|_| Some("postgres://app@db/erp".to_owned()),
+        ))
+        .expect("runs");
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(
+            out.pretty
+                .contains("  sdl billing: DIFFERS\n      the live SDL at http://billing/graphql"),
+            "{}",
+            out.pretty
+        );
+        assert!(
+            out.pretty.ends_with("  sdl management: matches\n"),
+            "{}",
+            out.pretty
+        );
+        assert_eq!(out.json["sdl"][0]["member"], serde_json::json!("billing"));
+        assert_eq!(out.json["sdl"][0]["matches"], serde_json::json!(false));
+        assert_eq!(out.json["sdl"][1]["matches"], serde_json::json!(true));
+    }
+
     const STACK: &str = "[stack]\nname = \"erp\"\nenvironment = \"staging\"\n\n\
                          [[stack.member]]\nconfig = \"router.toml\"\n\
                          depends_on = [\"billing\", \"management\"]\n\n\
@@ -426,7 +521,7 @@ mod tests {
     fn status(dir: &Path, fake: &Fake, dsn: &str) -> CommandOutput {
         let path = stack_dir(dir);
         let dsn = dsn.to_owned();
-        block_on(stack_status_with(&path, fake, &move |name| {
+        block_on(stack_status_with(&path, fake, &NoSdl, &move |name| {
             (name == "ERP_DSN").then(|| dsn.clone())
         }))
         .expect("runs")
@@ -507,6 +602,7 @@ mod tests {
                         "problems": [],
                     },
                 ],
+                "sdl": [],
             })
         );
     }
@@ -581,7 +677,7 @@ mod tests {
 
         let path = stack_dir(dir.path());
         let fake = Fake::default();
-        let out = block_on(stack_status_with(&path, &fake, &|_| None)).expect("runs");
+        let out = block_on(stack_status_with(&path, &fake, &NoSdl, &|_| None)).expect("runs");
         assert_eq!(out.exit_code, 1, "{}", out.pretty);
         assert!(
             out.pretty.contains(
@@ -599,7 +695,7 @@ mod tests {
         let path = stack_dir(dir.path());
         std::fs::remove_file(dir.path().join("billing.toml")).expect("rm");
         let fake = Fake::default();
-        let out = block_on(stack_status_with(&path, &fake, &|_| None)).expect("runs");
+        let out = block_on(stack_status_with(&path, &fake, &NoSdl, &|_| None)).expect("runs");
         assert_eq!(out.exit_code, 1, "{}", out.pretty);
         assert!(out.pretty.contains("billing.toml"), "{}", out.pretty);
         assert!(fake.probed.lock().expect("probed").is_empty());

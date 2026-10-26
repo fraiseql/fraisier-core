@@ -45,6 +45,10 @@ pub struct StackSection {
     /// The environment every member deploys to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+    /// The member (by `[deploy].name`) that is the stack's router: the release
+    /// every member's `sdl` path is read from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router: Option<String>,
     /// The members, in any order.
     #[serde(default, rename = "member", skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<MemberSpec>,
@@ -63,6 +67,14 @@ pub struct MemberSpec {
     /// router member's active release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sdl: Option<PathBuf>,
+    /// The member's GraphQL endpoint, asked for its live `{ _service { sdl } }`.
+    /// Required with `sdl`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql_url: Option<String>,
+    /// Headers sent with that query, each naming the environment variable that
+    /// holds its value (a credential never sits in the stack file).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sdl_headers: BTreeMap<String, String>,
 }
 
 /// A member, resolved: its config loaded and its name derived.
@@ -78,6 +90,10 @@ pub struct Member {
     pub depends_on: Vec<String>,
     /// See [`MemberSpec::sdl`].
     pub sdl: Option<PathBuf>,
+    /// See [`MemberSpec::graphql_url`].
+    pub graphql_url: Option<String>,
+    /// See [`MemberSpec::sdl_headers`].
+    pub sdl_headers: BTreeMap<String, String>,
 }
 
 /// A validated stack, its members in deploy order.
@@ -87,6 +103,8 @@ pub struct Stack {
     pub name: String,
     /// The environment every member deploys to.
     pub environment: String,
+    /// See [`StackSection::router`].
+    pub router: Option<String>,
     /// The members, each after everything it depends on.
     pub members: Vec<Member>,
 }
@@ -187,10 +205,13 @@ impl Stack {
                 config,
                 depends_on: spec.depends_on.clone(),
                 sdl: spec.sdl.clone(),
+                graphql_url: spec.graphql_url.clone(),
+                sdl_headers: spec.sdl_headers.clone(),
             });
         }
 
         problems.extend(reference_problems(&members));
+        problems.extend(sdl_problems(section.router.as_deref(), &members));
         if !problems.is_empty() {
             return Err(StackError(problems));
         }
@@ -209,6 +230,7 @@ impl Stack {
         Ok(Self {
             name: name.unwrap_or_default(),
             environment: environment.unwrap_or_default(),
+            router: section.router.clone(),
             members: order
                 .into_iter()
                 .filter_map(|index| slots.get_mut(index).and_then(Option::take))
@@ -242,6 +264,73 @@ fn reference_problems(members: &[Member]) -> Vec<String> {
                 ));
             }
         }
+    }
+    problems
+}
+
+/// What the subgraph/supergraph check needs and lacks.
+fn sdl_problems(router: Option<&str>, members: &[Member]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let router_member = router.and_then(|name| members.iter().find(|m| m.name == name));
+    if let (Some(name), None) = (router, router_member) {
+        problems.push(format!("[stack].router '{name}' is not a member"));
+    }
+    let checked: Vec<&Member> = members.iter().filter(|m| m.sdl.is_some()).collect();
+    for member in members {
+        let name = &member.name;
+        match (&member.sdl, &member.graphql_url) {
+            (Some(_), None) => problems.push(format!("member '{name}' has sdl but no graphql_url")),
+            (None, Some(_)) => problems.push(format!("member '{name}' has graphql_url but no sdl")),
+            (None, None) if !member.sdl_headers.is_empty() => {
+                problems.push(format!("member '{name}' has sdl_headers but no sdl"));
+            }
+            _ => {}
+        }
+        if let Some(sdl) = &member.sdl {
+            if sdl.is_absolute()
+                || sdl
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+            {
+                problems.push(format!(
+                    "member '{name}': sdl must be a path inside the router's release, not {}",
+                    sdl.display()
+                ));
+            }
+            if router == Some(name.as_str()) {
+                problems.push(format!(
+                    "member '{name}' is the router, which serves the supergraph; it has no sdl"
+                ));
+            }
+        }
+    }
+    if checked.is_empty() {
+        return problems;
+    }
+    match (router, router_member) {
+        (None, _) => problems.push(format!(
+            "member(s) {} have sdl, a path in the router's release: name the router with \
+             [stack].router",
+            checked
+                .iter()
+                .map(|m| format!("'{}'", m.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        (Some(name), Some(member))
+            if member
+                .config
+                .artifact
+                .as_ref()
+                .and_then(|a| a.active_path.as_ref())
+                .is_none() =>
+        {
+            problems.push(format!(
+                "the router '{name}' has no [artifact].active_path, the release sdl paths are \
+                 read from"
+            ));
+        }
+        _ => {}
     }
     problems
 }
@@ -378,12 +467,15 @@ mod tests {
     fn a_stack_resolves_its_members_in_deploy_order() {
         let stack = resolve(
             &format!(
-                "{HEAD}\n[[stack.member]]\nconfig = \"gateway.toml\"\ndepends_on = [\"management\"]\n\
+                "{HEAD}router = \"gateway\"\n\
+                 [[stack.member]]\nconfig = \"gateway.toml\"\ndepends_on = [\"management\"]\n\
+                 [[stack.member]]\nconfig = \"management.toml\"\n\
                  sdl = \"federation/sdl/management.graphql\"\n\
-                 [[stack.member]]\nconfig = \"management.toml\"\n"
+                 graphql_url = \"http://127.0.0.1:8042/graphql\"\n\
+                 sdl_headers = {{ \"x-api-key\" = \"SIDECAR_TOKEN\" }}\n"
             ),
             &[
-                ("gateway.toml", member("gateway", "staging")),
+                ("gateway.toml", router("gateway")),
                 ("management.toml", member("management", "staging")),
             ],
         )
@@ -396,10 +488,111 @@ mod tests {
             stack.members[1].config_path,
             Path::new("/stacks/gateway.toml")
         );
+        assert_eq!(stack.router.as_deref(), Some("gateway"));
+        let management = &stack.members[0];
         assert_eq!(
-            stack.members[1].sdl.as_deref(),
+            management.sdl.as_deref(),
             Some(Path::new("federation/sdl/management.graphql"))
         );
+        assert_eq!(
+            management.graphql_url.as_deref(),
+            Some("http://127.0.0.1:8042/graphql")
+        );
+        assert_eq!(
+            management.sdl_headers.get("x-api-key").map(String::as_str),
+            Some("SIDECAR_TOKEN")
+        );
+    }
+
+    /// A router member: a release with an active path to read `sdl` from.
+    fn router(name: &str) -> String {
+        format!(
+            "{}[artifact]\nsource = \"local\"\nactive_path = \"/srv/gateway/current\"\n",
+            member(name, "staging")
+        )
+    }
+
+    #[test]
+    fn what_the_sdl_check_needs_and_lacks_is_reported_together() {
+        let problems = resolve(
+            &format!(
+                "{HEAD}router = \"ghost\"\n\
+                 [[stack.member]]\nconfig = \"a.toml\"\nsdl = \"sdl/a.graphql\"\n\
+                 [[stack.member]]\nconfig = \"b.toml\"\ngraphql_url = \"http://b/graphql\"\n\
+                 [[stack.member]]\nconfig = \"c.toml\"\nsdl = \"../c.graphql\"\n\
+                 graphql_url = \"http://c/graphql\"\n"
+            ),
+            &[
+                ("a.toml", member("a", "staging")),
+                ("b.toml", member("b", "staging")),
+                ("c.toml", member("c", "staging")),
+            ],
+        )
+        .expect_err("invalid");
+        let all = problems.join("\n");
+        assert!(all.contains("router 'ghost'"), "{all}");
+        assert!(
+            all.contains("member 'a' has sdl but no graphql_url"),
+            "{all}"
+        );
+        assert!(
+            all.contains("member 'b' has graphql_url but no sdl"),
+            "{all}"
+        );
+        assert!(all.contains("member 'c': sdl"), "{all}");
+        assert_eq!(problems.len(), 4, "{all}");
+    }
+
+    #[test]
+    fn an_sdl_needs_a_router_with_a_release_that_is_not_itself() {
+        let sdl = "sdl = \"sdl/m.graphql\"\ngraphql_url = \"http://m/graphql\"\n";
+        let no_router = resolve(
+            &format!("{HEAD}\n[[stack.member]]\nconfig = \"m.toml\"\n{sdl}"),
+            &[("m.toml", member("m", "staging"))],
+        )
+        .expect_err("no router");
+        assert!(
+            no_router.iter().any(|p| p.contains("[stack].router")),
+            "{no_router:?}"
+        );
+
+        let no_release = resolve(
+            &format!(
+                "{HEAD}router = \"gw\"\n[[stack.member]]\nconfig = \"gw.toml\"\n\
+                 [[stack.member]]\nconfig = \"m.toml\"\n{sdl}"
+            ),
+            &[
+                ("gw.toml", member("gw", "staging")),
+                ("m.toml", member("m", "staging")),
+            ],
+        )
+        .expect_err("no active path");
+        assert!(
+            no_release
+                .iter()
+                .any(|p| p.contains("[artifact].active_path")),
+            "{no_release:?}"
+        );
+
+        let on_router = resolve(
+            &format!("{HEAD}router = \"gw\"\n[[stack.member]]\nconfig = \"gw.toml\"\n{sdl}"),
+            &[("gw.toml", router("gw"))],
+        )
+        .expect_err("sdl on the router");
+        assert!(
+            on_router.iter().any(|p| p.contains("the router")),
+            "{on_router:?}"
+        );
+    }
+
+    #[test]
+    fn a_stack_without_sdl_needs_no_router() {
+        let stack = resolve(
+            &format!("{HEAD}\n[[stack.member]]\nconfig = \"m.toml\"\n"),
+            &[("m.toml", member("m", "staging"))],
+        )
+        .expect("valid");
+        assert_eq!(stack.router, None);
     }
 
     #[test]

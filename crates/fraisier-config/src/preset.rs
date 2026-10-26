@@ -115,6 +115,7 @@ impl SpecqlPreset {
             ssh: None,
             webhook: None,
             schedule: None,
+            notify: None,
             backup: None,
             drill: None,
             metrics: None,
@@ -323,6 +324,8 @@ impl DeployConfig {
             webhook: prefer(base.webhook, self.webhook),
             // The preset never emits [schedule]; an author-supplied one wins.
             schedule: prefer(base.schedule, self.schedule),
+            // The preset never emits [notify]; an author-supplied one wins.
+            notify: prefer(base.notify, self.notify),
             // The preset never emits [backup]; an author-supplied one wins.
             backup: prefer(base.backup, self.backup),
             drill: prefer(base.drill, self.drill),

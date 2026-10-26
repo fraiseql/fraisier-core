@@ -1804,7 +1804,7 @@ async fn run_multi_host(
 }
 
 /// Run (or, with `dry_run`, summarize) an HTTP-tier blue-green deploy. On a
-/// non-committed outcome the `[schedule].notify` failure sink fires (unattended
+/// non-committed outcome the `[notify].command` failure sink fires (unattended
 /// path), exactly as the rolling/single deploys do.
 async fn run_blue_green(
     config: &DeployConfig,
@@ -3531,7 +3531,7 @@ fn with_metrics_warning(mut out: CommandOutput, warning: Option<String>) -> Comm
     out
 }
 
-/// Fire the configured `[schedule].notify` failure sink when a deploy did not
+/// Fire the configured `[notify].command` failure sink when a deploy did not
 /// commit. This is the unattended-failure path: a scheduled (operator-unwatched)
 /// deploy of a sick build rolls back **and** emits a notification, reusing the
 /// self-upgrade notify primitive. A committed deploy, or a config with no notify
@@ -3551,7 +3551,7 @@ async fn notify_deploy_failure(
     if matches!(outcome, SagaOutcome::Committed) {
         return;
     }
-    let Some(command) = config.schedule.as_ref().and_then(|s| s.notify.as_deref()) else {
+    let Some(command) = config.notify.as_ref().and_then(|n| n.command.as_deref()) else {
         return;
     };
     let (_, label, detail) = outcome_result(outcome);
@@ -3687,18 +3687,18 @@ url = "http://127.0.0.1:8080/health"
     fn notify_deploy_failure_carries_the_rollback_reason() {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("payload.txt");
-        // A [schedule].notify sink that records the reason the webhook carries.
+        // A [notify].command sink that records the reason the webhook carries.
         // A TOML literal string sidesteps escaping the shell's double quotes.
         let notify = format!(
-            "notify = 'printf \"%s\" \"$FRAISIER_NOTIFY_REASON\" > {}'",
+            "command = 'printf \"%s\" \"$FRAISIER_NOTIFY_REASON\" > {}'",
             out.display()
         );
-        let toml = format!("{VALID}\n[schedule]\n{notify}\n");
+        let toml = format!("{VALID}\n[notify]\n{notify}\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         // The named perf detail rides in via HealthStatus.detail → SagaError.message
         // → RolledBack.reason → FailurePayload.reason (the recommended zero-API-change
-        // path, Decision 3); with [schedule].notify set it reaches the webhook sink.
+        // path, Decision 3); with [notify].command set it reaches the webhook sink.
         // The reason here is the shape CommandHealth produces from a --json scan.
         let outcome = SagaOutcome::RolledBack {
             failed_step: "health".to_owned(),
@@ -3722,10 +3722,10 @@ url = "http://127.0.0.1:8080/health"
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("payload.txt");
         let notify = format!(
-            "notify = 'printf \"%s\" \"$FRAISIER_NOTIFY_REASON\" > {}'",
+            "command = 'printf \"%s\" \"$FRAISIER_NOTIFY_REASON\" > {}'",
             out.display()
         );
-        let toml = format!("{VALID}\n[schedule]\n{notify}\n");
+        let toml = format!("{VALID}\n[notify]\n{notify}\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         // Issue #62: the confiture adapter folds the first line of stderr into
@@ -3781,10 +3781,10 @@ url = "http://127.0.0.1:8080/health"
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("event.txt");
         let notify = format!(
-            "notify = 'printf \"%s\" \"$FRAISIER_NOTIFY_EVENT\" > {}'",
+            "command = 'printf \"%s\" \"$FRAISIER_NOTIFY_EVENT\" > {}'",
             out.display()
         );
-        let toml = format!("{VALID}\n[schedule]\n{notify}\n");
+        let toml = format!("{VALID}\n[notify]\n{notify}\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         let outcome = SagaOutcome::RolledBack {
@@ -6308,7 +6308,7 @@ current_revision = "true"
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = format!(
             "{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"deploy\"\n\
-             allow_unattended_deploy = true\nnotify = \"systemd-cat -t fraisier\"\n"
+             allow_unattended_deploy = true\n\n[notify]\ncommand = \"systemd-cat -t fraisier\"\n"
         );
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
@@ -6412,7 +6412,7 @@ current_revision = "true"
             "echo \"$FRAISIER_NOTIFY_EVENT $FRAISIER_NOTIFY_FRAISE\" > {}",
             out.display()
         );
-        let toml = format!("[schedule]\nnotify = '{command}'\n");
+        let toml = format!("[notify]\ncommand = '{command}'\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         // A rolled-back (sick) deploy fires the hook with a failure payload.
@@ -6478,7 +6478,7 @@ current_revision = "true"
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("captured");
         let command = format!("echo \"$FRAISIER_NOTIFY_EVENT\" > {}", out.display());
-        let toml = format!("[schedule]\nnotify = '{command}'\n");
+        let toml = format!("[notify]\ncommand = '{command}'\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         notify_deploy_failure(
@@ -6506,7 +6506,7 @@ current_revision = "true"
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("captured");
         let command = format!("echo \"$FRAISIER_NOTIFY_EVENT\" > {}", out.display());
-        let toml = format!("[schedule]\nnotify = '{command}'\n");
+        let toml = format!("[notify]\ncommand = '{command}'\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         notify_deploy_failure(
@@ -6525,7 +6525,7 @@ current_revision = "true"
 
     #[tokio::test]
     async fn notify_is_a_noop_without_a_configured_sink() {
-        // No [schedule].notify: a rolled-back deploy must not panic or error.
+        // No [notify].command: a rolled-back deploy must not panic or error.
         let config = DeployConfig::from_toml_str("[deploy]\nname = \"x\"\n").expect("parses");
         notify_deploy_failure(
             &config,

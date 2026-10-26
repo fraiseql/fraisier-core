@@ -1072,6 +1072,28 @@ fn a_drill_needs_a_backup_dir_to_take_archives_from() {
 }
 
 #[test]
+fn a_drill_schedule_is_kept_in_the_calendar_vocabulary() {
+    let config = DeployConfig::from_toml_str(&format!(
+        "{SCHEDULE_BASE}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[drill]\n\
+         schedule = \"weekly Sun 04:00\"\n"
+    ))
+    .expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    assert_eq!(
+        config.drill.and_then(|d| d.schedule).as_deref(),
+        Some("weekly Sun 04:00")
+    );
+}
+
+#[test]
+fn a_malformed_drill_schedule_is_an_error() {
+    assert!(has_error(
+        &drill_report("schedule = \"every tuesday\"\n"),
+        "drill.schedule"
+    ));
+}
+
+#[test]
 fn drill_max_age_hours_must_be_at_least_one() {
     assert!(has_error(
         &drill_report("max_age_hours = 0\n"),
@@ -1182,15 +1204,60 @@ fn unattended_deploy_requires_the_optin_and_a_notify_sink() {
         has_error(&report, "schedule.allow_unattended_deploy"),
         "{report}"
     );
-    assert!(has_error(&report, "schedule.notify"), "{report}");
+    assert!(has_error(&report, "notify.command"), "{report}");
 
     // With both, it validates clean.
     let ok = format!(
         "{SCHEDULE_BASE}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"deploy\"\n\
-         allow_unattended_deploy = true\nnotify = \"systemd-cat -t fraisier\"\n"
+         allow_unattended_deploy = true\n\n[notify]\ncommand = \"systemd-cat -t fraisier\"\n"
     );
     let report = DeployConfig::from_toml_str(&ok).expect("parses").validate();
     assert!(report.ok(), "opted-in unattended deploy is valid: {report}");
+}
+
+#[test]
+fn schedule_notify_is_refused_with_a_pointer_to_notify_command() {
+    // The sink moved: one spelling, so the old key is a targeted error, not an alias.
+    let toml = format!(
+        "{SCHEDULE_BASE}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"deploy\"\n\
+         allow_unattended_deploy = true\nnotify = \"systemd-cat -t fraisier\"\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    let issue = report
+        .issues
+        .iter()
+        .find(|i| i.path == "schedule.notify" && i.severity == Severity::Error)
+        .unwrap_or_else(|| panic!("{report}"));
+    assert!(
+        issue.message.contains("moved to `[notify].command`"),
+        "{}",
+        issue.message
+    );
+}
+
+#[test]
+fn a_notify_section_needs_a_command() {
+    for body in ["", "command = \"  \"\n"] {
+        let report = DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n[notify]\n{body}"))
+            .expect("parses")
+            .validate();
+        assert!(has_error(&report, "notify.command"), "{body:?}: {report}");
+    }
+}
+
+#[test]
+fn a_notify_command_is_kept() {
+    let config = DeployConfig::from_toml_str(&format!(
+        "{SCHEDULE_BASE}\n[notify]\ncommand = \"systemd-cat -t fraisier\"\n"
+    ))
+    .expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    assert_eq!(
+        config.notify.and_then(|n| n.command).as_deref(),
+        Some("systemd-cat -t fraisier")
+    );
 }
 
 const BLUE_GREEN: &str = r#"

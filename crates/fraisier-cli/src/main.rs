@@ -479,11 +479,14 @@ struct BackupArgs {
     #[arg(long, default_value = "fraisier.toml")]
     config: PathBuf,
 
-    /// Where to write the archive (defaults to `<fraise>-<environment>.pgdump`).
+    /// Where to write the archive. Without it, a new timestamped archive goes into
+    /// `[backup].dir` when that is set, and `<fraise>-<environment>.pgdump`
+    /// otherwise.
     #[arg(long)]
     output: Option<PathBuf>,
 
-    /// Overwrite the output file if it already exists.
+    /// Overwrite the output file if it already exists. Archives in `[backup].dir`
+    /// are never overwritten.
     #[arg(long)]
     force: bool,
 }

@@ -6,7 +6,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Changed
+### Added
+
+- **`[backup].dir`: each backup writes a new, timestamped archive into a
+  directory**, named `<fraise>-<environment>-<yyyymmddThhmmssZ>.pgdump` (UTC, to
+  the second). `pg_dump` writes into a hidden `.<name>.partial` file beside it,
+  and the archive is renamed into place only after `pg_dump` exits 0,
+  `pg_restore --list` reads it back, and it is at least half the size of the
+  newest archive already there (a smaller one looks like a truncated dump). A
+  dump that fails any check is deleted, so it can neither replace a good archive
+  nor become the next run's size baseline. Two runs in the same second refuse
+  rather than overwrite. If `pg_restore` cannot be run, the archive is kept with
+  a warning. `--output` still writes exactly where it says, and without
+  `[backup].dir` the command behaves as before. `fraisier_db::archive` lists the
+  archives and picks the latest by the timestamp in the name, never by mtime.
 
 - **The Rust toolchain is pinned to an exact release, 1.99.0, and the MSRV is
   now 1.99** (it was a declared 1.95 that nothing ever built with). A floating
@@ -31,6 +44,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a feature-gated path cannot be a working intra-doc link there.
 
 ### Fixed
+
+- **A scheduled backup no longer fails from its second run on.** The generated
+  unit runs `fraisier backup --config …` from `/`, which wrote
+  `/<fraise>-<environment>.pgdump` once and then refused to overwrite it on every
+  later run (and `--force` would have let a failed dump truncate the only good
+  archive). A `[schedule]` with `command = "backup"` now **requires** an
+  absolute `[backup].dir`: `fraisier validate-config` reports `backup.dir`, and
+  `scheduled install` refuses to generate the unit without it. Add a `[backup]`
+  section with `dir` to an existing scheduled-backup config before upgrading.
+  Closes [#87](https://github.com/fraiseql/fraisier-core/issues/87).
 
 - **`cargo deny` passes again**: `rustls` 0.23.46, `rustls-webpki` 0.103.16 and
   `webpki-root-certs` 1.0.11 clear RUSTSEC-2026-0346 to -0349 and the two

@@ -15,6 +15,8 @@
 //! **no** connection string on argv; only non-secret values (the database name a
 //! `pg_restore` needs as its target) ever appear as arguments.
 
+pub mod archive;
+
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::Path;

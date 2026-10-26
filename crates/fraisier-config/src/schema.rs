@@ -92,6 +92,10 @@ pub struct DeployConfig {
     /// calendar schedule. Absent when nothing is scheduled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ScheduleSection>,
+    /// The `[backup]` section: where `fraisier backup` keeps its archives.
+    /// Absent keeps the single `<fraise>-<environment>.pgdump` output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<BackupSection>,
     /// The `[sync]` section: the git remote the deploy ledger is shared through
     /// (experimental). Absent when state is not shared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -543,6 +547,19 @@ pub struct ScheduleSection {
     /// deploy rolls back — the required sink for `command = "deploy"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify: Option<String>,
+}
+
+/// The `[backup]` section: where `fraisier backup` keeps its archives.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupSection {
+    /// The directory each backup writes a new archive into, named
+    /// `<fraise>-<environment>-<yyyymmddThhmmssZ>.pgdump` (UTC). Must be
+    /// absolute, and is required by a scheduled backup (`[schedule].command =
+    /// "backup"`): without it every run writes the same file and the second one
+    /// fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<PathBuf>,
 }
 
 /// The `[lb]` section.

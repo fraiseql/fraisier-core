@@ -39,6 +39,9 @@ pub(crate) struct SdlFinding {
     pub(crate) member: String,
     /// Why it does not match, or could not be checked.
     pub(crate) problem: Option<String>,
+    /// Whether both SDLs were read and compared; a problem without a
+    /// comparison is a check that could not run, not a difference.
+    pub(crate) compared: bool,
 }
 
 /// Where `live` first differs from `served`, or `None` when they agree.
@@ -86,7 +89,12 @@ pub(crate) fn render(findings: &[SdlFinding]) -> (String, bool) {
                 let _ = writeln!(pretty, "  sdl {}: matches", finding.member);
             }
             Some(why) => {
-                let _ = writeln!(pretty, "  sdl {}: DIFFERS\n      {why}", finding.member);
+                let verdict = if finding.compared {
+                    "DIFFERS"
+                } else {
+                    "UNCHECKED"
+                };
+                let _ = writeln!(pretty, "  sdl {}: {verdict}\n      {why}", finding.member);
             }
         }
     }
@@ -101,6 +109,7 @@ pub(crate) fn to_json(findings: &[SdlFinding]) -> serde_json::Value {
             serde_json::json!({
                 "member": finding.member,
                 "matches": finding.problem.is_none(),
+                "checked": finding.compared,
                 "problem": finding.problem,
             })
         })
@@ -127,25 +136,29 @@ pub(crate) async fn check(
         let (Some(sdl), Some(url)) = (&member.sdl, &member.graphql_url) else {
             continue;
         };
-        let problem = check_member(&release.join(sdl), url, &member.sdl_headers, source, env)
-            .await
-            .err()
-            .map(|why| fraisier_saga::redact::credentials(&why));
+        let (compared, problem) =
+            match check_member(&release.join(sdl), url, &member.sdl_headers, source, env).await {
+                Ok(difference) => (true, difference),
+                Err(why) => (false, Some(why)),
+            };
         findings.push(SdlFinding {
             member: member.name.clone(),
-            problem,
+            problem: problem.map(|why| fraisier_saga::redact::credentials(&why)),
+            compared,
         });
     }
     findings
 }
 
+/// Compare one member's SDLs: `Ok` with the difference, if any, once both were
+/// read; `Err` when the check could not run.
 async fn check_member(
     served_path: &Path,
     url: &str,
     header_vars: &std::collections::BTreeMap<String, String>,
     source: &dyn SdlSource,
     env: &(dyn Fn(&str) -> Option<String> + Sync),
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let served = source
         .served_sdl(served_path)
         .map_err(|error| format!("cannot read {}: {error}", served_path.display()))?;
@@ -166,13 +179,13 @@ async fn check_member(
         .live_sdl(url, &headers)
         .await
         .map_err(|error| hide(format!("cannot ask {url} for its SDL: {error}")))?;
-    sdl_difference(&live, &served).map_or(Ok(()), |why| {
-        Err(hide(format!(
+    Ok(sdl_difference(&live, &served).map(|why| {
+        hide(format!(
             "the live SDL at {url} is not {}: {why}. Recapture the SDL, recompose, and \
              deploy the router",
             served_path.display()
-        )))
-    })
+        ))
+    }))
 }
 
 /// The real source: an HTTP POST of `{ _service { sdl } }`, and the file system.
@@ -349,6 +362,7 @@ mod tests {
             SdlFinding {
                 member: "billing".to_owned(),
                 problem: findings[0].problem.clone(),
+                compared: true,
             }
         );
         let billing = findings[0].problem.as_deref().expect("billing differs");
@@ -362,6 +376,7 @@ mod tests {
             SdlFinding {
                 member: "management".to_owned(),
                 problem: None,
+                compared: true,
             }
         );
         assert_eq!(findings.len(), 2, "the router has no sdl");
@@ -378,6 +393,7 @@ mod tests {
             ..Fake::default()
         };
         let findings = block_on(check(&stack(true), &fake, &|_| None));
+        assert!(!findings[0].compared && !findings[1].compared);
         let billing = findings[0].problem.as_deref().expect("unservable");
         assert!(billing.contains("No such file"), "{billing}");
         let management = findings[1].problem.as_deref().expect("no token");
@@ -398,6 +414,29 @@ mod tests {
         let management = findings[1].problem.as_deref().expect("refused");
         assert!(management.contains("connection refused"), "{management}");
         assert!(!management.contains("s3cret"), "{management}");
+    }
+
+    #[test]
+    fn a_check_that_could_not_run_is_not_called_a_difference() {
+        let finding = |problem: Option<&str>, compared| SdlFinding {
+            member: "m".to_owned(),
+            problem: problem.map(ToOwned::to_owned),
+            compared,
+        };
+        let (pretty, ok) = super::render(&[
+            finding(None, true),
+            finding(Some("they differ at line 2"), true),
+            finding(Some("cannot read sdl/m.graphql"), false),
+        ]);
+        assert!(!ok);
+        assert_eq!(
+            pretty,
+            "  sdl m: matches\n  sdl m: DIFFERS\n      they differ at line 2\n  \
+             sdl m: UNCHECKED\n      cannot read sdl/m.graphql\n"
+        );
+        let json = super::to_json(&[finding(Some("cannot read"), false)]);
+        assert_eq!(json[0]["checked"], serde_json::json!(false));
+        assert_eq!(json[0]["matches"], serde_json::json!(false));
     }
 
     #[test]

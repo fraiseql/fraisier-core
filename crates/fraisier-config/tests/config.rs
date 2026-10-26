@@ -1357,6 +1357,82 @@ fn database_requires_needs_the_dsn_env_var() {
     assert!(has_error(&report, "migration.database_url_env"), "{report}");
 }
 
+fn database_report(section: &str) -> fraisier_config::ValidationReport {
+    DeployConfig::from_toml_str(&format!("{REQUIRES_BASE}\n{section}"))
+        .expect("parses")
+        .validate()
+}
+
+#[test]
+fn an_admin_url_env_is_kept() {
+    let config = DeployConfig::from_toml_str(&format!(
+        "{REQUIRES_BASE}\n[database]\nadmin_url_env = \"CHECKOUT_ADMIN_URL\"\n"
+    ))
+    .expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    assert_eq!(
+        config.database.and_then(|d| d.admin_url_env).as_deref(),
+        Some("CHECKOUT_ADMIN_URL")
+    );
+}
+
+#[test]
+fn a_blank_admin_url_env_is_an_error() {
+    let report = database_report("[database]\nadmin_url_env = \" \"\n");
+    assert!(has_error(&report, "database.admin_url_env"), "{report}");
+}
+
+#[test]
+fn the_admin_identity_cannot_be_the_migration_dsn() {
+    // A separate identity is the point: the same env var would make the app
+    // role the superuser, or the superuser run migrations.
+    let report = database_report("[database]\nadmin_url_env = \"CHECKOUT_DATABASE_URL\"\n");
+    assert!(has_error(&report, "database.admin_url_env"), "{report}");
+}
+
+#[test]
+fn on_empty_takes_fail_or_warn() {
+    for value in ["fail", "warn"] {
+        let report = database_report(&format!(
+            "[database.requires]\npg_tviews = true\n\n[database.tviews]\non_empty = \"{value}\"\n"
+        ));
+        assert!(report.ok(), "{value}: {report}");
+    }
+    let config = DeployConfig::from_toml_str(&format!(
+        "{REQUIRES_BASE}\n[database.requires]\npg_tviews = true\n\n[database.tviews]\non_empty = \"warn\"\n"
+    ))
+    .expect("parses");
+    assert_eq!(
+        config
+            .database
+            .and_then(|d| d.tviews)
+            .and_then(|t| t.on_empty)
+            .as_deref(),
+        Some("warn")
+    );
+}
+
+#[test]
+fn on_empty_cannot_switch_the_gate_off() {
+    for value in ["off", "ignore", ""] {
+        let report = database_report(&format!(
+            "[database.requires]\npg_tviews = true\n\n[database.tviews]\non_empty = \"{value}\"\n"
+        ));
+        assert!(
+            has_error(&report, "database.tviews.on_empty"),
+            "{value:?}: {report}"
+        );
+    }
+}
+
+#[test]
+fn a_tviews_section_without_declaring_pg_tviews_is_an_error() {
+    // The gate is declared by [database.requires].pg_tviews; a knob for a gate
+    // that is not there would read as protection it does not give.
+    let report = database_report("[database.tviews]\non_empty = \"warn\"\n");
+    assert!(has_error(&report, "database.tviews"), "{report}");
+}
+
 #[test]
 fn an_unknown_requirement_is_a_parse_error() {
     let toml = format!("{REQUIRES_BASE}\n[database.requires]\npostgis = true\n");

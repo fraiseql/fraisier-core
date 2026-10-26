@@ -557,6 +557,27 @@ pub struct DatabaseSection {
     /// onto it. fraisier checks and refuses; it never installs what is missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires: Option<DatabaseRequires>,
+    /// The env var holding a superuser DSN — meant for peer auth over the Unix
+    /// socket, with no password — that fraisier uses **only** for
+    /// restore-class operations: creating and dropping throwaway and restore
+    /// target databases, `pg_restore`, and the post-restore TVIEW rebuild.
+    /// Never for migrations or deploy steps. Absent, those use the app DSN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_url_env: Option<String>,
+    /// `[database.tviews]`: the empty-TVIEW gate's one knob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tviews: Option<DatabaseTviews>,
+}
+
+/// `[database.tviews]`: what an empty TVIEW over a populated view costs a
+/// deploy. The gate itself is declared by `[database.requires].pg_tviews`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseTviews {
+    /// `"fail"` (the default) refuses the deploy at preflight; `"warn"` reports
+    /// and continues. A probe that cannot run is treated the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_empty: Option<String>,
 }
 
 /// `[database.requires]`: checked first in every deploy's preflight, and by

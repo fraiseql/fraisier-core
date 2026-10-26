@@ -74,7 +74,7 @@ pub use error::ConfigError;
 pub use preset::SpecqlPreset;
 pub use schema::{
     ArtifactSection, BlueGreenSection, CheckSection, DatabaseRequires, DatabaseSection,
-    DeployConfig, DeploySection, HealthSection, HostSpec, HostsSection, LbSection,
+    DatabaseTviews, DeployConfig, DeploySection, HealthSection, HostSpec, HostsSection, LbSection,
     MigrationSection, PolicySection, ScheduleSection, ServiceSection, SshSection,
     DEFAULT_APPROVAL_TIMEOUT_SECS, UNCLASSIFIED_ACTIONS,
 };

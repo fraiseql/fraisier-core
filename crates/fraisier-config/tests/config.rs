@@ -1703,3 +1703,93 @@ fn no_policy_section_means_no_policy_at_all() {
     assert!(cfg.policy.is_none());
     assert!(cfg.validate().ok(), "{}", cfg.validate());
 }
+
+const REFRESH_BASE: &str = r#"
+[deploy]
+name = "checkout"
+environment = "staging"
+
+[migration]
+adapter = "command"
+database_url_env = "CHECKOUT_DATABASE_URL"
+"#;
+
+fn refresh_config(section: &str) -> DeployConfig {
+    DeployConfig::from_toml_str(&format!("{REFRESH_BASE}\n[refresh]\n{section}")).expect("parses")
+}
+
+#[test]
+fn a_refresh_section_keeps_its_fields_and_defaults() {
+    let config = refresh_config(
+        "source_dir = \"/var/backups/checkout\"\nsource_environment = \"production\"\n",
+    );
+    assert!(
+        config.validate_db_ops().ok(),
+        "{}",
+        config.validate_db_ops()
+    );
+    let refresh = config.refresh.expect("[refresh]");
+    assert_eq!(
+        refresh.source_dir.as_deref(),
+        Some(std::path::Path::new("/var/backups/checkout"))
+    );
+    assert_eq!(refresh.source_environment.as_deref(), Some("production"));
+    assert_eq!(refresh.max_age_hours(), 48);
+    assert_eq!(refresh.min_tables, None);
+    assert_eq!(refresh.schedule, None);
+}
+
+#[test]
+fn a_refresh_needs_an_absolute_source_dir() {
+    let report = refresh_config("source_environment = \"production\"\n").validate_db_ops();
+    assert!(has_error(&report, "refresh.source_dir"), "{report}");
+    let report = refresh_config("source_dir = \"backups\"\nsource_environment = \"production\"\n")
+        .validate_db_ops();
+    assert!(has_error(&report, "refresh.source_dir"), "{report}");
+}
+
+#[test]
+fn a_refresh_needs_a_source_environment() {
+    let report = refresh_config("source_dir = \"/var/backups/checkout\"\n").validate_db_ops();
+    assert!(has_error(&report, "refresh.source_environment"), "{report}");
+}
+
+#[test]
+fn a_refresh_from_its_own_environment_is_a_config_error() {
+    // A [refresh] pasted into the production config, refreshing production from
+    // production archives, must never load.
+    let report = refresh_config(
+        "source_dir = \"/var/backups/checkout\"\nsource_environment = \"staging\"\n",
+    )
+    .validate_db_ops();
+    assert!(has_error(&report, "refresh.source_environment"), "{report}");
+}
+
+#[test]
+fn refresh_bounds_and_schedule_are_checked() {
+    let base = "source_dir = \"/var/backups/checkout\"\nsource_environment = \"production\"\n";
+    for (extra, path) in [
+        ("max_age_hours = 0\n", "refresh.max_age_hours"),
+        ("min_tables = 0\n", "refresh.min_tables"),
+        ("data_dir = \"pgdata\"\n", "refresh.data_dir"),
+        ("schedule = \"whenever\"\n", "refresh.schedule"),
+        (
+            "source_environment = \"prod uction\"\n",
+            "refresh.source_environment",
+        ),
+    ] {
+        let section = if extra.starts_with("source_environment") {
+            format!("source_dir = \"/var/backups/checkout\"\n{extra}")
+        } else {
+            format!("{base}{extra}")
+        };
+        let report = refresh_config(&section).validate_db_ops();
+        assert!(has_error(&report, path), "{extra}: {report}");
+    }
+    let config = refresh_config(&format!("{base}schedule = \"daily 03:30\"\n"));
+    assert!(
+        config.validate_db_ops().ok(),
+        "{}",
+        config.validate_db_ops()
+    );
+}

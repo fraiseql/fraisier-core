@@ -135,6 +135,7 @@ impl DeployConfig {
         validate_notify(self, &mut report);
         validate_backup(self, &mut report);
         validate_drill(self, &mut report);
+        validate_refresh(self, &mut report);
         validate_metrics(self, &mut report);
         validate_sync(self, &mut report);
         validate_blue_green(self, &mut report);
@@ -155,6 +156,7 @@ impl DeployConfig {
         let mut report = ValidationReport::default();
         validate_deploy(self, &mut report);
         validate_migration(self, &mut report);
+        validate_refresh(self, &mut report);
         validate_metrics(self, &mut report);
         report
     }
@@ -859,6 +861,68 @@ fn validate_drill(cfg: &DeployConfig, report: &mut ValidationReport) {
         if !dir.is_absolute() {
             report.error(
                 "drill.data_dir",
+                format!("data_dir must be an absolute path, not '{}'", dir.display()),
+            );
+        }
+    }
+}
+
+fn validate_refresh(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(refresh) = cfg.refresh.as_ref() else {
+        return;
+    };
+    match refresh.source_dir.as_deref() {
+        None => report.error(
+            "refresh.source_dir",
+            "a [refresh] needs source_dir: the directory holding the source environment's \
+             archives",
+        ),
+        Some(dir) if !dir.is_absolute() => report.error(
+            "refresh.source_dir",
+            format!(
+                "source_dir must be an absolute path, not '{}'",
+                dir.display()
+            ),
+        ),
+        Some(_) => {}
+    }
+    let own = cfg.deploy.as_ref().and_then(|d| d.environment.as_deref());
+    match refresh.source_environment.as_deref() {
+        None => report.error(
+            "refresh.source_environment",
+            "a [refresh] needs source_environment: the environment whose archives it restores",
+        ),
+        Some(source) if !is_unit_word(source) => report.error(
+            "refresh.source_environment",
+            format!("source_environment '{source}' is not a valid environment name"),
+        ),
+        Some(source) if Some(source) == own => report.error(
+            "refresh.source_environment",
+            format!(
+                "source_environment is this config's own environment ('{source}'); a refresh \
+                 replaces this environment's database with another environment's archive"
+            ),
+        ),
+        Some(_) => {}
+    }
+    if let Some(spec) = refresh.schedule.as_deref() {
+        if let Err(message) = crate::calendar::to_on_calendar(spec) {
+            report.error("refresh.schedule", message);
+        }
+    }
+    if refresh.max_age_hours == Some(0) {
+        report.error("refresh.max_age_hours", "max_age_hours must be at least 1");
+    }
+    if refresh.min_tables == Some(0) {
+        report.error(
+            "refresh.min_tables",
+            "min_tables must be at least 1 (omit it for no table check)",
+        );
+    }
+    if let Some(dir) = refresh.data_dir.as_deref() {
+        if !dir.is_absolute() {
+            report.error(
+                "refresh.data_dir",
                 format!("data_dir must be an absolute path, not '{}'", dir.display()),
             );
         }

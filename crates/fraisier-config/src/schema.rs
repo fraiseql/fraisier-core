@@ -104,6 +104,10 @@ pub struct DeployConfig {
     /// against the newest archive in `[backup].dir`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drill: Option<DrillSection>,
+    /// The `[refresh]` section: the staging refresh `fraisier db refresh` runs,
+    /// replacing this environment's database with the newest archive of another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<RefreshSection>,
     /// The `[metrics]` section: where each command writes its Prometheus
     /// textfile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -619,6 +623,53 @@ pub struct DrillSection {
 }
 
 impl DrillSection {
+    /// The age limit when `max_age_hours` is not declared.
+    pub const DEFAULT_MAX_AGE_HOURS: u32 = 48;
+
+    /// The declared age limit, or [`Self::DEFAULT_MAX_AGE_HOURS`].
+    #[must_use]
+    pub fn max_age_hours(&self) -> u32 {
+        self.max_age_hours.unwrap_or(Self::DEFAULT_MAX_AGE_HOURS)
+    }
+}
+
+/// The `[refresh]` section: a staging refresh.
+///
+/// `fraisier db refresh` replaces this environment's database with the newest
+/// archive another environment's backups wrote, then migrates it forward. The
+/// target database must carry the refresh marker `fraisier db
+/// mark-refresh-target` sets, so a config cannot refresh a database nobody
+/// marked as a refresh target.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshSection {
+    /// The directory holding the source environment's archives. Required, and
+    /// absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_dir: Option<PathBuf>,
+    /// The environment whose archives are restored
+    /// (`<fraise>-<source_environment>-*`). Required, and never this config's
+    /// own `[deploy].environment`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_environment: Option<String>,
+    /// The newest archive must be younger than this. Defaults to 48.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_hours: Option<u32>,
+    /// The refreshed, migrated database must hold at least this many tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_tables: Option<u64>,
+    /// The database server's data directory, when it is on this host. With it,
+    /// the refresh refuses unless the filesystem holding it has room for the
+    /// target database's current size plus 2 GB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<PathBuf>,
+    /// When `scheduled install` runs the refresh, in the `[schedule].calendar`
+    /// vocabulary. Absent, the refresh runs only when invoked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+}
+
+impl RefreshSection {
     /// The age limit when `max_age_hours` is not declared.
     pub const DEFAULT_MAX_AGE_HOURS: u32 = 48;
 

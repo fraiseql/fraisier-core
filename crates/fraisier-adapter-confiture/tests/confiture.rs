@@ -36,7 +36,7 @@ async fn describe_reports_version_and_capabilities() {
 
     assert_eq!(desc.name, "confiture");
     assert_eq!(desc.protocol_version, 1);
-    assert!(!desc.version.is_empty());
+    assert_ne!(desc.version, "");
     // The forward-compat lint capability must be advertised so the deploy layer
     // knows it can call preflight.
     assert!(

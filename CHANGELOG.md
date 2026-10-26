@@ -14,6 +14,28 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   old key is refused with a validation error that names the new one. There is
   no alias: two spellings of one sink would drift.
 
+- **The Rust toolchain is pinned to an exact release, 1.99.0, and the MSRV is
+  now 1.99** (it was a declared 1.95 that nothing ever built with). A floating
+  `channel = "stable"` let Rust 1.99's new clippy lints turn an untouched `main`
+  red; an exact pin moves only in a commit that carries its own lint fixes. The
+  MSRV is the pinned version because that is the only version the gate tests. A
+  new gate step, `cargo xtask toolchain`, refuses a channel that is not an exact
+  `X.Y.Z` and a `rust-version` that is not its `X.Y`, so the two move together.
+  `clippy.toml`'s separate `msrv` is gone (clippy reads `rust-version`). Closes
+  [#80](https://github.com/fraiseql/fraisier-core/issues/80).
+
+- **The CI gate now runs rustdoc**, as `cargo xtask doc`
+  (`RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --all-features`).
+  Nothing ran rustdoc before, which is how nine broken doc links accumulated
+  across six crates unnoticed — a broken intra-doc link is invisible while
+  writing and ships as a dead link on docs.rs, the only documentation an
+  embedder of these crates reads. All nine are fixed: six redundant explicit
+  link targets, a hyphenated crate name that was never a valid path
+  (`fraisier-core`), and two links to the saga's feature-gated `otel` module.
+  Those last two are now code spans rather than links: these crates set no
+  docs.rs `all-features` metadata, so docs.rs builds them with default features
+  and a feature-gated path cannot be a working intra-doc link there.
+
 ### Added
 
 - **A failed scheduled backup, prune or drill notifies exactly once.**
@@ -147,8 +169,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   either; see `docs/database-requirements.md`. Without the section nothing
   changes. Part of [#83](https://github.com/fraiseql/fraisier-core/issues/83).
 
-### Added
-
 - **FraiseQL 2.18.0 is the supported, proven version, pinned in
   `tools/fraiseql-version`.**
   - **The proof.** Criterion-1 now deploys a 2.18.0 `fraiseql-server` three
@@ -250,32 +270,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   are unchanged: those migration failures read as `InternalError` instead of
   `DbUnreachable`. The re-frozen transitive set also moves `pydantic` to 2.14.1 and
   `pydantic-core` to 2.50.1.
-
-### Changed
-
-- **The Rust toolchain is pinned to an exact release, 1.99.0, and the MSRV is
-  now 1.99** (it was a declared 1.95 that nothing ever built with). A floating
-  `channel = "stable"` let Rust 1.99's new clippy lints turn an untouched `main`
-  red; an exact pin moves only in a commit that carries its own lint fixes. The
-  MSRV is the pinned version because that is the only version the gate tests. A
-  new gate step, `cargo xtask toolchain`, refuses a channel that is not an exact
-  `X.Y.Z` and a `rust-version` that is not its `X.Y`, so the two move together.
-  `clippy.toml`'s separate `msrv` is gone (clippy reads `rust-version`). Closes
-  [#80](https://github.com/fraiseql/fraisier-core/issues/80).
-
-- **The CI gate now runs rustdoc**, as `cargo xtask doc`
-  (`RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --all-features`).
-  Nothing ran rustdoc before, which is how nine broken doc links accumulated
-  across six crates unnoticed — a broken intra-doc link is invisible while
-  writing and ships as a dead link on docs.rs, the only documentation an
-  embedder of these crates reads. All nine are fixed: six redundant explicit
-  link targets, a hyphenated crate name that was never a valid path
-  (`fraisier-core`), and two links to the saga's feature-gated `otel` module.
-  Those last two are now code spans rather than links: these crates set no
-  docs.rs `all-features` metadata, so docs.rs builds them with default features
-  and a feature-gated path cannot be a working intra-doc link there.
-
-### Fixed
 
 - **A scheduled backup no longer fails from its second run on.** The generated
   unit runs `fraisier backup --config …` from `/`, which wrote

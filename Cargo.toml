@@ -42,7 +42,7 @@ homepage = "https://fraiseql.dev"
 authors = ["Lionel Hamayon <evolution.digitale@gmail.com>"]
 keywords = ["deploy", "migration", "orchestration", "saga", "postgres"]
 categories = ["development-tools"]
-rust-version = "1.95"
+rust-version = "1.99"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

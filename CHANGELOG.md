@@ -8,6 +8,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The Rust toolchain is pinned to an exact release, 1.99.0, and the MSRV is
+  now 1.99** (it was a declared 1.95 that nothing ever built with). A floating
+  `channel = "stable"` let Rust 1.99's new clippy lints turn an untouched `main`
+  red; an exact pin moves only in a commit that carries its own lint fixes. The
+  MSRV is the pinned version because that is the only version the gate tests. A
+  new gate step, `cargo xtask toolchain`, refuses a channel that is not an exact
+  `X.Y.Z` and a `rust-version` that is not its `X.Y`, so the two move together.
+  `clippy.toml`'s separate `msrv` is gone (clippy reads `rust-version`). Closes
+  [#80](https://github.com/fraiseql/fraisier-core/issues/80).
+
 - **The CI gate now runs rustdoc**, as `cargo xtask doc`
   (`RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --all-features`).
   Nothing ran rustdoc before, which is how nine broken doc links accumulated
@@ -21,6 +31,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a feature-gated path cannot be a working intra-doc link there.
 
 ### Fixed
+
+- **`cargo deny` passes again**: `rustls` 0.23.46, `rustls-webpki` 0.103.16 and
+  `webpki-root-certs` 1.0.11 clear RUSTSEC-2026-0346 to -0349 and the two
+  distrusted-intermediate advisories, which failed the supply-chain gate on every
+  branch. `Cargo.lock` only.
 
 - **The test suite no longer fails because of a variable the environment happens
   to carry.** `cargo test` went from 158 passing to 151 whenever any `FRAISIER_*`

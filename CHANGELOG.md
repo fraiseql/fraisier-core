@@ -44,9 +44,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a TVIEW) and `DIFFER_408` (an index written before its relation). Exit 5 gains
   `CONFIG_015` (`preflight --scope pending` finds the ledger only in another schema)
   and `DIFFER_406` (an index on a relation the desired tree does not declare, which a
-  migration would drop). No exit integer changes class. confiture 1.36.0, not yet
-  released, is set to retire `DIFFER_407` and add `DIFFER_410`, which will take
-  another pin bump.
+  migration would drop). No exit integer changes class.
+
+- **The exit-code contract follows confiture 1.36.0.** The pin moves from 1.35.0. A
+  failed migration, a duplicate version and an embedded `COMMIT` (`MIGR_001`,
+  `MIGR_004`, `MIGR_100`, `MIGR_102`, `MIGR_106`–`MIGR_108`) and `GEN_001` move from
+  exit 3 to exit 1, so exit 3 (`db_unreachable`) now means `CONFIG_006` alone
+  ([fraiseql/confiture#727](https://github.com/fraiseql/confiture/issues/727)). Exit 0
+  loses `DIFFER_407`, retired because a TVIEW's indexes are now compared. Exit 5
+  gains `DIFFER_409` (a definition change with no statement) and `DIFFER_410` (a tree
+  index under a name pg_tviews owns). No exit integer changes class and only
+  `LockContention` is retriable, so `classify` and the `AdapterErrorKind` projection
+  are unchanged: those migration failures read as `InternalError` instead of
+  `DbUnreachable`. The re-frozen transitive set also moves `pydantic` to 2.14.1 and
+  `pydantic-core` to 2.50.1.
 
 ### Changed
 

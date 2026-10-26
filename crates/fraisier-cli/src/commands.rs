@@ -1281,7 +1281,7 @@ pub(crate) async fn rollback(
 /// fails the health probe. Sourcing strictly from the committed record (never a
 /// value stamped earlier in the saga) is the guardrail that keeps a deploy which
 /// failed before commit from ever reporting an in-flight version.
-async fn committed_version(
+pub(crate) async fn committed_version(
     config: &DeployConfig,
     state_dir: &Path,
 ) -> (Option<String>, Option<String>) {

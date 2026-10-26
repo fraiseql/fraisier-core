@@ -22,6 +22,7 @@ mod pg_readiness;
 mod pg_rehearsal;
 mod preview;
 mod stack;
+mod stack_status;
 #[cfg(test)]
 mod test_env;
 
@@ -445,6 +446,20 @@ enum DbCommand {
 enum StackCommand {
     /// Deploy every member in dependency order, stopping at the first failure.
     Deploy(StackDeployArgs),
+    /// Each member's health, version and last deploy, and each database's
+    /// readiness. Exits non-zero when anything is unhealthy.
+    Status(StackStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct StackStatusArgs {
+    /// Path to the stack file (`stack.<env>.toml`).
+    #[arg(long)]
+    stack: PathBuf,
+
+    /// The state store directory every member shares.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -831,6 +846,15 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
                     state_dir: args.state_dir.clone(),
                     dry_run: args.dry_run,
                     skip_preflight: args.skip_preflight,
+                },
+            )
+            .await
+        }
+        Command::Stack(StackCommand::Status(args)) => {
+            stack_status::stack_status(
+                &args.stack,
+                &stack_status::LiveProbe {
+                    state_dir: args.state_dir.clone(),
                 },
             )
             .await

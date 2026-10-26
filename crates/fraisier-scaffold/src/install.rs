@@ -335,7 +335,7 @@ upstream = "checkout_upstream"
 
     /// A scheduled `backup` config (the safe value; needs no unattended opt-in).
     fn scheduled_files() -> Vec<crate::GeneratedFile> {
-        let toml = format!("{CFG}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+        let toml = format!("{CFG}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
         crate::generate_scheduled(
             &fraisier_config::DeployConfig::from_toml_str(&toml).expect("parse"),
         )

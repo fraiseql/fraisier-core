@@ -358,6 +358,12 @@ fn settings_map(config: &DeployConfig, app_version: Option<&str>) -> BTreeMap<St
                 settings.insert("token_provider".to_owned(), value);
             }
         }
+        if let Some(required) = &health.require_capabilities {
+            settings.insert(
+                "require_capabilities".to_owned(),
+                Value::from(required.clone()),
+            );
+        }
     }
     if let Some(lb) = &config.lb {
         put_path(&mut settings, "config_path", lb.config_path.as_deref());
@@ -1556,6 +1562,22 @@ mod tests {
         assert_eq!(
             plan.ctx.env_secrets.get("DATABASE_URL").map(String::as_str),
             Some("APP_DATABASE_URL"),
+        );
+    }
+
+    #[test]
+    fn http_health_plumbs_require_capabilities() {
+        let toml = "[deploy]\nname = \"app\"\nenvironment = \"prod\"\n\n\
+             [artifact]\nsource = \"local\"\npath = \"/builds/app\"\nactive_path = \"/srv/app/current\"\n\n\
+             [migration]\nadapter = \"confiture\"\ndatabase_url_env = \"APP_DATABASE_URL\"\n\n\
+             [service]\nadapter = \"systemd\"\nunit = \"app.service\"\n\n\
+             [health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n\
+             require_capabilities = [\"observers\"]\n";
+        let config = DeployConfig::from_toml_str(toml).expect("parses");
+        let plan = build_health_probe(&config).expect("builds http health probe");
+        assert_eq!(
+            plan.ctx.settings.get("require_capabilities"),
+            Some(&serde_json::json!(["observers"])),
         );
     }
 

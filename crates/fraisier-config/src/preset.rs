@@ -288,6 +288,7 @@ impl Overlay for HealthSection {
                 over.headers
             },
             token_provider: prefer(self.token_provider, over.token_provider),
+            require_capabilities: prefer(self.require_capabilities, over.require_capabilities),
         }
     }
 }

@@ -1159,6 +1159,80 @@ fn http_health_still_requires_url() {
     assert!(has_error(&report, "health.url"), "{report}");
 }
 
+#[test]
+fn http_health_require_capabilities_parses_and_validates() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n\
+         require_capabilities = [\"observers\", \"mcp\"]\n"
+    );
+    let cfg = DeployConfig::from_toml_str(&toml).expect("parses");
+    assert!(cfg.validate().ok(), "{}", cfg.validate());
+    assert_eq!(
+        cfg.health.and_then(|h| h.require_capabilities),
+        Some(vec!["observers".to_owned(), "mcp".to_owned()])
+    );
+}
+
+#[test]
+fn require_capabilities_rejects_an_empty_list() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n\
+         require_capabilities = []\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(
+        has_error(&report, "health.require_capabilities"),
+        "{report}"
+    );
+}
+
+#[test]
+fn require_capabilities_rejects_duplicates() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n\
+         require_capabilities = [\"observers\", \"observers\"]\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(
+        has_error(&report, "health.require_capabilities"),
+        "{report}"
+    );
+}
+
+#[test]
+fn require_capabilities_rejects_a_blank_name() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n\
+         require_capabilities = [\" \"]\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(
+        has_error(&report, "health.require_capabilities"),
+        "{report}"
+    );
+}
+
+#[test]
+fn require_capabilities_applies_only_to_the_http_adapter() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"command\"\ncommand = \"scan\"\n\
+         require_capabilities = [\"observers\"]\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(
+        has_error(&report, "health.require_capabilities"),
+        "{report}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The [policy] section — the risk-keyed policy gate (issue #45)
 // ---------------------------------------------------------------------------

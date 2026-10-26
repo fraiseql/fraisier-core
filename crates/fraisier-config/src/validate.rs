@@ -526,6 +526,9 @@ fn validate_health(cfg: &DeployConfig, report: &mut ValidationReport) {
             );
         }
     }
+    if let Some(required) = &health.require_capabilities {
+        validate_require_capabilities(health.adapter.as_deref(), required, report);
+    }
     if let Some(provider) = &health.token_provider {
         // A token provider only makes sense injecting a header into the http probe.
         if health.adapter.as_deref() != Some("http") {
@@ -542,6 +545,38 @@ fn validate_health(cfg: &DeployConfig, report: &mut ValidationReport) {
             provider.validate_against_headers(health.headers.keys().map(String::as_str))
         {
             report.error("health.token_provider.header", error.to_string());
+        }
+    }
+}
+
+fn validate_require_capabilities(
+    adapter: Option<&str>,
+    required: &[String],
+    report: &mut ValidationReport,
+) {
+    const PATH: &str = "health.require_capabilities";
+    if adapter != Some("http") {
+        report.error(
+            PATH,
+            "require_capabilities applies only to the http adapter (it reads the \
+             /health body)",
+        );
+    }
+    if required.is_empty() {
+        report.error(
+            PATH,
+            "require_capabilities is empty; list a capability or remove the key",
+        );
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for name in required {
+        if name.trim().is_empty() {
+            report.error(PATH, "require_capabilities contains a blank name");
+        } else if !seen.insert(name.as_str()) {
+            report.error(
+                PATH,
+                format!("require_capabilities lists '{name}' more than once"),
+            );
         }
     }
 }

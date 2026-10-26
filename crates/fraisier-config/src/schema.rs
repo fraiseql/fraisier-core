@@ -434,6 +434,13 @@ pub struct HealthSection {
     /// template `Bearer {token}`). Resolved once per deploy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_provider: Option<TokenProvider>,
+    /// `http`: FraiseQL capabilities the server must report as running in its
+    /// `/health` body (`compiled_in`, `started`, and not `healthy = false`). A
+    /// capability that is not running makes the probe unhealthy, retried like a
+    /// wrong status. Names are not checked here: FraiseQL owns its registry, and
+    /// a name the server does not report fails at probe time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_capabilities: Option<Vec<String>>,
 }
 
 /// The `[ssh]` section: the connection parameters fraisier uses to run per-host

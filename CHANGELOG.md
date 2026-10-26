@@ -8,6 +8,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **FraiseQL 2.18.0 is the supported, proven version, pinned in
+  `tools/fraiseql-version`.**
+  - **The proof.** Criterion-1 now deploys a 2.18.0 `fraiseql-server` three
+    times in a row. Every criterion-1 script reads the pin, and refuses a
+    server whose `--version` differs from it.
+  - **The boot schema** is recompiled with 2.18.0, which refuses the old 2.4.0
+    one.
+  - **`deploy-local.sh`** now:
+    - recreates a scratch database named `fraisier_criterion1_*`;
+    - reaches Postgres through `PG*` variables instead of a DSN on `psql`'s
+      argv;
+    - takes the server and fraisier binaries from the environment.
+  - **The Hetzner orchestrator** ships this repository's assets and the pin. It
+    no longer ships hand-copied ones.
+  - **Real captures.** These sit in
+    `crates/fraisier-adapter-http/tests/fixtures/fraiseql-2.18.0/`, with a test
+    pinning what they show. They are 2.18's `/health` bodies for a capability
+    that is running, one configured but failed to start, and one not configured.
+    Two facts matter:
+    - `/health` answers 200 even when a configured capability failed to start;
+    - the observers runtime never reports `serving`.
+  - **Docs.** See [docs/fraiseql.md](docs/fraiseql.md).
+
 - **Releases carry a `SHA256SUMS` file and a CycloneDX SBOM per target.**
   `release-binaries.yml` now attaches `fraisier-<target>.cdx.json` next to each
   tarball, and a final job hashes every tarball and SBOM *as the release serves

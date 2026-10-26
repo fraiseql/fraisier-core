@@ -6,9 +6,11 @@ use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use fraisier_config::{DeployConfig, Severity, ValidationReport};
+use fraisier_core::adapter_axes::HealthAdapter;
 use fraisier_core::multi_host::MultiHostDeploy;
 use fraisier_core::policy::Baseline;
 use fraisier_core::redact;
@@ -1653,6 +1655,43 @@ pub(crate) async fn deploy(
     skip_preflight: bool,
     fail_on_block: bool,
 ) -> Result<CommandOutput> {
+    deploy_guarded(
+        config_path,
+        state_dir,
+        host,
+        app_version,
+        (dry_run, skip_preflight, fail_on_block),
+        None,
+    )
+    .await
+}
+
+/// Wraps a deploy's health adapter with a further check its health step runs
+/// (a stack's SDL check).
+pub(crate) type HealthGuard<'a> =
+    &'a (dyn Fn(Arc<dyn HealthAdapter>) -> Arc<dyn HealthAdapter> + Sync);
+
+/// `health`, wrapped by `guard` when there is one.
+fn guarded(
+    health: Arc<dyn HealthAdapter>,
+    guard: Option<HealthGuard<'_>>,
+) -> Arc<dyn HealthAdapter> {
+    match guard {
+        Some(guard) => guard(health),
+        None => health,
+    }
+}
+
+/// [`deploy`], its health adapter wrapped by `guard`. The flags are
+/// `(dry_run, skip_preflight, fail_on_block)`.
+pub(crate) async fn deploy_guarded(
+    config_path: &Path,
+    state_dir: &Path,
+    host: Option<&str>,
+    app_version: Option<&str>,
+    (dry_run, skip_preflight, fail_on_block): (bool, bool, bool),
+    guard: Option<HealthGuard<'_>>,
+) -> Result<CommandOutput> {
     let config = load(config_path)?;
     let report = config.validate();
     if !report.ok() {
@@ -1667,6 +1706,11 @@ pub(crate) async fn deploy(
 
     // `[deploy].strategy = "blue-green"` selects the HTTP-tier traffic-swap flow.
     if config.deploy.as_ref().and_then(|d| d.strategy.as_deref()) == Some("blue-green") {
+        // Its health step probes the green fleet, which a guard does not wrap.
+        anyhow::ensure!(
+            guard.is_none(),
+            "a blue-green deploy cannot run a stack's SDL check in its health step"
+        );
         return run_blue_green(&config, app_version, state_dir, dry_run, fail_on_block).await;
     }
 
@@ -1704,7 +1748,7 @@ pub(crate) async fn deploy(
         .with_context(|| format!("opening state store at {}", state_dir.display()))?;
 
     if multi_host {
-        return run_multi_host(&config, store, app_version, &report).await;
+        return run_multi_host(&config, store, app_version, &report, guard).await;
     }
 
     let resolved = factory::build(&config, host, app_version)?;
@@ -1721,7 +1765,7 @@ pub(crate) async fn deploy(
     .artifact(resolved.artifact)
     .migration(resolved.migration)
     .service(resolved.service)
-    .health(resolved.health);
+    .health(guarded(resolved.health, guard));
     if !skip_preflight {
         if let Some((db, backup)) = resolved.restore_rehearsal {
             builder = builder.restore_rehearsal(db, backup);
@@ -1753,6 +1797,7 @@ async fn run_multi_host(
     store: FilesystemStateStore,
     app_version: Option<&str>,
     report: &ValidationReport,
+    guard: Option<HealthGuard<'_>>,
 ) -> Result<CommandOutput> {
     let resolved = factory::build_multi_host(config, app_version)?;
     let mut builder = MultiHostDeploy::builder(
@@ -1766,7 +1811,7 @@ async fn run_multi_host(
     .artifact(resolved.artifact)
     .migration(resolved.migration)
     .service(resolved.service)
-    .health(resolved.health)
+    .health(guarded(resolved.health, guard))
     .lb(resolved.lb);
     if let Some(probe) = resolved.database_readiness {
         builder = builder.database_readiness(probe);

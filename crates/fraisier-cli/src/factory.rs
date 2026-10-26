@@ -920,6 +920,18 @@ pub struct ArtifactProbePlan {
 /// # Errors
 /// Fails if `[artifact].source` is missing or unsupported in this build.
 pub fn build_artifact_probe(config: &DeployConfig) -> Result<ArtifactProbePlan> {
+    build_artifact_probe_at(config, None)
+}
+
+/// [`build_artifact_probe`], with the artifact settings at `app_version`: what
+/// staging that release needs.
+///
+/// # Errors
+/// Fails if `[artifact].source` is missing or unsupported in this build.
+pub fn build_artifact_probe_at(
+    config: &DeployConfig,
+    app_version: Option<&str>,
+) -> Result<ArtifactProbePlan> {
     let transport = build_transport(config);
     let launcher = build_launcher(config);
     let artifact = build_artifact(config, &transport, &launcher)?;
@@ -932,7 +944,7 @@ pub fn build_artifact_probe(config: &DeployConfig) -> Result<ArtifactProbePlan> 
         .unwrap_or_else(|| "<none>".to_owned());
     let mut ctx = AdapterCtx::new(fraise, environment);
     ctx.workdir = PathBuf::from(".");
-    ctx.settings = settings_map(config, None);
+    ctx.settings = settings_map(config, app_version);
     let hosts = config.host_inventory().map_or_else(
         || vec![(HostId::new("localhost"), None)],
         |inventory| {

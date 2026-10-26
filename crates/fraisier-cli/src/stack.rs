@@ -6,26 +6,39 @@
 //! that fails rolls itself back, the members after it never start, and the
 //! members before it stay deployed. The report says which is which.
 //!
-//! Once every member deployed, each subgraph's live SDL is checked against
-//! the one its router serves (see [`crate::stack_sdl`]); a difference fails the
-//! command, though everything stays deployed.
+//! With a router, its candidate release is staged before any member deploys,
+//! and each subgraph's health step checks its live SDL against that release
+//! (see [`crate::stack_sdl`]). A difference fails the subgraph, which rolls
+//! itself back, so the stack stops before the router is committed.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use fraisier_config::stack::{Member, Stack};
 use serde_json::json;
 
 use crate::commands::CommandOutput;
+use crate::stack_sdl::{SdlGate, SdlSource};
 
 /// Deploys one member.
 #[async_trait]
 pub(crate) trait MemberDeployer: Send + Sync {
-    /// Deploy `member` at `app_version`, as `fraisier deploy` would.
-    async fn deploy(&self, member: &Member, app_version: Option<&str>) -> Result<CommandOutput>;
+    /// Deploy `member` at `app_version`, as `fraisier deploy` would, with
+    /// `gate` after its health check.
+    async fn deploy(
+        &self,
+        member: &Member,
+        app_version: Option<&str>,
+        gate: Option<&SdlGate>,
+    ) -> Result<CommandOutput>;
+
+    /// Stage `router`'s release at `app_version` without activating it, and
+    /// say where it is.
+    async fn stage(&self, router: &Member, app_version: Option<&str>) -> Result<PathBuf>;
 }
 
 /// What happened to one member.
@@ -44,6 +57,7 @@ pub(crate) async fn deploy_members(
     stack: &Stack,
     versions: &BTreeMap<String, String>,
     deployer: &dyn MemberDeployer,
+    gates: &BTreeMap<String, SdlGate>,
 ) -> Vec<(String, MemberOutcome)> {
     let mut report = Vec::with_capacity(stack.members.len());
     let mut failed = false;
@@ -53,7 +67,10 @@ pub(crate) async fn deploy_members(
             continue;
         }
         let version = versions.get(&member.name).map(String::as_str);
-        let outcome = match deployer.deploy(member, version).await {
+        let outcome = match deployer
+            .deploy(member, version, gates.get(&member.name))
+            .await
+        {
             Ok(output) if output.exit_code == 0 => MemberOutcome::Deployed,
             Ok(output) => MemberOutcome::Failed(output.pretty.trim().to_owned()),
             Err(error) => MemberOutcome::Failed(crate::commands::error_detail(&error)),
@@ -103,7 +120,14 @@ pub(crate) async fn stack_deploy(
     versions: &[String],
     deployer: &Deployer,
 ) -> Result<CommandOutput> {
-    stack_deploy_with(stack_path, versions, deployer, &crate::stack_sdl::LiveSdl).await
+    stack_deploy_with(
+        stack_path,
+        versions,
+        deployer,
+        Arc::new(crate::stack_sdl::LiveSdl),
+        deployer.dry_run,
+    )
+    .await
 }
 
 fn refused(message: &str) -> CommandOutput {
@@ -114,13 +138,63 @@ fn refused(message: &str) -> CommandOutput {
     }
 }
 
+/// Where the subgraphs' SDL is checked against, decided before any deploys.
+enum Candidate {
+    /// No member has `sdl`.
+    None,
+    /// Not checked, on purpose: why.
+    NotChecked(String),
+    /// The router's staged release, a local directory.
+    Staged(PathBuf),
+    /// The members deploy, but their SDL cannot be checked: why.
+    Unreadable(String),
+    /// Staging the router failed, so nothing deploys: why.
+    Failed(String),
+}
+
+/// Stage the router's candidate release, unless nothing is checked, this is a
+/// dry run, or the router deploys through `[hosts]`.
+async fn candidate(
+    stack: &Stack,
+    versions: &BTreeMap<String, String>,
+    deployer: &dyn MemberDeployer,
+    dry_run: bool,
+) -> Candidate {
+    let router = stack
+        .router
+        .as_deref()
+        .and_then(|router| stack.members.iter().find(|m| m.name == router));
+    let Some(router) = router.filter(|_| stack.members.iter().any(|m| m.sdl.is_some())) else {
+        return Candidate::None;
+    };
+    if dry_run {
+        return Candidate::NotChecked("dry run".to_owned());
+    }
+    if router.config.hosts.is_some() {
+        return Candidate::Unreadable(crate::stack_sdl::on_hosts(&router.name));
+    }
+    let version = versions.get(&router.name).map(String::as_str);
+    match deployer.stage(router, version).await {
+        Err(error) => Candidate::Failed(crate::commands::error_detail(&error)),
+        Ok(path) if path.is_dir() => Candidate::Staged(path),
+        Ok(path) => Candidate::Unreadable(format!(
+            "the router '{}' stages its release as {}, not a directory, so it holds no SDL file",
+            router.name,
+            path.display()
+        )),
+    }
+}
+
 /// [`stack_deploy`] with the deployer supplied by the caller.
 pub(crate) async fn stack_deploy_with(
     stack_path: &Path,
     versions: &[String],
     deployer: &dyn MemberDeployer,
-    sdl: &dyn crate::stack_sdl::SdlSource,
+    sdl: Arc<dyn SdlSource>,
+    dry_run: bool,
 ) -> Result<CommandOutput> {
+    use crate::stack_sdl::{SdlFinding, Verdict};
+
     let stack = match Stack::load(stack_path) {
         Ok(stack) => stack,
         Err(error) => return Ok(refused(&error.to_string())),
@@ -129,16 +203,58 @@ pub(crate) async fn stack_deploy_with(
         Ok(versions) => versions,
         Err(message) => return Ok(refused(&message)),
     };
-    let report = deploy_members(&stack, &versions, deployer).await;
+    let candidate = candidate(&stack, &versions, deployer, dry_run).await;
+    let gates: BTreeMap<String, SdlGate> = match &candidate {
+        Candidate::Staged(release) => stack
+            .members
+            .iter()
+            .filter_map(|m| Some((m.name.clone(), SdlGate::new(m, release, Arc::clone(&sdl))?)))
+            .collect(),
+        _ => BTreeMap::new(),
+    };
+    let (report, stopped) = if let Candidate::Failed(why) = &candidate {
+        let skipped = stack
+            .members
+            .iter()
+            .map(|m| (m.name.clone(), MemberOutcome::Skipped))
+            .collect();
+        (
+            skipped,
+            Some(format!(
+                "the router's candidate release could not be staged, so nothing deployed: {}",
+                fraisier_saga::redact::credentials(why)
+            )),
+        )
+    } else {
+        (
+            deploy_members(&stack, &versions, deployer, &gates).await,
+            None,
+        )
+    };
     let all_deployed = report
         .iter()
         .all(|(_, outcome)| *outcome == MemberOutcome::Deployed);
-    // Once, at the end: mid-stack, a subgraph ahead of its router is expected.
-    let findings = if all_deployed {
-        crate::stack_sdl::check(&stack, sdl).await
-    } else {
-        Vec::new()
-    };
+    // A member that never reached its health step has no SDL finding.
+    let findings: Vec<SdlFinding> = stack
+        .members
+        .iter()
+        .zip(&report)
+        .filter(|(member, _)| member.sdl.is_some())
+        .filter_map(|(member, (_, outcome))| {
+            let verdict = match &candidate {
+                Candidate::Staged(_) => return gates.get(&member.name)?.finding(),
+                Candidate::NotChecked(why) => Verdict::NotChecked(why.clone()),
+                Candidate::Unreadable(why) if *outcome == MemberOutcome::Deployed => {
+                    Verdict::Unchecked(why.clone())
+                }
+                _ => return None,
+            };
+            Some(SdlFinding {
+                member: member.name.clone(),
+                verdict,
+            })
+        })
+        .collect();
     let (sdl_pretty, sdl_ok) = crate::stack_sdl::render(&findings);
     let ok = all_deployed && sdl_ok;
     let mut pretty = format!("stack {} ({}):\n", stack.name, stack.environment);
@@ -156,7 +272,9 @@ pub(crate) async fn stack_deploy_with(
         pretty.push('\n');
         members.push(json!({ "name": name, "outcome": tag, "detail": detail }));
     }
-    if !all_deployed {
+    if let Some(why) = &stopped {
+        let _ = writeln!(pretty, "  {why}");
+    } else if !all_deployed {
         pretty.push_str(
             "  members before the failure stay deployed; the failed member rolled itself back\n",
         );
@@ -170,6 +288,7 @@ pub(crate) async fn stack_deploy_with(
             "environment": stack.environment,
             "ok": ok,
             "members": members,
+            "error": stopped,
             "sdl": crate::stack_sdl::to_json(&findings),
         }),
     })
@@ -187,38 +306,79 @@ pub(crate) struct Deployer {
 
 #[async_trait]
 impl MemberDeployer for Deployer {
-    async fn deploy(&self, member: &Member, app_version: Option<&str>) -> Result<CommandOutput> {
-        crate::commands::deploy(
+    async fn deploy(
+        &self,
+        member: &Member,
+        app_version: Option<&str>,
+        gate: Option<&SdlGate>,
+    ) -> Result<CommandOutput> {
+        let guard = gate.map(|gate| move |health| gate.guard(health));
+        crate::commands::deploy_guarded(
             &member.config_path,
             &self.state_dir,
             None,
             app_version,
-            self.dry_run,
-            self.skip_preflight,
-            false,
+            (self.dry_run, self.skip_preflight, false),
+            guard
+                .as_ref()
+                .map(|g| g as crate::commands::HealthGuard<'_>),
         )
         .await
+    }
+
+    /// Stage through the router's own artifact adapter, as its deploy's fetch
+    /// step will: its deploy stages the same version again before activating.
+    async fn stage(&self, router: &Member, app_version: Option<&str>) -> Result<PathBuf> {
+        let plan = crate::factory::build_artifact_probe_at(&router.config, app_version)?;
+        let (host, _) = plan
+            .hosts
+            .first()
+            .cloned()
+            .context("the router has no host to stage on")?;
+        let mut ctx = plan.ctx;
+        ctx.host = Some(host.clone());
+        Ok(plan.artifact.stage(&ctx, &host).await?.path)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::Path;
-    use std::sync::Mutex;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use fraisier_config::stack::{Member, Stack, StackFile};
+    use fraisier_core::adapter_axes::{
+        AdapterCtx, AdapterError, HealthAdapter, HealthStatus, HostId,
+    };
 
     use super::{deploy_members, parse_versions, stack_deploy_with, MemberDeployer, MemberOutcome};
     use crate::commands::CommandOutput;
+    use crate::stack_sdl::SdlGate;
     use crate::test_env::block_on;
 
-    /// Records each deploy; the members named in `fail` fail.
+    /// Records each stage and deploy; the members named in `fail` fail, and so
+    /// does a member whose gate finds it unhealthy, as its saga would.
     #[derive(Default)]
     struct Fake {
         deployed: Mutex<Vec<String>>,
         fail: Vec<&'static str>,
+        /// What staging the router answers; `None` fails it.
+        candidate: Option<PathBuf>,
+    }
+
+    /// The member's own health check: always up.
+    struct Healthy;
+
+    #[async_trait]
+    impl HealthAdapter for Healthy {
+        async fn check(&self, _: &AdapterCtx, _: &HostId) -> Result<HealthStatus, AdapterError> {
+            Ok(HealthStatus {
+                healthy: true,
+                detail: None,
+            })
+        }
     }
 
     #[async_trait]
@@ -227,18 +387,33 @@ mod tests {
             &self,
             member: &Member,
             app_version: Option<&str>,
+            gate: Option<&SdlGate>,
         ) -> anyhow::Result<CommandOutput> {
             self.deployed.lock().expect("log").push(format!(
                 "{}@{}",
                 member.name,
                 app_version.unwrap_or("-")
             ));
-            let failed = self.fail.contains(&member.name.as_str());
+            let unhealthy = match gate {
+                None => None,
+                Some(gate) => {
+                    let status = gate
+                        .guard(Arc::new(Healthy))
+                        .check(
+                            &AdapterCtx::new(member.name.clone(), "staging"),
+                            &HostId::new("localhost"),
+                        )
+                        .await?;
+                    (!status.healthy).then(|| status.detail.unwrap_or_default())
+                }
+            };
+            let failed = self.fail.contains(&member.name.as_str()) || unhealthy.is_some();
+            let why = unhealthy.unwrap_or_else(|| "postgres://u:hunter2@db/x".to_owned());
             Ok(CommandOutput {
                 exit_code: i32::from(failed),
                 pretty: if failed {
                     format!(
-                        "deploy of {}/staging rolled_back (step 'health': postgres://u:hunter2@db/x)\n",
+                        "deploy of {}/staging rolled_back (step 'health': {why})\n",
                         member.name
                     )
                 } else {
@@ -246,6 +421,21 @@ mod tests {
                 },
                 json: serde_json::json!({}),
             })
+        }
+
+        async fn stage(
+            &self,
+            router: &Member,
+            app_version: Option<&str>,
+        ) -> anyhow::Result<PathBuf> {
+            self.deployed.lock().expect("log").push(format!(
+                "stage {}@{}",
+                router.name,
+                app_version.unwrap_or("-")
+            ));
+            self.candidate
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("download of the router release failed"))
         }
     }
 
@@ -274,7 +464,12 @@ mod tests {
     #[test]
     fn members_deploy_in_order() {
         let fake = Fake::default();
-        let report = block_on(deploy_members(&stack(), &BTreeMap::new(), &fake));
+        let report = block_on(deploy_members(
+            &stack(),
+            &BTreeMap::new(),
+            &fake,
+            &BTreeMap::new(),
+        ));
         assert_eq!(
             *fake.deployed.lock().expect("log"),
             vec!["billing@-", "management@-", "router@-"]
@@ -288,7 +483,12 @@ mod tests {
             fail: vec!["management"],
             ..Fake::default()
         };
-        let report = block_on(deploy_members(&stack(), &BTreeMap::new(), &fake));
+        let report = block_on(deploy_members(
+            &stack(),
+            &BTreeMap::new(),
+            &fake,
+            &BTreeMap::new(),
+        ));
         assert_eq!(
             *fake.deployed.lock().expect("log"),
             vec!["billing@-", "management@-"],
@@ -305,7 +505,7 @@ mod tests {
         let fake = Fake::default();
         let versions = parse_versions(&stack(), &["router=v3".to_owned(), "billing=v1".to_owned()])
             .expect("valid");
-        block_on(deploy_members(&stack(), &versions, &fake));
+        block_on(deploy_members(&stack(), &versions, &fake, &BTreeMap::new()));
         assert_eq!(
             *fake.deployed.lock().expect("log"),
             vec!["billing@v1", "management@-", "router@v3"]
@@ -323,31 +523,48 @@ mod tests {
         );
     }
 
-    /// Answers every SDL query: the live SDL differs when `.0` is set.
-    struct Sdl(bool);
+    /// Answers every SDL query, the live SDL differing when `differs` is set;
+    /// records each release file read and each query.
+    #[derive(Default)]
+    struct Sdl {
+        differs: bool,
+        read: Mutex<Vec<PathBuf>>,
+        asked: Mutex<Vec<String>>,
+    }
 
     #[async_trait]
     impl crate::stack_sdl::SdlSource for Sdl {
-        async fn live_sdl(&self, _: &str, _: &[(String, String)]) -> Result<String, String> {
-            Ok(if self.0 {
+        async fn live_sdl(&self, url: &str, _: &[(String, String)]) -> Result<String, String> {
+            self.asked.lock().expect("asked").push(url.to_owned());
+            Ok(if self.differs {
                 "type Query { b: Int }"
             } else {
                 "type Query { a: Int }"
             }
             .to_owned())
         }
-        fn served_sdl(&self, _: &Path) -> Result<String, String> {
+        fn served_sdl(&self, path: &Path) -> Result<String, String> {
+            self.read.lock().expect("read").push(path.to_owned());
             Ok("type Query { a: Int }".to_owned())
         }
     }
 
-    /// [`stack_dir`], with `router` as the router and `management` checked.
-    fn routed_stack_dir(dir: &Path) -> std::path::PathBuf {
+    fn sdl(differs: bool) -> Arc<Sdl> {
+        Arc::new(Sdl {
+            differs,
+            ..Sdl::default()
+        })
+    }
+
+    /// [`stack_dir`], with `router` as the router (`router_extra` appended to
+    /// its config) and `management` checked.
+    fn routed_stack_dir(dir: &Path, router_extra: &str) -> PathBuf {
         let path = stack_dir(dir);
         std::fs::write(
             dir.join("router.toml"),
             format!(
-                "{}[artifact]\nsource = \"local\"\nactive_path = \"/srv/router/current\"\n",
+                "{}[artifact]\nsource = \"local\"\nactive_path = \"/srv/router/current\"\n\
+                 {router_extra}",
                 member_toml("router")
             ),
         )
@@ -376,24 +593,82 @@ mod tests {
         path
     }
 
+    /// A staged router release: a directory.
+    fn candidate(dir: &Path) -> PathBuf {
+        let candidate = dir.join("releases/v3");
+        std::fs::create_dir_all(&candidate).expect("mkdir");
+        candidate
+    }
+
     #[test]
-    fn the_sdl_is_checked_once_every_member_deployed() {
+    fn a_subgraph_its_candidate_router_release_does_not_hold_fails_and_the_router_never_deploys() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = routed_stack_dir(dir.path());
-        let out =
-            block_on(stack_deploy_with(&path, &[], &Fake::default(), &Sdl(true))).expect("runs");
+        let path = routed_stack_dir(dir.path(), "");
+        let fake = Fake {
+            candidate: Some(candidate(dir.path())),
+            ..Fake::default()
+        };
+        let source = sdl(true);
+        let out = block_on(stack_deploy_with(
+            &path,
+            &["router=v3".to_owned()],
+            &fake,
+            source.clone(),
+            false,
+        ))
+        .expect("runs");
         assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert_eq!(
+            *fake.deployed.lock().expect("log"),
+            vec!["stage router@v3", "billing@-", "management@-"],
+            "the candidate is staged first; the router never deploys"
+        );
+        assert_eq!(
+            *source.read.lock().expect("read"),
+            vec![candidate(dir.path()).join("sdl/management.graphql")],
+            "the SDL is read from the candidate, not the active release"
+        );
+        assert!(
+            out.pretty.contains(
+                "failed    management: deploy of management/staging rolled_back (step 'health'"
+            ),
+            "{}",
+            out.pretty
+        );
+        assert!(out.pretty.contains("skipped   router"), "{}", out.pretty);
         assert!(
             out.pretty.contains("  sdl management: DIFFERS"),
             "{}",
             out.pretty
         );
-        assert_eq!(out.json["ok"], serde_json::json!(false));
         assert_eq!(out.json["sdl"][0]["matches"], serde_json::json!(false));
+        assert_eq!(
+            out.json["members"][2]["outcome"],
+            serde_json::json!("skipped")
+        );
+    }
 
-        let out =
-            block_on(stack_deploy_with(&path, &[], &Fake::default(), &Sdl(false))).expect("runs");
+    #[test]
+    fn subgraphs_that_match_the_candidate_deploy_before_the_router() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = routed_stack_dir(dir.path(), "");
+        let fake = Fake {
+            candidate: Some(candidate(dir.path())),
+            ..Fake::default()
+        };
+        let out = block_on(stack_deploy_with(
+            &path,
+            &["router=v3".to_owned()],
+            &fake,
+            sdl(false),
+            false,
+        ))
+        .expect("runs");
         assert_eq!(out.exit_code, 0, "{}", out.pretty);
+        assert_eq!(
+            *fake.deployed.lock().expect("log"),
+            vec!["stage router@v3", "billing@-", "management@-", "router@v3"]
+        );
         assert!(
             out.pretty.contains("  sdl management: matches"),
             "{}",
@@ -402,16 +677,143 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_stack_deploy_checks_no_sdl() {
+    fn a_dry_run_stages_nothing_asks_no_sdl_and_says_so() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = routed_stack_dir(dir.path());
+        let path = routed_stack_dir(dir.path(), "");
+        let fake = Fake::default();
+        let source = sdl(true);
+        let out =
+            block_on(stack_deploy_with(&path, &[], &fake, source.clone(), true)).expect("runs");
+        assert_eq!(out.exit_code, 0, "{}", out.pretty);
+        assert_eq!(
+            *fake.deployed.lock().expect("log"),
+            vec!["billing@-", "management@-", "router@-"]
+        );
+        assert!(source.asked.lock().expect("asked").is_empty());
+        assert!(source.read.lock().expect("read").is_empty());
+        assert!(
+            out.pretty
+                .contains("  sdl management: not checked (dry run)"),
+            "{}",
+            out.pretty
+        );
+        assert_eq!(out.json["sdl"][0]["skipped"], serde_json::json!("dry run"));
+    }
+
+    #[test]
+    fn a_router_on_hosts_is_unchecked_never_green() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = routed_stack_dir(
+            dir.path(),
+            "[hosts]\nstrategy = \"rolling\"\n\
+             inventory = [{ name = \"gw-1\", address = \"10.0.0.1\" }]\n",
+        );
+        let fake = Fake::default();
+        let source = sdl(false);
+        let out =
+            block_on(stack_deploy_with(&path, &[], &fake, source.clone(), false)).expect("runs");
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert_eq!(
+            *fake.deployed.lock().expect("log"),
+            vec!["billing@-", "management@-", "router@-"],
+            "nothing is staged locally for a router on its hosts"
+        );
+        assert!(source.read.lock().expect("read").is_empty());
+        assert!(
+            out.pretty.contains(
+                "  sdl management: UNCHECKED\n      the router 'router' deploys through [hosts]"
+            ),
+            "{}",
+            out.pretty
+        );
+    }
+
+    #[test]
+    fn a_router_release_that_cannot_be_staged_deploys_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = routed_stack_dir(dir.path(), "");
+        let fake = Fake::default();
+        let out = block_on(stack_deploy_with(&path, &[], &fake, sdl(false), false)).expect("runs");
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert_eq!(*fake.deployed.lock().expect("log"), vec!["stage router@-"]);
+        assert!(
+            out.pretty.contains(
+                "the router's candidate release could not be staged, so nothing deployed: \
+                 download of the router release failed"
+            ),
+            "{}",
+            out.pretty
+        );
+        assert!(out.pretty.contains("skipped   billing"), "{}", out.pretty);
+    }
+
+    #[test]
+    fn a_router_release_that_is_not_a_directory_is_unchecked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = routed_stack_dir(dir.path(), "");
+        let file = dir.path().join("router-v3.tar.gz");
+        std::fs::write(&file, "bytes").expect("write");
         let fake = Fake {
-            fail: vec!["billing"],
+            candidate: Some(file),
             ..Fake::default()
         };
-        let out = block_on(stack_deploy_with(&path, &[], &fake, &Sdl(true))).expect("runs");
+        let out = block_on(stack_deploy_with(&path, &[], &fake, sdl(false), false)).expect("runs");
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(
+            out.pretty.contains("  sdl management: UNCHECKED"),
+            "{}",
+            out.pretty
+        );
+        assert!(out.pretty.contains("not a directory"), "{}", out.pretty);
+    }
+
+    #[test]
+    fn a_failed_stack_deploy_checks_no_sdl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = routed_stack_dir(dir.path(), "");
+        let fake = Fake {
+            fail: vec!["billing"],
+            candidate: Some(candidate(dir.path())),
+            ..Fake::default()
+        };
+        let out = block_on(stack_deploy_with(&path, &[], &fake, sdl(true), false)).expect("runs");
         assert_eq!(out.exit_code, 1, "{}", out.pretty);
         assert!(!out.pretty.contains("sdl"), "{}", out.pretty);
+    }
+
+    #[test]
+    fn the_real_deployer_stages_the_router_release_without_activating_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let build = dir.path().join("build");
+        std::fs::create_dir_all(build.join("sdl")).expect("mkdir");
+        std::fs::write(build.join("sdl/billing.graphql"), "type Query { a: Int }").expect("sdl");
+        let config = format!(
+            "{}[artifact]\nsource = \"local\"\npath = \"{}\"\nactive_path = \"{}\"\n\
+             staging_dir = \"{}\"\n",
+            member_toml("router"),
+            build.display(),
+            dir.path().join("current").display(),
+            dir.path().join("releases").display()
+        );
+        let router = Member {
+            name: "router".to_owned(),
+            config_path: dir.path().join("router.toml"),
+            config: fraisier_config::DeployConfig::from_toml_str(&config).expect("parses"),
+            depends_on: Vec::new(),
+            sdl: None,
+        };
+        let deployer = super::Deployer {
+            state_dir: dir.path().join("state"),
+            dry_run: false,
+            skip_preflight: false,
+        };
+        let staged = block_on(deployer.stage(&router, Some("v3"))).expect("staged");
+        assert_eq!(staged, dir.path().join("releases/v3"));
+        assert!(staged.join("sdl/billing.graphql").is_file());
+        assert!(
+            !dir.path().join("current").exists(),
+            "staging activates nothing"
+        );
     }
 
     fn stack_dir(dir: &Path) -> std::path::PathBuf {
@@ -431,7 +833,7 @@ mod tests {
             fail: vec!["management"],
             ..Fake::default()
         };
-        let out = block_on(stack_deploy_with(&path, &[], &fake, &Sdl(false))).expect("runs");
+        let out = block_on(stack_deploy_with(&path, &[], &fake, sdl(false), false)).expect("runs");
         assert_eq!(out.exit_code, 1, "{}", out.pretty);
         assert!(out.pretty.contains("deployed  billing"), "{}", out.pretty);
         assert!(
@@ -448,8 +850,14 @@ mod tests {
         );
         assert!(!out.json.to_string().contains("hunter2"));
 
-        let out =
-            block_on(stack_deploy_with(&path, &[], &Fake::default(), &Sdl(false))).expect("runs");
+        let out = block_on(stack_deploy_with(
+            &path,
+            &[],
+            &Fake::default(),
+            sdl(false),
+            false,
+        ))
+        .expect("runs");
         assert_eq!(out.exit_code, 0, "{}", out.pretty);
     }
 
@@ -459,7 +867,7 @@ mod tests {
         let path = stack_dir(dir.path());
         std::fs::remove_file(dir.path().join("billing.toml")).expect("rm");
         let fake = Fake::default();
-        let out = block_on(stack_deploy_with(&path, &[], &fake, &Sdl(false))).expect("runs");
+        let out = block_on(stack_deploy_with(&path, &[], &fake, sdl(false), false)).expect("runs");
         assert_eq!(out.exit_code, 1, "{}", out.pretty);
         assert!(out.pretty.contains("billing.toml"), "{}", out.pretty);
         assert!(fake.deployed.lock().expect("log").is_empty());

@@ -230,7 +230,7 @@ impl Stack {
             )])
         })?;
         let mut slots: Vec<Option<Member>> = members.into_iter().map(Some).collect();
-        Ok(Self {
+        let stack = Self {
             name: name.unwrap_or_default(),
             environment: environment.unwrap_or_default(),
             router: section.router.clone(),
@@ -238,7 +238,12 @@ impl Stack {
                 .into_iter()
                 .filter_map(|index| slots.get_mut(index).and_then(Option::take))
                 .collect(),
-        })
+        };
+        let early = stack.subgraphs_after_the_router();
+        if !early.is_empty() {
+            return Err(StackError(early));
+        }
+        Ok(stack)
     }
 }
 
@@ -279,6 +284,29 @@ fn moved_keys(toml: &str) -> Vec<String> {
         }
     }
     problems
+}
+
+impl Stack {
+    /// Each member with `sdl` that deploys after the router. The router must
+    /// come last: a subgraph whose SDL its candidate release does not hold
+    /// fails before the router is committed.
+    fn subgraphs_after_the_router(&self) -> Vec<String> {
+        let Some(router) = self.router.as_deref() else {
+            return Vec::new();
+        };
+        self.members
+            .iter()
+            .skip_while(|m| m.name != router)
+            .filter(|m| m.sdl.is_some())
+            .map(|m| {
+                format!(
+                    "the router '{router}' deploys before '{}', whose SDL its release holds: \
+                     add '{}' to its depends_on",
+                    m.name, m.name
+                )
+            })
+            .collect()
+    }
 }
 
 /// Duplicate member names, and dependencies that name no member.
@@ -323,6 +351,15 @@ fn sdl_problems(router: Option<&str>, members: &[Member]) -> Vec<String> {
         if member.sdl.is_some() && member.graphql_url().is_none() {
             problems.push(format!(
                 "member '{name}' has sdl, but its config has no [federation].graphql_url"
+            ));
+        }
+        // The check runs in the member's health step; a blue-green deploy
+        // probes its green fleet instead, which the stack does not gate.
+        let strategy = member.config.deploy.as_ref().and_then(|d| d.strategy.as_deref());
+        if member.sdl.is_some() && strategy == Some("blue-green") {
+            problems.push(format!(
+                "member '{name}' has sdl, but deploys blue-green; the SDL check runs in a \
+                 single- or multi-host deploy's health step"
             ));
         }
         if let Some(sdl) = &member.sdl {
@@ -640,6 +677,59 @@ mod tests {
         assert!(
             on_router.iter().any(|p| p.contains("the router")),
             "{on_router:?}"
+        );
+    }
+
+    #[test]
+    fn the_router_deploys_after_every_subgraph_it_checks() {
+        let problems = resolve(
+            &format!(
+                "{HEAD}router = \"gateway\"\n\
+                 [[stack.member]]\nconfig = \"gateway.toml\"\n\
+                 [[stack.member]]\nconfig = \"management.toml\"\n\
+                 sdl = \"federation/sdl/management.graphql\"\n"
+            ),
+            &[
+                ("gateway.toml", router("gateway")),
+                ("management.toml", subgraph("management")),
+            ],
+        )
+        .expect_err("the router deploys first");
+        assert_eq!(
+            problems,
+            vec![
+                "the router 'gateway' deploys before 'management', whose SDL its release \
+                 holds: add 'management' to its depends_on"
+                    .to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_checked_subgraph_is_not_a_blue_green_deploy() {
+        let problems = resolve(
+            &format!(
+                "{HEAD}router = \"gateway\"\n\
+                 [[stack.member]]\nconfig = \"gateway.toml\"\ndepends_on = [\"management\"]\n\
+                 [[stack.member]]\nconfig = \"management.toml\"\n\
+                 sdl = \"federation/sdl/management.graphql\"\n"
+            ),
+            &[
+                ("gateway.toml", router("gateway")),
+                (
+                    "management.toml",
+                    subgraph("management").replace(
+                        "environment = \"staging\"\n",
+                        "environment = \"staging\"\nstrategy = \"blue-green\"\n",
+                    ),
+                ),
+            ],
+        )
+        .expect_err("blue-green");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("member 'management' has sdl, but deploys blue-green"),
+            "{problems:?}"
         );
     }
 

@@ -3,19 +3,27 @@
 //!
 //! The application's build composes the supergraph from the committed SDL
 //! files and the router serves it; fraisier never composes. What it checks is
-//! that each deployed subgraph still serves the SDL the router's release was
-//! composed from. A subgraph deployed with a new schema under a router still
-//! serving the old supergraph is a silent break, so a difference fails.
+//! that each subgraph serves the SDL the router's release was composed from. A
+//! subgraph deployed with a new schema under a router still serving the old
+//! supergraph is a silent break, so a difference fails.
+//!
+//! `stack deploy` prevents it: the router's candidate release is staged first,
+//! and each subgraph's health step compares against it ([`SdlGate`]). A
+//! difference fails that member's health, so its saga rolls it back and the
+//! router is never committed. `stack status` detects it after the fact,
+//! against the router's active release ([`check`]).
 //!
 //! The comparison is the pilot's (`scripts/ci/live_sdl_matches.py`): exact,
 //! except that trailing newlines are not a difference.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use fraisier_config::stack::Stack;
-use fraisier_core::adapter_axes::AdapterCtx;
+use fraisier_adapter_http::HttpHealth;
+use fraisier_config::stack::{Member, Stack};
+use fraisier_core::adapter_axes::{AdapterCtx, AdapterError, HealthAdapter, HealthStatus, HostId};
 
 /// Where the two SDLs come from.
 #[async_trait]
@@ -33,16 +41,52 @@ pub(crate) trait SdlSource: Send + Sync {
     fn served_sdl(&self, path: &Path) -> Result<String, String>;
 }
 
-/// One member's check: `None` when its live SDL is the one the router serves.
+/// What one member's check found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// The live SDL is the one the router's release holds.
+    Matches,
+    /// Both SDLs were read, and they differ: why.
+    Differs(String),
+    /// The check could not run: why. A failure, but not a difference.
+    Unchecked(String),
+    /// The check was not run, on purpose: why (a dry run).
+    NotChecked(String),
+}
+
+impl Verdict {
+    /// Whether this verdict lets the command succeed.
+    const fn ok(&self) -> bool {
+        matches!(self, Self::Matches | Self::NotChecked(_))
+    }
+
+    /// Why the subgraph fails, if it does.
+    fn problem(&self) -> Option<&str> {
+        match self {
+            Self::Differs(why) | Self::Unchecked(why) => Some(why),
+            Self::Matches | Self::NotChecked(_) => None,
+        }
+    }
+
+    /// `Ok`'s difference, if any, as a verdict; `Err` as one that did not run.
+    /// Credentials are redacted from either.
+    fn of(compared: Result<Option<String>, String>) -> Self {
+        let redact = |why: String| fraisier_saga::redact::credentials(&why);
+        match compared {
+            Ok(None) => Self::Matches,
+            Ok(Some(why)) => Self::Differs(redact(why)),
+            Err(why) => Self::Unchecked(redact(why)),
+        }
+    }
+}
+
+/// One member's check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SdlFinding {
     /// The member.
     pub(crate) member: String,
-    /// Why it does not match, or could not be checked.
-    pub(crate) problem: Option<String>,
-    /// Whether both SDLs were read and compared; a problem without a
-    /// comparison is a check that could not run, not a difference.
-    pub(crate) compared: bool,
+    /// What the check found.
+    pub(crate) verdict: Verdict,
 }
 
 /// Where `live` first differs from `served`, or `None` when they agree.
@@ -81,67 +125,89 @@ fn clip(text: &str) -> String {
     format!("{}…", text.chars().take(MAX).collect::<String>())
 }
 
-/// `findings` as report lines, and whether every member matched.
+/// `findings` as report lines, and whether every member passed.
 pub(crate) fn render(findings: &[SdlFinding]) -> (String, bool) {
     let mut pretty = String::new();
     for finding in findings {
-        match &finding.problem {
-            None => {
-                let _ = writeln!(pretty, "  sdl {}: matches", finding.member);
-            }
-            Some(why) => {
-                let verdict = if finding.compared {
-                    "DIFFERS"
-                } else {
-                    "UNCHECKED"
-                };
-                let _ = writeln!(pretty, "  sdl {}: {verdict}\n      {why}", finding.member);
-            }
-        }
+        let member = &finding.member;
+        let _ = match &finding.verdict {
+            Verdict::Matches => writeln!(pretty, "  sdl {member}: matches"),
+            Verdict::Differs(why) => writeln!(pretty, "  sdl {member}: DIFFERS\n      {why}"),
+            Verdict::Unchecked(why) => writeln!(pretty, "  sdl {member}: UNCHECKED\n      {why}"),
+            Verdict::NotChecked(why) => writeln!(pretty, "  sdl {member}: not checked ({why})"),
+        };
     }
-    (pretty, findings.iter().all(|f| f.problem.is_none()))
+    (pretty, findings.iter().all(|f| f.verdict.ok()))
 }
 
-/// `findings` as JSON.
+/// `findings` as JSON. `matches` is `null` for a check not run on purpose.
 pub(crate) fn to_json(findings: &[SdlFinding]) -> serde_json::Value {
     findings
         .iter()
         .map(|finding| {
+            let (matches, checked) = match &finding.verdict {
+                Verdict::Matches => (Some(true), true),
+                Verdict::Differs(_) => (Some(false), true),
+                Verdict::Unchecked(_) => (Some(false), false),
+                Verdict::NotChecked(_) => (None, false),
+            };
+            let skipped = match &finding.verdict {
+                Verdict::NotChecked(why) => Some(why),
+                _ => None,
+            };
             serde_json::json!({
                 "member": finding.member,
-                "matches": finding.problem.is_none(),
-                "checked": finding.compared,
-                "problem": finding.problem,
+                "matches": matches,
+                "checked": checked,
+                "problem": finding.verdict.problem(),
+                "skipped": skipped,
             })
         })
         .collect()
 }
 
-/// Check every member with `sdl` against the router's release. Nothing is
-/// checked in a stack without a router.
+/// Why a router deployed through `[hosts]` is not checked: its releases live
+/// on its hosts, and fraisier reads SDL files only where it runs.
+pub(crate) fn on_hosts(router: &str) -> String {
+    format!(
+        "the router '{router}' deploys through [hosts], so its release is on its hosts; \
+         fraisier reads SDL files only on the host it runs on"
+    )
+}
+
+/// Check every member with `sdl` against the router's *active* release, after
+/// the fact (`stack status`). Nothing is checked in a stack without a router.
 pub(crate) async fn check(stack: &Stack, source: &dyn SdlSource) -> Vec<SdlFinding> {
-    let Some(release) = stack
+    let Some(router) = stack
         .router
         .as_deref()
         .and_then(|router| stack.members.iter().find(|m| m.name == router))
-        .and_then(|router| router.config.artifact.as_ref()?.active_path.clone())
     else {
         return Vec::new();
     };
+    let release = router
+        .config
+        .artifact
+        .as_ref()
+        .and_then(|a| a.active_path.clone());
     let mut findings = Vec::new();
     for member in &stack.members {
         let (Some(sdl), Some(url)) = (&member.sdl, member.graphql_url()) else {
             continue;
         };
-        let ctx = crate::factory::health_ctx(&member.config);
-        let (compared, problem) = match check_member(&release.join(sdl), url, &ctx, source).await {
-            Ok(difference) => (true, difference),
-            Err(why) => (false, Some(why)),
+        let verdict = match &release {
+            _ if router.config.hosts.is_some() => Verdict::Unchecked(on_hosts(&router.name)),
+            None => continue,
+            Some(release) => {
+                let ctx = crate::factory::health_ctx(&member.config);
+                Verdict::of(
+                    compare(&release.join(sdl), url, &ctx, &HttpHealth::new(), source).await,
+                )
+            }
         };
         findings.push(SdlFinding {
             member: member.name.clone(),
-            problem: problem.map(|why| fraisier_saga::redact::credentials(&why)),
-            compared,
+            verdict,
         });
     }
     findings
@@ -149,17 +215,19 @@ pub(crate) async fn check(stack: &Stack, source: &dyn SdlSource) -> Vec<SdlFindi
 
 /// Compare one member's SDLs: `Ok` with the difference, if any, once both were
 /// read; `Err` when the check could not run. The query sends the headers the
-/// member's own health probe sends, resolved from `ctx`.
-async fn check_member(
+/// member's own health probe sends (`http`, resolving them from `ctx`); their
+/// values never appear in the result.
+async fn compare(
     served_path: &Path,
     url: &str,
     ctx: &AdapterCtx,
+    http: &HttpHealth,
     source: &dyn SdlSource,
 ) -> Result<Option<String>, String> {
     let served = source
         .served_sdl(served_path)
         .map_err(|error| format!("cannot read {}: {error}", served_path.display()))?;
-    let headers = fraisier_adapter_http::HttpHealth::new()
+    let headers = http
         .resolve_headers(ctx)
         .await
         .map_err(|error| format!("cannot ask {url} for its SDL: {error}"))?;
@@ -180,6 +248,102 @@ async fn check_member(
             served_path.display()
         ))
     }))
+}
+
+/// One subgraph's check inside its deploy's health step, against the SDL file
+/// in the router's *candidate* release. [`SdlGate::guard`] wraps the member's
+/// health adapter: once the member is healthy, a difference, or a check that
+/// cannot run, makes it unhealthy, so its saga rolls it back.
+#[derive(Clone)]
+pub(crate) struct SdlGate {
+    member: String,
+    served: PathBuf,
+    url: String,
+    source: Arc<dyn SdlSource>,
+    /// The first failing verdict, or the last match; `None` until the member
+    /// was healthy enough to be asked.
+    verdict: Arc<Mutex<Option<Verdict>>>,
+}
+
+impl SdlGate {
+    /// `member`'s gate: its live SDL at its `[federation].graphql_url` against
+    /// `candidate`, the router's staged release. `None` without `sdl` or URL.
+    pub(crate) fn new(
+        member: &Member,
+        candidate: &Path,
+        source: Arc<dyn SdlSource>,
+    ) -> Option<Self> {
+        Some(Self {
+            member: member.name.clone(),
+            served: candidate.join(member.sdl.as_ref()?),
+            url: member.graphql_url()?.to_owned(),
+            source,
+            verdict: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// `inner`, with this check after it.
+    pub(crate) fn guard(&self, inner: Arc<dyn HealthAdapter>) -> Arc<dyn HealthAdapter> {
+        Arc::new(Guarded {
+            inner,
+            gate: self.clone(),
+            http: HttpHealth::new(),
+        })
+    }
+
+    /// Keep `verdict`, unless an earlier host already failed.
+    fn record(&self, verdict: Verdict) {
+        if let Ok(mut kept) = self.verdict.lock() {
+            if kept.as_ref().is_none_or(Verdict::ok) {
+                *kept = Some(verdict);
+            }
+        }
+    }
+
+    /// What the check found, or `None` when the health step never asked.
+    pub(crate) fn finding(&self) -> Option<SdlFinding> {
+        let verdict = self.verdict.lock().ok()?.clone()?;
+        Some(SdlFinding {
+            member: self.member.clone(),
+            verdict,
+        })
+    }
+}
+
+/// A member's health adapter, then its [`SdlGate`].
+struct Guarded {
+    inner: Arc<dyn HealthAdapter>,
+    gate: SdlGate,
+    /// Resolves the member's `[health]` headers for the query, its token
+    /// provider at most once.
+    http: HttpHealth,
+}
+
+#[async_trait]
+impl HealthAdapter for Guarded {
+    async fn check(&self, ctx: &AdapterCtx, host: &HostId) -> Result<HealthStatus, AdapterError> {
+        let status = self.inner.check(ctx, host).await?;
+        if !status.healthy {
+            return Ok(status);
+        }
+        let gate = &self.gate;
+        let verdict = Verdict::of(
+            compare(
+                &gate.served,
+                &gate.url,
+                ctx,
+                &self.http,
+                gate.source.as_ref(),
+            )
+            .await,
+        );
+        let problem = verdict.problem().map(ToOwned::to_owned);
+        gate.record(verdict);
+        Ok(problem.map_or(status, |why| HealthStatus {
+            healthy: false,
+            detail: Some(why),
+        }))
+    }
 }
 
 /// The real source: an HTTP POST of `{ _service { sdl } }`, and the file system.
@@ -232,7 +396,13 @@ mod tests {
     use async_trait::async_trait;
     use fraisier_config::stack::{Stack, StackFile};
 
-    use super::{check, sdl_difference, SdlFinding, SdlSource};
+    use std::sync::Arc;
+
+    use fraisier_core::adapter_axes::{
+        AdapterCtx, AdapterError, HealthAdapter, HealthStatus, HostId,
+    };
+
+    use super::{check, sdl_difference, SdlFinding, SdlGate, SdlSource, Verdict};
     use crate::test_env::block_on;
 
     const SDL: &str =
@@ -362,15 +532,10 @@ mod tests {
             ..Fake::default()
         };
         let findings = block_on(check(&stack(true), &fake));
-        assert_eq!(
-            findings[0],
-            SdlFinding {
-                member: "billing".to_owned(),
-                problem: findings[0].problem.clone(),
-                compared: true,
-            }
-        );
-        let billing = findings[0].problem.as_deref().expect("billing differs");
+        assert_eq!(findings[0].member, "billing");
+        let Verdict::Differs(billing) = &findings[0].verdict else {
+            panic!("billing differs: {findings:?}");
+        };
         assert!(billing.contains("Invoice"), "{billing}");
         assert!(
             billing.contains("/srv/gateway/current/federation/sdl/billing.graphql"),
@@ -380,8 +545,7 @@ mod tests {
             findings[1],
             SdlFinding {
                 member: "management".to_owned(),
-                problem: None,
-                compared: true,
+                verdict: Verdict::Matches,
             }
         );
         assert_eq!(findings.len(), 2, "the router has no sdl");
@@ -401,10 +565,12 @@ mod tests {
             ..Fake::default()
         };
         let findings = block_on(check(&stack_with(true, "[\"false\"]"), &fake));
-        assert!(!findings[0].compared && !findings[1].compared);
-        let billing = findings[0].problem.as_deref().expect("no token");
+        let (Verdict::Unchecked(billing), Verdict::Unchecked(management)) =
+            (&findings[0].verdict, &findings[1].verdict)
+        else {
+            panic!("neither could run: {findings:?}");
+        };
         assert!(billing.contains("token"), "{billing}");
-        let management = findings[1].problem.as_deref().expect("unservable");
         assert!(management.contains("No such file"), "{management}");
         assert!(
             fake.asked.lock().expect("asked").is_empty(),
@@ -419,22 +585,26 @@ mod tests {
             ..Fake::default()
         };
         let findings = block_on(check(&stack(true), &fake));
-        let management = findings[1].problem.as_deref().expect("refused");
+        let Verdict::Unchecked(management) = &findings[1].verdict else {
+            panic!("refused: {findings:?}");
+        };
         assert!(management.contains("connection refused"), "{management}");
         assert!(!management.contains("s3cret"), "{management}");
     }
 
+    fn finding(verdict: Verdict) -> SdlFinding {
+        SdlFinding {
+            member: "m".to_owned(),
+            verdict,
+        }
+    }
+
     #[test]
     fn a_check_that_could_not_run_is_not_called_a_difference() {
-        let finding = |problem: Option<&str>, compared| SdlFinding {
-            member: "m".to_owned(),
-            problem: problem.map(ToOwned::to_owned),
-            compared,
-        };
         let (pretty, ok) = super::render(&[
-            finding(None, true),
-            finding(Some("they differ at line 2"), true),
-            finding(Some("cannot read sdl/m.graphql"), false),
+            finding(Verdict::Matches),
+            finding(Verdict::Differs("they differ at line 2".to_owned())),
+            finding(Verdict::Unchecked("cannot read sdl/m.graphql".to_owned())),
         ]);
         assert!(!ok);
         assert_eq!(
@@ -442,9 +612,145 @@ mod tests {
             "  sdl m: matches\n  sdl m: DIFFERS\n      they differ at line 2\n  \
              sdl m: UNCHECKED\n      cannot read sdl/m.graphql\n"
         );
-        let json = super::to_json(&[finding(Some("cannot read"), false)]);
+        let json = super::to_json(&[finding(Verdict::Unchecked("cannot read".to_owned()))]);
         assert_eq!(json[0]["checked"], serde_json::json!(false));
         assert_eq!(json[0]["matches"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn a_check_not_run_on_purpose_says_why_and_fails_nothing() {
+        let (pretty, ok) = super::render(&[finding(Verdict::NotChecked("dry run".to_owned()))]);
+        assert!(ok);
+        assert_eq!(pretty, "  sdl m: not checked (dry run)\n");
+        let json = super::to_json(&[finding(Verdict::NotChecked("dry run".to_owned()))]);
+        assert_eq!(json[0]["matches"], serde_json::Value::Null);
+        assert_eq!(json[0]["checked"], serde_json::json!(false));
+        assert_eq!(json[0]["skipped"], serde_json::json!("dry run"));
+    }
+
+    #[test]
+    fn a_router_on_hosts_is_unchecked_and_never_read_locally() {
+        let mut stack = stack(true);
+        let gateway = stack
+            .members
+            .iter_mut()
+            .find(|m| m.name == "gateway")
+            .expect("router");
+        gateway.config.hosts = Some(fraisier_config::HostsSection::default());
+        let fake = Fake {
+            served: BTreeMap::from([
+                (served("management"), SDL.to_owned()),
+                (served("billing"), SDL.to_owned()),
+            ]),
+            ..Fake::default()
+        };
+        let findings = block_on(check(&stack, &fake));
+        assert_eq!(findings.len(), 2);
+        for finding in &findings {
+            let Verdict::Unchecked(why) = &finding.verdict else {
+                panic!("a [hosts] router is never green: {findings:?}");
+            };
+            assert!(
+                why.contains("the router 'gateway' deploys through [hosts]"),
+                "{why}"
+            );
+        }
+        assert!(fake.asked.lock().expect("asked").is_empty());
+    }
+
+    /// A health adapter that answers `.0`.
+    struct Up(bool);
+
+    #[async_trait]
+    impl HealthAdapter for Up {
+        async fn check(&self, _: &AdapterCtx, _: &HostId) -> Result<HealthStatus, AdapterError> {
+            Ok(HealthStatus {
+                healthy: self.0,
+                detail: Some("HTTP 200".to_owned()),
+            })
+        }
+    }
+
+    /// Billing's gate against a candidate release at `/srv/gateway/releases/v2`.
+    fn gate(fake: Arc<Fake>) -> (SdlGate, PathBuf) {
+        let stack = stack(true);
+        let billing = stack
+            .members
+            .iter()
+            .find(|m| m.name == "billing")
+            .expect("billing");
+        let candidate = Path::new("/srv/gateway/releases/v2");
+        let gate = SdlGate::new(billing, candidate, fake).expect("billing has sdl");
+        (gate, candidate.join("federation/sdl/billing.graphql"))
+    }
+
+    fn probe(health: &dyn HealthAdapter) -> HealthStatus {
+        block_on(health.check(
+            &AdapterCtx::new("billing", "staging"),
+            &HostId::new("localhost"),
+        ))
+        .expect("probed")
+    }
+
+    #[test]
+    fn the_gate_fails_a_healthy_subgraph_its_candidate_router_release_does_not_hold() {
+        let candidate = PathBuf::from("/srv/gateway/releases/v2/federation/sdl/billing.graphql");
+        let fake = Arc::new(Fake {
+            live: BTreeMap::from([("http://b/graphql", Ok(SDL.replace("Order", "Invoice")))]),
+            served: BTreeMap::from([(candidate.clone(), SDL.to_owned())]),
+            ..Fake::default()
+        });
+        let (gate, served) = gate(Arc::clone(&fake));
+        assert_eq!(served, candidate);
+        let status = probe(gate.guard(Arc::new(Up(true))).as_ref());
+        assert!(!status.healthy, "{status:?}");
+        let detail = status.detail.expect("why");
+        assert!(
+            detail.contains(&candidate.display().to_string()),
+            "{detail}"
+        );
+        assert!(detail.contains("Invoice"), "{detail}");
+        assert!(matches!(
+            gate.finding().expect("asked").verdict,
+            Verdict::Differs(_)
+        ));
+    }
+
+    #[test]
+    fn the_gate_passes_a_matching_subgraph_and_never_asks_an_unhealthy_one() {
+        let candidate = PathBuf::from("/srv/gateway/releases/v2/federation/sdl/billing.graphql");
+        let fake = Arc::new(Fake {
+            live: BTreeMap::from([("http://b/graphql", Ok(SDL.to_owned()))]),
+            served: BTreeMap::from([(candidate, SDL.to_owned())]),
+            ..Fake::default()
+        });
+        let (gate, _) = gate(Arc::clone(&fake));
+        assert!(!probe(gate.guard(Arc::new(Up(false))).as_ref()).healthy);
+        assert_eq!(gate.finding(), None, "an unhealthy subgraph is not asked");
+        assert!(fake.asked.lock().expect("asked").is_empty());
+
+        let status = probe(gate.guard(Arc::new(Up(true))).as_ref());
+        assert!(status.healthy, "{status:?}");
+        assert_eq!(gate.finding().expect("asked").verdict, Verdict::Matches);
+    }
+
+    #[test]
+    fn the_gate_fails_closed_when_its_check_cannot_run() {
+        let fake = Arc::new(Fake::default());
+        let (gate, served) = gate(fake);
+        let status = probe(gate.guard(Arc::new(Up(true))).as_ref());
+        assert!(!status.healthy, "{status:?}");
+        assert!(
+            status
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains(&format!("cannot read {}", served.display()))),
+            "{status:?}"
+        );
+        assert!(matches!(
+            gate.finding().expect("asked").verdict,
+            Verdict::Unchecked(_)
+        ));
     }
 
     #[test]

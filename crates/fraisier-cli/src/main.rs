@@ -350,6 +350,12 @@ struct DeployArgs {
     /// real deploy, which a policy block fails outright.
     #[arg(long)]
     fail_on_block: bool,
+
+    /// With `--dry-run` under a fresh-dump restore rehearsal, classify against a
+    /// throwaway restored from a fresh dump of the live database, as the deploy
+    /// will. Without it the dry run classifies statically and dumps nothing.
+    #[arg(long, requires = "dry_run")]
+    deep: bool,
 }
 
 #[derive(Debug, Args)]
@@ -776,6 +782,11 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
                 args.dry_run,
                 args.skip_preflight,
                 args.fail_on_block,
+                if args.deep {
+                    preview::Depth::Deep
+                } else {
+                    preview::Depth::Static
+                },
             )
             .await
         }
@@ -1131,6 +1142,19 @@ mod cli_tests {
     fn deploy_accepts_fail_on_block_beside_dry_run() {
         assert!(
             Cli::try_parse_from(["fraisier", "deploy", "--dry-run", "--fail-on-block"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn deploy_accepts_deep_beside_dry_run() {
+        assert!(Cli::try_parse_from(["fraisier", "deploy", "--dry-run", "--deep"]).is_ok());
+    }
+
+    #[test]
+    fn deploy_refuses_deep_without_dry_run() {
+        assert!(
+            Cli::try_parse_from(["fraisier", "deploy", "--deep"]).is_err(),
+            "a real deploy always classifies the way its config says"
         );
     }
 

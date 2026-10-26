@@ -18,7 +18,7 @@ use fraisier_saga::state_store::{FilesystemStateStore, FraiseKey, StateStore};
 use serde_json::{json, Value};
 
 use crate::factory;
-use crate::preview::{self, SchemaPreview, Unavailable};
+use crate::preview::{self, Depth, SchemaPreview, Unavailable};
 
 /// The result of a command: an exit code and both renderings of its output.
 pub(crate) struct CommandOutput {
@@ -268,6 +268,7 @@ pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
         false,
         false,
         false,
+        Depth::Static,
     )
     .await?;
     pretty.push_str(&deploy_out.pretty);
@@ -1604,6 +1605,7 @@ async fn preview_schema(
     baseline: Baseline,
     skip_preflight: bool,
     single_host: bool,
+    depth: Depth,
 ) -> SchemaPreview {
     let (gate, approval_command) = factory::preview_gate(config);
     let approval_command = approval_command.as_deref();
@@ -1646,6 +1648,7 @@ async fn preview_schema(
             &gate,
             approval_command,
             baseline,
+            depth,
         )
         .await;
     }
@@ -1669,6 +1672,7 @@ pub(crate) async fn deploy(
     dry_run: bool,
     skip_preflight: bool,
     fail_on_block: bool,
+    depth: Depth,
 ) -> Result<CommandOutput> {
     let config = load(config_path)?;
     let report = config.validate();
@@ -1701,6 +1705,7 @@ pub(crate) async fn deploy(
             Baseline::None,
             skip_preflight,
             !multi_host,
+            depth,
         )
         .await;
         // A plan *was* produced, so the command succeeds — terraform semantics.
@@ -1841,6 +1846,7 @@ async fn run_blue_green(
             Baseline::WindowSafety,
             false,
             false,
+            Depth::Static,
         )
         .await;
         let mut lines = vec![format!(
@@ -2977,6 +2983,7 @@ impl fraisier_webhook::WebhookHandler for DeployHandler {
             false,
             false,
             false,
+            Depth::Static,
         )
         .await
         .map_err(|error| error_detail(&error))?;
@@ -3481,7 +3488,8 @@ mod tests {
         deploy, discover_adapters, health, init, list, notify_deploy_failure, provider_test,
         providers, render_check_report, render_failed_output, rollback, scaffold, scaffold_install,
         scheduled_install, scheduled_list, scheduled_uninstall, ship, slugify, status, sync,
-        validate_config, version_bump, version_show, webhook_server, write_check_log, ShipArgs,
+        validate_config, version_bump, version_show, webhook_server, write_check_log, Depth,
+        ShipArgs,
     };
     use fraisier_config::DeployConfig;
     use fraisier_core::single_host::DeployRecord;
@@ -4199,6 +4207,7 @@ url = "http://127.0.0.1:8080/health"
             true,
             false,
             false,
+            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4231,6 +4240,7 @@ url = "http://127.0.0.1:8080/health"
             true,
             true,
             false,
+            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4275,6 +4285,7 @@ url = "http://127.0.0.1:8080/health"
             true,
             false,
             false,
+            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4295,6 +4306,7 @@ url = "http://127.0.0.1:8080/health"
             true,
             false,
             true,
+            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4317,6 +4329,7 @@ url = "http://127.0.0.1:8080/health"
             true,
             false,
             true,
+            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4346,6 +4359,7 @@ url = "http://127.0.0.1:8080/health"
             true,
             false,
             false,
+            Depth::Static,
         )
         .await
         .expect("a plan was produced");
@@ -4381,9 +4395,18 @@ url = "http://127.0.0.1:8080/health"
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let state = dir.path().join("state");
         // Dry run: the strategy is recognized and routed; nothing is executed.
-        let out = deploy(&config, &state, None, Some("1.2.3"), true, false, false)
-            .await
-            .expect("dry run");
+        let out = deploy(
+            &config,
+            &state,
+            None,
+            Some("1.2.3"),
+            true,
+            false,
+            false,
+            Depth::Static,
+        )
+        .await
+        .expect("dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
         assert_eq!(out.json["strategy"], serde_json::json!("blue-green"));
         assert_eq!(out.json["dry_run"], serde_json::json!(true));
@@ -4426,6 +4449,7 @@ url = "http://127.0.0.1:8080/health"
             true,
             false,
             false,
+            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4461,6 +4485,7 @@ url = "http://127.0.0.1:8080/health"
             true,
             false,
             false,
+            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4486,6 +4511,7 @@ url = "http://127.0.0.1:8080/health"
             true,
             false,
             true,
+            Depth::Static,
         )
         .await
         .expect("dry run");
@@ -4498,9 +4524,18 @@ url = "http://127.0.0.1:8080/health"
         let bad = VALID.replace("database_url_env = \"CHECKOUT_DATABASE_URL\"\n", "");
         let config = write(dir.path(), "fraisier.toml", &bad);
         let state = dir.path().join("state");
-        let out = deploy(&config, &state, None, None, false, false, false)
-            .await
-            .expect("run");
+        let out = deploy(
+            &config,
+            &state,
+            None,
+            None,
+            false,
+            false,
+            false,
+            Depth::Static,
+        )
+        .await
+        .expect("run");
         assert_eq!(out.exit_code, 1);
         assert_eq!(out.json["ok"], serde_json::json!(false));
     }
@@ -4775,9 +4810,18 @@ upstream = "checkout_upstream"
         let config = write(dir.path(), "fraisier.toml", MULTI_HOST);
         let state = dir.path().join("state");
         // No --host override: [hosts] selects the multi-host path.
-        let out = deploy(&config, &state, None, Some("1.2.3"), true, false, false)
-            .await
-            .expect("multi-host dry run");
+        let out = deploy(
+            &config,
+            &state,
+            None,
+            Some("1.2.3"),
+            true,
+            false,
+            false,
+            Depth::Static,
+        )
+        .await
+        .expect("multi-host dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
         assert_eq!(out.json["strategy"], serde_json::json!("rolling(1)"));
         assert_eq!(out.json["lb"], serde_json::json!("nginx"));
@@ -4813,6 +4857,7 @@ upstream = "checkout_upstream"
             true,
             false,
             false,
+            Depth::Static,
         )
         .await
         .expect("single-host dry run");
@@ -4828,9 +4873,18 @@ upstream = "checkout_upstream"
         let pull = MULTI_HOST.replace("source = \"release\"", "source = \"pull\"");
         let config = write(dir.path(), "fraisier.toml", &pull);
         let state = dir.path().join("state");
-        let out = deploy(&config, &state, None, Some("1.2.3"), true, false, false)
-            .await
-            .expect("multi-host pull dry run");
+        let out = deploy(
+            &config,
+            &state,
+            None,
+            Some("1.2.3"),
+            true,
+            false,
+            false,
+            Depth::Static,
+        )
+        .await
+        .expect("multi-host pull dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
         assert_eq!(out.json["artifact"], serde_json::json!("pull"));
         assert!(
@@ -6160,9 +6214,18 @@ current_revision = "true"
         let config = write(dir.path(), "fraisier.toml", &toml);
         let state = dir.path().join("state");
 
-        let out = deploy(&config, &state, None, Some("1.2.3"), false, false, false)
-            .await
-            .expect("the deploy runs and is refused");
+        let out = deploy(
+            &config,
+            &state,
+            None,
+            Some("1.2.3"),
+            false,
+            false,
+            false,
+            Depth::Static,
+        )
+        .await
+        .expect("the deploy runs and is refused");
         assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
         assert!(out.pretty.contains("policy refused"), "{}", out.pretty);
         assert!(

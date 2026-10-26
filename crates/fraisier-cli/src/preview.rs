@@ -101,6 +101,16 @@ pub enum ClassificationKind {
     Static,
 }
 
+/// How far a restore-rehearsal dry run may go to classify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Depth {
+    /// From the migration files alone. Provisions nothing.
+    Static,
+    /// Against a throwaway restored from a fresh dump of the live database, as
+    /// the deploy classifies (`--dry-run --deep`).
+    Deep,
+}
+
 /// The change-set as a plan renders it: which adapter classified it, at which
 /// contract, and every change it listed.
 ///
@@ -338,6 +348,7 @@ pub async fn gather_rehearsed(
     gate: &PolicyGate,
     approval_command: Option<&str>,
     baseline: Baseline,
+    _depth: Depth,
 ) -> SchemaPreview {
     let described = match migration.describe().await {
         Ok(described) => described,
@@ -789,7 +800,7 @@ fn wrap(text: &str) -> Vec<String> {
 mod tests {
     use super::{
         gather, gather_rehearsed, not_inspected, render, ChangeSetPreview, ClassificationKind,
-        PolicyPreview, SchemaPreview, Unavailable, Verdict,
+        Depth, PolicyPreview, SchemaPreview, Unavailable, Verdict,
     };
     use async_trait::async_trait;
     use fraisier_core::adapter_axes::{
@@ -975,10 +986,20 @@ mod tests {
         change("alter_column_type", "public.tb_order.note").with_tier(RiskTier::Irreversible)
     }
 
+    /// A `--dry-run --deep` preview.
     async fn rehearsed(
         db: &FakeRehearsalDb,
         backup: &BackupSource,
         migration: &FakeMigration,
+    ) -> SchemaPreview {
+        rehearsed_at(db, backup, migration, Depth::Deep).await
+    }
+
+    async fn rehearsed_at(
+        db: &FakeRehearsalDb,
+        backup: &BackupSource,
+        migration: &FakeMigration,
+        depth: Depth,
     ) -> SchemaPreview {
         gather_rehearsed(
             db,
@@ -988,6 +1009,7 @@ mod tests {
             &PolicyGate::new(Policy::default()),
             None,
             Baseline::None,
+            depth,
         )
         .await
     }
@@ -1009,6 +1031,30 @@ mod tests {
         let policy = preview.policy.expect("a [policy] section decides");
         assert_eq!(policy.decision, Verdict::Deny);
         assert_eq!(policy.worst_tier, Some(RiskTier::Irreversible));
+    }
+
+    /// D13 (ii): a plain `--dry-run` never dumps production. It classifies
+    /// statically and says so, naming the flag that would look deeper.
+    #[tokio::test]
+    async fn a_default_dry_run_does_not_dump_the_live_database() {
+        let db = FakeRehearsalDb::new();
+        let migration = deep_adapter(vec![narrowing()]);
+        let preview = rehearsed_at(&db, &BackupSource::FreshDump, &migration, Depth::Static).await;
+        assert!(
+            db.calls().is_empty(),
+            "nothing provisioned: {:?}",
+            db.calls()
+        );
+        assert_eq!(migration.against.lock().expect("against").clone(), [None]);
+        let classification = preview
+            .classification
+            .expect("a rehearsal says how it classified");
+        assert_eq!(classification.kind, ClassificationKind::Static);
+        assert!(
+            classification.detail.contains("--deep"),
+            "{}",
+            classification.detail
+        );
     }
 
     #[tokio::test]

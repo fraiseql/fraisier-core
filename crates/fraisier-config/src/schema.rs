@@ -8,7 +8,7 @@
 //! fields are actually required.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fraisier_core::adapter_axes::{AdapterCtx, HostId, RiskTier};
 use fraisier_core::multi_host::{HostEntry, HostInventory, RolloutStrategy};
@@ -560,6 +560,81 @@ pub struct BackupSection {
     /// fails.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<PathBuf>,
+    /// The `[[backup.retain]]` entries: one retention policy per corpus, each
+    /// pruned on its own schedule by `fraisier backup prune`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retain: Vec<RetainEntry>,
+}
+
+/// One `[[backup.retain]]` entry: which archives in a directory are kept.
+///
+/// An archive older than `retention_days` is removed, except that the newest
+/// `keep_minimum` valid archives are always kept, and no more than `keep_last`
+/// are kept however young they are.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainEntry {
+    /// The directory holding the corpus. Required; must be absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<PathBuf>,
+    /// When the prune runs, in the `[schedule].calendar` vocabulary
+    /// (`daily HH:MM`, `hourly`, …). Required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+    /// Archives older than this many days are removed. Required, at least 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<u32>,
+    /// The newest this many valid archives are kept however old they are.
+    /// Defaults to 3; 0 means no floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_minimum: Option<u32>,
+    /// At most this many archives are kept, however young the rest are. At
+    /// least 1, and not below `keep_minimum`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_last: Option<u32>,
+    /// A file-name glob (`*`, `?`) selecting the corpus within `dir`. Defaults
+    /// to `*.pgdump`; it cannot name another directory.
+    #[serde(default, rename = "match", skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// Warn when the filesystem holding `dir` has less than this many GB free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_free_gb: Option<u64>,
+    /// The entry's name, unique within the file; it names its systemd units.
+    /// Defaults to the last component of `dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl RetainEntry {
+    /// The floor when `keep_minimum` is not declared.
+    pub const DEFAULT_KEEP_MINIMUM: u32 = 3;
+    /// The glob when `match` is not declared.
+    pub const DEFAULT_PATTERN: &str = "*.pgdump";
+
+    /// The declared floor, or [`Self::DEFAULT_KEEP_MINIMUM`].
+    #[must_use]
+    pub fn keep_minimum(&self) -> u32 {
+        self.keep_minimum.unwrap_or(Self::DEFAULT_KEEP_MINIMUM)
+    }
+
+    /// The declared glob, or [`Self::DEFAULT_PATTERN`].
+    #[must_use]
+    pub fn pattern(&self) -> &str {
+        self.pattern.as_deref().unwrap_or(Self::DEFAULT_PATTERN)
+    }
+
+    /// The declared name, or the last component of `dir`. `None` when neither
+    /// gives one.
+    #[must_use]
+    pub fn name(&self) -> Option<String> {
+        self.name.clone().or_else(|| {
+            self.dir
+                .as_deref()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+    }
 }
 
 /// The `[lb]` section.

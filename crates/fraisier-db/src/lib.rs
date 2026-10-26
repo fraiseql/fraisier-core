@@ -16,6 +16,7 @@
 //! `pg_restore` needs as its target) ever appear as arguments.
 
 pub mod archive;
+pub mod retention;
 
 use std::ffi::OsString;
 use std::fmt::Write as _;

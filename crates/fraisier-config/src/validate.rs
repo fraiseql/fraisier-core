@@ -725,16 +725,149 @@ fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
                 dir.display()
             ),
         ),
-        None if cfg.backup.is_some() => report.error(
-            "backup.dir",
-            "the [backup] section requires dir (the directory archives are written to)",
-        ),
+        None if cfg
+            .backup
+            .as_ref()
+            .is_some_and(|backup| backup.retain.is_empty()) =>
+        {
+            report.error(
+                "backup.dir",
+                "the [backup] section requires dir (the directory archives are written to) \
+                 or at least one [[backup.retain]] entry",
+            );
+        }
         None if scheduled => report.error(
             "backup.dir",
             "a scheduled backup requires [backup].dir: without it every run writes the \
              same file and fails from the second run on",
         ),
         _ => {}
+    }
+    let retain = cfg
+        .backup
+        .as_ref()
+        .map_or(&[][..], |backup| &backup.retain[..]);
+    let mut names: Vec<(String, usize)> = Vec::new();
+    for (index, entry) in retain.iter().enumerate() {
+        validate_retain_entry(entry, &format!("backup.retain[{index}]"), report);
+        if let Some(name) = entry.name() {
+            if let Some((_, first)) = names.iter().find(|(seen, _)| *seen == name) {
+                report.error(
+                    &format!("backup.retain[{index}].name"),
+                    format!(
+                        "retain entry name '{name}' is already used by backup.retain[{first}]; \
+                         set a distinct `name` on one of them"
+                    ),
+                );
+            } else {
+                names.push((name, index));
+            }
+        }
+    }
+}
+
+/// A character a value interpolated into a systemd unit or an argv may carry.
+///
+/// Whitespace, `%` (a unit specifier), `$`, `;`, quotes and newlines all change
+/// what a unit line means, so none is allowed.
+const fn is_plain(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
+}
+
+fn validate_retain_entry(entry: &crate::RetainEntry, at: &str, report: &mut ValidationReport) {
+    match entry.dir.as_deref() {
+        None => report.error(&format!("{at}.dir"), "a retain entry requires dir"),
+        Some(dir) => {
+            let text = dir.to_string_lossy();
+            let parent = dir
+                .components()
+                .any(|part| part == std::path::Component::ParentDir);
+            if !dir.is_absolute() || parent || !text.bytes().all(is_plain) {
+                report.error(
+                    &format!("{at}.dir"),
+                    format!(
+                        "dir must be an absolute path of letters, digits, '/', '.', '_' and \
+                         '-' with no '..', not {text:?}"
+                    ),
+                );
+            }
+        }
+    }
+    match entry.schedule.as_deref() {
+        None => report.error(
+            &format!("{at}.schedule"),
+            "a retain entry requires schedule (for example \"daily 05:30\")",
+        ),
+        Some(spec) => {
+            if let Err(message) = crate::calendar::to_on_calendar(spec) {
+                report.error(&format!("{at}.schedule"), message);
+            }
+        }
+    }
+    match entry.retention_days {
+        None => report.error(
+            &format!("{at}.retention_days"),
+            "a retain entry requires retention_days",
+        ),
+        Some(0) => report.error(
+            &format!("{at}.retention_days"),
+            "retention_days must be at least 1",
+        ),
+        Some(_) => {}
+    }
+    match entry.keep_last {
+        Some(0) => report.error(
+            &format!("{at}.keep_last"),
+            "keep_last must be at least 1: the newest archive is the restore point",
+        ),
+        Some(keep_last) if keep_last < entry.keep_minimum() => report.error(
+            &format!("{at}.keep_last"),
+            format!(
+                "keep_last = {keep_last} is below keep_minimum = {}: a corpus cannot hold at \
+                 least {} and at most {keep_last} archives",
+                entry.keep_minimum(),
+                entry.keep_minimum()
+            ),
+        ),
+        _ => {}
+    }
+    let pattern = entry.pattern();
+    let pattern_ok = !pattern.is_empty()
+        && pattern != "."
+        && pattern != ".."
+        && pattern
+            .bytes()
+            .all(|byte| is_plain(byte) && byte != b'/' || matches!(byte, b'*' | b'?'));
+    if !pattern_ok {
+        report.error(
+            &format!("{at}.match"),
+            format!(
+                "match must be a file-name glob within dir (letters, digits, '.', '_', '-', \
+                 '*', '?'; no '/'), not {pattern:?}"
+            ),
+        );
+    }
+    if entry.min_free_gb == Some(0) {
+        report.error(
+            &format!("{at}.min_free_gb"),
+            "min_free_gb must be at least 1 (omit it for no threshold)",
+        );
+    }
+    let name_ok = entry.name().is_some_and(|name| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    });
+    if !name_ok {
+        report.error(
+            &format!("{at}.name"),
+            format!(
+                "the entry's name ({:?}) names its systemd units, so it must be letters, \
+                 digits, '_' and '-'; set `name` explicitly",
+                entry.name().unwrap_or_default()
+            ),
+        );
     }
 }
 

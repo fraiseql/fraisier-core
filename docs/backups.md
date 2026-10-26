@@ -160,6 +160,88 @@ It records:
 - on success, the throwaway's name, the migrations applied, and the table count;
 - on failure, the failed step and the error, with any credentials redacted.
 
+## Staging refresh
+
+`fraisier db refresh` replaces this environment's database with the newest
+archive another environment's backups wrote, then migrates it forward. It runs
+from the staging config:
+
+```toml
+[deploy]
+name = "checkout"
+environment = "staging"
+
+[refresh]
+source_dir = "/var/backups/checkout"   # where production's archives land
+source_environment = "production"
+max_age_hours = 48
+min_tables = 20
+data_dir = "/var/lib/postgresql"
+schedule = "daily 04:30"
+```
+
+| Key | Meaning |
+|---|---|
+| `source_dir` | The directory holding the source environment's archives. Required, absolute. Only `<fraise>-<source_environment>-*` archives are considered. |
+| `source_environment` | The environment whose archives are restored. Required, and never this config's own environment: a `[refresh]` pasted into the production config does not load. |
+| `max_age_hours` | Fail when the newest archive is older than this. Default 48. |
+| `min_tables` | Fail when the refreshed database holds fewer tables than this. Optional. |
+| `data_dir` | When set, refuse unless its filesystem has room for the target's current size plus 2 GB. |
+| `schedule` | When `scheduled install` runs it. Absent, it runs only when invoked. |
+
+Without `--yes`, `db refresh` shows the plan: the archive it would restore, the
+target, and whether the target is marked.
+
+### The marker
+
+A refresh drops a database, so it refuses any database that does not carry
+the refresh marker naming this config:
+
+```sh
+fraisier db mark-refresh-target --config /etc/fraisier/checkout.staging.toml
+```
+
+This sets `fraisier.refresh_target = 'checkout/staging'` on the database
+(`ALTER DATABASE … SET`), once. Marking a database already marked for another
+config is refused; clearing a marker is a deliberate act, by hand
+(`ALTER DATABASE … RESET fraisier.refresh_target`). The refresh sets the
+marker again right after it re-creates the database, before restoring into it.
+`fraisier doctor` reports it as `refresh_target` when the config has a
+`[refresh]`.
+
+The guard fails closed. A database nobody marked is never a target, so an
+environment nobody thought to list is still protected. A list of databases a
+refresh must not touch would fail open. The marker cannot travel inside an
+archive either: `pg_dump` does not carry database-level settings.
+
+### What a refresh does
+
+1. It takes the deploy lock. With `--skip-if-locked`, which the generated unit
+   passes, a held lock exits 0 and skips this run. Without the flag, a held lock
+   fails the run.
+2. It lists the newest source archive with `pg_restore --list`, then checks its
+   age and the free space.
+3. It checks the marker, the source environment, and every extension the
+   archive creates. Each extension must be available on this server, and an
+   untrusted one (pg_tviews, for one) needs a superuser.
+4. It stops the `[service]`. A service adapter that cannot stop refuses, and a
+   config with no `[service]` skips this step.
+5. It drops the database, creates it again owned by the connecting role, and
+   sets the marker on it.
+6. It restores the archive with `--no-owner --no-acl`, because the source
+   environment's roles need not exist here. It then migrates up and counts the
+   tables.
+7. It starts the service.
+
+Nothing changes before step 4. A failed drop restarts the service. Any failure
+after the drop leaves the service **stopped**, because the database it would
+read is half-restored or unmigrated, and serving from it is worse than serving
+nothing. The failure says so.
+
+Every run with `--yes` writes `<state-dir>/refreshes/<fraise>-<environment>.json`.
+It records the archive, `ok`, and either the migrations applied and the table
+count, or the failed step and the error with credentials redacted.
+
 ## Scheduling and failure alerts
 
 `fraisier scheduled install` writes a timer and a oneshot service for each
@@ -188,6 +270,7 @@ command = "/usr/local/bin/page-oncall"
 | `[schedule] command = "backup"` | `fraisier-<name>-<env>-scheduled.{service,timer}` |
 | each `[[backup.retain]]` entry | `fraisier-<name>-<env>-retain-<entry>.{service,timer}`, running `backup prune --name <entry> --apply` |
 | `[drill].schedule` | `fraisier-<name>-<env>-drill.{service,timer}` |
+| `[refresh].schedule` | `fraisier-<name>-<env>-refresh.{service,timer}`, running `db refresh --yes --skip-if-locked` |
 
 A retain entry's name becomes part of its unit names, so it may hold only
 letters, digits, `_`, `.` and `-`.
@@ -222,6 +305,7 @@ and in `FRAISIER_NOTIFY_EVENT`, `_REASON`, `_FAILED` (`<fraise>/<environment>`),
 | `scheduled-backup-failed` | a scheduled backup |
 | `scheduled-prune-failed` | a prune |
 | `scheduled-drill-failed` | a drill |
+| `scheduled-refresh-failed` | a staging refresh |
 
 With no `[notify].command`, the alert writes the payload to stderr, and the
 journal keeps it.

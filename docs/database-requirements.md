@@ -45,6 +45,101 @@ argv, and fails closed: anything it cannot read is a refusal, never a skip.
 The extension's schema is read from the catalogue, not assumed.
 `pg_extension.extversion` is not used, because it reads `0.1.0` on every beta.
 
+## Empty TVIEWs
+
+A pg_tviews TVIEW can be empty while its backing view has rows. A restore, a
+crash-recovery start or a failover can leave an UNLOGGED TVIEW that way, and a
+`TRUNCATE` can do it to any TVIEW. Nothing else notices: the API serves empty
+results.
+
+With `pg_tviews = true`, every deploy's preflight checks for this right after
+the readiness check passes, and so does `doctor`'s `database_ready` check. The
+check compares each registered TVIEW with its backing view. It fails closed: a
+probe that could not run, or a TVIEW this role cannot read, counts as a finding.
+
+```toml
+[database.tviews]
+on_empty = "fail"   # the default: refuse the deploy at preflight
+# on_empty = "warn" # report it on stderr and continue
+```
+
+There is no `off`. A role must be able to read every TVIEW and its view for the
+check to clear it; the finding names the `GRANT SELECT` that fixes an unreadable
+one.
+
+## The admin identity: `[database].admin_url_env`
+
+Some operations need more than the app role has:
+
+- **Restoring a pg_tviews archive.** `CREATE EXTENSION pg_tviews` needs a
+  superuser (the extension is written in C). A non-superuser `pg_restore` loads
+  the tables, fails on the extension, and leaves a database with no TVIEW
+  machinery.
+- **Rebuilding TVIEWs.** pg_tviews does not grant `pg_tviews_rebuild_all` to
+  `PUBLIC`.
+
+Name an environment variable that holds a superuser DSN for these, and only
+these:
+
+```toml
+[database]
+admin_url_env = "CHECKOUT_DATABASE_ADMIN_URL"
+```
+
+It is used by `fraisier db restore`, `fraisier db tviews rebuild`, and a
+`restore_rehearsal` preflight, which creates its throwaway database through it
+(owned by the app role) and restores into it as the admin. Migrations, health
+checks and everything else keep running as the app role. The admin DSN reaches
+`psql` and `pg_restore` through `PG*` variables, never argv, and is never printed.
+
+The recommended identity is the `postgres` role over the Unix socket, with peer
+authentication mapped from the OS user fraisier runs as, so no password exists
+to leak:
+
+```text
+# pg_ident.conf
+fraisier_admin  deploy    postgres
+fraisier_admin  postgres  postgres
+
+# pg_hba.conf (replacing the default `local all postgres peer` line)
+local  all  postgres  peer  map=fraisier_admin
+```
+
+```sh
+export CHECKOUT_DATABASE_ADMIN_URL='postgresql://postgres@%2Fvar%2Frun%2Fpostgresql/postgres'
+```
+
+The socket directory goes in the host part, percent-encoded. A `?host=` query
+parameter is not read.
+
+`fraisier doctor` checks the identity as `database_admin`: it must connect, be a
+superuser, and reach the same cluster as the app DSN (the same
+`pg_control_system()` system identifier). It must not be the migration DSN's
+variable.
+
+### `fraisier db restore` and pg_tviews
+
+Before it changes anything, `db restore` lists the archive. When the archive
+creates pg_tviews and the restoring identity is not a superuser, the restore is
+refused and the refusal names `admin_url_env`. After a successful restore it
+rebuilds the empty TVIEWs.
+
+## Rebuilding TVIEWs: `fraisier db tviews rebuild`
+
+```sh
+fraisier db tviews rebuild --config fraisier.toml         # the empty UNLOGGED ones
+fraisier db tviews rebuild --config fraisier.toml --all   # every TVIEW
+```
+
+It runs as the admin identity when one is configured, otherwise as the app
+role. Either way it first refuses on a standby (TVIEWs can only be rebuilt on
+the primary) and without `EXECUTE` on the rebuild function, naming the `GRANT`.
+
+Without `--all`, pg_tviews refills only the UNLOGGED TVIEWs PostgreSQL reset. A
+LOGGED TVIEW (the default since pg_tviews 0.1.0-beta.28) that was emptied by
+hand stays empty. The command then names what is still empty and exits 1; run it
+again with `--all`.
+
 ## Getting a host ready
 
 [`scripts/provision-pg18-tviews.sh`](../scripts/provision-pg18-tviews.sh) gets a

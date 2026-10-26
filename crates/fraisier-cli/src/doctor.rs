@@ -207,7 +207,10 @@ async fn check_database_admin(config: &DeployConfig) -> Option<Check> {
         .migration
         .as_ref()
         .and_then(|m| m.database_url_env.as_deref());
-    let mut check = judge_admin(identity_of(Some(admin_env)).await, identity_of(app_env).await);
+    let mut check = judge_admin(
+        identity_of(Some(admin_env)).await,
+        identity_of(app_env).await,
+    );
     check.detail = fraisier_saga::redact::credentials(&check.detail);
     Some(check)
 }
@@ -441,11 +444,11 @@ pub(crate) fn env_check(config_path: &Path, subcommand: &str) -> CommandOutput {
 
 #[cfg(test)]
 mod tests {
-    use fraisier_config::DeployConfig;
     use super::{
         doctor, env_check, judge_admin, parse_version, referenced_secrets, Identity, Status,
         CONFITURE_FLOOR,
     };
+    use fraisier_config::DeployConfig;
     use std::io::Write as _;
 
     fn write_config(body: &str) -> tempfile::NamedTempFile {
@@ -605,7 +608,11 @@ url = "http://127.0.0.1/health"
             Ok(identity("app", false, "8")),
         );
         assert_eq!(check.status, Status::Fail);
-        assert!(check.detail.contains("different cluster"), "{}", check.detail);
+        assert!(
+            check.detail.contains("different cluster"),
+            "{}",
+            check.detail
+        );
     }
 
     #[test]

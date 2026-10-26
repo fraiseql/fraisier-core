@@ -8,6 +8,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Empty pg_tviews TVIEWs refuse a deploy, and `fraisier db tviews rebuild`
+  refills them.** With `[database.requires] pg_tviews = true`, preflight and
+  `doctor` check every TVIEW against its backing view, after readiness passes.
+  `[database.tviews] on_empty = "fail"` (the default) refuses the deploy, and
+  `"warn"` reports it and continues. The check fails closed. `db tviews rebuild`
+  refills the empty UNLOGGED TVIEWs, or every TVIEW with `--all`. It refuses on a
+  standby and without `EXECUTE`, and exits 1 when a TVIEW stays empty.
+  Part of [#88](https://github.com/fraiseql/fraisier-core/issues/88).
+
+- **`[database].admin_url_env`: a superuser identity for restore-class
+  operations only.** `db restore`, `db tviews rebuild` and a `restore_rehearsal`
+  preflight use it; nothing else does. `db restore` now refuses a pg_tviews
+  archive before changing anything when the restoring identity is not a
+  superuser (a non-superuser restore loads the tables and silently drops the
+  extension), and rebuilds the TVIEWs after a restore. The rehearsal creates its
+  throwaway through the admin, owned by the app role. `doctor` checks the
+  identity (`database_admin`): it connects, is a superuser, and reaches the app
+  DSN's cluster. Peer authentication over the Unix socket is the documented
+  setup; see `docs/database-requirements.md`.
+  Part of [#83](https://github.com/fraiseql/fraisier-core/issues/83).
+
 - **`scripts/provision-pg18-tviews.sh`: a documented way to get a Debian host
   ready for `[database.requires] postgres_major = 18, pg_tviews = true`.**
   - **What it does.** It installs PostgreSQL 18 from PGDG, after checking the

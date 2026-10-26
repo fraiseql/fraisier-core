@@ -788,12 +788,55 @@ fn has_error(report: &fraisier_config::ValidationReport, path: &str) -> bool {
 
 #[test]
 fn schedule_backup_with_native_calendar_validates_clean() {
+    let toml = format!(
+        "{SCHEDULE_BASE}\n[backup]\ndir = \"/var/backups/checkout\"\n\
+         [schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(report.ok(), "backup + native calendar is valid: {report}");
+}
+
+#[test]
+fn a_scheduled_backup_requires_a_backup_dir() {
+    // Without one, every run writes the same file in the unit's working
+    // directory and fails from the second run on (#87).
     let toml =
         format!("{SCHEDULE_BASE}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
     let report = DeployConfig::from_toml_str(&toml)
         .expect("parses")
         .validate();
-    assert!(report.ok(), "backup + native calendar is valid: {report}");
+    assert!(has_error(&report, "backup.dir"), "{report}");
+}
+
+#[test]
+fn the_backup_dir_must_be_absolute() {
+    let toml = format!("{SCHEDULE_BASE}\n[backup]\ndir = \"backups\"\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "backup.dir"), "{report}");
+}
+
+#[test]
+fn a_backup_section_without_a_dir_is_an_error() {
+    let toml = format!("{SCHEDULE_BASE}\n[backup]\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "backup.dir"), "{report}");
+}
+
+#[test]
+fn an_absolute_backup_dir_validates_clean() {
+    let toml = format!("{SCHEDULE_BASE}\n[backup]\ndir = \"/var/backups/checkout\"\n");
+    let config = DeployConfig::from_toml_str(&toml).expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    assert_eq!(
+        config.backup.and_then(|backup| backup.dir),
+        Some(std::path::PathBuf::from("/var/backups/checkout"))
+    );
 }
 
 #[test]

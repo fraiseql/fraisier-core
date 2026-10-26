@@ -38,6 +38,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   no exit integer changed class, so `classify` and the `AdapterErrorKind` projection are
   unchanged. Closes [#63](https://github.com/fraiseql/fraisier-core/issues/63).
 
+- **The exit-code contract follows confiture 1.35.0.** The pin moves from 1.33.0, and
+  the regenerated file adds five codes and changes nothing else. Exit 0 gains
+  `DIFFER_405` (an index on a table neither tree declares), `DIFFER_407` (an index on
+  a TVIEW) and `DIFFER_408` (an index written before its relation). Exit 5 gains
+  `CONFIG_015` (`preflight --scope pending` finds the ledger only in another schema)
+  and `DIFFER_406` (an index on a relation the desired tree does not declare, which a
+  migration would drop). No exit integer changes class. confiture 1.36.0, not yet
+  released, is set to retire `DIFFER_407` and add `DIFFER_410`, which will take
+  another pin bump.
+
 ### Changed
 
 - **The Rust toolchain is pinned to an exact release, 1.99.0, and the MSRV is

@@ -1726,6 +1726,9 @@ pub(crate) async fn deploy(
         if let Some((db, backup)) = resolved.restore_rehearsal {
             builder = builder.restore_rehearsal(db, backup);
         }
+        if let Some(probe) = resolved.database_readiness {
+            builder = builder.database_readiness(probe);
+        }
     }
     let plan = builder.build()?;
 
@@ -1752,7 +1755,7 @@ async fn run_multi_host(
     report: &ValidationReport,
 ) -> Result<CommandOutput> {
     let resolved = factory::build_multi_host(config, app_version)?;
-    let deploy = MultiHostDeploy::builder(
+    let mut builder = MultiHostDeploy::builder(
         resolved.fraise.clone(),
         resolved.environment.clone(),
         resolved.plan,
@@ -1764,8 +1767,11 @@ async fn run_multi_host(
     .migration(resolved.migration)
     .service(resolved.service)
     .health(resolved.health)
-    .lb(resolved.lb)
-    .build()?;
+    .lb(resolved.lb);
+    if let Some(probe) = resolved.database_readiness {
+        builder = builder.database_readiness(probe);
+    }
+    let deploy = builder.build()?;
 
     let outcome = deploy.run(store).await?;
     notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
@@ -1989,6 +1995,28 @@ fn resolve_pg_conn(config: &DeployConfig) -> Result<fraisier_db::PgConn> {
     let dsn = std::env::var(&source)
         .with_context(|| format!("the configured database_url_env '{source}' is not set"))?;
     fraisier_db::PgConn::parse(&dsn).context("parsing the database DSN")
+}
+
+/// Resolve the restore identity, `[database].admin_url_env`, when one is
+/// configured. A configured identity whose env var is unset is an error, never
+/// a silent fall back to the app DSN: the operator asked for the restore to run
+/// as that identity.
+///
+/// # Errors
+/// The named env var is unset, or its DSN is not a parseable `postgres://` URL.
+pub(crate) fn resolve_admin_conn(config: &DeployConfig) -> Result<Option<fraisier_db::PgConn>> {
+    let Some(source) = config
+        .database
+        .as_ref()
+        .and_then(|d| d.admin_url_env.as_deref())
+    else {
+        return Ok(None);
+    };
+    let dsn = std::env::var(source)
+        .with_context(|| format!("the configured admin_url_env '{source}' is not set"))?;
+    fraisier_db::PgConn::parse(&dsn)
+        .map(Some)
+        .context("parsing the admin DSN")
 }
 
 /// A clean exit-1 [`CommandOutput`] for an expected db-op configuration error
@@ -2438,7 +2466,10 @@ pub(crate) async fn backup_drill(config_path: &Path, state_dir: &Path) -> Result
     backup_drill_with(
         config_path,
         state_dir,
-        &crate::pg_rehearsal::PgRehearsalDb,
+        // The drill restores as the app role; the restore identity is not wired here.
+        &crate::pg_rehearsal::PgRehearsalDb {
+            admin_url_env: None,
+        },
         &fraisier_db::archive::ArchiveTools::default().pg_restore,
         std::time::SystemTime::now(),
     )
@@ -2698,7 +2729,7 @@ pub(crate) async fn db_restore(
     if let Some(refusal) = refuse_invalid_db_config(&config, "restore") {
         return Ok(refusal);
     }
-    let conn = match resolve_pg_conn(&config) {
+    let conn = match restore_conn(&config) {
         Ok(conn) => conn,
         Err(error) => return Ok(db_config_error(&error)),
     };
@@ -2728,10 +2759,22 @@ pub(crate) async fn db_restore(
         });
     }
 
+    // Refuse, before anything is dropped, a restore that cannot finish.
+    let creates_tviews = match restore_precheck(&config, &conn, input).await {
+        Ok(creates_tviews) => creates_tviews,
+        Err(refusal) => {
+            return Ok(CommandOutput {
+                exit_code: 1,
+                pretty: format!("refusing to restore: {refusal}\n"),
+                json: json!({ "ok": false, "executed": false, "refused": refusal }),
+            })
+        }
+    };
+
     let outcome = fraisier_db::run(fraisier_db::restore_command(&conn, input, true))
         .await
         .context("running pg_restore")?;
-    let (exit_code, ok) = (i32::from(!outcome.succeeded()), outcome.succeeded());
+    let (mut exit_code, ok) = (i32::from(!outcome.succeeded()), outcome.succeeded());
     let mut pretty = if ok {
         format!("restored {} → {}\n", input.display(), conn.redacted())
     } else {
@@ -2741,11 +2784,181 @@ pub(crate) async fn db_restore(
         // pg_restore can emit non-fatal warnings on stderr while still exiting 0.
         let _ = writeln!(pretty, "(warnings)\n{}", outcome.stderr.trim());
     }
+    let mut rebuilt = Value::Null;
+    if ok && creates_tviews {
+        // An UNLOGGED TVIEW comes back empty from a restore; refill those only.
+        match rebuild_tviews(&conn, true).await {
+            Ok(rows) => {
+                let _ = writeln!(
+                    pretty,
+                    "post-restore TVIEW rebuild: {}",
+                    describe_rebuilt(&rows)
+                );
+                rebuilt = json!(rows
+                    .iter()
+                    .map(|r| json!({ "entity": r.entity, "rows": r.rows }))
+                    .collect::<Vec<_>>());
+            }
+            Err(error) => {
+                exit_code = 1;
+                let _ = writeln!(
+                    pretty,
+                    "the restore succeeded but the post-restore TVIEW rebuild failed: {error}\n\
+                     run `fraisier db tviews rebuild` once it is fixed"
+                );
+            }
+        }
+    }
     Ok(CommandOutput {
         exit_code,
         pretty,
-        json: json!({ "ok": ok, "executed": true, "input": input.display().to_string() }),
+        json: json!({
+            "ok": ok && exit_code == 0,
+            "executed": true,
+            "input": input.display().to_string(),
+            "tviews_rebuilt": rebuilt,
+        }),
     })
+}
+
+/// The connection a restore-class operation runs as: the admin identity on the
+/// app's database when `[database].admin_url_env` is set, the app DSN otherwise.
+fn restore_conn(config: &DeployConfig) -> Result<fraisier_db::PgConn> {
+    let app = resolve_pg_conn(config)?;
+    Ok(resolve_admin_conn(config)?
+        .map_or_else(|| app.clone(), |admin| admin.with_database(app.database())))
+}
+
+/// Whether `archive` creates pg_tviews, after refusing a restore of it that
+/// `conn` could not finish.
+async fn restore_precheck(
+    config: &DeployConfig,
+    conn: &fraisier_db::PgConn,
+    archive: &Path,
+) -> std::result::Result<bool, String> {
+    use fraisier_db::tviews;
+    let psql = Path::new("psql");
+    let listed = fraisier_db::run(tviews::list_command(archive))
+        .await
+        .map_err(|error| error.to_string())?;
+    if !listed.succeeded() {
+        return Err(format!(
+            "pg_restore --list cannot read the archive: {}",
+            listed.stderr.trim()
+        ));
+    }
+    if !tviews::archive_creates_pg_tviews(&listed.stdout) {
+        return Ok(false);
+    }
+    let identity = tviews::parse_identity(&tviews::query(psql, conn, tviews::IDENTITY_SQL).await?)?;
+    // A superuser can execute every function; a non-superuser is refused
+    // before the privilege matters.
+    let admin_env = config
+        .database
+        .as_ref()
+        .and_then(|d| d.admin_url_env.as_deref());
+    tviews::restore_precheck(&listed.stdout, &identity, None, admin_env)?;
+    Ok(true)
+}
+
+/// Run `pg_tviews_rebuild_all` as `conn`, after refusing on a standby or
+/// without the privilege.
+async fn rebuild_tviews(
+    conn: &fraisier_db::PgConn,
+    only_empty: bool,
+) -> std::result::Result<Vec<fraisier_db::tviews::Rebuilt>, String> {
+    use fraisier_db::tviews;
+    let psql = Path::new("psql");
+    let schema = tviews::usable_schema(psql, conn)
+        .await?
+        .ok_or_else(|| format!("pg_tviews is not installed in {}", conn.database()))?;
+    let identity = tviews::parse_identity(&tviews::query(psql, conn, tviews::IDENTITY_SQL).await?)?;
+    if identity.recovery {
+        return Err(
+            "the database is in recovery (a standby, or still starting); TVIEWs can \
+                    only be rebuilt on the primary"
+                .to_owned(),
+        );
+    }
+    let privilege = tviews::query(psql, conn, &tviews::rebuild_privilege_sql(&schema)).await?;
+    if let Some(problem) = tviews::rebuild_privilege_problem(&schema, &privilege)? {
+        return Err(problem);
+    }
+    tviews::parse_rebuild(
+        &tviews::query(psql, conn, &tviews::rebuild_sql(&schema, only_empty)).await?,
+    )
+}
+
+/// `item 2, order 0`, or `nothing needed rebuilding`.
+fn describe_rebuilt(rows: &[fraisier_db::tviews::Rebuilt]) -> String {
+    if rows.is_empty() {
+        return "nothing needed rebuilding".to_owned();
+    }
+    rows.iter()
+        .map(|r| format!("{} {} row(s)", r.entity, r.rows))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `db tviews rebuild`: refill TVIEWs from their backing views. Without `all`
+/// only the empty UNLOGGED ones PostgreSQL reset; with it, every TVIEW.
+///
+/// Runs as the admin identity when one is configured, otherwise the app role,
+/// after the same privilege precheck either way.
+pub(crate) async fn db_tviews_rebuild(config_path: &Path, all: bool) -> Result<CommandOutput> {
+    let config = load(config_path)?;
+    if let Some(refusal) = refuse_invalid_db_config(&config, "rebuild TVIEWs") {
+        return Ok(refusal);
+    }
+    let conn = match restore_conn(&config) {
+        Ok(conn) => conn,
+        Err(error) => return Ok(db_config_error(&error)),
+    };
+    match rebuild_tviews(&conn, !all).await {
+        Ok(rows) => {
+            let mut pretty = format!(
+                "rebuilt TVIEWs in {}: {}\n",
+                conn.redacted(),
+                describe_rebuilt(&rows)
+            );
+            // What `only_empty` leaves behind (a LOGGED TVIEW, one emptied by
+            // hand) is worth saying, since this is the command the gate names.
+            let still = match fraisier_db::tviews::usable_schema(Path::new("psql"), &conn).await {
+                Ok(Some(schema)) => {
+                    fraisier_db::tviews::find_empty(Path::new("psql"), &conn, &schema)
+                        .await
+                        .map(|found| found.empty)
+                        .unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
+            if !still.is_empty() {
+                let names: Vec<String> = still
+                    .iter()
+                    .map(fraisier_db::tviews::Tview::qualified)
+                    .collect();
+                let _ = writeln!(
+                    pretty,
+                    "still empty over a populated view: {} — run again with --all",
+                    names.join(", ")
+                );
+            }
+            Ok(CommandOutput {
+                exit_code: i32::from(!still.is_empty()),
+                pretty,
+                json: json!({
+                    "ok": still.is_empty(),
+                    "rebuilt": rows.iter().map(|r| json!({ "entity": r.entity, "rows": r.rows })).collect::<Vec<_>>(),
+                    "still_empty": still.iter().map(fraisier_db::tviews::Tview::qualified).collect::<Vec<_>>(),
+                }),
+            })
+        }
+        Err(error) => Ok(CommandOutput {
+            exit_code: 1,
+            pretty: format!("TVIEW rebuild refused or failed: {error}\n"),
+            json: json!({ "ok": false, "error": error }),
+        }),
+    }
 }
 
 /// `db reset`: drop every user schema and re-apply migrations from scratch.
@@ -6237,6 +6450,44 @@ current_revision = "true"
             out.pretty.contains("secret_env"),
             "names the missing field: {}",
             out.pretty
+        );
+    }
+
+    #[test]
+    fn no_admin_identity_resolves_to_none() {
+        let config = DeployConfig::from_toml_str("[deploy]\nname = \"a\"\nenvironment = \"b\"\n")
+            .expect("parses");
+        assert!(super::resolve_admin_conn(&config)
+            .expect("resolves")
+            .is_none());
+    }
+
+    #[test]
+    fn a_configured_admin_identity_is_read_from_its_env_var() {
+        let _env = crate::test_env::env_guard();
+        let toml = "[deploy]\nname = \"a\"\nenvironment = \"b\"\n\n[database]\n\
+                    admin_url_env = \"FRAISIER_TEST_ADMIN_URL\"\n";
+        let config = DeployConfig::from_toml_str(toml).expect("parses");
+        std::env::set_var(
+            "FRAISIER_TEST_ADMIN_URL",
+            "postgresql:///postgres?host=/var/run/postgresql",
+        );
+        let admin = super::resolve_admin_conn(&config).expect("resolves");
+        std::env::remove_var("FRAISIER_TEST_ADMIN_URL");
+        assert_eq!(admin.expect("an identity").database(), "postgres");
+    }
+
+    #[test]
+    fn an_unset_admin_env_var_is_an_error_not_a_fallback() {
+        let _env = crate::test_env::env_guard();
+        std::env::remove_var("FRAISIER_TEST_ADMIN_UNSET");
+        let toml = "[deploy]\nname = \"a\"\nenvironment = \"b\"\n\n[database]\n\
+                    admin_url_env = \"FRAISIER_TEST_ADMIN_UNSET\"\n";
+        let config = DeployConfig::from_toml_str(toml).expect("parses");
+        let error = super::resolve_admin_conn(&config).expect_err("unset");
+        assert!(
+            error.to_string().contains("FRAISIER_TEST_ADMIN_UNSET"),
+            "{error}"
         );
     }
 }

@@ -140,7 +140,8 @@ checked elsewhere:
 4. Unpack and install it: `tar xzf fraisier-<target>.tar.gz && install -m 0755
    fraisier /usr/local/bin/fraisier`.
 5. Confirm with `fraisier --version` and `fraisier doctor`. Neither needs
-   network access.
+   network access, except that `doctor` connects to the database when the
+   config sets `[database.requires]`.
 
 The Linux `-gnu` binaries need glibc 2.28 or later. The musl binary is fully
 static and has no runtime dependencies.

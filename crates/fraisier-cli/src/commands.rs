@@ -757,18 +757,24 @@ pub(crate) fn scheduled_install(
 ) -> Result<CommandOutput> {
     let config = load(config_path)?;
 
-    // The unattended-deploy gate: refuse to install a schedule whose [schedule]
-    // section is invalid — in particular `command = "deploy"` without
-    // `allow_unattended_deploy = true` + a notify sink. The validator carries the
-    // policy; here we refuse (with the located reasons) rather than install.
+    // The unattended-deploy gate: refuse to install units whose sections are
+    // invalid — in particular `command = "deploy"` without
+    // `allow_unattended_deploy = true` + a `[notify].command` sink, or a retain
+    // entry whose name cannot name a unit. The validator carries the policy;
+    // here we refuse (with the located reasons) rather than install.
     let report = config.validate();
     let schedule_errors: Vec<&fraisier_config::ValidationIssue> = report
         .issues
         .iter()
-        .filter(|issue| issue.severity == Severity::Error && issue.path.starts_with("schedule"))
+        .filter(|issue| {
+            issue.severity == Severity::Error
+                && ["schedule", "notify", "backup", "drill"]
+                    .iter()
+                    .any(|section| issue.path.starts_with(section))
+        })
         .collect();
     if !schedule_errors.is_empty() {
-        let mut pretty = String::from("refusing to install: invalid [schedule] config\n");
+        let mut pretty = String::from("refusing to install: invalid scheduling config\n");
         for issue in &schedule_errors {
             let _ = writeln!(pretty, "  [error] {}: {}", issue.path, issue.message);
         }
@@ -6289,6 +6295,69 @@ current_revision = "true"
     }
 
     #[test]
+    fn scheduled_install_serves_a_prune_only_host() {
+        // No [schedule]: the retain units and their alert still install.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = format!(
+            "{VALID}\n[[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"nightly\"\n\
+             schedule = \"daily 05:30\"\nretention_days = 14\n"
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        let done = scheduled_install(&config, &root, true, false, false, false).expect("install");
+        assert_eq!(done.exit_code, 0, "{}", done.pretty);
+        let systemd = root.join("etc/systemd/system");
+        for unit in [
+            "fraisier-checkout-staging-retain-nightly.service",
+            "fraisier-checkout-staging-retain-nightly.timer",
+            "fraisier-checkout-staging-alert@.service",
+        ] {
+            assert!(systemd.join(unit).exists(), "{unit}");
+        }
+    }
+
+    #[test]
+    fn scheduled_install_detects_drift_in_the_alert_unit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = format!(
+            "{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[drill]\n\
+             schedule = \"weekly Sun 04:00\"\n"
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        scheduled_install(&config, &root, true, false, false, false).expect("install");
+        let alert = root.join("etc/systemd/system/fraisier-checkout-staging-alert@.service");
+        let marker = fraisier_scaffold::MARKER;
+        std::fs::write(
+            &alert,
+            format!("# {marker}\n[Service]\nExecStart=/bin/true\n"),
+        )
+        .expect("edit");
+        let out = scheduled_install(&config, &root, true, false, false, false).expect("runs");
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(out.pretty.contains("alert@.service"), "{}", out.pretty);
+    }
+
+    #[test]
+    fn scheduled_install_refuses_an_invalid_retain_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = format!(
+            "{VALID}\n[[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"night ly\"\n\
+             schedule = \"daily 05:30\"\nretention_days = 14\n"
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        let out = scheduled_install(&config, &root, true, false, false, false).expect("runs");
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(
+            out.pretty.contains("backup.retain[0].name"),
+            "{}",
+            out.pretty
+        );
+        assert!(!root.exists(), "nothing installed");
+    }
+
+    #[test]
     fn scheduled_install_refuses_an_unattended_deploy_without_the_optin() {
         let dir = tempfile::tempdir().expect("tempdir");
         // command = "deploy" without allow_unattended_deploy + notify: refused.
@@ -6332,7 +6401,12 @@ current_revision = "true"
         scheduled_install(&config, &root, true, false, false, false).expect("install");
         let listed = scheduled_list(&root).expect("list");
         let units = listed.json["units"].as_array().expect("units array");
-        assert_eq!(units.len(), 2, "timer + service listed: {}", listed.pretty);
+        assert_eq!(
+            units.len(),
+            3,
+            "timer + service + alert listed: {}",
+            listed.pretty
+        );
 
         // Plan only: nothing removed yet.
         let plan = scheduled_uninstall(&config, &root, false).expect("plan");

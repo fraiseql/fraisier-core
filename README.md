@@ -243,7 +243,7 @@ arbitrary gate: it runs a configured shell command, passes iff the command exits
 FraiseQL's `fraiseql perf regression-scan --fail-on-regression --json` — a deploy
 that makes a database mutation slower rolls back automatically, naming the
 regressed operation (`perf regression: order/UPDATE p50 +42% (12ms→17ms)`) in the
-rollback reason and the `[schedule].notify` webhook. The DSN reaches the scan by
+rollback reason and the `[notify].command` webhook. The DSN reaches the scan by
 environment, never argv. See [`docs/perf-regression-gate.md`](docs/perf-regression-gate.md).
 
 ### Schema risk policy gate

@@ -12,7 +12,7 @@ database client that cannot connect prints the DSN it tried, password included.
 That text becomes the saga's failure reason, and a reason is the most widely-copied
 string the engine produces: printed, logged to the tracing/OTel pipeline, persisted
 to the state store, replicated to a remote ledger, and sent to the
-`[schedule].notify` webhook.
+`[notify].command` webhook.
 
 So the reason is redacted — at the **boundaries**, never at the places a reason is
 built. There are around twenty-five of those and one more appears with every new

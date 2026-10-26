@@ -849,6 +849,27 @@ fn retain_report(entry: &str) -> fraisier_config::ValidationReport {
 }
 
 #[test]
+fn a_retain_name_must_be_safe_in_a_unit_name() {
+    // The name becomes part of a systemd unit name and an ExecStart= argument.
+    for name in ["night ly", "-nightly", "nightly;rm", "100%", "a/b"] {
+        let report = retain_report(&format!(
+            "[[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"{name}\"\n\
+             schedule = \"daily 05:30\"\nretention_days = 14\n"
+        ));
+        assert!(
+            has_error(&report, "backup.retain[0].name"),
+            "{name:?}: {report}"
+        );
+    }
+    // A name taken from `dir` is held to the same rule.
+    let report = retain_report(
+        "[[backup.retain]]\ndir = \"/var/backups/check out\"\n\
+         schedule = \"daily 05:30\"\nretention_days = 14\n",
+    );
+    assert!(has_error(&report, "backup.retain[0].name"), "{report}");
+}
+
+#[test]
 fn a_retain_entry_parses_with_its_defaults_and_needs_no_backup_dir() {
     let config =
         DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{RETAIN}")).expect("parses");

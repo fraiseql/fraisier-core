@@ -789,6 +789,15 @@ fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
     for (index, entry) in retain.iter().enumerate() {
         validate_retain_entry(entry, &format!("backup.retain[{index}]"), report);
         if let Some(name) = entry.name() {
+            if !is_unit_word(&name) {
+                report.error(
+                    &format!("backup.retain[{index}].name"),
+                    format!(
+                        "retain entry name '{name}' names its systemd units, so it may hold \
+                         only letters, digits, '_', '.' and '-', and not start with '-'"
+                    ),
+                );
+            }
             if let Some((_, first)) = names.iter().find(|(seen, _)| *seen == name) {
                 report.error(
                     &format!("backup.retain[{index}].name"),
@@ -802,6 +811,18 @@ fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
             }
         }
     }
+}
+
+/// Whether `word` is safe as part of a systemd unit name and as an
+/// `ExecStart=` argument: letters, digits, `_`, `.` and `-`, not starting with
+/// `-`.
+#[must_use]
+pub fn is_unit_word(word: &str) -> bool {
+    !word.is_empty()
+        && !word.starts_with('-')
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
 fn validate_drill(cfg: &DeployConfig, report: &mut ValidationReport) {

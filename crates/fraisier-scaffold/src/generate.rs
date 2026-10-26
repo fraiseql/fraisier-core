@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use fraisier_config::DeployConfig;
+use fraisier_config::{DeployConfig, RetainEntry};
 
 use crate::ScaffoldError;
 
@@ -104,19 +104,28 @@ pub fn generate(config: &DeployConfig) -> Result<Vec<GeneratedFile>, ScaffoldErr
     ])
 }
 
-/// Render the systemd timer + service that run fraisier on a calendar schedule.
+/// Render the systemd units that run fraisier on a calendar schedule.
 ///
-/// Produces `fraisier-<name>-<environment>-scheduled.{service,timer}` (a oneshot
-/// service the timer triggers). The service's `ExecStart` runs `fraisier
-/// <command> --config <config_path>` on the host; `<command>` is explicit (no
-/// default), `<config_path>` defaults to `/etc/fraisier/<name>.toml`. The
-/// `OnCalendar=` comes from the native `[schedule].calendar` vocabulary
-/// (translated) or the `on_calendar_raw` escape hatch.
+/// - `[schedule]`: `fraisier-<name>-<environment>-scheduled.{service,timer}`, a
+///   oneshot service running `fraisier <command> --config <config_path>`.
+///   `<command>` is explicit (no default); `<config_path>` defaults to
+///   `/etc/fraisier/<name>.toml`. The `OnCalendar=` comes from the native
+///   `calendar` vocabulary (translated) or the `on_calendar_raw` escape hatch.
+/// - each `[[backup.retain]]` entry: `…-retain-<entry>.{service,timer}`,
+///   running `fraisier backup prune --name <entry> --apply`;
+/// - a `[drill]` with a `schedule`: `…-drill.{service,timer}`.
+///
+/// A scheduled backup, a prune and a drill each name
+/// `fraisier-<name>-<environment>-alert@.service` in `OnFailure=` and run with
+/// `--failure-record %n`; that alert template is generated with them, because
+/// an `OnFailure=` naming a missing unit fails silently. A scheduled deploy
+/// notifies in-process instead and references no alert.
 ///
 /// # Errors
-/// [`ScaffoldError::MissingField`] if `[deploy].name`/`[deploy].environment`,
-/// `[schedule].command`, or a calendar surface is absent;
-/// [`ScaffoldError::InvalidField`] if the native `calendar` is malformed.
+/// [`ScaffoldError::MissingField`] if `[deploy].name`/`[deploy].environment`
+/// is absent, if nothing is scheduled, or if `[schedule]` lacks its `command`
+/// or a calendar surface; [`ScaffoldError::InvalidField`] if a calendar is
+/// malformed or a retain entry has no usable name.
 pub fn generate_scheduled(config: &DeployConfig) -> Result<Vec<GeneratedFile>, ScaffoldError> {
     let deploy = config.deploy.as_ref();
     let name = required(deploy.and_then(|d| d.name.as_deref()), "deploy", "name")?;
@@ -126,70 +135,200 @@ pub fn generate_scheduled(config: &DeployConfig) -> Result<Vec<GeneratedFile>, S
         "environment",
     )?;
     let schedule = config.schedule.as_ref();
-    // `command` is explicit — there is no silent "deploy" default (an unattended
-    // deploy must never be an accident); see the unattended-deploy gate.
-    let command = required(
-        schedule.and_then(|s| s.command.as_deref()),
-        "schedule",
-        "command",
-    )?;
-    let on_calendar = resolve_on_calendar(schedule)?;
-    let notes = if command == "backup" {
-        let dir = config
-            .backup
-            .as_ref()
-            .and_then(|backup| backup.dir.as_deref())
-            .ok_or(ScaffoldError::MissingField {
-                section: "backup",
-                field: "dir",
-            })?;
-        format!(
-            "# Each run writes a new timestamped archive into [backup].dir\n\
-             # ({}), so no run overwrites an earlier one.\n",
-            dir.display()
-        )
-    } else {
-        String::new()
-    };
+    let retain = config
+        .backup
+        .as_ref()
+        .map_or(&[][..], |backup| &backup.retain[..]);
+    let drill_schedule = config
+        .drill
+        .as_ref()
+        .and_then(|drill| drill.schedule.as_deref())
+        .filter(|spec| !spec.trim().is_empty());
+    if schedule.is_none() && retain.is_empty() && drill_schedule.is_none() {
+        return Err(ScaffoldError::MissingField {
+            section: "schedule",
+            field: "calendar",
+        });
+    }
+
     let config_path = schedule.and_then(|s| s.config_path.as_deref()).map_or_else(
         || format!("/etc/fraisier/{name}.toml"),
         |p| p.display().to_string(),
     );
-    let env_file = format!("/etc/{name}/{environment}.env");
+    let units = Units {
+        name: &name,
+        environment: &environment,
+        config_path: &config_path,
+        env_file: format!("/etc/{name}/{environment}.env"),
+    };
+    let mut files = Vec::new();
+    let mut alerting = false;
 
-    let base = format!("fraisier-{name}-{environment}-scheduled");
-    let service_unit = format!("{base}.service");
-    let timer_unit = format!("{base}.timer");
+    if schedule.is_some() {
+        let (service, timer) = units.scheduled(config)?;
+        alerting |= service.contents.contains("OnFailure=");
+        files.push(service);
+        files.push(timer);
+    }
+    for entry in retain {
+        let (service, timer) = units.retain(entry)?;
+        files.push(service);
+        files.push(timer);
+        alerting = true;
+    }
+    if let Some(spec) = drill_schedule {
+        let on_calendar = translate(spec, "drill", "schedule")?;
+        files.push(
+            units.unit(
+                "drill.service",
+                &units
+                    .fill(DRILL_SERVICE)
+                    .replace("{failure}", FAILURE_RECORD),
+            ),
+        );
+        files.push(
+            units.unit(
+                "drill.timer",
+                &units
+                    .fill(DRILL_TIMER)
+                    .replace("{on_calendar}", &on_calendar),
+            ),
+        );
+        alerting = true;
+    }
+    if alerting {
+        files.push(units.unit("alert@.service", &units.fill(ALERT_SERVICE)));
+    }
+    Ok(files)
+}
 
-    let service = with_header(
-        &SCHEDULED_SERVICE
-            .replace("{name}", &name)
-            .replace("{environment}", &environment)
-            .replace("{command}", &command)
-            .replace("{config_path}", &config_path)
-            .replace("{env_file}", &env_file)
-            .replace("{notes}", &notes),
-    );
-    let timer = with_header(
-        &SCHEDULED_TIMER
-            .replace("{name}", &name)
-            .replace("{environment}", &environment)
-            .replace("{command}", &command)
-            .replace("{on_calendar}", &on_calendar),
-    );
+/// What every scheduled unit of one deployable is rendered from.
+struct Units<'a> {
+    name: &'a str,
+    environment: &'a str,
+    config_path: &'a str,
+    env_file: String,
+}
 
-    Ok(vec![
+impl Units<'_> {
+    /// `template` with the fields every unit shares filled in.
+    fn fill(&self, template: &str) -> String {
+        template
+            .replace("{name}", self.name)
+            .replace("{environment}", self.environment)
+            .replace("{config_path}", self.config_path)
+            .replace("{env_file}", &self.env_file)
+    }
+
+    /// The unit `fraisier-<name>-<environment>-<suffix>`, under the marker.
+    fn unit(&self, suffix: &str, body: &str) -> GeneratedFile {
+        let unit = format!("fraisier-{}-{}-{suffix}", self.name, self.environment);
         GeneratedFile {
-            rel_path: PathBuf::from(format!("systemd/{service_unit}")),
-            install_dest: Some(PathBuf::from(format!("/etc/systemd/system/{service_unit}"))),
-            contents: service,
-        },
-        GeneratedFile {
-            rel_path: PathBuf::from(format!("systemd/{timer_unit}")),
-            install_dest: Some(PathBuf::from(format!("/etc/systemd/system/{timer_unit}"))),
-            contents: timer,
-        },
-    ])
+            rel_path: PathBuf::from(format!("systemd/{unit}")),
+            install_dest: Some(PathBuf::from(format!("/etc/systemd/system/{unit}"))),
+            contents: with_header(body),
+        }
+    }
+
+    /// The `[schedule]` service and timer. Only a backup alerts through a
+    /// failure record: a deploy notifies in-process, so it must not also alert.
+    fn scheduled(
+        &self,
+        config: &DeployConfig,
+    ) -> Result<(GeneratedFile, GeneratedFile), ScaffoldError> {
+        let schedule = config.schedule.as_ref();
+        // `command` is explicit — there is no silent "deploy" default (an
+        // unattended deploy must never be an accident); see the unattended-deploy
+        // gate.
+        let command = required(
+            schedule.and_then(|s| s.command.as_deref()),
+            "schedule",
+            "command",
+        )?;
+        let on_calendar = resolve_on_calendar(schedule)?;
+        let (notes, on_failure, failure) = if command == "backup" {
+            let dir = config
+                .backup
+                .as_ref()
+                .and_then(|backup| backup.dir.as_deref())
+                .ok_or(ScaffoldError::MissingField {
+                    section: "backup",
+                    field: "dir",
+                })?;
+            (
+                format!(
+                    "# Each run writes a new timestamped archive into [backup].dir\n\
+                     # ({}), so no run overwrites an earlier one.\n",
+                    dir.display()
+                ),
+                self.fill(ON_FAILURE),
+                FAILURE_RECORD,
+            )
+        } else {
+            (String::new(), String::new(), "")
+        };
+        let flag = if failure.is_empty() {
+            ""
+        } else {
+            " --failure-record %n"
+        };
+        let service = self
+            .fill(SCHEDULED_SERVICE)
+            .replace("{command}", &command)
+            .replace("{notes}", &notes)
+            .replace("{on_failure}", &on_failure)
+            .replace("{flag}", flag)
+            .replace("{failure}", failure);
+        let timer = self
+            .fill(SCHEDULED_TIMER)
+            .replace("{command}", &command)
+            .replace("{on_calendar}", &on_calendar);
+        Ok((
+            self.unit("scheduled.service", &service),
+            self.unit("scheduled.timer", &timer),
+        ))
+    }
+
+    /// The prune service and timer for one `[[backup.retain]]` entry.
+    fn retain(&self, entry: &RetainEntry) -> Result<(GeneratedFile, GeneratedFile), ScaffoldError> {
+        let retain = entry
+            .name()
+            .filter(|name| fraisier_config::is_unit_word(name))
+            .ok_or_else(|| ScaffoldError::InvalidField {
+                section: "backup.retain",
+                field: "name",
+                message: "a retain entry needs a name of letters, digits, '_', '.' or '-' \
+                          (it names the entry's systemd units)"
+                    .to_owned(),
+            })?;
+        let spec = required(entry.schedule.as_deref(), "backup.retain", "schedule")?;
+        let on_calendar = translate(&spec, "backup.retain", "schedule")?;
+        let service = self
+            .fill(RETAIN_SERVICE)
+            .replace("{retain}", &retain)
+            .replace("{failure}", FAILURE_RECORD);
+        let timer = self
+            .fill(RETAIN_TIMER)
+            .replace("{retain}", &retain)
+            .replace("{on_calendar}", &on_calendar);
+        Ok((
+            self.unit(&format!("retain-{retain}.service"), &service),
+            self.unit(&format!("retain-{retain}.timer"), &timer),
+        ))
+    }
+}
+
+/// A native calendar spec as an `OnCalendar=` expression.
+fn translate(
+    spec: &str,
+    section: &'static str,
+    field: &'static str,
+) -> Result<String, ScaffoldError> {
+    fraisier_config::calendar::to_on_calendar(spec).map_err(|message| ScaffoldError::InvalidField {
+        section,
+        field,
+        message,
+    })
 }
 
 /// A required string field, or [`ScaffoldError::MissingField`].
@@ -374,13 +513,13 @@ const SCHEDULED_SERVICE: &str = "[Unit]
 Description=fraisier scheduled {command} for {name} ({environment})
 After=network-online.target
 Wants=network-online.target
-
+{on_failure}
 [Service]
 Type=oneshot
 # Runs fraisier on the host; edit --config / add flags as needed.
-{notes}ExecStart=fraisier {command} --config {config_path}
+{notes}ExecStart=fraisier {command} --config {config_path}{flag}
 EnvironmentFile=-{env_file}
-";
+{failure}";
 
 const SCHEDULED_TIMER: &str = "[Unit]
 Description=fraisier scheduled {command} timer for {name} ({environment})
@@ -391,6 +530,78 @@ Persistent=true
 
 [Install]
 WantedBy=timers.target
+";
+
+/// The `[Unit]` line of every unit that alerts through a failure record.
+const ON_FAILURE: &str = "OnFailure=fraisier-{name}-{environment}-alert@%n.service\n";
+
+/// Where such a unit's failed run leaves its record (`--failure-record %n`).
+const FAILURE_RECORD: &str = "# A failed run leaves its redacted reason here for the alert unit.
+RuntimeDirectory=fraisier/failures
+RuntimeDirectoryPreserve=yes
+";
+
+const RETAIN_SERVICE: &str = "[Unit]
+Description=fraisier prune of {retain} archives for {name} ({environment})
+OnFailure=fraisier-{name}-{environment}-alert@%n.service
+
+[Service]
+Type=oneshot
+# The policy (dir, match, retention, floor) stays in the config: this
+# unit only names the [[backup.retain]] entry.
+ExecStart=fraisier backup prune --config {config_path} --name {retain} --apply --failure-record %n
+EnvironmentFile=-{env_file}
+{failure}";
+
+const RETAIN_TIMER: &str = "[Unit]
+Description=fraisier prune timer of {retain} archives for {name} ({environment})
+
+[Timer]
+# Exactly one OnCalendar=: systemd adds every non-empty assignment as
+# another trigger rather than replacing the last.
+OnCalendar={on_calendar}
+# A host that was down at the hour prunes on boot.
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+";
+
+const DRILL_SERVICE: &str = "[Unit]
+Description=fraisier restore drill for {name} ({environment})
+After=network-online.target
+Wants=network-online.target
+OnFailure=fraisier-{name}-{environment}-alert@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=fraisier backup drill --config {config_path} --failure-record %n
+EnvironmentFile=-{env_file}
+{failure}";
+
+const DRILL_TIMER: &str = "[Unit]
+Description=fraisier restore drill timer for {name} ({environment})
+
+[Timer]
+# Exactly one OnCalendar=: systemd adds every non-empty assignment as
+# another trigger rather than replacing the last.
+OnCalendar={on_calendar}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+";
+
+const ALERT_SERVICE: &str = "[Unit]
+Description=fraisier failure alert for {name} ({environment}): %i
+
+[Service]
+Type=oneshot
+# Sends the failed unit's record through [notify].command, once. This
+# unit has no OnFailure=: a failed alert is logged, never re-alerted.
+ExecStart=fraisier notify --config {config_path} --unit %i
+EnvironmentFile=-{env_file}
 ";
 
 const NGINX_SITE: &str = "upstream {upstream} {
@@ -572,7 +783,7 @@ upstream = "checkout_upstream"
         );
         let cfg = DeployConfig::from_toml_str(&toml).expect("parse");
         let files = generate_scheduled(&cfg).expect("generate");
-        assert_eq!(files.len(), 2, "timer + service: {files:?}");
+        assert_eq!(files.len(), 3, "timer + service + alert: {files:?}");
 
         let timer = find(&files, "scheduled.timer");
         assert!(
@@ -625,14 +836,19 @@ upstream = "checkout_upstream"
                  Description=fraisier scheduled backup for checkout (production)\n\
                  After=network-online.target\n\
                  Wants=network-online.target\n\
+                 OnFailure=fraisier-checkout-production-alert@%n.service\n\
                  \n\
                  [Service]\n\
                  Type=oneshot\n\
                  # Runs fraisier on the host; edit --config / add flags as needed.\n\
                  # Each run writes a new timestamped archive into [backup].dir\n\
                  # (/var/backups/checkout), so no run overwrites an earlier one.\n\
-                 ExecStart=fraisier backup --config /etc/fraisier/checkout.toml\n\
-                 EnvironmentFile=-/etc/checkout/production.env\n"
+                 ExecStart=fraisier backup --config /etc/fraisier/checkout.toml \
+                 --failure-record %n\n\
+                 EnvironmentFile=-/etc/checkout/production.env\n\
+                 # A failed run leaves its redacted reason here for the alert unit.\n\
+                 RuntimeDirectory=fraisier/failures\n\
+                 RuntimeDirectoryPreserve=yes\n"
             )
         );
     }

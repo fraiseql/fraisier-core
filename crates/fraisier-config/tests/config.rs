@@ -1438,3 +1438,21 @@ fn an_unknown_requirement_is_a_parse_error() {
     let toml = format!("{REQUIRES_BASE}\n[database.requires]\npostgis = true\n");
     assert!(DeployConfig::from_toml_str(&toml).is_err());
 }
+
+/// A subgraph names the endpoint a stack's SDL check asks; nothing else goes there.
+#[test]
+fn federation_names_the_graphql_endpoint() {
+    let cfg = DeployConfig::from_toml_str(
+        "[deploy]\nname = \"users\"\nenvironment = \"staging\"\n\
+         [federation]\ngraphql_url = \"http://127.0.0.1:8101/graphql\"\n",
+    )
+    .expect("parses");
+    assert_eq!(
+        cfg.federation.and_then(|f| f.graphql_url).as_deref(),
+        Some("http://127.0.0.1:8101/graphql")
+    );
+    assert!(DeployConfig::from_toml_str(
+        "[federation]\ngraphql_url = \"http://u/graphql\"\nsdl_headers = {}\n"
+    )
+    .is_err());
+}

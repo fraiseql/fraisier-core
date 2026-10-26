@@ -77,6 +77,10 @@ pub struct DeployConfig {
     /// The `[health]` section: the health probe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthSection>,
+    /// The `[federation]` section: this deployable as a subgraph. Absent when
+    /// it is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation: Option<FederationSection>,
     /// The `[lb]` section: the load balancer. Absent when there is none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lb: Option<LbSection>,
@@ -434,6 +438,17 @@ pub struct HealthSection {
     /// template `Bearer {token}`). Resolved once per deploy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_provider: Option<TokenProvider>,
+}
+
+/// The `[federation]` section: what a stack's SDL check needs of a subgraph.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FederationSection {
+    /// The subgraph's GraphQL endpoint, asked for its live `{ _service { sdl } }`.
+    /// The query sends the `[health]` headers and `token_provider`, so the
+    /// subgraph's credentials are configured once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql_url: Option<String>,
 }
 
 /// The `[ssh]` section: the connection parameters fraisier uses to run per-host

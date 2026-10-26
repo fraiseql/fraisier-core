@@ -262,7 +262,7 @@ pub(crate) async fn stack_status_with(
         });
     }
     let databases = databases(&stack, probe, env).await;
-    let findings = crate::stack_sdl::check(&stack, sdl, env).await;
+    let findings = crate::stack_sdl::check(&stack, sdl).await;
     let (sdl_pretty, sdl_ok) = crate::stack_sdl::render(&findings);
     let healthy = sdl_ok
         && members.iter().all(|row| row.unhealthy.is_none())
@@ -443,16 +443,23 @@ mod tests {
                 )
                 .replace(
                     "config = \"billing.toml\"\n",
-                    "config = \"billing.toml\"\nsdl = \"sdl/billing.graphql\"\n\
-                 graphql_url = \"http://billing/graphql\"\n",
+                    "config = \"billing.toml\"\nsdl = \"sdl/billing.graphql\"\n",
                 )
                 .replace(
                     "config = \"management.toml\"\n",
-                    "config = \"management.toml\"\nsdl = \"sdl/management.graphql\"\n\
-                 graphql_url = \"http://management/graphql\"\n",
+                    "config = \"management.toml\"\nsdl = \"sdl/management.graphql\"\n",
                 ),
         )
         .expect("write");
+        for name in ["billing", "management"] {
+            let config = dir.path().join(format!("{name}.toml"));
+            let toml = std::fs::read_to_string(&config).expect("read");
+            std::fs::write(
+                &config,
+                format!("{toml}[federation]\ngraphql_url = \"http://{name}/graphql\"\n"),
+            )
+            .expect("write");
+        }
         let out = block_on(stack_status_with(
             &path,
             &Fake::default(),

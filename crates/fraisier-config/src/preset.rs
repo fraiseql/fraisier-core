@@ -112,6 +112,7 @@ impl SpecqlPreset {
                 ..HealthSection::default()
             }),
             lb: multi_host.then(|| Self::lb_defaults(name.as_deref())),
+            federation: None,
             ssh: None,
             webhook: None,
             schedule: None,
@@ -315,6 +316,8 @@ impl DeployConfig {
             service: base.service.overlay(self.service),
             health: base.health.overlay(self.health),
             lb: base.lb.overlay(self.lb),
+            // The preset never emits [federation]; an author-supplied one wins.
+            federation: prefer(base.federation, self.federation),
             // The SpecQL preset never emits [ssh]; an author-supplied one wins.
             ssh: prefer(base.ssh, self.ssh),
             // The preset never emits [webhook]; an author-supplied one wins.

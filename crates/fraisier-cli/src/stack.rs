@@ -103,14 +103,7 @@ pub(crate) async fn stack_deploy(
     versions: &[String],
     deployer: &Deployer,
 ) -> Result<CommandOutput> {
-    stack_deploy_with(
-        stack_path,
-        versions,
-        deployer,
-        &crate::stack_sdl::LiveSdl,
-        &|name| std::env::var(name).ok(),
-    )
-    .await
+    stack_deploy_with(stack_path, versions, deployer, &crate::stack_sdl::LiveSdl).await
 }
 
 fn refused(message: &str) -> CommandOutput {
@@ -127,7 +120,6 @@ pub(crate) async fn stack_deploy_with(
     versions: &[String],
     deployer: &dyn MemberDeployer,
     sdl: &dyn crate::stack_sdl::SdlSource,
-    env: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> Result<CommandOutput> {
     let stack = match Stack::load(stack_path) {
         Ok(stack) => stack,
@@ -143,7 +135,7 @@ pub(crate) async fn stack_deploy_with(
         .all(|(_, outcome)| *outcome == MemberOutcome::Deployed);
     // Once, at the end: mid-stack, a subgraph ahead of its router is expected.
     let findings = if all_deployed {
-        crate::stack_sdl::check(&stack, sdl, env).await
+        crate::stack_sdl::check(&stack, sdl).await
     } else {
         Vec::new()
     };
@@ -361,6 +353,14 @@ mod tests {
         )
         .expect("write");
         std::fs::write(
+            dir.join("management.toml"),
+            format!(
+                "{}[federation]\ngraphql_url = \"http://management/graphql\"\n",
+                member_toml("management")
+            ),
+        )
+        .expect("write");
+        std::fs::write(
             &path,
             STACK
                 .replace(
@@ -369,8 +369,7 @@ mod tests {
                 )
                 .replace(
                     "config = \"management.toml\"\n",
-                    "config = \"management.toml\"\nsdl = \"sdl/management.graphql\"\n\
-                     graphql_url = \"http://management/graphql\"\n",
+                    "config = \"management.toml\"\nsdl = \"sdl/management.graphql\"\n",
                 ),
         )
         .expect("write");
@@ -381,14 +380,8 @@ mod tests {
     fn the_sdl_is_checked_once_every_member_deployed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = routed_stack_dir(dir.path());
-        let out = block_on(stack_deploy_with(
-            &path,
-            &[],
-            &Fake::default(),
-            &Sdl(true),
-            &|_| None,
-        ))
-        .expect("runs");
+        let out =
+            block_on(stack_deploy_with(&path, &[], &Fake::default(), &Sdl(true))).expect("runs");
         assert_eq!(out.exit_code, 1, "{}", out.pretty);
         assert!(
             out.pretty.contains("  sdl management: DIFFERS"),
@@ -398,14 +391,8 @@ mod tests {
         assert_eq!(out.json["ok"], serde_json::json!(false));
         assert_eq!(out.json["sdl"][0]["matches"], serde_json::json!(false));
 
-        let out = block_on(stack_deploy_with(
-            &path,
-            &[],
-            &Fake::default(),
-            &Sdl(false),
-            &|_| None,
-        ))
-        .expect("runs");
+        let out =
+            block_on(stack_deploy_with(&path, &[], &Fake::default(), &Sdl(false))).expect("runs");
         assert_eq!(out.exit_code, 0, "{}", out.pretty);
         assert!(
             out.pretty.contains("  sdl management: matches"),
@@ -422,8 +409,7 @@ mod tests {
             fail: vec!["billing"],
             ..Fake::default()
         };
-        let out =
-            block_on(stack_deploy_with(&path, &[], &fake, &Sdl(true), &|_| None)).expect("runs");
+        let out = block_on(stack_deploy_with(&path, &[], &fake, &Sdl(true))).expect("runs");
         assert_eq!(out.exit_code, 1, "{}", out.pretty);
         assert!(!out.pretty.contains("sdl"), "{}", out.pretty);
     }
@@ -445,8 +431,7 @@ mod tests {
             fail: vec!["management"],
             ..Fake::default()
         };
-        let out =
-            block_on(stack_deploy_with(&path, &[], &fake, &Sdl(false), &|_| None)).expect("runs");
+        let out = block_on(stack_deploy_with(&path, &[], &fake, &Sdl(false))).expect("runs");
         assert_eq!(out.exit_code, 1, "{}", out.pretty);
         assert!(out.pretty.contains("deployed  billing"), "{}", out.pretty);
         assert!(
@@ -463,14 +448,8 @@ mod tests {
         );
         assert!(!out.json.to_string().contains("hunter2"));
 
-        let out = block_on(stack_deploy_with(
-            &path,
-            &[],
-            &Fake::default(),
-            &Sdl(false),
-            &|_| None,
-        ))
-        .expect("runs");
+        let out =
+            block_on(stack_deploy_with(&path, &[], &Fake::default(), &Sdl(false))).expect("runs");
         assert_eq!(out.exit_code, 0, "{}", out.pretty);
     }
 
@@ -480,8 +459,7 @@ mod tests {
         let path = stack_dir(dir.path());
         std::fs::remove_file(dir.path().join("billing.toml")).expect("rm");
         let fake = Fake::default();
-        let out =
-            block_on(stack_deploy_with(&path, &[], &fake, &Sdl(false), &|_| None)).expect("runs");
+        let out = block_on(stack_deploy_with(&path, &[], &fake, &Sdl(false))).expect("runs");
         assert_eq!(out.exit_code, 1, "{}", out.pretty);
         assert!(out.pretty.contains("billing.toml"), "{}", out.pretty);
         assert!(fake.deployed.lock().expect("log").is_empty());

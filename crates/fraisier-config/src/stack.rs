@@ -64,17 +64,10 @@ pub struct MemberSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
     /// The member's subgraph SDL as the router serves it: a path inside the
-    /// router member's active release.
+    /// router member's release. The endpoint it is compared with is the member
+    /// config's `[federation].graphql_url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sdl: Option<PathBuf>,
-    /// The member's GraphQL endpoint, asked for its live `{ _service { sdl } }`.
-    /// Required with `sdl`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub graphql_url: Option<String>,
-    /// Headers sent with that query, each naming the environment variable that
-    /// holds its value (a credential never sits in the stack file).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub sdl_headers: BTreeMap<String, String>,
 }
 
 /// A member, resolved: its config loaded and its name derived.
@@ -90,10 +83,17 @@ pub struct Member {
     pub depends_on: Vec<String>,
     /// See [`MemberSpec::sdl`].
     pub sdl: Option<PathBuf>,
-    /// See [`MemberSpec::graphql_url`].
-    pub graphql_url: Option<String>,
-    /// See [`MemberSpec::sdl_headers`].
-    pub sdl_headers: BTreeMap<String, String>,
+}
+
+impl Member {
+    /// The endpoint the SDL check asks: the config's `[federation].graphql_url`.
+    #[must_use]
+    pub fn graphql_url(&self) -> Option<&str> {
+        self.config
+            .federation
+            .as_ref()
+            .and_then(|f| f.graphql_url.as_deref())
+    }
 }
 
 /// A validated stack, its members in deploy order.
@@ -118,8 +118,13 @@ impl StackFile {
     /// Parse a stack file.
     ///
     /// # Errors
-    /// The TOML does not parse, or has an unknown field.
+    /// The TOML does not parse, has an unknown field, or restates a member
+    /// property that lives in the member's config.
     pub fn from_toml_str(toml: &str) -> Result<Self, StackError> {
+        let moved = moved_keys(toml);
+        if !moved.is_empty() {
+            return Err(StackError(moved));
+        }
         toml::from_str(toml).map_err(|error| StackError(vec![error.to_string()]))
     }
 }
@@ -205,8 +210,6 @@ impl Stack {
                 config,
                 depends_on: spec.depends_on.clone(),
                 sdl: spec.sdl.clone(),
-                graphql_url: spec.graphql_url.clone(),
-                sdl_headers: spec.sdl_headers.clone(),
             });
         }
 
@@ -237,6 +240,45 @@ impl Stack {
                 .collect(),
         })
     }
+}
+
+/// Member keys a stack file once had, each with where it went.
+const MOVED: [(&str, &str); 2] = [
+    (
+        "graphql_url",
+        "graphql_url moved to the member's config, as [federation].graphql_url",
+    ),
+    (
+        "sdl_headers",
+        "sdl_headers is gone; the SDL query sends the member's [health] headers and \
+         token_provider",
+    ),
+];
+
+/// A pointer for every member that still sets a key in [`MOVED`]. Empty when
+/// `toml` does not parse: the typed parse reports that.
+fn moved_keys(toml: &str) -> Vec<String> {
+    let Ok(file) = toml.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let members = file
+        .get("stack")
+        .and_then(|stack| stack.get("member"))
+        .and_then(toml::Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let mut problems = Vec::new();
+    for member in members {
+        let shown = member
+            .get("config")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("<no config>");
+        for (key, pointer) in MOVED {
+            if member.get(key).is_some() {
+                problems.push(format!("member {shown}: {pointer}"));
+            }
+        }
+    }
+    problems
 }
 
 /// Duplicate member names, and dependencies that name no member.
@@ -278,13 +320,10 @@ fn sdl_problems(router: Option<&str>, members: &[Member]) -> Vec<String> {
     let checked: Vec<&Member> = members.iter().filter(|m| m.sdl.is_some()).collect();
     for member in members {
         let name = &member.name;
-        match (&member.sdl, &member.graphql_url) {
-            (Some(_), None) => problems.push(format!("member '{name}' has sdl but no graphql_url")),
-            (None, Some(_)) => problems.push(format!("member '{name}' has graphql_url but no sdl")),
-            (None, None) if !member.sdl_headers.is_empty() => {
-                problems.push(format!("member '{name}' has sdl_headers but no sdl"));
-            }
-            _ => {}
+        if member.sdl.is_some() && member.graphql_url().is_none() {
+            problems.push(format!(
+                "member '{name}' has sdl, but its config has no [federation].graphql_url"
+            ));
         }
         if let Some(sdl) = &member.sdl {
             if sdl.is_absolute()
@@ -470,13 +509,11 @@ mod tests {
                 "{HEAD}router = \"gateway\"\n\
                  [[stack.member]]\nconfig = \"gateway.toml\"\ndepends_on = [\"management\"]\n\
                  [[stack.member]]\nconfig = \"management.toml\"\n\
-                 sdl = \"federation/sdl/management.graphql\"\n\
-                 graphql_url = \"http://127.0.0.1:8042/graphql\"\n\
-                 sdl_headers = {{ \"x-api-key\" = \"SIDECAR_TOKEN\" }}\n"
+                 sdl = \"federation/sdl/management.graphql\"\n"
             ),
             &[
                 ("gateway.toml", router("gateway")),
-                ("management.toml", member("management", "staging")),
+                ("management.toml", subgraph("management")),
             ],
         )
         .expect("valid");
@@ -495,12 +532,38 @@ mod tests {
             Some(Path::new("federation/sdl/management.graphql"))
         );
         assert_eq!(
-            management.graphql_url.as_deref(),
+            management.graphql_url(),
             Some("http://127.0.0.1:8042/graphql")
         );
-        assert_eq!(
-            management.sdl_headers.get("x-api-key").map(String::as_str),
-            Some("SIDECAR_TOKEN")
+    }
+
+    /// A subgraph member: its config names the endpoint the SDL is asked from.
+    fn subgraph(name: &str) -> String {
+        format!(
+            "{}[federation]\ngraphql_url = \"http://127.0.0.1:8042/graphql\"\n",
+            member(name, "staging")
+        )
+    }
+
+    #[test]
+    fn a_stack_file_that_restates_the_endpoint_or_its_headers_is_refused_with_a_pointer() {
+        let restated = StackFile::from_toml_str(&format!(
+            "{HEAD}\n[[stack.member]]\nconfig = \"m.toml\"\nsdl = \"sdl/m.graphql\"\n\
+             graphql_url = \"http://m/graphql\"\nsdl_headers = {{ \"x-api-key\" = \"M_TOKEN\" }}\n"
+        ))
+        .expect_err("moved keys")
+        .0
+        .join("\n");
+        assert!(
+            restated.contains("member m.toml: graphql_url moved to the member's config, as [federation].graphql_url"),
+            "{restated}"
+        );
+        assert!(
+            restated.contains(
+                "member m.toml: sdl_headers is gone; the SDL query sends the member's [health] \
+                 headers and token_provider"
+            ),
+            "{restated}"
         );
     }
 
@@ -518,37 +581,32 @@ mod tests {
             &format!(
                 "{HEAD}router = \"ghost\"\n\
                  [[stack.member]]\nconfig = \"a.toml\"\nsdl = \"sdl/a.graphql\"\n\
-                 [[stack.member]]\nconfig = \"b.toml\"\ngraphql_url = \"http://b/graphql\"\n\
-                 [[stack.member]]\nconfig = \"c.toml\"\nsdl = \"../c.graphql\"\n\
-                 graphql_url = \"http://c/graphql\"\n"
+                 [[stack.member]]\nconfig = \"b.toml\"\n\
+                 [[stack.member]]\nconfig = \"c.toml\"\nsdl = \"../c.graphql\"\n"
             ),
             &[
                 ("a.toml", member("a", "staging")),
-                ("b.toml", member("b", "staging")),
-                ("c.toml", member("c", "staging")),
+                ("b.toml", subgraph("b")),
+                ("c.toml", subgraph("c")),
             ],
         )
         .expect_err("invalid");
         let all = problems.join("\n");
         assert!(all.contains("router 'ghost'"), "{all}");
         assert!(
-            all.contains("member 'a' has sdl but no graphql_url"),
-            "{all}"
-        );
-        assert!(
-            all.contains("member 'b' has graphql_url but no sdl"),
+            all.contains("member 'a' has sdl, but its config has no [federation].graphql_url"),
             "{all}"
         );
         assert!(all.contains("member 'c': sdl"), "{all}");
-        assert_eq!(problems.len(), 4, "{all}");
+        assert_eq!(problems.len(), 3, "{all}");
     }
 
     #[test]
     fn an_sdl_needs_a_router_with_a_release_that_is_not_itself() {
-        let sdl = "sdl = \"sdl/m.graphql\"\ngraphql_url = \"http://m/graphql\"\n";
+        let sdl = "sdl = \"sdl/m.graphql\"\n";
         let no_router = resolve(
             &format!("{HEAD}\n[[stack.member]]\nconfig = \"m.toml\"\n{sdl}"),
-            &[("m.toml", member("m", "staging"))],
+            &[("m.toml", subgraph("m"))],
         )
         .expect_err("no router");
         assert!(
@@ -559,11 +617,11 @@ mod tests {
         let no_release = resolve(
             &format!(
                 "{HEAD}router = \"gw\"\n[[stack.member]]\nconfig = \"gw.toml\"\n\
-                 [[stack.member]]\nconfig = \"m.toml\"\n{sdl}"
+                 depends_on = [\"m\"]\n[[stack.member]]\nconfig = \"m.toml\"\n{sdl}"
             ),
             &[
                 ("gw.toml", member("gw", "staging")),
-                ("m.toml", member("m", "staging")),
+                ("m.toml", subgraph("m")),
             ],
         )
         .expect_err("no active path");

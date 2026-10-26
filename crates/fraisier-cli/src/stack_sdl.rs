@@ -15,6 +15,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use fraisier_config::stack::Stack;
+use fraisier_core::adapter_axes::AdapterCtx;
 
 /// Where the two SDLs come from.
 #[async_trait]
@@ -118,11 +119,7 @@ pub(crate) fn to_json(findings: &[SdlFinding]) -> serde_json::Value {
 
 /// Check every member with `sdl` against the router's release. Nothing is
 /// checked in a stack without a router.
-pub(crate) async fn check(
-    stack: &Stack,
-    source: &dyn SdlSource,
-    env: &(dyn Fn(&str) -> Option<String> + Sync),
-) -> Vec<SdlFinding> {
+pub(crate) async fn check(stack: &Stack, source: &dyn SdlSource) -> Vec<SdlFinding> {
     let Some(release) = stack
         .router
         .as_deref()
@@ -133,14 +130,14 @@ pub(crate) async fn check(
     };
     let mut findings = Vec::new();
     for member in &stack.members {
-        let (Some(sdl), Some(url)) = (&member.sdl, &member.graphql_url) else {
+        let (Some(sdl), Some(url)) = (&member.sdl, member.graphql_url()) else {
             continue;
         };
-        let (compared, problem) =
-            match check_member(&release.join(sdl), url, &member.sdl_headers, source, env).await {
-                Ok(difference) => (true, difference),
-                Err(why) => (false, Some(why)),
-            };
+        let ctx = crate::factory::health_ctx(&member.config);
+        let (compared, problem) = match check_member(&release.join(sdl), url, &ctx, source).await {
+            Ok(difference) => (true, difference),
+            Err(why) => (false, Some(why)),
+        };
         findings.push(SdlFinding {
             member: member.name.clone(),
             problem: problem.map(|why| fraisier_saga::redact::credentials(&why)),
@@ -151,24 +148,21 @@ pub(crate) async fn check(
 }
 
 /// Compare one member's SDLs: `Ok` with the difference, if any, once both were
-/// read; `Err` when the check could not run.
+/// read; `Err` when the check could not run. The query sends the headers the
+/// member's own health probe sends, resolved from `ctx`.
 async fn check_member(
     served_path: &Path,
     url: &str,
-    header_vars: &std::collections::BTreeMap<String, String>,
+    ctx: &AdapterCtx,
     source: &dyn SdlSource,
-    env: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> Result<Option<String>, String> {
     let served = source
         .served_sdl(served_path)
         .map_err(|error| format!("cannot read {}: {error}", served_path.display()))?;
-    let mut headers = Vec::with_capacity(header_vars.len());
-    for (name, var) in header_vars {
-        let value = env(var).filter(|v| !v.is_empty()).ok_or_else(|| {
-            format!("cannot ask {url} for its SDL: ${var} is not set (header {name})")
-        })?;
-        headers.push((name.clone(), value));
-    }
+    let headers = fraisier_adapter_http::HttpHealth::new()
+        .resolve_headers(ctx)
+        .await
+        .map_err(|error| format!("cannot ask {url} for its SDL: {error}"))?;
     let values: Vec<String> = headers.iter().map(|(_, v)| v.clone()).collect();
     let hide = |text: String| {
         values
@@ -301,6 +295,11 @@ mod tests {
     }
 
     fn stack(router: bool) -> Stack {
+        stack_with(router, "[\"printf\", \"tok\"]")
+    }
+
+    /// The stack, billing's bearer token printed by `token_command`.
+    fn stack_with(router: bool, token_command: &str) -> Stack {
         let head = if router {
             "[stack]\nname = \"erp\"\nenvironment = \"staging\"\nrouter = \"gateway\"\n"
         } else {
@@ -309,9 +308,7 @@ mod tests {
         let members = if router {
             "[[stack.member]]\nconfig = \"gateway.toml\"\ndepends_on = [\"billing\", \"management\"]\n\
              [[stack.member]]\nconfig = \"management.toml\"\nsdl = \"federation/sdl/management.graphql\"\n\
-             graphql_url = \"http://m/graphql\"\nsdl_headers = { \"x-api-key\" = \"M_TOKEN\" }\n\
-             [[stack.member]]\nconfig = \"billing.toml\"\nsdl = \"federation/sdl/billing.graphql\"\n\
-             graphql_url = \"http://b/graphql\"\n"
+             [[stack.member]]\nconfig = \"billing.toml\"\nsdl = \"federation/sdl/billing.graphql\"\n"
         } else {
             "[[stack.member]]\nconfig = \"management.toml\"\n"
         };
@@ -322,13 +319,25 @@ mod tests {
                 .expect("stem")
                 .to_string_lossy()
                 .into_owned();
-            let artifact = if name == "gateway" {
-                "[artifact]\nsource = \"local\"\nactive_path = \"/srv/gateway/current\"\n"
-            } else {
-                ""
+            let rest = match name.as_str() {
+                "gateway" => {
+                    "[artifact]\nsource = \"local\"\nactive_path = \"/srv/gateway/current\"\n"
+                        .to_owned()
+                }
+                // The SDL query sends the member's own [health] headers...
+                "management" => "[federation]\ngraphql_url = \"http://m/graphql\"\n\
+                                 [health]\nadapter = \"http\"\nurl = \"http://m/health\"\n\
+                                 headers = { \"x-api-key\" = \"s3cret\" }\n"
+                    .to_owned(),
+                // ...and the token its [health].token_provider resolves.
+                _ => format!(
+                    "[federation]\ngraphql_url = \"http://b/graphql\"\n\
+                     [health]\nadapter = \"http\"\nurl = \"http://b/health\"\n\
+                     [health.token_provider]\ntype = \"exec\"\ncommand = {token_command}\n"
+                ),
             };
             Ok(format!(
-                "[deploy]\nname = \"{name}\"\nenvironment = \"staging\"\n{artifact}"
+                "[deploy]\nname = \"{name}\"\nenvironment = \"staging\"\n{rest}"
             ))
         })
         .expect("valid")
@@ -336,10 +345,6 @@ mod tests {
 
     fn served(name: &str) -> PathBuf {
         Path::new("/srv/gateway/current/federation/sdl").join(format!("{name}.graphql"))
-    }
-
-    fn env(name: &str) -> Option<String> {
-        (name == "M_TOKEN").then(|| "s3cret".to_owned())
     }
 
     #[test]
@@ -356,7 +361,7 @@ mod tests {
             ]),
             ..Fake::default()
         };
-        let findings = block_on(check(&stack(true), &fake, &env));
+        let findings = block_on(check(&stack(true), &fake));
         assert_eq!(
             findings[0],
             SdlFinding {
@@ -382,22 +387,25 @@ mod tests {
         assert_eq!(findings.len(), 2, "the router has no sdl");
         assert_eq!(
             *fake.asked.lock().expect("asked"),
-            vec!["http://b/graphql []", "http://m/graphql [x-api-key=s3cret]"]
+            vec![
+                "http://b/graphql [Authorization=Bearer tok]",
+                "http://m/graphql [x-api-key=s3cret]"
+            ]
         );
     }
 
     #[test]
     fn a_member_that_cannot_be_checked_fails_without_its_credential() {
         let fake = Fake {
-            served: BTreeMap::from([(served("management"), SDL.to_owned())]),
+            served: BTreeMap::from([(served("billing"), SDL.to_owned())]),
             ..Fake::default()
         };
-        let findings = block_on(check(&stack(true), &fake, &|_| None));
+        let findings = block_on(check(&stack_with(true, "[\"false\"]"), &fake));
         assert!(!findings[0].compared && !findings[1].compared);
-        let billing = findings[0].problem.as_deref().expect("unservable");
-        assert!(billing.contains("No such file"), "{billing}");
-        let management = findings[1].problem.as_deref().expect("no token");
-        assert!(management.contains("$M_TOKEN is not set"), "{management}");
+        let billing = findings[0].problem.as_deref().expect("no token");
+        assert!(billing.contains("token"), "{billing}");
+        let management = findings[1].problem.as_deref().expect("unservable");
+        assert!(management.contains("No such file"), "{management}");
         assert!(
             fake.asked.lock().expect("asked").is_empty(),
             "nothing is asked without both sides"
@@ -410,7 +418,7 @@ mod tests {
             ]),
             ..Fake::default()
         };
-        let findings = block_on(check(&stack(true), &fake, &env));
+        let findings = block_on(check(&stack(true), &fake));
         let management = findings[1].problem.as_deref().expect("refused");
         assert!(management.contains("connection refused"), "{management}");
         assert!(!management.contains("s3cret"), "{management}");
@@ -443,7 +451,7 @@ mod tests {
     fn a_stack_without_a_router_checks_nothing() {
         let fake = Fake::default();
         assert_eq!(
-            block_on(check(&stack(false), &fake, &env)),
+            block_on(check(&stack(false), &fake)),
             Vec::<SdlFinding>::new()
         );
         assert!(fake.asked.lock().expect("asked").is_empty());

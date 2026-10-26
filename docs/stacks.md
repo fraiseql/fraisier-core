@@ -66,13 +66,15 @@ path = "/srv/erp/_src/erp"                # holds federation/supergraph.graphql
 active_path = "/srv/erp/gateway/current"
 staging_dir = "/srv/erp/gateway/releases"
 
-# The router owns no database; the migration axis is a no-op.
+# The router owns no database; the migration axis is a no-op. It still prints
+# a constant revision: one that prints none makes every failed router deploy a
+# partial_rollback, because migrate cannot undo an "initial" migration.
 [migration]
 adapter = "command"
 preflight_mode = "off"
 
 [migration.settings.commands]
-current_revision = "true"
+current_revision = "echo none"
 up = "true"
 down_to = "true"
 
@@ -80,10 +82,15 @@ down_to = "true"
 adapter = "systemd"
 unit = "erp-gateway.service"
 
+# /readiness, not /health: Hive Router answers /health with 200 while it has no
+# supergraph it can serve, and /readiness with 503.
 [health]
 adapter = "http"
-url = "http://127.0.0.1:4000/health"
+url = "http://127.0.0.1:4000/readiness"
 ```
+
+Probe `/readiness`: a router release whose supergraph does not load then fails
+its health step, and the deploy rolls back to the previous release.
 
 ## `fraisier stack deploy`
 
@@ -156,10 +163,11 @@ supergraph, is a silent break. For every member with `sdl`, fraisier:
 3. compares the two exactly, except that trailing newlines are not a
    difference.
 
-A difference names the first line where the two differ. To fix it, recapture
-the subgraph's SDL, recompose, and deploy the router. A member that cannot be
-checked is a failure too: the file is missing, a header's variable is unset, or
-the query fails. Header values never appear in output.
+A difference (`DIFFERS`) names the first line where the two differ. To fix it,
+recapture the subgraph's SDL, recompose, and deploy the router. A member that
+cannot be checked (`UNCHECKED`) is a failure too: the file is missing, a
+header's variable is unset, or the query fails. Header values never appear in
+output.
 
 The check reads the router's release on the host fraisier runs on.
 

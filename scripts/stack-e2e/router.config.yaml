@@ -1,0 +1,6 @@
+http:
+  host: "127.0.0.1"
+  port: 4000
+supergraph:
+  source: file
+  path: ./supergraph.graphql

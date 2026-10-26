@@ -71,6 +71,23 @@ fraisier init
 CHECKOUT_DATABASE_URL=postgres://… fraisier deploy --app-version 1.4.2
 ```
 
+### Prebuilt binaries
+
+Each `fraisier-v*` release carries a binary per target
+(`fraisier-<target>.tar.gz`: Linux `x86_64`/`aarch64` gnu with a glibc 2.28 floor,
+static `x86_64` musl, and macOS), a CycloneDX SBOM per target
+(`fraisier-<target>.cdx.json`), and a `SHA256SUMS` file covering all of them.
+Check a download against it before installing:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+That proves the files are the ones the release lists. It does not prove who
+published the release, because the checksums come from the same place as the
+binaries. [docs/security.md](docs/security.md#offline-install) covers installing
+on a host with no network access.
+
 A minimal `fraisier.toml`:
 
 ```toml

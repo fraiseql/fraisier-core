@@ -8,6 +8,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Releases carry a `SHA256SUMS` file and a CycloneDX SBOM per target.**
+  `release-binaries.yml` now attaches `fraisier-<target>.cdx.json` next to each
+  tarball, and a final job hashes every tarball and SBOM *as the release serves
+  them* into `SHA256SUMS`. If any target fails to build, no `SHA256SUMS` is
+  written, so it can never silently omit a binary. Check a download with
+  `sha256sum --check --ignore-missing SHA256SUMS`. Part of
+  [#81](https://github.com/fraiseql/fraisier-core/issues/81).
+- **`SECURITY.md`**: private vulnerability reporting through GitHub, and the
+  supported-version policy (the latest beta only, until 1.0.0).
+- **`docs/security.md` states that the binary makes no call-home**, and lists
+  every outbound connection with the setting that turns it on. It also gains an
+  offline install procedure.
+
 - **`[backup].dir`: each backup writes a new, timestamped archive into a
   directory**, named `<fraise>-<environment>-<yyyymmddThhmmssZ>.pgdump` (UTC, to
   the second). `pg_dump` writes into a hidden `.<name>.partial` file beside it,

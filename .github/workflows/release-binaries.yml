@@ -16,6 +16,11 @@ name: release-binaries
 # when we upload — release-plz creates it via a GitHub App token, so the event does
 # fire this workflow. Only the `fraisier` bin crate's tags qualify (fraisier-webhook-v*
 # and other workspace crates are filtered out).
+#
+# Each target also gets a CycloneDX SBOM (`fraisier-<target>.cdx.json`), and a final
+# job writes `SHA256SUMS` over every tarball and SBOM once all targets have uploaded.
+# If any target fails, `SHA256SUMS` is not written, so a release never carries a
+# checksum file that silently omits a binary.
 
 on:
   release:
@@ -110,7 +115,58 @@ jobs:
         shell: bash
         run: tar czf "fraisier-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" fraisier
 
+      # The SBOM describes the dependency graph resolved for this target with the
+      # default features, which is what `--bin fraisier` above builds. cargo-cyclonedx
+      # writes one file per workspace member; only the `fraisier` crate's is shipped.
+      - name: SBOM (CycloneDX)
+        shell: bash
+        run: |
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo cyclonedx --target "${{ matrix.target }}" --no-build-deps --format json \
+            --spec-version 1.5 --override-filename "fraisier-${{ matrix.target }}.cdx"
+          mv "crates/fraisier-cli/fraisier-${{ matrix.target }}.cdx.json" .
+
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" "fraisier-${{ matrix.target }}.tar.gz" --clobber
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" --clobber \
+            "fraisier-${{ matrix.target }}.tar.gz" "fraisier-${{ matrix.target }}.cdx.json"
+
+  checksums:
+    name: SHA256SUMS
+    needs: binaries
+    if: >-
+      github.repository == 'fraiseql/fraisier-core' &&
+      startsWith(github.event.release.tag_name, 'fraisier-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Hashes what the release actually serves, downloaded back, rather than the
+      # build jobs' local files: a checksum must describe the published bytes.
+      - name: Download every tarball and SBOM
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release download "$TAG" --repo "${{ github.repository }}" \
+            --pattern 'fraisier-*.tar.gz' --pattern 'fraisier-*.cdx.json'
+
+      - name: Write SHA256SUMS
+        shell: bash
+        run: |
+          expected=10   # five targets, a tarball and an SBOM each
+          shopt -s nullglob
+          files=(fraisier-*.tar.gz fraisier-*.cdx.json)
+          if [ "${#files[@]}" -ne "$expected" ]; then
+            echo "::error::expected $expected release files, found ${#files[@]}: ${files[*]}"
+            exit 1
+          fi
+          sha256sum "${files[@]}" | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" --repo "${{ github.repository }}" --clobber SHA256SUMS

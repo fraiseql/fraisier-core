@@ -50,6 +50,7 @@ use crate::adapter_axes::{
     ServiceAdapter, Severity, StagedArtifact,
 };
 use crate::policy::{self, Baseline, Inspection, PolicyGate};
+use crate::readiness::{self, DatabaseReadiness};
 use crate::restore_rehearsal::{run_restore_rehearsal, BackupSource, RehearsalDb};
 
 /// Which preflight a deploy runs before touching the live database.
@@ -134,6 +135,7 @@ pub struct SingleHostDeploy {
     /// throwaway DB (`[migration].preflight_mode = "restore_rehearsal"`).
     restore_rehearsal: Option<Arc<dyn RehearsalDb>>,
     backup_source: BackupSource,
+    database_readiness: Option<Arc<dyn DatabaseReadiness>>,
     artifact: Arc<dyn ArtifactAdapter>,
     migration: Arc<dyn MigrationAdapter>,
     service: Arc<dyn ServiceAdapter>,
@@ -219,6 +221,7 @@ pub struct SingleHostDeployBuilder {
     policy: PolicyGate,
     restore_rehearsal: Option<Arc<dyn RehearsalDb>>,
     backup_source: BackupSource,
+    database_readiness: Option<Arc<dyn DatabaseReadiness>>,
     artifact: Option<Arc<dyn ArtifactAdapter>>,
     migration: Option<Arc<dyn MigrationAdapter>>,
     service: Option<Arc<dyn ServiceAdapter>>,
@@ -240,6 +243,7 @@ impl SingleHostDeployBuilder {
             policy: PolicyGate::default(),
             restore_rehearsal: None,
             backup_source: BackupSource::FreshDump,
+            database_readiness: None,
             artifact: None,
             migration: None,
             service: None,
@@ -307,6 +311,15 @@ impl SingleHostDeployBuilder {
         self
     }
 
+    /// Check the live database against what the deployable declared it needs
+    /// (`[database.requires]`) as the first thing preflight does, before any
+    /// mutation. See [`crate::readiness`].
+    #[must_use]
+    pub fn database_readiness(mut self, probe: Arc<dyn DatabaseReadiness>) -> Self {
+        self.database_readiness = Some(probe);
+        self
+    }
+
     /// Set the artifact adapter (required).
     #[must_use]
     pub fn artifact(mut self, artifact: Arc<dyn ArtifactAdapter>) -> Self {
@@ -366,6 +379,7 @@ impl SingleHostDeployBuilder {
             policy: self.policy,
             restore_rehearsal: self.restore_rehearsal,
             backup_source: self.backup_source,
+            database_readiness: self.database_readiness,
         })
     }
 }
@@ -392,6 +406,7 @@ struct DeployShared {
     policy: PolicyGate,
     restore_rehearsal: Option<Arc<dyn RehearsalDb>>,
     backup_source: BackupSource,
+    database_readiness: Option<Arc<dyn DatabaseReadiness>>,
     artifact: Arc<dyn ArtifactAdapter>,
     migration: Arc<dyn MigrationAdapter>,
     service: Arc<dyn ServiceAdapter>,
@@ -469,6 +484,7 @@ impl DeployShared {
             policy: deploy.policy.clone(),
             restore_rehearsal: deploy.restore_rehearsal.clone(),
             backup_source: deploy.backup_source.clone(),
+            database_readiness: deploy.database_readiness.clone(),
             artifact: Arc::clone(&deploy.artifact),
             migration: Arc::clone(&deploy.migration),
             service: Arc::clone(&deploy.service),
@@ -502,6 +518,14 @@ impl DeployShared {
     /// not permitted to make anyway. Both read one [`Inspection`], so the adapter
     /// is asked once.
     async fn run_preflight(&self) -> Result<(), SagaError> {
+        // First, before the adapter is even asked what it can do. A deliberate
+        // rollback is not held behind it, for the policy gate's reason: refusing
+        // an emergency rollback protects nothing.
+        if let Some(probe) = &self.database_readiness {
+            if self.rollback_to.is_none() {
+                readiness::check(probe.as_ref(), &self.ctx).await?;
+            }
+        }
         let inspection = self.inspect().await?;
         self.run_policy_gate(&inspection).await?;
         Self::run_forward_compat_lint(&inspection)?;
@@ -666,6 +690,9 @@ impl DeployShared {
     }
 
     async fn undo_migrate(&self, runtime: &DeployRuntime) -> Result<(), SagaError> {
+        if !self.migration.owns_database() {
+            return Ok(());
+        }
         let Some(previous) = runtime.previous_revision.clone() else {
             return Err(SagaError::StepFailed {
                 step: "migrate".to_owned(),
@@ -1830,6 +1857,67 @@ mod tests {
         assert_eq!(drain(&trail), vec!["describe", "preflight"]);
     }
 
+    /// A readiness probe that logs to the trail and answers `reasons`.
+    struct FakeReadiness {
+        trail: Trail,
+        reasons: Vec<String>,
+    }
+
+    #[async_trait]
+    impl crate::readiness::DatabaseReadiness for FakeReadiness {
+        async fn unready(&self, _live_dsn: &str) -> Result<Vec<String>, String> {
+            log(&self.trail, "readiness");
+            Ok(self.reasons.clone())
+        }
+    }
+
+    fn deploy_with_readiness(trail: &Trail, reasons: Vec<String>) -> SingleHostDeploy {
+        SingleHostDeploy::builder("checkout", "production", HostId::new("localhost"))
+            .context(ctx_with_dsn())
+            .artifact(Arc::new(FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            }))
+            .migration(Arc::new(FakeMigration::healthy(trail)))
+            .service(Arc::new(FakeService {
+                trail: trail.clone(),
+                fail_restarts: Arc::new(Mutex::new(0)),
+            }))
+            .health(Arc::new(FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            }))
+            .database_readiness(Arc::new(FakeReadiness {
+                trail: trail.clone(),
+                reasons,
+            }))
+            .build()
+            .expect("all adapters provided")
+    }
+
+    #[tokio::test]
+    async fn an_unready_database_stops_preflight_before_anything_else() {
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let plan = deploy_with_readiness(&trail, vec!["pg_tviews is not preloaded".to_owned()]);
+        let outcome = plan.run(store).await.expect("run");
+        assert!(
+            matches!(&outcome, SagaOutcome::RolledBack { failed_step, .. } if failed_step == "preflight"),
+            "got {outcome:?}"
+        );
+        assert_eq!(drain(&trail), vec!["readiness"]);
+    }
+
+    #[tokio::test]
+    async fn a_ready_database_is_checked_first_and_the_deploy_commits() {
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let plan = deploy_with_readiness(&trail, Vec::new());
+        let outcome = plan.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+        assert_eq!(drain(&trail).first().map(String::as_str), Some("readiness"));
+    }
+
     #[tokio::test]
     async fn first_deploy_failure_yields_partial_rollback() {
         // No prior ledger: a failed first-ever deploy has no committed state to
@@ -1853,6 +1941,53 @@ mod tests {
         assert!(
             matches!(outcome, SagaOutcome::PartialRollback { .. }),
             "a first-deploy rollback with no prior release is a PartialRollback, got {outcome:?}"
+        );
+    }
+
+    fn database_less(trail: &Trail, healthy: bool) -> SingleHostDeploy {
+        SingleHostDeploy::builder("checkout", "production", HostId::new("localhost"))
+            .artifact(Arc::new(FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            }))
+            .migration(Arc::new(crate::no_database::NoDatabase))
+            .service(Arc::new(FakeService {
+                trail: trail.clone(),
+                fail_restarts: Arc::new(Mutex::new(0)),
+            }))
+            .health(Arc::new(FakeHealth {
+                trail: trail.clone(),
+                healthy,
+            }))
+            .build()
+            .expect("all adapters provided")
+    }
+
+    #[tokio::test]
+    async fn a_database_less_deploy_commits() {
+        let (_dir, store) = store();
+        seed_prior(&store).await;
+        let outcome = database_less(&Trail::default(), true)
+            .run(store)
+            .await
+            .expect("run completes");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_database_less_deploy_rolls_back_without_a_revision() {
+        // `adapter = "none"`: nothing was migrated, so the failed health check
+        // re-activates the prior release and the saga ends RolledBack, not
+        // PartialRollback for want of a revision to return to.
+        let (_dir, store) = store();
+        seed_prior(&store).await;
+        let outcome = database_less(&Trail::default(), false)
+            .run(store)
+            .await
+            .expect("run completes");
+        assert!(
+            matches!(&outcome, SagaOutcome::RolledBack { failed_step, .. } if failed_step == "health"),
+            "got {outcome:?}"
         );
     }
 

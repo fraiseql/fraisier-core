@@ -24,7 +24,9 @@ use fraisier_core::adapter_axes::{
     AdapterCtx, ArtifactAdapter, HealthAdapter, HostId, LbAdapter, MigrationAdapter, ServiceAdapter,
 };
 use fraisier_core::multi_host::{MultiHostPlan, RolloutStrategy};
+use fraisier_core::no_database::NoDatabase;
 use fraisier_core::policy::{ApprovalHook, PolicyGate};
+use fraisier_core::readiness::DatabaseReadiness;
 use fraisier_core::restore_rehearsal::{BackupSource, RehearsalDb};
 use fraisier_core::single_host::PreflightMode;
 use fraisier_ipc::{Launcher, SshLauncher};
@@ -200,6 +202,9 @@ pub struct ResolvedDeploy {
     /// the given [`RehearsalDb`]) seeded from [`BackupSource`] and rehearses the
     /// pending migrations there. Populated when `preflight_mode = "restore_rehearsal"`.
     pub restore_rehearsal: Option<RestoreRehearsalPlan>,
+    /// The `[database.requires]` probe, run first in preflight. `None` when the
+    /// section declares nothing.
+    pub database_readiness: Option<Arc<dyn DatabaseReadiness>>,
     /// The artifact adapter.
     pub artifact: Arc<dyn ArtifactAdapter>,
     /// The migration adapter (in-process or IPC).
@@ -253,7 +258,12 @@ fn resolve_preflight(config: &DeployConfig) -> (bool, Option<RestoreRehearsalPla
                 .preflight_backup_path
                 .clone()
                 .map_or(BackupSource::FreshDump, BackupSource::Archive);
-            let db: Arc<dyn RehearsalDb> = Arc::new(PgRehearsalDb);
+            let db: Arc<dyn RehearsalDb> = Arc::new(PgRehearsalDb {
+                admin_url_env: config
+                    .database
+                    .as_ref()
+                    .and_then(|d| d.admin_url_env.clone()),
+            });
             (true, Some((db, backup)))
         }
     }
@@ -357,6 +367,12 @@ fn settings_map(config: &DeployConfig, app_version: Option<&str>) -> BTreeMap<St
                 settings.insert("token_provider".to_owned(), value);
             }
         }
+        if let Some(required) = &health.require_capabilities {
+            settings.insert(
+                "require_capabilities".to_owned(),
+                Value::from(required.clone()),
+            );
+        }
     }
     if let Some(lb) = &config.lb {
         put_path(&mut settings, "config_path", lb.config_path.as_deref());
@@ -454,6 +470,7 @@ fn put_path(map: &mut BTreeMap<String, Value>, key: &str, value: Option<&std::pa
 
 fn render_migration(config: &DeployConfig) -> String {
     match config.migration.as_ref().and_then(|m| m.adapter.as_deref()) {
+        Some(fraisier_core::no_database::ADAPTER_NAME) => "none (no database)".to_owned(),
         Some(name @ ("confiture" | "command")) => format!("{name} (in-process)"),
         Some(name) => format!("{name} (IPC: fraisier-adapter-{name})"),
         None => "<none>".to_owned(),
@@ -555,6 +572,7 @@ pub fn build(
         forward_compatible_lint,
         policy: build_policy_gate(config),
         restore_rehearsal,
+        database_readiness: crate::pg_readiness::probe(config),
         artifact,
         migration,
         service,
@@ -576,6 +594,9 @@ pub struct ResolvedMultiHost {
     pub forward_compatible_lint: bool,
     /// The schema policy gate resolved from `[policy]` (default: no tier gate).
     pub policy: PolicyGate,
+    /// The `[database.requires]` probe, run first in preflight. `None` when the
+    /// section declares nothing.
+    pub database_readiness: Option<Arc<dyn DatabaseReadiness>>,
     /// The artifact adapter.
     pub artifact: Arc<dyn ArtifactAdapter>,
     /// The migration adapter (run once on the orchestrator).
@@ -656,6 +677,7 @@ pub fn build_multi_host(
         ctx,
         forward_compatible_lint,
         policy: build_policy_gate(config),
+        database_readiness: crate::pg_readiness::probe(config),
         artifact,
         migration,
         service,
@@ -1061,6 +1083,7 @@ fn build_migration(
         .and_then(|m| m.adapter.as_deref())
         .context("[migration].adapter is required")?;
     match name {
+        fraisier_core::no_database::ADAPTER_NAME => Ok(Arc::new(NoDatabase)),
         "confiture" => {
             // In-process: map the logical secret to its source env var name.
             if let Some(source) = database_url_env {
@@ -1383,7 +1406,11 @@ pub fn build_blue_green(
     Ok(ResolvedBlueGreen {
         fraise,
         environment,
-        deploy: BlueGreenDeploy::new(params, migration, traffic, fleet, budget),
+        deploy: match crate::pg_readiness::probe(config) {
+            Some(probe) => BlueGreenDeploy::new(params, migration, traffic, fleet, budget)
+                .database_readiness(probe),
+            None => BlueGreenDeploy::new(params, migration, traffic, fleet, budget),
+        },
     })
 }
 
@@ -1453,6 +1480,19 @@ mod tests {
              [service]\nadapter = \"systemd\"\nunit = \"app.service\"\n\n\
              [health]\nadapter = \"http\"\nurl = \"http://127.0.0.1/health\"\n"
         )
+    }
+
+    #[test]
+    fn a_database_less_axis_builds_the_no_database_adapter() {
+        let toml = single_host_with_migration("").replace(
+            "adapter = \"confiture\"\ndatabase_url_env = \"APP_DATABASE_URL\"",
+            "adapter = \"none\"",
+        );
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+        let resolved = build(&config, None, None).expect("builds");
+        assert!(!resolved.migration.owns_database());
+        let summary = summarize(&config, None, None).expect("summarize");
+        assert_eq!(summary.migration, "none (no database)");
     }
 
     #[test]
@@ -1540,6 +1580,22 @@ mod tests {
         assert_eq!(
             plan.ctx.env_secrets.get("DATABASE_URL").map(String::as_str),
             Some("APP_DATABASE_URL"),
+        );
+    }
+
+    #[test]
+    fn http_health_plumbs_require_capabilities() {
+        let toml = "[deploy]\nname = \"app\"\nenvironment = \"prod\"\n\n\
+             [artifact]\nsource = \"local\"\npath = \"/builds/app\"\nactive_path = \"/srv/app/current\"\n\n\
+             [migration]\nadapter = \"confiture\"\ndatabase_url_env = \"APP_DATABASE_URL\"\n\n\
+             [service]\nadapter = \"systemd\"\nunit = \"app.service\"\n\n\
+             [health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n\
+             require_capabilities = [\"observers\"]\n";
+        let config = DeployConfig::from_toml_str(toml).expect("parses");
+        let plan = build_health_probe(&config).expect("builds http health probe");
+        assert_eq!(
+            plan.ctx.settings.get("require_capabilities"),
+            Some(&serde_json::json!(["observers"])),
         );
     }
 

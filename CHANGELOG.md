@@ -144,6 +144,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
       kept;
     - an optional `keep_last` cap: at most that many are kept, however young.
       It is rejected when below the floor.
+  - **Only archives can be selected.** A prune removes every old file its
+    entry selects, so `dir` must be `[backup].dir` or below it (making
+    `[backup].dir` required once an entry exists), and `match` must end in
+    `.pgdump`. `match = "*"` or a `dir` outside the backups is a validation
+    error.
   - **The floor comes first.** It is applied before the age rule, so a producer
     that has stopped never ages the whole corpus out. An archive `pg_restore
     --list` rejects gives up its floor slot. One that cannot be checked keeps

@@ -8,6 +8,7 @@
 //! deploy time, not config-load time.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use fraisier_core::adapter_axes::{RiskTier, Severity};
 use fraisier_core::policy::{PolicyAction, UnclassifiedAction};
@@ -913,17 +914,11 @@ fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
                 dir.display()
             ),
         ),
-        None if cfg
-            .backup
-            .as_ref()
-            .is_some_and(|backup| backup.retain.is_empty()) =>
-        {
-            report.error(
-                "backup.dir",
-                "the [backup] section requires dir (the directory archives are written to) \
-                 or at least one [[backup.retain]] entry",
-            );
-        }
+        None if cfg.backup.is_some() => report.error(
+            "backup.dir",
+            "the [backup] section requires dir: the directory archives are written to, \
+             and the one every [[backup.retain]].dir must be within",
+        ),
         None if scheduled => report.error(
             "backup.dir",
             "a scheduled backup requires [backup].dir: without it every run writes the \
@@ -937,7 +932,7 @@ fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
         .map_or(&[][..], |backup| &backup.retain[..]);
     let mut names: Vec<(String, usize)> = Vec::new();
     for (index, entry) in retain.iter().enumerate() {
-        validate_retain_entry(entry, &format!("backup.retain[{index}]"), report);
+        validate_retain_entry(entry, dir, &format!("backup.retain[{index}]"), report);
         if let Some(name) = entry.name() {
             if !is_unit_word(&name) {
                 report.error(
@@ -1044,8 +1039,17 @@ const fn is_plain(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
 }
 
-fn validate_retain_entry(entry: &crate::RetainEntry, at: &str, report: &mut ValidationReport) {
-    match entry.dir.as_deref() {
+/// A retain entry's `dir`: absolute, plain, and `backup_dir` or below it.
+///
+/// `starts_with` compares whole components, so `/srv/backups2` is not below
+/// `/srv/backups`.
+fn validate_retain_dir(
+    dir: Option<&Path>,
+    backup_dir: Option<&Path>,
+    at: &str,
+    report: &mut ValidationReport,
+) {
+    match dir {
         None => report.error(&format!("{at}.dir"), "a retain entry requires dir"),
         Some(dir) => {
             let text = dir.to_string_lossy();
@@ -1060,9 +1064,60 @@ fn validate_retain_entry(entry: &crate::RetainEntry, at: &str, report: &mut Vali
                          '-' with no '..', not {text:?}"
                     ),
                 );
+            } else if let Some(backup_dir) = backup_dir.filter(|base| !dir.starts_with(base)) {
+                report.error(
+                    &format!("{at}.dir"),
+                    format!(
+                        "dir must be [backup].dir ({}) or a directory below it, not {text:?}: \
+                         a prune removes old files, so it may only reach the archives",
+                        backup_dir.display()
+                    ),
+                );
             }
         }
     }
+}
+
+/// A retain entry's `match`: a file-name glob that can only select archives.
+fn validate_retain_match(pattern: &str, at: &str, report: &mut ValidationReport) {
+    let pattern_ok = !pattern.is_empty()
+        && pattern != "."
+        && pattern != ".."
+        && pattern
+            .bytes()
+            .all(|byte| is_plain(byte) && byte != b'/' || matches!(byte, b'*' | b'?'));
+    let suffix = crate::RetainEntry::DEFAULT_PATTERN.trim_start_matches('*');
+    if !pattern_ok {
+        report.error(
+            &format!("{at}.match"),
+            format!(
+                "match must be a file-name glob within dir (letters, digits, '.', '_', '-', \
+                 '*', '?'; no '/'), not {pattern:?}"
+            ),
+        );
+    } else if !pattern.ends_with(suffix) {
+        report.error(
+            &format!("{at}.match"),
+            format!(
+                "match must end in the archive suffix '{suffix}', not {pattern:?}: a prune \
+                 removes every old file the glob selects"
+            ),
+        );
+    }
+}
+
+/// Validate one `[[backup.retain]]` entry.
+///
+/// `backup prune --apply` removes every old file the entry selects, so the
+/// entry may select archives only: its `dir` must be `backup_dir` or below it,
+/// and its `match` must end in the archive suffix.
+fn validate_retain_entry(
+    entry: &crate::RetainEntry,
+    backup_dir: Option<&Path>,
+    at: &str,
+    report: &mut ValidationReport,
+) {
+    validate_retain_dir(entry.dir.as_deref(), backup_dir, at, report);
     match entry.schedule.as_deref() {
         None => report.error(
             &format!("{at}.schedule"),
@@ -1101,22 +1156,7 @@ fn validate_retain_entry(entry: &crate::RetainEntry, at: &str, report: &mut Vali
         ),
         _ => {}
     }
-    let pattern = entry.pattern();
-    let pattern_ok = !pattern.is_empty()
-        && pattern != "."
-        && pattern != ".."
-        && pattern
-            .bytes()
-            .all(|byte| is_plain(byte) && byte != b'/' || matches!(byte, b'*' | b'?'));
-    if !pattern_ok {
-        report.error(
-            &format!("{at}.match"),
-            format!(
-                "match must be a file-name glob within dir (letters, digits, '.', '_', '-', \
-                 '*', '?'; no '/'), not {pattern:?}"
-            ),
-        );
-    }
+    validate_retain_match(entry.pattern(), at, report);
     if entry.min_free_gb == Some(0) {
         report.error(
             &format!("{at}.min_free_gb"),

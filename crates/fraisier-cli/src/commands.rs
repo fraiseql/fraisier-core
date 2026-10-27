@@ -5580,11 +5580,13 @@ current_revision = "true"
         std::time::UNIX_EPOCH + std::time::Duration::from_mins(29_883_075)
     }
 
-    /// A config with one `[[backup.retain]]` entry per `(name, dir, extra)`.
+    /// A config with one `[[backup.retain]]` entry per `(name, dir, extra)`, and
+    /// `dir` as `[backup].dir`: every corpus must sit within it.
     fn prune_config(dir: &Path, entries: &[(&str, &Path, &str)]) -> std::path::PathBuf {
         use std::fmt::Write as _;
 
         let mut body = db_ops_config("FRAISIER_PRUNE_UNUSED_DSN");
+        let _ = write!(body, "\n[backup]\ndir = \"{}\"\n", dir.display());
         for (name, corpus, extra) in entries {
             let _ = write!(
                 body,
@@ -6743,7 +6745,8 @@ current_revision = "true"
         // No [schedule]: the retain units and their alert still install.
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = format!(
-            "{VALID}\n[[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"nightly\"\n\
+            "{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n\
+             [[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"nightly\"\n\
              schedule = \"daily 05:30\"\nretention_days = 14\n"
         );
         let config = write(dir.path(), "fraisier.toml", &cfg);
@@ -6786,7 +6789,8 @@ current_revision = "true"
     fn scheduled_install_refuses_an_invalid_retain_entry() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = format!(
-            "{VALID}\n[[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"night ly\"\n\
+            "{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n\
+             [[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"night ly\"\n\
              schedule = \"daily 05:30\"\nretention_days = 14\n"
         );
         let config = write(dir.path(), "fraisier.toml", &cfg);

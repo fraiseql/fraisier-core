@@ -345,9 +345,11 @@ Every deploy checks this first in preflight, before any mutation, and
 `fraisier doctor` reports it. With `pg_tviews = true`, a TVIEW that is empty
 while its backing view has rows refuses the deploy (`[database.tviews]
 on_empty`), and `fraisier db tviews rebuild` repopulates it. An optional
-`[database].admin_url_env` names a superuser identity used only to restore a
-pg_tviews archive (the restore rehearsal, drills, `db restore`) and to rebuild
-TVIEWs, never by a webhook-triggered deploy.
+`[database].admin_url_env` names a superuser identity. Once it is set, every
+operator-triggered restore runs as that identity (`db restore`, drills, and the
+restore rehearsal of a deploy you start yourself), and so does `db tviews
+rebuild`; migrations and health checks stay on the app role. A
+webhook-triggered deploy never reads it.
 fraisier never installs PostgreSQL or an extension;
 [`scripts/provision-pg18-tviews.sh`](scripts/provision-pg18-tviews.sh) gets a
 Debian host ready. See

@@ -1873,7 +1873,7 @@ fn an_omitted_policy_key_takes_its_documented_default() {
 
 #[test]
 fn no_policy_section_means_no_policy_at_all() {
-    // D6: configuring the section is the opt-in. Absent stays absent — there is
+    // Configuring the section is the opt-in. Absent stays absent — there is
     // no implicit default policy for a config that never asked for one.
     let cfg = DeployConfig::from_toml_str(PRD_7_1).expect("parses");
     assert!(cfg.policy.is_none());

@@ -307,8 +307,8 @@ impl SingleHostDeployBuilder {
     /// Apply `gate` — the resolved `[policy]` section and its approval hook — to
     /// this deploy's preflight step.
     ///
-    /// Absent, the tier gate does not run at all (D6: configuring the section is
-    /// the opt-in), and a single-host deploy behaves exactly as it does without a
+    /// Absent, the tier gate does not run at all (configuring the section is the
+    /// opt-in), and a single-host deploy behaves exactly as it does without a
     /// policy: single-host runs one version at a time, so it has no always-on
     /// baseline rule either.
     #[must_use]
@@ -680,7 +680,7 @@ impl DeployShared {
     ///
     /// Single-host runs one version at a time against the database, so there is
     /// no shared hold window to certify: the baseline is [`Baseline::None`] and
-    /// the gate is entirely opt-in through `[policy]` (D6). With no section
+    /// the gate is entirely opt-in through `[policy]`. With no section
     /// configured this decides nothing and allows.
     ///
     /// A deliberate rollback is **not** gated, for the same reason the restore
@@ -2797,9 +2797,9 @@ mod tests {
 
     #[tokio::test]
     async fn no_policy_section_leaves_behaviour_unchanged() {
-        // The D6 guarantee, and the regression test that protects every existing
-        // user: the same irreversible change, with no `[policy]` section, still
-        // deploys exactly as it does today.
+        // The opt-in guarantee, and the regression test that protects every
+        // existing user: the same irreversible change, with no `[policy]` section,
+        // still deploys exactly as it does today.
         let (_dir, store) = store();
         let trail = Trail::default();
         let plan = deploy(

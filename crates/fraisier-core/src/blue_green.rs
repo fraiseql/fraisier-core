@@ -155,8 +155,8 @@ impl BgShared {
     /// configured, if doubling connections would exhaust the shared DB.
     ///
     /// One decision function answers both questions from one preflight report
-    /// (D3). The window rule is the [`Baseline::WindowSafety`] half and applies
-    /// unconditionally; the tier policy is the opt-in half.
+    /// rather than two gates. The window rule is the [`Baseline::WindowSafety`]
+    /// half and applies unconditionally; the tier policy is the opt-in half.
     async fn run_preflight(&self) -> Result<(), SagaError> {
         if let Some(probe) = &self.database_readiness {
             readiness::check(probe.as_ref(), &self.ctx).await?;
@@ -857,7 +857,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The schema policy gate (#45, D3). Blue-green is the strategy whose
+    // The schema policy gate (#45). Blue-green is the strategy whose
     // window-safety rule the policy gate replaced: one decision function now
     // answers both "can N-1 and N share this database?" and "is this change
     // destructive enough to need a human?".
@@ -885,7 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_gate_refuses_for_either_cause_with_distinguishable_reasons() {
-        // The test that pins D3's resolved reading. `window_safe` is not a second
+        // The test that pins the one-gate design. `window_safe` is not a second
         // gate, it is an input to the one gate — and a refusal has to say which
         // rule fired, because the two have completely different fixes: one is
         // "rewrite the migration expand/contract", the other is "get sign-off".
@@ -922,7 +922,7 @@ mod tests {
 
     #[tokio::test]
     async fn blue_green_is_still_gated_with_no_policy_section() {
-        // The D6 carve-out at the saga level: the tier policy is opt-in, the
+        // The baseline carve-out at the saga level: the tier policy is opt-in, the
         // window-safety baseline is not. If this ever passes, replacing the
         // window-safety gate has silently deleted it for every existing user —
         // which is all of them, since nobody has a `[policy]` section today.

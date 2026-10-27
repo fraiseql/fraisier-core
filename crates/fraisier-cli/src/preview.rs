@@ -22,7 +22,7 @@
 //! ## The cost of seeing
 //!
 //! Reaching a change-set means spawning the migration adapter and reading the
-//! database, so a dry-run now does I/O where it did none (D8). Every way that
+//! database, so a dry-run now does I/O where it did none. Every way that
 //! can fail — no DSN, unreachable database, an adapter that does not lint —
 //! **degrades**: the plan still prints and still exits 0, carrying an explicit
 //! unavailability. `--dry-run --skip-preflight` restores the pure offline plan
@@ -56,7 +56,8 @@ pub struct SchemaPreview {
     /// `None`. Never omitted from the serialized form.
     pub change_set_unavailable: Option<Unavailable>,
     /// What the gate would decide. `None` when nothing would decide anything: no
-    /// `[policy]` section and a strategy with no always-on baseline (D6).
+    /// `[policy]` section (the policy is opt-in) and a strategy with no always-on
+    /// baseline.
     pub policy: Option<PolicyPreview>,
     /// The adapter's window-safety verdict. `None` when the strategy never asks
     /// — only blue-green holds two versions against one database.
@@ -133,7 +134,7 @@ pub struct ChangeSetPreview {
 ///
 /// [`code`](Self::code) is the stable machine name a pipeline branches on;
 /// [`detail`](Self::detail) is the line an operator reads. The pair is what
-/// keeps rule 3 honest — *unknown* is distinguishable from *empty* without
+/// keeps the plan honest — *unknown* is distinguishable from *empty* without
 /// parsing prose.
 #[derive(Debug, Clone, Serialize)]
 pub struct Unavailable {
@@ -148,7 +149,7 @@ impl Unavailable {
     ///
     /// The one state the human render stays silent about: telling an operator
     /// the plan cannot see the schema is telling them what they just asked for,
-    /// and rule 1 makes `--dry-run --skip-preflight` print today's plan
+    /// and `--dry-run --skip-preflight` must print the offline plan
     /// byte-for-byte. The machine form still says it.
     pub const SKIPPED: &'static str = "preflight_skipped";
     /// The config turned every preflight off (`[migration].preflight_mode`).
@@ -253,7 +254,7 @@ impl WindowSafety {
 ///
 /// Never fails. An adapter that cannot be inspected yields a plan with an
 /// explicit unavailability, because a dry-run that cannot reach the database
-/// still owes the operator the plan (rule 2, D8).
+/// still owes the operator the plan.
 pub async fn gather(
     migration: &dyn MigrationAdapter,
     ctx: &AdapterCtx,
@@ -521,9 +522,9 @@ fn assemble(
         Ok(change_set) => (Some(change_set), None),
         Err(reason) => (None, Some(reason)),
     };
-    // With the tier gate switched off (D6) *and* no always-on baseline, nothing
-    // decides anything — which is not the same as deciding to allow, and must
-    // not render as a verdict the operator never configured.
+    // With the tier gate switched off (no `[policy]`) *and* no always-on baseline,
+    // nothing decides anything — which is not the same as deciding to allow, and
+    // must not render as a verdict the operator never configured.
     let decides = gate.policy().is_some() || baseline != Baseline::None;
     SchemaPreview {
         change_set,
@@ -590,7 +591,7 @@ impl PolicyPreview {
 /// and a decision waiting on a human qualify, because neither one deploys
 /// unattended.
 ///
-/// A plan with no verdict at all (D6: no `[policy]`, no baseline) never blocks —
+/// A plan with no verdict at all (no `[policy]`, no baseline) never blocks —
 /// a pipeline must not start failing on a gate its config never opted in to.
 #[must_use]
 pub fn would_block(preview: &SchemaPreview) -> bool {
@@ -623,9 +624,9 @@ pub fn render(preview: &SchemaPreview) -> String {
     let mut lines: Vec<String> = Vec::new();
     match (&preview.change_set, &preview.change_set_unavailable) {
         (Some(change_set), _) => lines.extend(render_change_set(change_set)),
-        // The operator turned preflight off on this run, so telling them the
-        // plan cannot see the schema is telling them what they just asked for
-        // (rule 1). Every other cause is said out loud.
+        // The operator turned preflight off on this run, so telling them the plan
+        // cannot see the schema is telling them what they just asked for (the
+        // offline plan stays byte-for-byte). Every other cause is said out loud.
         (None, Some(reason)) if reason.code != Unavailable::SKIPPED => {
             lines.extend(wrap(&format!(
                 "schema change-set: UNAVAILABLE — {}. {UNKNOWN_NOT_ZERO}",
@@ -1044,7 +1045,7 @@ mod tests {
         assert_eq!(policy.worst_tier, Some(RiskTier::Irreversible));
     }
 
-    /// D13 (ii): a plain `--dry-run` never dumps production. It classifies
+    /// A plain `--dry-run` never dumps production. It classifies
     /// statically and says so, naming the flag that would look deeper.
     #[tokio::test]
     async fn a_default_dry_run_does_not_dump_the_live_database() {
@@ -1593,8 +1594,8 @@ mod tests {
 
     #[tokio::test]
     async fn no_policy_section_and_no_baseline_previews_no_verdict() {
-        // D6: an operator who has not opted in sees the change-set and nothing
-        // else — there is no decision to report.
+        // The policy is opt-in: an operator who has not opted in sees the
+        // change-set and nothing else — there is no decision to report.
         let adapter = FakeMigration::classifying(vec![
             change("drop_table", "public.tb_legacy").with_tier(RiskTier::Irreversible)
         ]);
@@ -1674,7 +1675,7 @@ mod tests {
 
     #[test]
     fn fail_on_block_exits_zero_when_nothing_decided() {
-        // D6: no `[policy]` section and no baseline means no verdict, and a
+        // No `[policy]` section and no baseline means no verdict, and a
         // pipeline must not start failing on a gate its config never opted in
         // to.
         assert!(!super::would_block(&SchemaPreview::default()));
@@ -1808,9 +1809,10 @@ mod tests {
 
     #[test]
     fn render_is_silent_when_preflight_was_skipped() {
-        // Rule 1's other half: the operator who turned preflight off is not told
-        // that preflight is off. This is what keeps `--dry-run --skip-preflight`
-        // byte-identical to the plan it printed before this phase.
+        // The other half of the offline promise: the operator who turned preflight
+        // off is not told that preflight is off. This is what keeps
+        // `--dry-run --skip-preflight` byte-identical to the plan it printed
+        // before the schema was inspected.
         let rendered = super::render(&SchemaPreview {
             change_set_unavailable: Some(Unavailable::new(
                 Unavailable::SKIPPED,
@@ -1895,7 +1897,7 @@ mod tests {
 
     #[tokio::test]
     async fn blue_green_previews_a_verdict_with_no_policy_section() {
-        // The D6 carve-out: the window-safety baseline is not opt-in, so
+        // The window-safety baseline is not opt-in, unlike the policy, so
         // blue-green always has something to report.
         // `window_safe` is advertised as well as returned: a verdict from an
         // adapter that never claimed the capability is refused for *that*
@@ -1985,7 +1987,7 @@ mod tests {
 
     #[test]
     fn an_empty_change_set_is_not_an_unavailable_one() {
-        // The presence distinction the type system carries in Phase 01, out on
+        // The presence distinction the type system carries, out on
         // the wire: "the adapter looked and found nothing" must not serialize
         // the same as "nobody looked".
         let looked = SchemaPreview {

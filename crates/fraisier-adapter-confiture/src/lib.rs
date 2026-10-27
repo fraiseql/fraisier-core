@@ -2244,7 +2244,7 @@ mod tests {
         assert!(!err.message.contains("hunter2"), "{}", err.message);
     }
 
-    /// The `--against` captures (Phase 05 Cycle 1), each read as the adapter
+    /// The `--against` captures, each read as the adapter
     /// reads a preflight report. See `tests/fixtures/against/README.md`.
     fn against_capture(name: &str) -> Value {
         let bytes = match name {
@@ -2309,7 +2309,7 @@ mod tests {
 
     #[test]
     fn deep_classification_is_advertised_from_0_44_0() {
-        // Observed (Phase 05 Cycle 1): 0.43.0 leaves `ALTER COLUMN … TYPE`
+        // Observed in the captures: 0.43.0 leaves `ALTER COLUMN … TYPE`
         // untiered under `--against`; 0.44.0 tiers it from the target's schema.
         for (version, deep) in [("0.43.0", false), ("0.44.0", true), ("1.36.0", true)] {
             assert_eq!(
@@ -2531,7 +2531,7 @@ mod tests {
 
     #[test]
     fn preflight_report_reads_the_first_class_window_safe_verdict() {
-        // A confiture that emits the typed verdict (the cross-repo Phase-3 contract).
+        // A confiture that emits the typed verdict as a first-class field.
         let safe = parse_preflight_report(
             &serde_json::json!({ "ok": true, "window_safe": true, "issues": [] }),
         );

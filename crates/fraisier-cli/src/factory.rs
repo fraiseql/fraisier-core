@@ -77,10 +77,11 @@ pub struct PlanSummary {
 
 /// Resolve the `[policy]` section into the gate a deploy runs at preflight.
 ///
-/// An absent section is the D6 opt-out and yields the default gate: no tier
-/// policy at all, and whatever always-on baseline the strategy itself applies.
-/// An `approval_command` becomes the one [`ApprovalHook`] implementation; without
-/// one, anything the policy sends for sign-off is refused rather than passed.
+/// An absent section is the opt-out (the policy is opt-in) and yields the default
+/// gate: no tier policy at all, and whatever always-on baseline the strategy itself
+/// applies. An `approval_command` becomes the one [`ApprovalHook`] implementation;
+/// without one, anything the policy sends for sign-off is refused rather than
+/// passed.
 fn build_policy_gate(config: &DeployConfig) -> PolicyGate {
     let Some(section) = config.policy.as_ref() else {
         return PolicyGate::default();
@@ -1187,7 +1188,7 @@ fn build_migration(
 }
 
 // ---------------------------------------------------------------------------
-// Blue-green (phase-07) wiring
+// Blue-green wiring
 // ---------------------------------------------------------------------------
 
 use std::time::Duration;
@@ -1486,7 +1487,7 @@ mod tests {
 
     #[test]
     fn an_absent_policy_section_builds_no_gate() {
-        // The D6 opt-out, at the wiring layer: nothing to configure means
+        // The policy opt-out, at the wiring layer: nothing to configure means
         // nothing to decide, and no approval hook to spawn.
         let config = DeployConfig::from_toml_str(&single_host_with_migration("")).expect("parses");
         let gate = build_policy_gate(&config);
@@ -1592,8 +1593,8 @@ mod tests {
     async fn rehearsal_error(trigger: fraisier_db::restore::Trigger) -> String {
         let toml = single_host_with_migration(
             "preflight_mode = \"restore_rehearsal\"\n\
-             preflight_backup_path = \"/nonexistent/fraisier-d14.dump\"\n",
-        ) + "\n[database]\nadmin_url_env = \"FRAISIER_D14_ADMIN_NEVER_SET\"\n";
+             preflight_backup_path = \"/nonexistent/fraisier-rehearsal.dump\"\n",
+        ) + "\n[database]\nadmin_url_env = \"FRAISIER_ADMIN_NEVER_SET\"\n";
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
         let resolved = build_for(&config, None, None, trigger).expect("builds");
         let (db, backup) = resolved.restore_rehearsal.expect("a rehearsal");
@@ -1606,13 +1607,13 @@ mod tests {
     #[tokio::test]
     async fn a_webhook_deploys_rehearsal_never_resolves_the_admin_identity() {
         let error = rehearsal_error(fraisier_db::restore::Trigger::Webhook).await;
-        assert!(!error.contains("FRAISIER_D14_ADMIN_NEVER_SET"), "{error}");
+        assert!(!error.contains("FRAISIER_ADMIN_NEVER_SET"), "{error}");
     }
 
     #[tokio::test]
     async fn an_operator_deploys_rehearsal_resolves_the_admin_identity() {
         let error = rehearsal_error(fraisier_db::restore::Trigger::Operator).await;
-        assert!(error.contains("FRAISIER_D14_ADMIN_NEVER_SET"), "{error}");
+        assert!(error.contains("FRAISIER_ADMIN_NEVER_SET"), "{error}");
     }
 
     #[test]

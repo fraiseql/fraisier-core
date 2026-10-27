@@ -16,7 +16,7 @@ It ships three ways:
   workflows over the same engine),
 - an **adapter protocol** you can implement in any language over JSON-RPC.
 
-> **Status: pre-release (`1.0.0-beta.1`).** The engine and adapter contracts are
+> **Status: pre-release (the `1.0.0` betas).** The engine and adapter contracts are
 > frozen for v1.0 and exercised end-to-end against real infrastructure (real
 > Postgres + confiture, real systemd, real nginx, real multi-host over SSH).
 
@@ -218,7 +218,13 @@ webhook-server    Run the signed-webhook deploy trigger (socket-activated/standa
 scheduled         Manage scheduled fraisier runs via systemd timers
 self-upgrade      Coordinated management of fraisier's own service
 sync              Share the deploy ledger across operators over git refs (experimental)
-backup / db       Database lifecycle: backup, migrate, restore, reset
+backup            Back up the database; `backup prune` applies retention,
+                  `backup drill` proves the newest archive restores
+db                Database lifecycle: migrate, restore, reset, `tviews rebuild`
+stack             Deploy or report a stack: subgraphs, router and databases
+notify            Send a failed scheduled run's record through [notify].command
+doctor            Diagnose the install: config, secrets, toolchain, database
+env-check         Report which env vars a subcommand would read, and which are unset
 providers         List the adapters available to this binary, per axis
 provider-test     Probe one provider (IPC handshake or built-in presence)
 check             Run the project's [[checks]] with cross-check parallelism (-j)
@@ -311,6 +317,52 @@ that cannot see the schema says so (*"Risk is unknown, not zero"*) instead of
 printing as though it were clean. See
 [`docs/schema-risk-policy.md`](docs/schema-risk-policy.md).
 
+## Backups, retention and drills
+
+With `[backup].dir` set, `fraisier backup` writes a new timestamped archive on
+every run and renames it into place only after `pg_restore --list` reads it
+back. `[[backup.retain]]` policies decide what `fraisier backup prune` removes:
+a dry run unless `--apply`, and never below the policy's floor.
+`fraisier backup drill` restores the newest archive into a throwaway database,
+migrates it forward, checks it, and drops it, because an archive that has never
+been restored is not yet a backup.
+
+`fraisier scheduled install` turns backups, prunes and drills into systemd
+timers. Each failed run notifies once, through `[notify].command`, with
+credentials stripped from the reason. See [`docs/backups.md`](docs/backups.md).
+
+## Database readiness: PostgreSQL 18 and pg_tviews
+
+A deployable can declare what its database server must offer:
+
+```toml
+[database.requires]
+postgres_major = 18   # PostgreSQL 18.x or later
+pg_tviews = true      # preloaded, installed, and on read contract 2
+```
+
+Every deploy checks this first in preflight, before any mutation, and
+`fraisier doctor` reports it. With `pg_tviews = true`, a TVIEW that is empty
+while its backing view has rows refuses the deploy (`[database.tviews]
+on_empty`), and `fraisier db tviews rebuild` repopulates it. An optional
+`[database].admin_url_env` names a superuser identity used only to restore a
+pg_tviews archive (the restore rehearsal, drills, `db restore`) and to rebuild
+TVIEWs, never by a webhook-triggered deploy.
+fraisier never installs PostgreSQL or an extension;
+[`scripts/provision-pg18-tviews.sh`](scripts/provision-pg18-tviews.sh) gets a
+Debian host ready. See
+[`docs/database-requirements.md`](docs/database-requirements.md).
+
+## Stacks
+
+A stack is one environment's federated application: the subgraphs, the router
+in front of them, and their databases. A `stack.<env>.toml` references each
+member's own `fraisier.toml`. `fraisier stack deploy` deploys the members in
+dependency order and stops at the first failure; `fraisier stack status`
+reports them as one. With `[stack].router`, each subgraph's live SDL is checked
+against the router's candidate release before the router deploys. See
+[`docs/stacks.md`](docs/stacks.md).
+
 ## Observability
 
 Every saga step is both persisted (via the state store) and exported as an
@@ -320,6 +372,10 @@ including which step failed and which compensations ran.
 With `[metrics].textfile_dir` set, deploy, backup and backup drill each write a
 Prometheus textfile of gauges describing their last run, for node_exporter's
 textfile collector. See [`docs/metrics.md`](docs/metrics.md).
+
+A failed deploy, and a failed scheduled backup, prune or drill, runs
+`[notify].command` once, with a structured payload whose reason has its
+credentials stripped.
 
 ## Security model
 

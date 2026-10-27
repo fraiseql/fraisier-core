@@ -102,6 +102,7 @@ pub async fn run_command(
     operation: &str,
 ) -> Result<Captured, AdapterError> {
     let mut command = tokio::process::Command::new(program);
+    fraisier_core::child_env::scrub(command.as_std_mut());
     command.args(args);
     for (key, value) in envs {
         command.env(key, value);

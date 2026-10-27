@@ -1243,6 +1243,7 @@ impl AdapterFleet {
 
     async fn stop_unit(&self, unit: &str) -> Result<(), String> {
         let mut command = tokio::process::Command::new("systemctl");
+        fraisier_core::child_env::scrub(command.as_std_mut());
         if self.user {
             command.arg("--user");
         }

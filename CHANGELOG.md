@@ -20,6 +20,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   runs as the app role. On a pg_tviews database, the rehearsal refuses before it
   creates anything, and says to run the deploy from the CLI or its timer. CLI
   and timer deploys are unchanged.
+- **The admin DSN stays out of the app and of every child process.** The
+  scheduled units that `fraisier scheduled install` writes (backup, prune,
+  drill, a scheduled deploy, and the alert unit) now also load
+  `/etc/<name>/<env>.ops.env`, after the shared `<env>.env`; the app unit does
+  not load it. Put `[database].admin_url_env`'s DSN there, and the drill can
+  restore as the admin while the application never sees it. Once a config
+  names `admin_url_env`, fraisier also removes that variable from every
+  command it runs: the migration tool, hooks, the approval and notify
+  commands, an exec token provider, IPC adapters and `systemctl`. Only the
+  restore tools get the DSN, as `PG*` variables. Re-run `scheduled install` to
+  pick up the new units.
 - **Every restore goes through one primitive in `fraisier-db`.** `db restore`,
   the restore rehearsal and the drill share one identity choice, archive
   listing, pg_tviews precheck, rebuild and teardown guard.

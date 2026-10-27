@@ -207,6 +207,12 @@ command = "/usr/local/bin/page-oncall"
 A retain entry's name becomes part of its unit names, so it may hold only
 letters, digits, `_`, `.` and `-`.
 
+Every one of these services, and the alert unit, loads two environment files:
+`/etc/<name>/<env>.env`, which the app unit loads too, then
+`/etc/<name>/<env>.ops.env`, which only fraisier's own runs load. Put
+`[database].admin_url_env`'s DSN in the `.ops.env` file, so the drill can
+restore as the admin while the application never sees a superuser DSN.
+
 ### Every failure notifies exactly once
 
 Each of those services sets

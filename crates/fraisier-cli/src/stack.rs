@@ -24,6 +24,19 @@ use serde_json::json;
 use crate::commands::CommandOutput;
 use crate::stack_sdl::{SdlGate, SdlSource};
 
+/// Load the stack at `stack_path`, withholding every member's admin DSN from
+/// the children any member's deploy spawns.
+///
+/// # Errors
+/// The stack file or a member config does not load.
+pub(crate) fn load(stack_path: &Path) -> Result<Stack, fraisier_config::stack::StackError> {
+    let stack = Stack::load(stack_path)?;
+    for member in &stack.members {
+        crate::commands::withhold_admin_env(&member.config);
+    }
+    Ok(stack)
+}
+
 /// Deploys one member.
 #[async_trait]
 pub(crate) trait MemberDeployer: Send + Sync {
@@ -141,7 +154,7 @@ fn ready(
     versions: &[String],
     deployer: &dyn MemberDeployer,
 ) -> Result<(Stack, BTreeMap<String, String>), CommandOutput> {
-    let stack = Stack::load(stack_path).map_err(|error| refused(&error.to_string()))?;
+    let stack = load(stack_path).map_err(|error| refused(&error.to_string()))?;
     let versions = parse_versions(&stack, versions).map_err(|message| refused(&message))?;
     invalid_members(&stack, deployer).map_or(Ok((stack, versions)), Err)
 }

@@ -80,6 +80,7 @@ impl Launcher {
         match self {
             Self::Local => {
                 let mut command = Command::new(program);
+                fraisier_core::child_env::scrub(command.as_std_mut());
                 command.args(args).envs(envs);
                 Ok(command)
             }
@@ -224,6 +225,7 @@ impl SshLauncher {
         let destination = self.destination(ctx, operation)?;
         let remote = remote_command(program, args);
         let mut command = Command::new(&self.program);
+        fraisier_core::child_env::scrub(command.as_std_mut());
         command.args(self.ssh_argv(&destination, &remote));
         Ok(command)
     }

@@ -91,6 +91,33 @@ pub enum RehearsalError {
     Migrate(#[source] AdapterError),
 }
 
+impl RehearsalError {
+    /// What the operator should do about this failure.
+    ///
+    /// Only [`Migrate`](Self::Migrate) means the pending migrations ran and
+    /// broke. The other variants fail before any migration runs, so their
+    /// advice points at the throwaway copy instead.
+    #[must_use]
+    pub const fn remedy(&self) -> &'static str {
+        match self {
+            Self::Migrate(_) => {
+                "The pending migrations did not apply cleanly on a fresh restore. Fix the \
+                 migrations"
+            }
+            Self::Provision(_) => {
+                "The pending migrations were not rehearsed: the throwaway copy could not be \
+                 created or seeded. If the database role may not create databases, grant it \
+                 CREATEDB or name a restore identity with `[database].admin_url_env`. Otherwise \
+                 fix the cause above"
+            }
+            Self::Secret(_) => {
+                "The pending migrations were not rehearsed: the live database DSN could not \
+                 be resolved. Check the `DATABASE_URL` secret"
+            }
+        }
+    }
+}
+
 /// Provision and tear down the throwaway database the rehearsal runs against.
 ///
 /// Implementations restore a **full** backup (schema + migration-tracking rows) so
@@ -346,5 +373,36 @@ mod tests {
             report.teardown_warning.is_some(),
             "a leaked throwaway DB must be surfaced as a warning"
         );
+    }
+
+    #[test]
+    fn only_a_failed_rehearsed_migration_blames_the_migrations() {
+        let migrate = RehearsalError::Migrate(AdapterError::new(
+            AdapterErrorKind::Execution,
+            "relation \"widgets\" does not exist",
+        ));
+        assert!(
+            migrate.remedy().contains("did not apply cleanly"),
+            "{}",
+            migrate.remedy()
+        );
+
+        let provision = RehearsalError::Provision("CREATE DATABASE failed".to_owned());
+        let secret = RehearsalError::Secret(AdapterError::new(
+            AdapterErrorKind::MissingSecret,
+            "DATABASE_URL is not declared",
+        ));
+        for unrehearsed in [provision, secret] {
+            let remedy = unrehearsed.remedy();
+            assert!(remedy.contains("were not rehearsed"), "{remedy}");
+            assert!(!remedy.contains("did not apply cleanly"), "{remedy}");
+        }
+    }
+
+    #[test]
+    fn a_provisioning_failure_names_the_admin_identity_escape() {
+        let remedy =
+            RehearsalError::Provision("permission denied to create database".to_owned()).remedy();
+        assert!(remedy.contains("[database].admin_url_env"), "{remedy}");
     }
 }

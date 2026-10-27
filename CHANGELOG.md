@@ -270,6 +270,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`stack deploy` validates every member before deploying any.** A member's
+  config was validated only when its own deploy began, so an invalid third
+  member refused after the first two were already live. The stack is now
+  refused up front, naming each invalid member and its errors.
+||||||| eac43bc
 - **A notify hook that fails is no longer reported as sent.** `fraisier
   notify` (the `OnFailure=` alert unit) printed "sent" and exited 0 whatever
   `[notify].command` did, and the hook's exit status went only to a log line

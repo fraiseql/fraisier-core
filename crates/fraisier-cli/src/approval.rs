@@ -72,6 +72,7 @@ impl ExecApproval {
         // hook's; send an empty object rather than failing the deploy for it.
         let payload = serde_json::to_string(request).unwrap_or_else(|_| "{}".to_owned());
         let mut command = tokio::process::Command::new(&self.shell);
+        fraisier_core::child_env::scrub(command.as_std_mut());
         command
             .arg("-c")
             .arg(&self.command)

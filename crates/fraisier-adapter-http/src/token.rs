@@ -86,6 +86,7 @@ async fn resolve_exec(command: &[String], timeout: Duration) -> Result<String, A
         .split_first()
         .ok_or_else(|| token_error("exec token provider has an empty command"))?;
     let mut cmd = tokio::process::Command::new(program);
+    fraisier_core::child_env::scrub(cmd.as_std_mut());
     cmd.args(args);
     let run = cmd.output();
     let output = match tokio::time::timeout(timeout, run).await {

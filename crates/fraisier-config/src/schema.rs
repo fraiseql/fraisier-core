@@ -723,7 +723,8 @@ pub struct MetricsSection {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetainEntry {
-    /// The directory holding the corpus. Required; must be absolute.
+    /// The directory holding the corpus. Required; must be absolute, and be
+    /// `[backup].dir` or a directory below it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<PathBuf>,
     /// When the prune runs, in the `[schedule].calendar` vocabulary
@@ -742,7 +743,8 @@ pub struct RetainEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_last: Option<u32>,
     /// A file-name glob (`*`, `?`) selecting the corpus within `dir`. Defaults
-    /// to `*.pgdump`; it cannot name another directory.
+    /// to `*.pgdump`; it cannot name another directory, and must end in
+    /// `.pgdump`.
     #[serde(default, rename = "match", skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
     /// Warn when the filesystem holding `dir` has less than this many GB free.

@@ -66,6 +66,7 @@ The router is an ordinary deployable. fraisier does not compose the supergraph:
 the application's build composes it from the committed SDL files and ships it in
 the router's release. For Hive Router serving a committed supergraph:
 
+<!-- router-example -->
 ```toml
 [deploy]
 name = "gateway"
@@ -77,18 +78,9 @@ path = "/srv/erp/_src/erp"                # holds federation/supergraph.graphql
 active_path = "/srv/erp/gateway/current"
 staging_dir = "/srv/erp/gateway/releases"
 
-# The router owns no database. Until `adapter = "none"` arrives (PR #106), the
-# migration axis is a no-op command that prints a constant revision: one that
-# prints none makes every failed router deploy a partial_rollback, because
-# migrate cannot undo an "initial" migration.
+# The router owns no database.
 [migration]
-adapter = "command"
-preflight_mode = "off"
-
-[migration.settings.commands]
-current_revision = "echo none"
-up = "true"
-down_to = "true"
+adapter = "none"
 
 [service]
 adapter = "systemd"
@@ -106,8 +98,10 @@ Two rules for the router member:
 - **Probe `/readiness`, not `/health`.** A router release whose supergraph does
   not load then fails its health step, and the deploy rolls back to the
   previous release.
-- **Declare that it owns no database: `[migration] adapter = "none"`.** This
-  arrives with PR #106; until then, use the constant-revision no-op above.
+- **Declare that it owns no database: `[migration] adapter = "none"`.** The
+  saga then knows there is nothing to compensate on that axis, so a failed
+  router deploy ends `rolled_back`, not `partial_rollback` for want of a
+  revision to return to.
 
 ## `fraisier stack deploy`
 
@@ -120,6 +114,10 @@ on, and ties go to the lexicographically first name, so the order never depends
 on the file's order. Each member deploys exactly as `fraisier deploy` would,
 with its own preflight, saga and rollback. `--app-version <member>=<version>`
 can repeat; `--dry-run` and `--skip-preflight` apply to every member.
+
+Every member's config is validated before anything is staged or deployed. One
+invalid member refuses the whole stack, naming the member and each error, and
+nothing deploys.
 
 The first member that fails stops the stack:
 

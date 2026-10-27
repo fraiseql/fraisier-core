@@ -788,12 +788,390 @@ fn has_error(report: &fraisier_config::ValidationReport, path: &str) -> bool {
 
 #[test]
 fn schedule_backup_with_native_calendar_validates_clean() {
+    let toml = format!(
+        "{SCHEDULE_BASE}\n[backup]\ndir = \"/var/backups/checkout\"\n\
+         [schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(report.ok(), "backup + native calendar is valid: {report}");
+}
+
+#[test]
+fn a_scheduled_backup_requires_a_backup_dir() {
+    // Without one, every run writes the same file in the unit's working
+    // directory and fails from the second run on (#87).
     let toml =
         format!("{SCHEDULE_BASE}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
     let report = DeployConfig::from_toml_str(&toml)
         .expect("parses")
         .validate();
-    assert!(report.ok(), "backup + native calendar is valid: {report}");
+    assert!(has_error(&report, "backup.dir"), "{report}");
+}
+
+#[test]
+fn the_backup_dir_must_be_absolute() {
+    let toml = format!("{SCHEDULE_BASE}\n[backup]\ndir = \"backups\"\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "backup.dir"), "{report}");
+}
+
+#[test]
+fn a_backup_section_without_a_dir_is_an_error() {
+    let toml = format!("{SCHEDULE_BASE}\n[backup]\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "backup.dir"), "{report}");
+}
+
+#[test]
+fn an_absolute_backup_dir_validates_clean() {
+    let toml = format!("{SCHEDULE_BASE}\n[backup]\ndir = \"/var/backups/checkout\"\n");
+    let config = DeployConfig::from_toml_str(&toml).expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    assert_eq!(
+        config.backup.and_then(|backup| backup.dir),
+        Some(std::path::PathBuf::from("/var/backups/checkout"))
+    );
+}
+
+const RETAIN: &str = "[[backup.retain]]\ndir = \"/var/backups/checkout\"\n\
+                      schedule = \"daily 05:30\"\nretention_days = 3\n";
+
+fn retain_report(entry: &str) -> fraisier_config::ValidationReport {
+    DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{entry}"))
+        .expect("parses")
+        .validate()
+}
+
+#[test]
+fn a_retain_name_must_be_safe_in_a_unit_name() {
+    // The name becomes part of a systemd unit name and an ExecStart= argument.
+    for name in ["night ly", "-nightly", "nightly;rm", "100%", "a/b"] {
+        let report = retain_report(&format!(
+            "[[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"{name}\"\n\
+             schedule = \"daily 05:30\"\nretention_days = 14\n"
+        ));
+        assert!(
+            has_error(&report, "backup.retain[0].name"),
+            "{name:?}: {report}"
+        );
+    }
+    // A name taken from `dir` is held to the same rule.
+    let report = retain_report(
+        "[[backup.retain]]\ndir = \"/var/backups/check out\"\n\
+         schedule = \"daily 05:30\"\nretention_days = 14\n",
+    );
+    assert!(has_error(&report, "backup.retain[0].name"), "{report}");
+}
+
+#[test]
+fn a_retain_entry_parses_with_its_defaults_and_needs_no_backup_dir() {
+    let config =
+        DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{RETAIN}")).expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    let backup = config.backup.expect("[backup]");
+    let [entry] = backup.retain.as_slice() else {
+        panic!("one entry, got {:?}", backup.retain)
+    };
+    assert_eq!(
+        entry.dir.as_deref(),
+        Some(std::path::Path::new("/var/backups/checkout"))
+    );
+    assert_eq!(entry.schedule.as_deref(), Some("daily 05:30"));
+    assert_eq!(entry.retention_days, Some(3));
+    assert_eq!(entry.keep_minimum(), 3);
+    assert_eq!(entry.keep_last, None);
+    assert_eq!(entry.pattern(), "*.pgdump");
+    assert_eq!(entry.name().as_deref(), Some("checkout"));
+    assert_eq!(entry.min_free_gb, None);
+}
+
+#[test]
+fn declared_retain_fields_win_over_the_defaults() {
+    let config = DeployConfig::from_toml_str(&format!(
+        "{SCHEDULE_BASE}\n{RETAIN}keep_minimum = 5\nkeep_last = 9\n\
+         match = \"checkout-production-*.pgdump\"\nname = \"prod-full\"\nmin_free_gb = 20\n"
+    ))
+    .expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    let entry = &config.backup.expect("[backup]").retain[0];
+    assert_eq!(entry.keep_minimum(), 5);
+    assert_eq!(entry.keep_last, Some(9));
+    assert_eq!(entry.pattern(), "checkout-production-*.pgdump");
+    assert_eq!(entry.name().as_deref(), Some("prod-full"));
+    assert_eq!(entry.min_free_gb, Some(20));
+}
+
+#[test]
+fn a_retain_entry_requires_dir_schedule_and_retention_days() {
+    for (field, line) in [
+        ("dir", "dir = \"/var/backups/checkout\"\n"),
+        ("schedule", "schedule = \"daily 05:30\"\n"),
+        ("retention_days", "retention_days = 3\n"),
+    ] {
+        let report = retain_report(&RETAIN.replace(line, ""));
+        assert!(
+            has_error(&report, &format!("backup.retain[0].{field}")),
+            "{field}: {report}"
+        );
+    }
+}
+
+#[test]
+fn retention_days_must_be_at_least_one() {
+    let report = retain_report(&RETAIN.replace("retention_days = 3", "retention_days = 0"));
+    assert!(
+        has_error(&report, "backup.retain[0].retention_days"),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_retain_dir_must_be_absolute_and_plain() {
+    for bad in [
+        "backups",
+        "/backup/../etc",
+        "/backup/$(whoami)",
+        "/backup/a;rm -rf /",
+        "/backup/%H",
+        "/backup/prod\\nExecStartPost=/bin/rm",
+    ] {
+        let report = retain_report(&RETAIN.replace("/var/backups/checkout", bad));
+        assert!(
+            has_error(&report, "backup.retain[0].dir"),
+            "{bad}: {report}"
+        );
+    }
+}
+
+#[test]
+fn a_retain_match_is_confined_to_the_dir() {
+    for bad in [
+        "../staging/*.pgdump",
+        "/etc/*.pgdump",
+        "sub/*.pgdump",
+        "*%i*.pgdump",
+        "*\\n",
+    ] {
+        let report = retain_report(&format!("{RETAIN}match = \"{bad}\"\n"));
+        assert!(
+            has_error(&report, "backup.retain[0].match"),
+            "{bad}: {report}"
+        );
+    }
+}
+
+#[test]
+fn a_retain_schedule_uses_the_calendar_vocabulary() {
+    let report = retain_report(&RETAIN.replace("daily 05:30", "every tuesday"));
+    assert!(has_error(&report, "backup.retain[0].schedule"), "{report}");
+}
+
+#[test]
+fn a_retain_name_must_be_a_safe_identifier() {
+    for bad in ["prod duction", "prod/uction", "prod%n", "prod$X", ""] {
+        let report = retain_report(&format!("{RETAIN}name = \"{bad}\"\n"));
+        assert!(
+            has_error(&report, "backup.retain[0].name"),
+            "{bad}: {report}"
+        );
+    }
+}
+
+#[test]
+fn a_derived_name_must_also_be_safe() {
+    let report = retain_report(&RETAIN.replace("/var/backups/checkout", "/"));
+    assert!(has_error(&report, "backup.retain[0].name"), "{report}");
+}
+
+#[test]
+fn retain_names_are_unique() {
+    let report = retain_report(&format!("{RETAIN}{RETAIN}"));
+    assert!(has_error(&report, "backup.retain[1].name"), "{report}");
+}
+
+#[test]
+fn keep_last_below_keep_minimum_is_rejected() {
+    let report = retain_report(&format!("{RETAIN}keep_minimum = 3\nkeep_last = 2\n"));
+    assert!(has_error(&report, "backup.retain[0].keep_last"), "{report}");
+}
+
+#[test]
+fn keep_last_of_zero_is_rejected() {
+    let report = retain_report(&format!("{RETAIN}keep_minimum = 0\nkeep_last = 0\n"));
+    assert!(has_error(&report, "backup.retain[0].keep_last"), "{report}");
+}
+
+#[test]
+fn a_zero_floor_is_allowed() {
+    let report = retain_report(&format!("{RETAIN}keep_minimum = 0\n"));
+    assert!(report.ok(), "{report}");
+}
+
+#[test]
+fn min_free_gb_must_be_at_least_one() {
+    let report = retain_report(&format!("{RETAIN}min_free_gb = 0\n"));
+    assert!(
+        has_error(&report, "backup.retain[0].min_free_gb"),
+        "{report}"
+    );
+}
+
+#[test]
+fn the_documented_retain_example_validates() {
+    // An example that fails to load teaches the wrong shape, and nobody notices
+    // because nothing runs it. Taken from the real page, not retyped.
+    let page = include_str!("../../../docs/backups.md");
+    let after = page
+        .split_once("<!-- retain-example -->\n```toml\n")
+        .expect("the marked example")
+        .1;
+    let example = after.split_once("```").expect("closing fence").0;
+    let config = DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{example}"))
+        .expect("the example parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    let entry = &config.backup.expect("[backup]").retain[0];
+    assert_eq!(entry.name().as_deref(), Some("nightly"));
+    assert_eq!(entry.keep_last, Some(60));
+}
+
+#[test]
+fn a_backup_section_with_neither_dir_nor_retain_is_still_an_error() {
+    let report = retain_report("[backup]\nretain = []\n");
+    assert!(has_error(&report, "backup.dir"), "{report}");
+}
+
+fn drill_report(section: &str) -> fraisier_config::ValidationReport {
+    DeployConfig::from_toml_str(&format!(
+        "{SCHEDULE_BASE}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[drill]\n{section}"
+    ))
+    .expect("parses")
+    .validate()
+}
+
+#[test]
+fn an_empty_drill_section_takes_its_defaults() {
+    let config = DeployConfig::from_toml_str(&format!(
+        "{SCHEDULE_BASE}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[drill]\n"
+    ))
+    .expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    let drill = config.drill.expect("[drill]");
+    assert_eq!(drill.max_age_hours(), 48);
+    assert_eq!(drill.min_tables, None);
+    assert_eq!(drill.data_dir, None);
+}
+
+#[test]
+fn declared_drill_fields_are_kept() {
+    let config = DeployConfig::from_toml_str(&format!(
+        "{SCHEDULE_BASE}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[drill]\n\
+         max_age_hours = 26\nmin_tables = 15\ndata_dir = \"/var/lib/postgresql/18/main\"\n"
+    ))
+    .expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    let drill = config.drill.expect("[drill]");
+    assert_eq!(drill.max_age_hours(), 26);
+    assert_eq!(drill.min_tables, Some(15));
+    assert_eq!(
+        drill.data_dir.as_deref(),
+        Some(std::path::Path::new("/var/lib/postgresql/18/main"))
+    );
+}
+
+#[test]
+fn a_drill_needs_a_backup_dir_to_take_archives_from() {
+    let report = DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n[drill]\n"))
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "drill"), "{report}");
+}
+
+#[test]
+fn a_drill_schedule_is_kept_in_the_calendar_vocabulary() {
+    let config = DeployConfig::from_toml_str(&format!(
+        "{SCHEDULE_BASE}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[drill]\n\
+         schedule = \"weekly Sun 04:00\"\n"
+    ))
+    .expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    assert_eq!(
+        config.drill.and_then(|d| d.schedule).as_deref(),
+        Some("weekly Sun 04:00")
+    );
+}
+
+#[test]
+fn a_malformed_drill_schedule_is_an_error() {
+    assert!(has_error(
+        &drill_report("schedule = \"every tuesday\"\n"),
+        "drill.schedule"
+    ));
+}
+
+#[test]
+fn drill_max_age_hours_must_be_at_least_one() {
+    assert!(has_error(
+        &drill_report("max_age_hours = 0\n"),
+        "drill.max_age_hours"
+    ));
+}
+
+#[test]
+fn drill_min_tables_must_be_at_least_one() {
+    assert!(has_error(
+        &drill_report("min_tables = 0\n"),
+        "drill.min_tables"
+    ));
+}
+
+#[test]
+fn drill_data_dir_must_be_absolute() {
+    assert!(has_error(
+        &drill_report("data_dir = \"pgdata\"\n"),
+        "drill.data_dir"
+    ));
+}
+
+fn metrics_config(section: &str) -> DeployConfig {
+    DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n[metrics]\n{section}")).expect("parses")
+}
+
+#[test]
+fn a_metrics_textfile_dir_is_kept() {
+    let config = metrics_config("textfile_dir = \"/var/lib/node_exporter/textfile\"\n");
+    assert!(config.validate().ok(), "{}", config.validate());
+    assert_eq!(
+        config.metrics.expect("[metrics]").textfile_dir.as_deref(),
+        Some(std::path::Path::new("/var/lib/node_exporter/textfile"))
+    );
+}
+
+#[test]
+fn a_metrics_section_needs_a_textfile_dir() {
+    let config = metrics_config("");
+    assert!(
+        has_error(&config.validate(), "metrics.textfile_dir"),
+        "{}",
+        config.validate()
+    );
+}
+
+#[test]
+fn the_metrics_textfile_dir_must_be_absolute() {
+    let config = metrics_config("textfile_dir = \"textfile\"\n");
+    for report in [
+        config.validate(),
+        config.validate_db_ops(),
+        config.validate_backup_ops(),
+    ] {
+        assert!(has_error(&report, "metrics.textfile_dir"), "{report}");
+    }
 }
 
 #[test]
@@ -847,15 +1225,60 @@ fn unattended_deploy_requires_the_optin_and_a_notify_sink() {
         has_error(&report, "schedule.allow_unattended_deploy"),
         "{report}"
     );
-    assert!(has_error(&report, "schedule.notify"), "{report}");
+    assert!(has_error(&report, "notify.command"), "{report}");
 
     // With both, it validates clean.
     let ok = format!(
         "{SCHEDULE_BASE}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"deploy\"\n\
-         allow_unattended_deploy = true\nnotify = \"systemd-cat -t fraisier\"\n"
+         allow_unattended_deploy = true\n\n[notify]\ncommand = \"systemd-cat -t fraisier\"\n"
     );
     let report = DeployConfig::from_toml_str(&ok).expect("parses").validate();
     assert!(report.ok(), "opted-in unattended deploy is valid: {report}");
+}
+
+#[test]
+fn schedule_notify_is_refused_with_a_pointer_to_notify_command() {
+    // The sink moved: one spelling, so the old key is a targeted error, not an alias.
+    let toml = format!(
+        "{SCHEDULE_BASE}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"deploy\"\n\
+         allow_unattended_deploy = true\nnotify = \"systemd-cat -t fraisier\"\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    let issue = report
+        .issues
+        .iter()
+        .find(|i| i.path == "schedule.notify" && i.severity == Severity::Error)
+        .unwrap_or_else(|| panic!("{report}"));
+    assert!(
+        issue.message.contains("moved to `[notify].command`"),
+        "{}",
+        issue.message
+    );
+}
+
+#[test]
+fn a_notify_section_needs_a_command() {
+    for body in ["", "command = \"  \"\n"] {
+        let report = DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n[notify]\n{body}"))
+            .expect("parses")
+            .validate();
+        assert!(has_error(&report, "notify.command"), "{body:?}: {report}");
+    }
+}
+
+#[test]
+fn a_notify_command_is_kept() {
+    let config = DeployConfig::from_toml_str(&format!(
+        "{SCHEDULE_BASE}\n[notify]\ncommand = \"systemd-cat -t fraisier\"\n"
+    ))
+    .expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    assert_eq!(
+        config.notify.and_then(|n| n.command).as_deref(),
+        Some("systemd-cat -t fraisier")
+    );
 }
 
 const BLUE_GREEN: &str = r#"
@@ -1114,6 +1537,80 @@ fn http_health_still_requires_url() {
         .expect("parses")
         .validate();
     assert!(has_error(&report, "health.url"), "{report}");
+}
+
+#[test]
+fn http_health_require_capabilities_parses_and_validates() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n\
+         require_capabilities = [\"observers\", \"mcp\"]\n"
+    );
+    let cfg = DeployConfig::from_toml_str(&toml).expect("parses");
+    assert!(cfg.validate().ok(), "{}", cfg.validate());
+    assert_eq!(
+        cfg.health.and_then(|h| h.require_capabilities),
+        Some(vec!["observers".to_owned(), "mcp".to_owned()])
+    );
+}
+
+#[test]
+fn require_capabilities_rejects_an_empty_list() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n\
+         require_capabilities = []\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(
+        has_error(&report, "health.require_capabilities"),
+        "{report}"
+    );
+}
+
+#[test]
+fn require_capabilities_rejects_duplicates() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n\
+         require_capabilities = [\"observers\", \"observers\"]\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(
+        has_error(&report, "health.require_capabilities"),
+        "{report}"
+    );
+}
+
+#[test]
+fn require_capabilities_rejects_a_blank_name() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n\
+         require_capabilities = [\" \"]\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(
+        has_error(&report, "health.require_capabilities"),
+        "{report}"
+    );
+}
+
+#[test]
+fn require_capabilities_applies_only_to_the_http_adapter() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"command\"\ncommand = \"scan\"\n\
+         require_capabilities = [\"observers\"]\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(
+        has_error(&report, "health.require_capabilities"),
+        "{report}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,4 +1952,55 @@ fn federation_names_the_graphql_endpoint() {
         "[federation]\ngraphql_url = \"http://u/graphql\"\nsdl_headers = {}\n"
     )
     .is_err());
+}
+
+fn database_less(extra: &str) -> String {
+    format!(
+        r#"
+[deploy]
+name = "gateway"
+environment = "production"
+[artifact]
+source = "local"
+path = "/srv/gateway"
+[migration]
+adapter = "none"
+{extra}
+[service]
+adapter = "systemd"
+unit = "gateway.service"
+[health]
+adapter = "http"
+url = "http://127.0.0.1/readiness"
+"#
+    )
+}
+
+/// `adapter = "none"` declares a deployable that owns no database.
+#[test]
+fn a_database_less_migration_axis_validates() {
+    let cfg = DeployConfig::from_toml_str(&database_less("")).expect("parses");
+    let report = cfg.validate();
+    assert!(report.ok(), "got {:?}", report.issues);
+}
+
+/// A database-less axis takes no DSN and no settings: either one means the
+/// config believes there is a database after all.
+#[test]
+fn a_database_less_axis_refuses_a_dsn_or_settings() {
+    for (extra, path) in [
+        ("database_url_env = \"X_DB\"", "migration.database_url_env"),
+        ("[migration.settings]\nup = \"true\"", "migration.settings"),
+    ] {
+        let cfg = DeployConfig::from_toml_str(&database_less(extra)).expect("parses");
+        let report = cfg.validate();
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.path == path && i.severity == Severity::Error),
+            "expected an error at {path}, got {:?}",
+            report.issues
+        );
+    }
 }

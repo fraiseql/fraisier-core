@@ -16,6 +16,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+nix = { version = "0.31.3", features = ["fs"] }
 percent-encoding = "2.3.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -24,4 +25,5 @@ tokio = { version = "1.52.3", features = ["process"] }
 url = "2.5.8"
 
 [dev-dependencies]
+tempfile = "3.27.0"
 tokio = { version = "1.52.3", features = ["macros", "rt", "rt-multi-thread"] }

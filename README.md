@@ -71,6 +71,23 @@ fraisier init
 CHECKOUT_DATABASE_URL=postgres://… fraisier deploy --app-version 1.4.2
 ```
 
+### Prebuilt binaries
+
+Each `fraisier-v*` release carries a binary per target
+(`fraisier-<target>.tar.gz`: Linux `x86_64`/`aarch64` gnu with a glibc 2.28 floor,
+static `x86_64` musl, and macOS), a CycloneDX SBOM per target
+(`fraisier-<target>.cdx.json`), and a `SHA256SUMS` file covering all of them.
+Check a download against it before installing:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+That proves the files are the ones the release lists. It does not prove who
+published the release, because the checksums come from the same place as the
+binaries. [docs/security.md](docs/security.md#offline-install) covers installing
+on a host with no network access.
+
 A minimal `fraisier.toml`:
 
 ```toml
@@ -235,6 +252,14 @@ printed, and the full stdout+stderr is written to a `0o600` log under
 is named in the report, so nothing is lost. Small failures print whole. The
 `--json` report always carries the full output regardless.
 
+### Deploying FraiseQL
+
+fraisier is proven against FraiseQL **2.18.0**, pinned in
+[`tools/fraiseql-version`](tools/fraiseql-version). On 2.18, `/health` answers 200
+even when a configured capability failed to start. See
+[`docs/fraiseql.md`](docs/fraiseql.md) for the supported versions, the
+migrate-then-restart order, and what the health check does and does not prove.
+
 ### Perf-regression rollback gate
 
 The `command` health adapter turns the saga's post-deploy `health` step into an
@@ -243,7 +268,7 @@ arbitrary gate: it runs a configured shell command, passes iff the command exits
 FraiseQL's `fraiseql perf regression-scan --fail-on-regression --json` — a deploy
 that makes a database mutation slower rolls back automatically, naming the
 regressed operation (`perf regression: order/UPDATE p50 +42% (12ms→17ms)`) in the
-rollback reason and the `[schedule].notify` webhook. The DSN reaches the scan by
+rollback reason and the `[notify].command` webhook. The DSN reaches the scan by
 environment, never argv. See [`docs/perf-regression-gate.md`](docs/perf-regression-gate.md).
 
 ### Schema risk policy gate
@@ -288,6 +313,10 @@ printing as though it were clean. See
 Every saga step is both persisted (via the state store) and exported as an
 OpenTelemetry span, so a tracing backend reconstructs exactly what happened —
 including which step failed and which compensations ran.
+
+With `[metrics].textfile_dir` set, deploy, backup and backup drill each write a
+Prometheus textfile of gauges describing their last run, for node_exporter's
+textfile collector. See [`docs/metrics.md`](docs/metrics.md).
 
 ## Security model
 

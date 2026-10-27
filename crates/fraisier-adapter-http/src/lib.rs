@@ -16,7 +16,18 @@
 //! attempts = 3                            # default 3
 //! retry_delay_ms = 500                    # default 500
 //! timeout_ms = 5000                       # default 5000
+//! require_capabilities = ["observers"]    # optional; see below
 //! ```
+//!
+//! ## Required capabilities
+//!
+//! With `require_capabilities` set, a response with the expected status is
+//! healthy only if its JSON body (FraiseQL's `/health`) reports every listed
+//! capability as running: `compiled_in && started == Some(true) && healthy !=
+//! Some(false)`. A missing `healthy` means the capability cannot tell, not that
+//! it is broken. A body that is not JSON, has no `capabilities` object, or does
+//! not list a declared capability is unhealthy: what the probe cannot see does
+//! not pass. Without the key the body is never read.
 //!
 //! ## Healthy vs. unreachable
 //!
@@ -37,6 +48,7 @@ use fraisier_core::token_provider::TokenProvider;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
+mod capabilities;
 mod token;
 
 /// The adapter's identity name.
@@ -51,6 +63,8 @@ const DEFAULT_TIMEOUT_MS: u64 = 5000;
 enum ProbeFailure {
     /// A response arrived, but its status was not the expected one.
     Unhealthy(u16),
+    /// The status matched, but a required capability is not running.
+    Capabilities(String),
     /// The request could not be completed (refused, timeout, DNS, …).
     Unreachable(String),
 }
@@ -63,6 +77,7 @@ struct Probe {
     attempts: u32,
     retry_delay: Duration,
     timeout: Duration,
+    required: Vec<String>,
 }
 
 impl Probe {
@@ -108,12 +123,26 @@ impl Probe {
         let timeout =
             Duration::from_millis(u64_setting(ctx, "timeout_ms").unwrap_or(DEFAULT_TIMEOUT_MS));
 
+        let required = ctx
+            .settings
+            .get("require_capabilities")
+            .and_then(Value::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Ok(Self {
             url,
             expected_status,
             attempts,
             retry_delay,
             timeout,
+            required,
         })
     }
 }
@@ -198,25 +227,30 @@ impl HttpHealth {
 /// Perform one probe: `Ok(status)` when healthy, else the failure reason.
 async fn probe_once(
     client: &reqwest::Client,
-    url: &str,
-    expected: u16,
+    probe: &Probe,
     headers: &[(String, String)],
 ) -> Result<u16, ProbeFailure> {
-    let mut request = client.get(url);
+    let mut request = client.get(&probe.url);
     for (name, value) in headers {
         request = request.header(name, value);
     }
-    match request.send().await {
-        Ok(response) => {
-            let status = response.status().as_u16();
-            if status == expected {
-                Ok(status)
-            } else {
-                Err(ProbeFailure::Unhealthy(status))
-            }
-        }
-        Err(err) => Err(ProbeFailure::Unreachable(err.to_string())),
+    let response = request
+        .send()
+        .await
+        .map_err(|err| ProbeFailure::Unreachable(err.to_string()))?;
+    let status = response.status().as_u16();
+    if status != probe.expected_status {
+        return Err(ProbeFailure::Unhealthy(status));
     }
+    if probe.required.is_empty() {
+        return Ok(status);
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|err| ProbeFailure::Unreachable(err.to_string()))?;
+    capabilities::check(&body, &probe.required).map_err(ProbeFailure::Capabilities)?;
+    Ok(status)
 }
 
 #[async_trait]
@@ -239,14 +273,25 @@ impl HealthAdapter for HttpHealth {
             })?;
 
         let result = retry_on_err(probe.attempts, probe.retry_delay, || {
-            probe_once(&client, &probe.url, probe.expected_status, &headers)
+            probe_once(&client, &probe, &headers)
         })
         .await;
 
         match result {
-            Ok(status) => Ok(HealthStatus {
+            Ok(status) if probe.required.is_empty() => Ok(HealthStatus {
                 healthy: true,
                 detail: Some(format!("HTTP {status}")),
+            }),
+            Ok(status) => Ok(HealthStatus {
+                healthy: true,
+                detail: Some(format!(
+                    "HTTP {status}; capabilities running: {}",
+                    probe.required.join(", ")
+                )),
+            }),
+            Err(ProbeFailure::Capabilities(reason)) => Ok(HealthStatus {
+                healthy: false,
+                detail: Some(format!("HTTP {}; {reason}", probe.expected_status)),
             }),
             Err(ProbeFailure::Unhealthy(status)) => Ok(HealthStatus {
                 healthy: false,

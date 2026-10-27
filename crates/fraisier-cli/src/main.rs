@@ -12,12 +12,15 @@
 // a public API that a binary crate does not actually expose.
 #![allow(clippy::redundant_pub_crate)]
 
+mod alert;
 mod approval;
 mod commands;
 mod doctor;
 #[cfg(test)]
 mod e2e;
 mod factory;
+mod failure_record;
+mod metrics;
 mod pg_readiness;
 mod pg_rehearsal;
 mod preview;
@@ -94,8 +97,9 @@ enum Command {
     /// Share the deploy ledger across operators over git refs (experimental).
     Sync(SyncArgs),
 
-    /// Back up the database to a custom-format archive (`pg_dump -Fc`).
-    Backup(BackupArgs),
+    /// Back up the database to a custom-format archive (`pg_dump -Fc`), or prune
+    /// archives by their `[[backup.retain]]` policy (`backup prune`).
+    Backup(BackupCli),
 
     /// Database lifecycle operations (migrate / restore / reset).
     #[command(subcommand)]
@@ -104,6 +108,10 @@ enum Command {
     /// A stack: one environment's deployables, deployed in dependency order.
     #[command(subcommand)]
     Stack(StackCommand),
+
+    /// Report a failed scheduled backup, prune or drill through
+    /// `[notify].command`: the body of the `OnFailure=` alert unit.
+    Notify(NotifyArgs),
 
     /// List the adapters available to this binary, per axis (built-in + IPC).
     Providers,
@@ -549,18 +557,100 @@ struct BootstrapArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct BackupCli {
+    #[command(subcommand)]
+    command: Option<BackupCommand>,
+
+    #[command(flatten)]
+    backup: BackupArgs,
+}
+
+#[derive(Debug, Subcommand)]
+enum BackupCommand {
+    /// Remove archives by each `[[backup.retain]]` policy. A dry run unless
+    /// `--apply` is given.
+    Prune(BackupPruneArgs),
+    /// Restore the newest archive into a throwaway database, migrate it, check
+    /// it, and drop it.
+    Drill(BackupDrillArgs),
+}
+
+#[derive(Debug, Args)]
+struct BackupDrillArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// The state store directory; the drill's receipt goes in its `drills/`.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+
+    /// Run by a systemd unit: on failure, leave a redacted record for the
+    /// unit's `OnFailure=` alert, keyed by `$INVOCATION_ID`. The value is the
+    /// unit's name (`%n`).
+    #[arg(long, value_name = "UNIT")]
+    failure_record: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct BackupPruneArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// The state store directory, whose deploy lock a prune honours.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+
+    /// Prune only the retain entry with this name.
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Remove the archives the policy selects. Without it, only list them.
+    #[arg(long)]
+    apply: bool,
+
+    /// Run by a systemd unit: on failure, leave a redacted record for the
+    /// unit's `OnFailure=` alert, keyed by `$INVOCATION_ID`. The value is the
+    /// unit's name (`%n`).
+    #[arg(long, value_name = "UNIT")]
+    failure_record: Option<String>,
+}
+
+#[derive(Debug, Args)]
 struct BackupArgs {
     /// Path to the `fraisier.toml`.
     #[arg(long, default_value = "fraisier.toml")]
     config: PathBuf,
 
-    /// Where to write the archive (defaults to `<fraise>-<environment>.pgdump`).
+    /// Where to write the archive. Without it, a new timestamped archive goes into
+    /// `[backup].dir` when that is set, and `<fraise>-<environment>.pgdump`
+    /// otherwise.
     #[arg(long)]
     output: Option<PathBuf>,
 
-    /// Overwrite the output file if it already exists.
+    /// Overwrite the output file if it already exists. Archives in `[backup].dir`
+    /// are never overwritten.
     #[arg(long)]
     force: bool,
+
+    /// Run by a systemd unit: on failure, leave a redacted record for the
+    /// unit's `OnFailure=` alert, keyed by `$INVOCATION_ID`. The value is the
+    /// unit's name (`%n`).
+    #[arg(long, value_name = "UNIT")]
+    failure_record: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct NotifyArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// The failed unit (the alert unit's `%i`).
+    #[arg(long)]
+    unit: String,
 }
 
 #[derive(Debug, Args)]
@@ -824,8 +914,57 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::WebhookServer(args) => {
             commands::webhook_server(&args.config, &args.state_dir, args.listen.as_deref()).await
         }
-        Command::Backup(args) => {
-            commands::db_backup(&args.config, args.output.as_deref(), args.force).await
+        Command::Backup(BackupCli {
+            command: Some(BackupCommand::Prune(args)),
+            ..
+        }) => {
+            let outcome = async {
+                let run = commands::backup_prune(
+                    &args.config,
+                    &args.state_dir,
+                    args.name.as_deref(),
+                    args.apply,
+                )
+                .await?;
+                for warning in &run.warnings {
+                    eprintln!("warning: {}", fraisier_saga::redact::credentials(warning));
+                }
+                Ok(run.output)
+            }
+            .await;
+            recorded(
+                outcome,
+                &args.config,
+                alert::ScheduledRun::Prune,
+                args.failure_record.as_deref(),
+            )
+        }
+        Command::Backup(BackupCli {
+            command: Some(BackupCommand::Drill(args)),
+            ..
+        }) => recorded(
+            commands::backup_drill(&args.config, &args.state_dir).await,
+            &args.config,
+            alert::ScheduledRun::Drill,
+            args.failure_record.as_deref(),
+        ),
+        Command::Backup(BackupCli {
+            command: None,
+            backup: args,
+        }) => recorded(
+            commands::db_backup(&args.config, args.output.as_deref(), args.force).await,
+            &args.config,
+            alert::ScheduledRun::Backup,
+            args.failure_record.as_deref(),
+        ),
+        Command::Notify(args) => {
+            alert::notify(
+                &args.config,
+                &args.unit,
+                std::env::var("MONITOR_INVOCATION_ID").ok().as_deref(),
+                &failure_record::dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref()),
+            )
+            .await
         }
         Command::Db(DbCommand::Migrate(args)) => {
             commands::db_migrate(&args.config, &args.state_dir).await
@@ -1017,6 +1156,26 @@ fn render(output: CommandOutput, json: bool, verbose: u8) {
 /// Anyhow contexts wrap adapter errors (`"applying migrations"` over an
 /// `AdapterError`, say), so this line carries adapter text and is redacted for the
 /// same reason [`rendered`] is.
+/// Leave the failure record a `--failure-record` run asks for, then hand the
+/// outcome back unchanged: recording never alters what the run reports.
+fn recorded(
+    outcome: Result<CommandOutput>,
+    config: &std::path::Path,
+    run: alert::ScheduledRun,
+    unit: Option<&str>,
+) -> Result<CommandOutput> {
+    if let Some(unit) = unit {
+        let dir = failure_record::dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref());
+        let invocation_id = std::env::var("INVOCATION_ID").ok();
+        if let Err(warning) =
+            alert::record_failure(config, run, unit, &outcome, invocation_id.as_deref(), &dir)
+        {
+            eprintln!("warning: {warning}");
+        }
+    }
+    outcome
+}
+
 fn error_line(error: &anyhow::Error) -> String {
     format!("error: {}", commands::error_detail(error))
 }
@@ -1108,6 +1267,30 @@ mod cli_tests {
     fn cli_definition_is_valid() {
         use clap::CommandFactory as _;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn backup_still_parses_alone_and_prune_is_its_subcommand() {
+        assert!(Cli::try_parse_from(["fraisier", "backup"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["fraisier", "backup", "--output", "x.pgdump", "--force"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["fraisier", "backup", "prune"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "fraisier",
+            "backup",
+            "prune",
+            "--apply",
+            "--name",
+            "nightly",
+            "--config",
+            "f.toml",
+            "--state-dir",
+            "/s"
+        ])
+        .is_ok());
+        // `--output` belongs to taking a backup, not to pruning.
+        assert!(Cli::try_parse_from(["fraisier", "backup", "prune", "--output", "x"]).is_err());
     }
 
     #[test]

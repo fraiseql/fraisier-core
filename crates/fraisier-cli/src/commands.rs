@@ -80,7 +80,7 @@ fn redact_json(value: Value) -> Value {
     }
 }
 
-fn load(config_path: &Path) -> Result<DeployConfig> {
+pub(crate) fn load(config_path: &Path) -> Result<DeployConfig> {
     let toml = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading config {}", config_path.display()))?;
     DeployConfig::from_toml_str(&toml)
@@ -759,18 +759,24 @@ pub(crate) fn scheduled_install(
 ) -> Result<CommandOutput> {
     let config = load(config_path)?;
 
-    // The unattended-deploy gate: refuse to install a schedule whose [schedule]
-    // section is invalid — in particular `command = "deploy"` without
-    // `allow_unattended_deploy = true` + a notify sink. The validator carries the
-    // policy; here we refuse (with the located reasons) rather than install.
+    // The unattended-deploy gate: refuse to install units whose sections are
+    // invalid — in particular `command = "deploy"` without
+    // `allow_unattended_deploy = true` + a `[notify].command` sink, or a retain
+    // entry whose name cannot name a unit. The validator carries the policy;
+    // here we refuse (with the located reasons) rather than install.
     let report = config.validate();
     let schedule_errors: Vec<&fraisier_config::ValidationIssue> = report
         .issues
         .iter()
-        .filter(|issue| issue.severity == Severity::Error && issue.path.starts_with("schedule"))
+        .filter(|issue| {
+            issue.severity == Severity::Error
+                && ["schedule", "notify", "backup", "drill"]
+                    .iter()
+                    .any(|section| issue.path.starts_with(section))
+        })
         .collect();
     if !schedule_errors.is_empty() {
-        let mut pretty = String::from("refusing to install: invalid [schedule] config\n");
+        let mut pretty = String::from("refusing to install: invalid scheduling config\n");
         for issue in &schedule_errors {
             let _ = writeln!(pretty, "  [error] {}: {}", issue.path, issue.message);
         }
@@ -1776,17 +1782,27 @@ pub(crate) async fn deploy_guarded(
     }
     let plan = builder.build()?;
 
+    let started = std::time::Instant::now();
     let outcome = plan.run(store).await?;
     notify_deploy_failure(&config, &resolved.fraise, &resolved.environment, &outcome).await;
+    let metrics_warning = record_metrics(
+        &config,
+        &resolved.fraise,
+        &resolved.environment,
+        &deploy_metrics(&outcome, started.elapsed()),
+    );
     let (exit_code, label, detail) = outcome_result(&outcome);
-    Ok(CommandOutput {
-        exit_code,
-        pretty: format!(
-            "deploy of {}/{} {label}{detail}\n",
-            resolved.fraise, resolved.environment
-        ),
-        json: json!({ "outcome": label, "detail": detail.trim() }),
-    })
+    Ok(with_metrics_warning(
+        CommandOutput {
+            exit_code,
+            pretty: format!(
+                "deploy of {}/{} {label}{detail}\n",
+                resolved.fraise, resolved.environment
+            ),
+            json: json!({ "outcome": label, "detail": detail.trim() }),
+        },
+        metrics_warning,
+    ))
 }
 
 /// Build and run the multi-host rollout, mapping its outcome onto a
@@ -1818,8 +1834,15 @@ async fn run_multi_host(
     }
     let deploy = builder.build()?;
 
+    let started = std::time::Instant::now();
     let outcome = deploy.run(store).await?;
     notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
+    let metrics_warning = record_metrics(
+        config,
+        &resolved.fraise,
+        &resolved.environment,
+        &deploy_metrics(&outcome, started.elapsed()),
+    );
     let (exit_code, label, detail) = outcome_result(&outcome);
     let mut pretty = render_warnings(report);
     let _ = writeln!(
@@ -1827,15 +1850,18 @@ async fn run_multi_host(
         "multi-host deploy of {}/{} {label}{detail}",
         resolved.fraise, resolved.environment
     );
-    Ok(CommandOutput {
-        exit_code,
-        pretty,
-        json: json!({ "outcome": label, "detail": detail.trim(), "multi_host": true }),
-    })
+    Ok(with_metrics_warning(
+        CommandOutput {
+            exit_code,
+            pretty,
+            json: json!({ "outcome": label, "detail": detail.trim(), "multi_host": true }),
+        },
+        metrics_warning,
+    ))
 }
 
 /// Run (or, with `dry_run`, summarize) an HTTP-tier blue-green deploy. On a
-/// non-committed outcome the `[schedule].notify` failure sink fires (unattended
+/// non-committed outcome the `[notify].command` failure sink fires (unattended
 /// path), exactly as the rolling/single deploys do.
 async fn run_blue_green(
     config: &DeployConfig,
@@ -1873,17 +1899,27 @@ async fn run_blue_green(
 
     let store = FilesystemStateStore::new(state_dir)
         .with_context(|| format!("opening state store at {}", state_dir.display()))?;
+    let started = std::time::Instant::now();
     let outcome = resolved.deploy.run(store).await?;
     notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
+    let metrics_warning = record_metrics(
+        config,
+        &resolved.fraise,
+        &resolved.environment,
+        &deploy_metrics(&outcome, started.elapsed()),
+    );
     let (exit_code, label, detail) = outcome_result(&outcome);
-    Ok(CommandOutput {
-        exit_code,
-        pretty: format!(
-            "blue-green deploy of {}/{} {label}{detail}\n",
-            resolved.fraise, resolved.environment
-        ),
-        json: json!({ "strategy": "blue-green", "outcome": label, "detail": detail.trim() }),
-    })
+    Ok(with_metrics_warning(
+        CommandOutput {
+            exit_code,
+            pretty: format!(
+                "blue-green deploy of {}/{} {label}{detail}\n",
+                resolved.fraise, resolved.environment
+            ),
+            json: json!({ "strategy": "blue-green", "outcome": label, "detail": detail.trim() }),
+        },
+        metrics_warning,
+    ))
 }
 
 /// Refuse a database operation whose `[deploy]`/`[migration]` config is invalid,
@@ -2077,12 +2113,33 @@ fn db_config_error(error: &anyhow::Error) -> CommandOutput {
 
 /// `backup`: dump the database to a custom-format archive with `pg_dump -Fc`.
 ///
-/// Non-destructive, but refuses to clobber an existing archive unless `force` is
-/// set. The output path defaults to `<fraise>-<environment>.pgdump`.
+/// With `[backup].dir` set and no `output`, each run writes a new timestamped
+/// archive into that directory, atomically and after checking it (see
+/// [`fraisier_db::archive::write_archive`]); nothing there is ever overwritten.
+/// Otherwise it writes `output`, defaulting to `<fraise>-<environment>.pgdump`,
+/// and refuses to clobber an existing file unless `force` is set.
 pub(crate) async fn db_backup(
     config_path: &Path,
     output: Option<&Path>,
     force: bool,
+) -> Result<CommandOutput> {
+    db_backup_with(
+        config_path,
+        output,
+        force,
+        &fraisier_db::archive::ArchiveTools::default(),
+        std::time::SystemTime::now(),
+    )
+    .await
+}
+
+/// [`db_backup`] with the database tools and the clock supplied by the caller.
+async fn db_backup_with(
+    config_path: &Path,
+    output: Option<&Path>,
+    force: bool,
+    tools: &fraisier_db::archive::ArchiveTools,
+    now: std::time::SystemTime,
 ) -> Result<CommandOutput> {
     let config = load(config_path)?;
     if let Some(refusal) = refuse_invalid_db_config(&config, "back up") {
@@ -2096,6 +2153,32 @@ pub(crate) async fn db_backup(
     let deploy = config.deploy.as_ref().context("[deploy] section")?;
     let fraise = deploy.name.clone().unwrap_or_default();
     let environment = deploy.environment.clone().unwrap_or_default();
+    if output.is_none() {
+        if let Some(dir) = config.backup.as_ref().and_then(|b| b.dir.as_deref()) {
+            let stamp = fraisier_db::archive::UtcStamp::from_system_time(now);
+            let written = fraisier_db::archive::write_archive(
+                &conn,
+                dir,
+                &fraise,
+                &environment,
+                &stamp,
+                tools,
+            )
+            .await;
+            let metrics_warning = written.as_ref().ok().and_then(|written| {
+                record_metrics(
+                    &config,
+                    &fraise,
+                    &environment,
+                    &crate::metrics::Metrics::backup(now, written.bytes),
+                )
+            });
+            return Ok(with_metrics_warning(
+                archive_backup_output(&conn, written),
+                metrics_warning,
+            ));
+        }
+    }
     let default_path = PathBuf::from(format!("{fraise}-{environment}.pgdump"));
     let out_path: &Path = output.unwrap_or(&default_path);
 
@@ -2114,11 +2197,25 @@ pub(crate) async fn db_backup(
         .await
         .context("running pg_dump")?;
     if outcome.succeeded() {
-        Ok(CommandOutput {
-            exit_code: 0,
-            pretty: format!("backed up {} → {}\n", conn.redacted(), out_path.display()),
-            json: json!({ "ok": true, "output": out_path.display().to_string() }),
-        })
+        let metrics_warning = match std::fs::metadata(out_path) {
+            Ok(written) => record_metrics(
+                &config,
+                &fraise,
+                &environment,
+                &crate::metrics::Metrics::backup(now, written.len()),
+            ),
+            Err(error) => Some(format!(
+                "the backup's size could not be read for its metrics: {error}"
+            )),
+        };
+        Ok(with_metrics_warning(
+            CommandOutput {
+                exit_code: 0,
+                pretty: format!("backed up {} → {}\n", conn.redacted(), out_path.display()),
+                json: json!({ "ok": true, "output": out_path.display().to_string() }),
+            },
+            metrics_warning,
+        ))
     } else {
         Ok(CommandOutput {
             exit_code: 1,
@@ -2126,6 +2223,624 @@ pub(crate) async fn db_backup(
             json: json!({ "ok": false, "stderr": outcome.stderr.trim() }),
         })
     }
+}
+
+/// The [`CommandOutput`] for a backup into `[backup].dir`.
+fn archive_backup_output(
+    conn: &fraisier_db::PgConn,
+    written: Result<fraisier_db::archive::WrittenArchive, fraisier_db::archive::ArchiveError>,
+) -> CommandOutput {
+    match written {
+        Ok(written) => {
+            let path = written.archive.path.display().to_string();
+            let mut pretty = format!(
+                "backed up {} → {path} ({} bytes)\n",
+                conn.redacted(),
+                written.bytes
+            );
+            for warning in &written.warnings {
+                let _ = writeln!(pretty, "warning: {warning}");
+            }
+            CommandOutput {
+                exit_code: 0,
+                pretty,
+                json: json!({
+                    "ok": true,
+                    "output": path,
+                    "bytes": written.bytes,
+                    "warnings": written.warnings,
+                }),
+            }
+        }
+        Err(error) => CommandOutput {
+            exit_code: 1,
+            pretty: format!("backup failed: {error}\n"),
+            json: json!({ "ok": false, "wrote": false, "error": error.to_string() }),
+        },
+    }
+}
+
+/// A prune's output, and the warnings it prints on stderr.
+pub(crate) struct PruneRun {
+    /// What the prune did, rendered like every other command.
+    pub output: CommandOutput,
+    /// Conditions the operator should know about that do not fail the prune.
+    pub warnings: Vec<String>,
+}
+
+/// `backup prune`: apply each `[[backup.retain]]` policy (or only the one named
+/// `name`) to its directory, removing archives only with `apply`.
+///
+/// It refuses (exit 1) an invalid config, a config with no policy, an unknown
+/// name, and any corpus while a deploy holds the deploy lock. A missing directory
+/// fails that entry and the prune, after every other entry has run. A volume
+/// below `min_free_gb`, an archive `pg_restore` rejects, a symlink out of the
+/// directory and a corpus only the floor is keeping are warnings, not failures:
+/// failing would stop the pruning that is the one thing that might still help.
+pub(crate) async fn backup_prune(
+    config_path: &Path,
+    state_dir: &Path,
+    name: Option<&str>,
+    apply: bool,
+) -> Result<PruneRun> {
+    backup_prune_with(
+        config_path,
+        state_dir,
+        name,
+        apply,
+        &fraisier_db::archive::ArchiveTools::default().pg_restore,
+        std::time::SystemTime::now(),
+    )
+    .await
+}
+
+/// [`backup_prune`] with `pg_restore` and the clock supplied by the caller.
+async fn backup_prune_with(
+    config_path: &Path,
+    state_dir: &Path,
+    name: Option<&str>,
+    apply: bool,
+    pg_restore: &Path,
+    now: std::time::SystemTime,
+) -> Result<PruneRun> {
+    let refuse = |pretty: String, json: Value| PruneRun {
+        output: CommandOutput {
+            exit_code: 1,
+            pretty,
+            json,
+        },
+        warnings: Vec::new(),
+    };
+    let config = load(config_path)?;
+    let report = config.validate_backup_ops();
+    if !report.ok() {
+        let mut pretty = render_issues(&report);
+        let _ = writeln!(pretty, "refusing to prune with an invalid config");
+        return Ok(refuse(
+            pretty,
+            json!({ "ok": false, "issues": serde_json::to_value(&report.issues).unwrap_or(Value::Null) }),
+        ));
+    }
+    let retain = config.backup.as_ref().map_or(&[][..], |b| &b.retain[..]);
+    if retain.is_empty() {
+        return Ok(refuse(
+            format!(
+                "{} declares no [[backup.retain]] policy, so there is nothing to prune\n",
+                config_path.display()
+            ),
+            json!({ "ok": false, "error": "no retention policy" }),
+        ));
+    }
+    let entries: Vec<&fraisier_config::RetainEntry> = match name {
+        None => retain.iter().collect(),
+        Some(wanted) => {
+            let chosen: Vec<_> = retain
+                .iter()
+                .filter(|entry| entry.name().as_deref() == Some(wanted))
+                .collect();
+            if chosen.is_empty() {
+                let known: Vec<String> = retain
+                    .iter()
+                    .filter_map(fraisier_config::RetainEntry::name)
+                    .collect();
+                return Ok(refuse(
+                    format!(
+                        "no retain entry is named '{wanted}' (known: {})\n",
+                        known.join(", ")
+                    ),
+                    json!({ "ok": false, "error": "unknown retain entry", "known": known }),
+                ));
+            }
+            chosen
+        }
+    };
+
+    // A deploy may be about to restore from this corpus; never prune under it.
+    let deploy = config.deploy.as_ref().context("[deploy] section")?;
+    let fraise = deploy.name.clone().unwrap_or_default();
+    let environment = deploy.environment.clone().unwrap_or_default();
+    let store = FilesystemStateStore::new(state_dir)
+        .with_context(|| format!("opening state store at {}", state_dir.display()))?;
+    let key = FraiseKey::new(&fraise, &environment);
+    let guard = match store.acquire_lock(&key).await {
+        Ok(guard) => guard,
+        Err(fraisier_saga::state_store::StateStoreError::Locked { .. }) => {
+            return Ok(refuse(
+                format!(
+                    "a deploy of {key} holds the deploy lock; refusing to prune while it runs \
+                     (try again once it finishes)\n"
+                ),
+                json!({ "ok": false, "error": "deploy lock held" }),
+            ));
+        }
+        Err(error) => return Err(error).context("taking the deploy lock"),
+    };
+
+    let mut pretty = String::new();
+    let mut warnings = Vec::new();
+    let mut reports = Vec::new();
+    let mut failed = false;
+    for entry in entries {
+        let pruned = prune_entry(entry, apply, pg_restore, now).await;
+        failed |= pruned.failed;
+        pretty.push_str(&pruned.pretty);
+        warnings.extend(pruned.warnings);
+        reports.push(pruned.json);
+    }
+    store
+        .release_lock(guard)
+        .await
+        .context("releasing the deploy lock")?;
+    if !apply {
+        pretty.push_str("dry run: nothing was removed; pass --apply to remove these\n");
+    }
+    Ok(PruneRun {
+        output: CommandOutput {
+            exit_code: i32::from(failed),
+            pretty,
+            json: json!({ "ok": !failed, "applied": apply, "entries": reports }),
+        },
+        warnings,
+    })
+}
+
+/// One retain entry's prune.
+struct EntryPrune {
+    failed: bool,
+    pretty: String,
+    warnings: Vec<String>,
+    json: Value,
+}
+
+/// Plan, and with `apply` carry out, one retain entry's prune.
+async fn prune_entry(
+    entry: &fraisier_config::RetainEntry,
+    apply: bool,
+    pg_restore: &Path,
+    now: std::time::SystemTime,
+) -> EntryPrune {
+    use fraisier_db::retention::{self, Policy};
+
+    let name = entry.name().unwrap_or_default();
+    let dir = entry.dir.clone().unwrap_or_default();
+    let failure = |message: String| EntryPrune {
+        failed: true,
+        pretty: format!("{name}: {message}\n"),
+        warnings: Vec::new(),
+        json: json!({ "name": name, "dir": dir.display().to_string(), "error": message }),
+    };
+    let policy = match Policy::new(
+        Some(std::time::Duration::from_hours(
+            u64::from(entry.retention_days.unwrap_or(1)) * 24,
+        )),
+        usize::try_from(entry.keep_minimum()).unwrap_or(usize::MAX),
+        entry
+            .keep_last
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
+    ) {
+        Ok(policy) => policy,
+        Err(error) => return failure(error.to_string()),
+    };
+    let corpus = match retention::corpus(&dir, entry.pattern()) {
+        Ok(corpus) => corpus,
+        Err(error) => {
+            return failure(format!("cannot read {}: {error}", dir.display()));
+        }
+    };
+    let plan = retention::plan(corpus.candidates, &policy, now, |archive| async move {
+        fraisier_db::archive::verify_archive(pg_restore, &archive).await
+    })
+    .await;
+
+    let warnings = prune_warnings(entry, &name, &dir, &corpus.outside, &plan);
+    let left = if apply {
+        retention::remove(&dir, &plan.remove)
+    } else {
+        Vec::new()
+    };
+    let removed: Vec<&PathBuf> = plan
+        .remove
+        .iter()
+        .filter(|archive| !left.iter().any(|(kept, _)| kept == *archive))
+        .collect();
+    let verb = if apply { "removed" } else { "would remove" };
+    let mut pretty = format!(
+        "{name} ({}): {verb} {}, kept {}, kept by the floor {}\n",
+        dir.display(),
+        removed.len(),
+        plan.keep.len(),
+        plan.exempt.len()
+    );
+    for archive in &removed {
+        let _ = writeln!(pretty, "  {verb} {}", archive.display());
+    }
+    for (archive, error) in &left {
+        let _ = writeln!(pretty, "  could not remove {}: {error}", archive.display());
+    }
+    let paths = |list: &[PathBuf]| -> Vec<String> {
+        list.iter().map(|p| p.display().to_string()).collect()
+    };
+    EntryPrune {
+        failed: !left.is_empty(),
+        pretty,
+        warnings,
+        json: json!({
+            "name": name,
+            "dir": dir.display().to_string(),
+            "removed": removed.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "kept": paths(&plan.keep),
+            "exempted_by_minimum": paths(&plan.exempt),
+            "removed_by_ceiling": paths(&plan.removed_by_ceiling),
+            "invalid": plan.invalid.iter().map(|(p, reason)| json!({
+                "path": p.display().to_string(),
+                "reason": reason,
+            })).collect::<Vec<_>>(),
+            "outside": paths(&corpus.outside),
+            "left": left.iter().map(|(p, error)| json!({
+                "path": p.display().to_string(),
+                "error": error.to_string(),
+            })).collect::<Vec<_>>(),
+        }),
+    }
+}
+
+/// What an operator should know about one entry's prune that does not fail it.
+fn prune_warnings(
+    entry: &fraisier_config::RetainEntry,
+    name: &str,
+    dir: &Path,
+    outside: &[PathBuf],
+    plan: &fraisier_db::retention::Plan,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(min_free_gb) = entry.min_free_gb {
+        // An unmeasurable volume is not a full one any more than it is an empty
+        // one, so it says nothing.
+        if let Ok(free) = fraisier_db::retention::available_bytes(dir) {
+            if free < min_free_gb.saturating_mul(1_000_000_000) {
+                warnings.push(format!(
+                    "{} has {} GB free, below the min_free_gb = {min_free_gb} declared for \
+                     {name}; retention bounds this corpus but cannot free a disk something else \
+                     filled",
+                    dir.display(),
+                    free / 1_000_000_000
+                ));
+            }
+        }
+    }
+    for (archive, reason) in &plan.invalid {
+        warnings.push(format!(
+            "{} is not a readable archive and holds no keep_minimum slot: {reason}",
+            archive.display()
+        ));
+    }
+    if plan.floor_is_load_bearing() {
+        warnings.push(format!(
+            "{name}: every archive in {} is older than retention_days; only the keep_minimum \
+             floor is keeping them, so backups have stopped arriving",
+            dir.display()
+        ));
+    }
+    for link in outside {
+        warnings.push(format!(
+            "{} is a symlink resolving outside {}; it was left alone",
+            link.display(),
+            dir.display()
+        ));
+    }
+    warnings
+}
+
+/// The database server a drill runs against: a [`DrillDb`](fraisier_core::drill::DrillDb)
+/// that can also size the live database, for the free-space check.
+#[async_trait::async_trait]
+pub(crate) trait DrillServer: fraisier_core::drill::DrillDb {
+    /// The live database's size on disk, in bytes.
+    async fn live_bytes(&self, live_dsn: &str) -> Result<u64, String>;
+}
+
+/// `backup drill`: restore the newest archive in `[backup].dir` into a throwaway
+/// database, run the migrations forward on it, count its tables, and drop it.
+///
+/// It fails (exit 1), before creating anything, when there is no archive, when
+/// the newest one does not read back, when it is older than
+/// `[drill].max_age_hours`, or when the filesystem holding `[drill].data_dir`
+/// has no room for the copy. It fails after restoring when the migrations fail
+/// or fewer than `[drill].min_tables` tables come back. Every run that gets past
+/// loading the config writes a receipt to `<state_dir>/drills/`.
+pub(crate) async fn backup_drill(config_path: &Path, state_dir: &Path) -> Result<CommandOutput> {
+    backup_drill_with(
+        config_path,
+        state_dir,
+        // The drill restores as the app role; the restore identity is not wired here.
+        &crate::pg_rehearsal::PgRehearsalDb {
+            admin_url_env: None,
+        },
+        &fraisier_db::archive::ArchiveTools::default().pg_restore,
+        std::time::SystemTime::now(),
+    )
+    .await
+}
+
+/// [`backup_drill`] with the server, `pg_restore` and the clock supplied by the
+/// caller.
+async fn backup_drill_with(
+    config_path: &Path,
+    state_dir: &Path,
+    server: &dyn DrillServer,
+    pg_restore: &Path,
+    now: std::time::SystemTime,
+) -> Result<CommandOutput> {
+    let config = load(config_path)?;
+    if let Some(refusal) = refuse_invalid_db_config(&config, "drill") {
+        return Ok(refusal);
+    }
+    let report = config.validate_backup_ops();
+    if !report.ok() {
+        let mut pretty = render_issues(&report);
+        let _ = writeln!(pretty, "refusing to drill with an invalid config");
+        return Ok(CommandOutput {
+            exit_code: 1,
+            pretty,
+            json: json!({ "ok": false, "issues": serde_json::to_value(&report.issues).unwrap_or(Value::Null) }),
+        });
+    }
+    let Some(dir) = config.backup.as_ref().and_then(|b| b.dir.clone()) else {
+        return Ok(CommandOutput {
+            exit_code: 1,
+            pretty: "a drill restores the newest archive in [backup].dir, and none is set\n"
+                .to_owned(),
+            json: json!({ "ok": false, "error": "no [backup].dir" }),
+        });
+    };
+
+    let deploy = config.deploy.as_ref().context("[deploy] section")?;
+    let fraise = deploy.name.clone().unwrap_or_default();
+    let environment = deploy.environment.clone().unwrap_or_default();
+    let mut archive = None;
+    let outcome = drill_steps(
+        &config,
+        &dir,
+        (&fraise, &environment),
+        server,
+        pg_restore,
+        now,
+        &mut archive,
+    )
+    .await;
+
+    let mut receipt = json!({
+        "fraise": fraise,
+        "environment": environment,
+        "started_at": fraisier_db::archive::UtcStamp::from_system_time(now).as_str(),
+        "archive": archive.as_ref().map(|a: &fraisier_db::archive::Archive| a.path.display().to_string()),
+        "archive_taken_at": archive.as_ref().map(|a| a.stamp.as_str().to_owned()),
+        "ok": outcome.is_ok(),
+    });
+    let (exit_code, pretty) = drill_result(&outcome, archive.as_ref(), &mut receipt);
+    let written = write_drill_receipt(state_dir, &fraise, &environment, &receipt);
+    let mut pretty = pretty;
+    if let Err(error) = &written {
+        let _ = writeln!(
+            pretty,
+            "warning: the drill receipt was not written: {error}"
+        );
+    }
+    let metrics_warning = outcome
+        .is_ok()
+        .then(|| {
+            record_metrics(
+                &config,
+                &fraise,
+                &environment,
+                &crate::metrics::Metrics::drill(now),
+            )
+        })
+        .flatten();
+    Ok(with_metrics_warning(
+        CommandOutput {
+            exit_code,
+            pretty,
+            json: receipt,
+        },
+        metrics_warning,
+    ))
+}
+
+/// The exit code and rendering of a drill's `outcome`, recording it in `receipt`.
+fn drill_result(
+    outcome: &std::result::Result<fraisier_core::drill::DrillReport, (&'static str, String)>,
+    archive: Option<&fraisier_db::archive::Archive>,
+    receipt: &mut Value,
+) -> (i32, String) {
+    match outcome {
+        Ok(report) => {
+            receipt["throwaway"] = json!(report.throwaway);
+            receipt["applied"] = json!(report
+                .applied
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>());
+            receipt["tables"] = json!(report.tables);
+            receipt["teardown_warning"] = json!(report.teardown_warning);
+            let mut pretty = format!(
+                "drill passed: restored {} into {}, applied {} migration(s), found {} \
+             table(s), and dropped it\n",
+                archive.map_or_else(String::new, |a| a.path.display().to_string()),
+                report.throwaway,
+                report.applied.len(),
+                report.tables
+            );
+            if let Some(warning) = &report.teardown_warning {
+                let _ = writeln!(
+                    pretty,
+                    "warning: {} was not dropped: {warning}; drop it by hand",
+                    report.throwaway
+                );
+            }
+            (0, pretty)
+        }
+        Err((step, message)) => {
+            receipt["failed_step"] = json!(step);
+            let message = fraisier_saga::redact::credentials(message);
+            receipt["error"] = json!(message);
+            (1, format!("drill failed at {step}: {message}\n"))
+        }
+    }
+}
+
+/// The drill's steps up to and including [`fraisier_core::drill::run_restore_drill`],
+/// failing with the step's name and why. `archive` is set once the newest archive
+/// is known.
+async fn drill_steps(
+    config: &DeployConfig,
+    dir: &Path,
+    (fraise, environment): (&str, &str),
+    server: &dyn DrillServer,
+    pg_restore: &Path,
+    now: std::time::SystemTime,
+    archive: &mut Option<fraisier_db::archive::Archive>,
+) -> std::result::Result<fraisier_core::drill::DrillReport, (&'static str, String)> {
+    use fraisier_db::retention::Verdict;
+
+    let drill = config.drill.clone().unwrap_or_default();
+    let newest = fraisier_db::archive::latest_archive(dir, fraise, environment)
+        .map_err(|error| ("listing", format!("cannot read {}: {error}", dir.display())))?
+        .ok_or_else(|| {
+            (
+                "listing",
+                format!("no archive of {fraise}/{environment} in {}", dir.display()),
+            )
+        })?;
+    let path = archive.insert(newest).path.clone();
+
+    // Before anything is created: an archive that does not read back cannot restore.
+    if let Verdict::Invalid(reason) = fraisier_db::archive::verify_archive(pg_restore, &path).await
+    {
+        return Err((
+            "verify",
+            format!("{} is not a readable archive: {reason}", path.display()),
+        ));
+    }
+    let taken_at = archive.as_ref().map_or(now, |a| a.stamp.to_system_time());
+    let max_age = std::time::Duration::from_hours(u64::from(drill.max_age_hours()));
+    if let Ok(age) = now.duration_since(taken_at) {
+        if age > max_age {
+            return Err((
+                "age",
+                format!(
+                    "the newest archive, {}, is {} hours old: older than max_age_hours = {}, \
+                     so backups have stopped arriving",
+                    path.display(),
+                    age.as_secs() / 3_600,
+                    drill.max_age_hours()
+                ),
+            ));
+        }
+    }
+
+    let resolved =
+        factory::build_migration_only(config).map_err(|error| ("config", format!("{error:#}")))?;
+    let live_dsn = resolved
+        .ctx
+        .secret(fraisier_core::restore_rehearsal::DATABASE_URL_SECRET)
+        .map_err(|error| {
+            (
+                "config",
+                format!("the database DSN is unavailable: {error}"),
+            )
+        })?;
+    if let Some(data_dir) = drill.data_dir.as_deref() {
+        drill_room(server, &live_dsn, data_dir).await?;
+    }
+
+    fraisier_core::drill::run_restore_drill(
+        server,
+        resolved.migration.as_ref(),
+        &resolved.ctx,
+        &path,
+        drill.min_tables,
+    )
+    .await
+    .map_err(|error| ("drill", error.to_string()))
+}
+
+/// Refuse a drill when the filesystem holding `data_dir` cannot take another
+/// copy of the live database plus 2 GB. A measurement that fails refuses too: a
+/// copy that fills the disk can stop the live server beside it.
+async fn drill_room(
+    server: &dyn DrillServer,
+    live_dsn: &str,
+    data_dir: &Path,
+) -> std::result::Result<(), (&'static str, String)> {
+    const HEADROOM: u64 = 2_000_000_000;
+    let live = server.live_bytes(live_dsn).await.map_err(|error| {
+        (
+            "free space",
+            format!("could not size the live database: {error}"),
+        )
+    })?;
+    let free = fraisier_db::retention::available_bytes(data_dir).map_err(|error| {
+        (
+            "free space",
+            format!(
+                "could not measure free space in {}: {error}",
+                data_dir.display()
+            ),
+        )
+    })?;
+    let needed = live.saturating_add(HEADROOM);
+    if free < needed {
+        return Err((
+            "free space",
+            format!(
+                "{} has {} GB free; a restored copy needs about {} GB (the live database's \
+                 size plus 2 GB)",
+                data_dir.display(),
+                free / 1_000_000_000,
+                needed.div_ceil(1_000_000_000)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Write `receipt` to `<state_dir>/drills/<fraise>-<environment>.json`, replacing
+/// the previous one only once the new one is complete.
+fn write_drill_receipt(
+    state_dir: &Path,
+    fraise: &str,
+    environment: &str,
+    receipt: &Value,
+) -> std::io::Result<PathBuf> {
+    let dir = state_dir.join("drills");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{fraise}-{environment}.json"));
+    let partial = dir.join(format!(".{fraise}-{environment}.json.partial"));
+    let body = serde_json::to_vec_pretty(receipt).map_err(std::io::Error::other)?;
+    std::fs::write(&partial, body)?;
+    std::fs::rename(&partial, &path)?;
+    Ok(path)
 }
 
 /// `db restore`: restore a `pg_dump -Fc` archive into the database with
@@ -3034,7 +3749,53 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
     }
 }
 
-/// Fire the configured `[schedule].notify` failure sink when a deploy did not
+/// The deploy metrics for `outcome`: committed, or rolled back fully or partly.
+fn deploy_metrics(outcome: &SagaOutcome, took: std::time::Duration) -> crate::metrics::Metrics {
+    crate::metrics::Metrics::deploy(
+        std::time::SystemTime::now(),
+        matches!(outcome, SagaOutcome::Committed),
+        matches!(
+            outcome,
+            SagaOutcome::RolledBack { .. } | SagaOutcome::PartialRollback { .. }
+        ),
+        took,
+    )
+}
+
+/// Write `metrics` into `[metrics].textfile_dir`, when it is set, returning a
+/// warning for the command's output when the write fails. A failed write never
+/// fails the command: the deploy or backup it describes already happened.
+fn record_metrics(
+    config: &DeployConfig,
+    fraise: &str,
+    environment: &str,
+    metrics: &crate::metrics::Metrics,
+) -> Option<String> {
+    let dir = config.metrics.as_ref()?.textfile_dir.as_deref()?;
+    let labels = crate::metrics::Labels {
+        fraise,
+        environment,
+    };
+    metrics.write(dir, &labels).err().map(|error| {
+        format!(
+            "the metrics file {} was not written: {error}",
+            dir.join(metrics.file()).display()
+        )
+    })
+}
+
+/// `out` with a metrics-write warning appended, if there is one.
+fn with_metrics_warning(mut out: CommandOutput, warning: Option<String>) -> CommandOutput {
+    if let Some(warning) = warning {
+        let _ = writeln!(out.pretty, "warning: {warning}");
+        if let Some(json) = out.json.as_object_mut() {
+            json.insert("metrics_warning".to_owned(), json!(warning));
+        }
+    }
+    out
+}
+
+/// Fire the configured `[notify].command` failure sink when a deploy did not
 /// commit. This is the unattended-failure path: a scheduled (operator-unwatched)
 /// deploy of a sick build rolls back **and** emits a notification, reusing the
 /// self-upgrade notify primitive. A committed deploy, or a config with no notify
@@ -3054,7 +3815,7 @@ async fn notify_deploy_failure(
     if matches!(outcome, SagaOutcome::Committed) {
         return;
     }
-    let Some(command) = config.schedule.as_ref().and_then(|s| s.notify.as_deref()) else {
+    let Some(command) = config.notify.as_ref().and_then(|n| n.command.as_deref()) else {
         return;
     };
     let (_, label, detail) = outcome_result(outcome);
@@ -3190,18 +3951,18 @@ url = "http://127.0.0.1:8080/health"
     fn notify_deploy_failure_carries_the_rollback_reason() {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("payload.txt");
-        // A [schedule].notify sink that records the reason the webhook carries.
+        // A [notify].command sink that records the reason the webhook carries.
         // A TOML literal string sidesteps escaping the shell's double quotes.
         let notify = format!(
-            "notify = 'printf \"%s\" \"$FRAISIER_NOTIFY_REASON\" > {}'",
+            "command = 'printf \"%s\" \"$FRAISIER_NOTIFY_REASON\" > {}'",
             out.display()
         );
-        let toml = format!("{VALID}\n[schedule]\n{notify}\n");
+        let toml = format!("{VALID}\n[notify]\n{notify}\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         // The named perf detail rides in via HealthStatus.detail → SagaError.message
         // → RolledBack.reason → FailurePayload.reason (the recommended zero-API-change
-        // path, Decision 3); with [schedule].notify set it reaches the webhook sink.
+        // path, Decision 3); with [notify].command set it reaches the webhook sink.
         // The reason here is the shape CommandHealth produces from a --json scan.
         let outcome = SagaOutcome::RolledBack {
             failed_step: "health".to_owned(),
@@ -3225,10 +3986,10 @@ url = "http://127.0.0.1:8080/health"
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("payload.txt");
         let notify = format!(
-            "notify = 'printf \"%s\" \"$FRAISIER_NOTIFY_REASON\" > {}'",
+            "command = 'printf \"%s\" \"$FRAISIER_NOTIFY_REASON\" > {}'",
             out.display()
         );
-        let toml = format!("{VALID}\n[schedule]\n{notify}\n");
+        let toml = format!("{VALID}\n[notify]\n{notify}\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         // Issue #62: the confiture adapter folds the first line of stderr into
@@ -3284,10 +4045,10 @@ url = "http://127.0.0.1:8080/health"
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("event.txt");
         let notify = format!(
-            "notify = 'printf \"%s\" \"$FRAISIER_NOTIFY_EVENT\" > {}'",
+            "command = 'printf \"%s\" \"$FRAISIER_NOTIFY_EVENT\" > {}'",
             out.display()
         );
-        let toml = format!("{VALID}\n[schedule]\n{notify}\n");
+        let toml = format!("{VALID}\n[notify]\n{notify}\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         let outcome = SagaOutcome::RolledBack {
@@ -4564,6 +5325,883 @@ current_revision = "true"
         assert_eq!(std::fs::read(&existing).expect("read"), b"old archive");
     }
 
+    /// A fake `pg_dump` (writes 1000 bytes to the `-f` path, or exits 1 when a
+    /// `fail` file sits beside the backup directory) and a fake `pg_restore`
+    /// that lists any archive. Written once per process, never rewritten, so no
+    /// sibling fork can hold them open for writing when they are exec'd.
+    fn fake_pg_tools() -> &'static fraisier_db::archive::ArchiveTools {
+        use std::os::unix::fs::PermissionsExt;
+        static TOOLS: std::sync::OnceLock<fraisier_db::archive::ArchiveTools> =
+            std::sync::OnceLock::new();
+        TOOLS.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("fraisier-cli-pg-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let write = |name: &str, body: &str| {
+                let path = dir.join(name);
+                // `--probe` (the burn-in below) exits before the body touches any file.
+                std::fs::write(&path, format!("#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\n{body}"))
+                    .expect("write fake");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+                for _ in 0..200 {
+                    match std::process::Command::new(&path).arg("--probe").output() {
+                        Ok(_) => return path,
+                        Err(error) if error.raw_os_error() == Some(26) => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("fake is not executable: {error}"),
+                    }
+                }
+                panic!("fake stayed ETXTBSY");
+            };
+            fraisier_db::archive::ArchiveTools {
+                pg_dump: write(
+                    "pg_dump",
+                    "head -c 1000 /dev/zero > \"$4\"\n\
+                     [ -e \"$(dirname \"$4\")/../fail\" ] && { echo 'pg_dump: boom' >&2; exit 1; }\n\
+                     exit 0\n",
+                ),
+                pg_restore: write(
+                    "pg_restore",
+                    "grep -q BAD \"$2\" && { echo 'pg_restore: error: not an archive' >&2; exit 1; }\n\
+                     exit 0\n",
+                ),
+            }
+        })
+    }
+
+    /// A db-ops config whose `[backup].dir` is `<dir>/backups`.
+    fn db_backup_dir_config(dir: &Path, dsn_env: &str) -> std::path::PathBuf {
+        let backups = dir.join("backups");
+        std::fs::create_dir(&backups).expect("mkdir backups");
+        write(
+            dir,
+            "fraisier.toml",
+            &format!(
+                "{}\n[backup]\ndir = \"{}\"\n",
+                db_ops_config(dsn_env),
+                backups.display()
+            ),
+        )
+    }
+
+    fn archive_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .into_string()
+                    .expect("utf-8")
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_backup_with_a_backup_dir_succeeds_on_every_run() {
+        // #87: the scheduled unit passes no --output and no --force, and must
+        // succeed on its second run as on its first.
+        let _guard = crate::test_env::env_guard();
+        let var = "FRAISIER_DBOPS_BACKUP_DIR";
+        std::env::set_var(var, "postgres://app:s3cret@dbhost/shop");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = db_backup_dir_config(dir.path(), var);
+        let day = std::time::Duration::from_hours(24);
+        let first = std::time::UNIX_EPOCH + std::time::Duration::from_mins(29_883_075);
+        let runs: Vec<super::CommandOutput> = [first, first + day]
+            .into_iter()
+            .map(|now| {
+                block_on(super::db_backup_with(
+                    &config,
+                    None,
+                    false,
+                    fake_pg_tools(),
+                    now,
+                ))
+                .expect("run")
+            })
+            .collect();
+        std::env::remove_var(var);
+
+        for out in &runs {
+            assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
+            assert!(!out.pretty.contains("s3cret"), "{}", out.pretty);
+        }
+        assert_eq!(
+            archive_names(&dir.path().join("backups")),
+            [
+                "demo-test-20261026T031500Z.pgdump",
+                "demo-test-20261027T031500Z.pgdump"
+            ]
+        );
+        assert_eq!(
+            runs[1].json["output"],
+            serde_json::json!(dir
+                .path()
+                .join("backups/demo-test-20261027T031500Z.pgdump")
+                .display()
+                .to_string())
+        );
+    }
+
+    #[test]
+    fn a_failed_backup_into_a_backup_dir_exits_1_and_keeps_the_earlier_archive() {
+        let _guard = crate::test_env::env_guard();
+        let var = "FRAISIER_DBOPS_BACKUP_DIR_FAIL";
+        std::env::set_var(var, "postgres://app@dbhost/shop");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = db_backup_dir_config(dir.path(), var);
+        let earlier = dir.path().join("backups/demo-test-20261025T031500Z.pgdump");
+        std::fs::write(&earlier, vec![b'g'; 1_000]).expect("seed");
+        std::fs::write(dir.path().join("fail"), b"").expect("arm failure");
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_mins(29_883_075);
+        let out = block_on(super::db_backup_with(
+            &config,
+            None,
+            false,
+            fake_pg_tools(),
+            now,
+        ))
+        .expect("run");
+        std::env::remove_var(var);
+
+        assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
+        assert_eq!(out.json["ok"], serde_json::json!(false));
+        assert!(out.pretty.contains("boom"), "{}", out.pretty);
+        assert_eq!(
+            archive_names(&dir.path().join("backups")),
+            ["demo-test-20261025T031500Z.pgdump"]
+        );
+        assert_eq!(std::fs::read(&earlier).expect("read"), vec![b'g'; 1_000]);
+    }
+
+    /// 2026-10-26T03:15:00Z.
+    fn prune_now() -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_mins(29_883_075)
+    }
+
+    /// A config with one `[[backup.retain]]` entry per `(name, dir, extra)`.
+    fn prune_config(dir: &Path, entries: &[(&str, &Path, &str)]) -> std::path::PathBuf {
+        use std::fmt::Write as _;
+
+        let mut body = db_ops_config("FRAISIER_PRUNE_UNUSED_DSN");
+        for (name, corpus, extra) in entries {
+            let _ = write!(
+                body,
+                "\n[[backup.retain]]\nname = \"{name}\"\ndir = \"{}\"\n\
+                 schedule = \"daily 05:30\"\nretention_days = 1\nkeep_minimum = 2\n{extra}",
+                corpus.display()
+            );
+        }
+        write(dir, "fraisier.toml", &body)
+    }
+
+    /// A corpus dir under `root` holding an archive per `(stamp, body)`.
+    fn prune_corpus(root: &Path, archives: &[(&str, &[u8])]) -> std::path::PathBuf {
+        let corpus = root.join("backups");
+        std::fs::create_dir(&corpus).expect("mkdir");
+        for (stamp, body) in archives {
+            std::fs::write(corpus.join(format!("demo-test-{stamp}.pgdump")), body).expect("write");
+        }
+        corpus
+    }
+
+    fn prune(config: &Path, state_dir: &Path, name: Option<&str>, apply: bool) -> super::PruneRun {
+        block_on(super::backup_prune_with(
+            config,
+            state_dir,
+            name,
+            apply,
+            &fake_pg_tools().pg_restore,
+            prune_now(),
+        ))
+        .expect("run")
+    }
+
+    /// Three archives 30, 40 and 50 hours old: the floor of 2 keeps two.
+    const AGED: &[(&str, &[u8])] = &[
+        ("20261024T211500Z", b"PGDMP"),
+        ("20261024T111500Z", b"PGDMP"),
+        ("20261024T011500Z", b"PGDMP"),
+    ];
+
+    #[test]
+    fn a_dry_run_prune_removes_nothing_and_lists_the_plan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(dir.path(), AGED);
+        let config = prune_config(dir.path(), &[("nightly", &corpus, "")]);
+        let run = prune(&config, &dir.path().join("state"), None, false);
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert_eq!(archive_names(&corpus).len(), 3);
+        assert!(
+            run.output.pretty.contains("would remove"),
+            "{}",
+            run.output.pretty
+        );
+        assert!(
+            run.output
+                .pretty
+                .contains("demo-test-20261024T011500Z.pgdump"),
+            "{}",
+            run.output.pretty
+        );
+        assert_eq!(run.output.json["applied"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn an_applied_prune_removes_exactly_the_plan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(dir.path(), AGED);
+        let config = prune_config(dir.path(), &[("nightly", &corpus, "")]);
+        let run = prune(&config, &dir.path().join("state"), None, true);
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert_eq!(
+            archive_names(&corpus),
+            [
+                "demo-test-20261024T111500Z.pgdump",
+                "demo-test-20261024T211500Z.pgdump"
+            ]
+        );
+        assert_eq!(
+            run.output.json["entries"][0]["removed"],
+            serde_json::json!([corpus
+                .join("demo-test-20261024T011500Z.pgdump")
+                .display()
+                .to_string()])
+        );
+    }
+
+    #[test]
+    fn a_prune_keeps_the_floor_when_every_archive_is_old_and_warns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(
+            dir.path(),
+            &[
+                ("20261001T000000Z", b"PGDMP"),
+                ("20260901T000000Z", b"PGDMP"),
+            ],
+        );
+        let config = prune_config(dir.path(), &[("nightly", &corpus, "")]);
+        let run = prune(&config, &dir.path().join("state"), None, true);
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert_eq!(archive_names(&corpus).len(), 2);
+        assert!(
+            run.warnings
+                .iter()
+                .any(|w| w.contains("only the keep_minimum floor")),
+            "{:?}",
+            run.warnings
+        );
+    }
+
+    #[test]
+    fn no_warning_when_an_archive_is_within_retention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(dir.path(), &[("20261026T000000Z", b"PGDMP")]);
+        let config = prune_config(dir.path(), &[("nightly", &corpus, "")]);
+        let run = prune(&config, &dir.path().join("state"), None, true);
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert!(run.warnings.is_empty(), "{:?}", run.warnings);
+    }
+
+    #[test]
+    fn an_invalid_archive_is_named_in_a_warning_and_does_not_fail_the_prune() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(
+            dir.path(),
+            &[
+                ("20261024T211500Z", b"BAD"),
+                ("20261024T111500Z", b"PGDMP"),
+                ("20261024T011500Z", b"PGDMP"),
+            ],
+        );
+        let config = prune_config(dir.path(), &[("nightly", &corpus, "")]);
+        let run = prune(&config, &dir.path().join("state"), None, true);
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert!(
+            run.warnings
+                .iter()
+                .any(|w| w.contains("demo-test-20261024T211500Z.pgdump")
+                    && w.contains("not an archive")),
+            "{:?}",
+            run.warnings
+        );
+        // The invalid one gave up its slot to the oldest valid one.
+        assert_eq!(
+            archive_names(&corpus),
+            [
+                "demo-test-20261024T011500Z.pgdump",
+                "demo-test-20261024T111500Z.pgdump"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_prune_never_touches_a_symlink_out_of_its_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(dir.path(), AGED);
+        let precious = dir.path().join("precious.pgdump");
+        std::fs::write(&precious, b"PGDMP").expect("write");
+        let link = corpus.join("demo-test-20260101T000000Z.pgdump");
+        std::os::unix::fs::symlink(&precious, &link).expect("symlink");
+        let config = prune_config(dir.path(), &[("nightly", &corpus, "")]);
+        let run = prune(&config, &dir.path().join("state"), None, true);
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert!(precious.exists());
+        assert!(link.symlink_metadata().is_ok());
+        assert!(
+            run.warnings
+                .iter()
+                .any(|w| w.contains("demo-test-20260101T000000Z.pgdump")),
+            "{:?}",
+            run.warnings
+        );
+    }
+
+    #[test]
+    fn a_missing_dir_fails_the_prune_and_is_reported_for_every_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = prune_config(
+            dir.path(),
+            &[
+                ("first", &dir.path().join("absent-one"), ""),
+                ("second", &dir.path().join("absent-two"), ""),
+            ],
+        );
+        let run = prune(&config, &dir.path().join("state"), None, true);
+        assert_eq!(run.output.exit_code, 1, "{}", run.output.pretty);
+        assert!(
+            run.output.pretty.contains("absent-one"),
+            "{}",
+            run.output.pretty
+        );
+        assert!(
+            run.output.pretty.contains("absent-two"),
+            "{}",
+            run.output.pretty
+        );
+    }
+
+    #[test]
+    fn a_prune_with_no_policy_says_so_and_exits_1() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(
+            dir.path(),
+            "fraisier.toml",
+            &db_ops_config("FRAISIER_PRUNE_UNUSED_DSN"),
+        );
+        let run = prune(&config, &dir.path().join("state"), None, true);
+        assert_eq!(run.output.exit_code, 1, "{}", run.output.pretty);
+        assert!(
+            run.output.pretty.contains("[[backup.retain]]"),
+            "{}",
+            run.output.pretty
+        );
+    }
+
+    #[test]
+    fn a_name_selects_one_entry_and_an_unknown_one_lists_the_known() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(dir.path(), AGED);
+        let config = prune_config(
+            dir.path(),
+            &[
+                ("nightly", &corpus, ""),
+                ("other", &dir.path().join("absent"), ""),
+            ],
+        );
+        let run = prune(&config, &dir.path().join("state"), Some("nightly"), true);
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert_eq!(archive_names(&corpus).len(), 2);
+
+        let run = prune(&config, &dir.path().join("state"), Some("weekly"), true);
+        assert_eq!(run.output.exit_code, 1, "{}", run.output.pretty);
+        assert!(
+            run.output.pretty.contains("nightly"),
+            "{}",
+            run.output.pretty
+        );
+        assert!(run.output.pretty.contains("other"), "{}", run.output.pretty);
+    }
+
+    #[test]
+    fn a_prune_refuses_while_a_deploy_holds_the_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(dir.path(), AGED);
+        let config = prune_config(dir.path(), &[("nightly", &corpus, "")]);
+        let state_dir = dir.path().join("state");
+        let store = FilesystemStateStore::new(&state_dir).expect("store");
+        let guard = block_on(store.acquire_lock(&FraiseKey::new("demo", "test"))).expect("lock");
+        let run = prune(&config, &state_dir, None, true);
+        block_on(store.release_lock(guard)).expect("release");
+        assert_eq!(run.output.exit_code, 1, "{}", run.output.pretty);
+        assert!(run.output.pretty.contains("lock"), "{}", run.output.pretty);
+        assert_eq!(archive_names(&corpus).len(), 3);
+    }
+
+    #[test]
+    fn a_volume_below_min_free_gb_warns_and_still_prunes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(dir.path(), AGED);
+        let config = prune_config(
+            dir.path(),
+            &[("nightly", &corpus, "min_free_gb = 1000000000\n")],
+        );
+        let run = prune(&config, &dir.path().join("state"), None, true);
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert_eq!(archive_names(&corpus).len(), 2);
+        assert!(
+            run.warnings.iter().any(|w| w.contains("min_free_gb")),
+            "{:?}",
+            run.warnings
+        );
+    }
+
+    /// A database server for drills: records what it was asked, answers from its
+    /// fields.
+    #[derive(Default)]
+    struct FakeServer {
+        calls: std::sync::Mutex<Vec<String>>,
+        throwaway: Option<String>,
+        tables: u64,
+        live_bytes: u64,
+    }
+
+    impl FakeServer {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("calls").clone()
+        }
+        fn record(&self, call: String) {
+            self.calls.lock().expect("calls").push(call);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fraisier_core::restore_rehearsal::RehearsalDb for FakeServer {
+        async fn provision(
+            &self,
+            _live_dsn: &str,
+            backup: &fraisier_core::restore_rehearsal::BackupSource,
+        ) -> Result<
+            fraisier_core::restore_rehearsal::ThrowawayDb,
+            fraisier_core::restore_rehearsal::RehearsalError,
+        > {
+            self.record(format!("provision:{backup:?}"));
+            let name = self
+                .throwaway
+                .clone()
+                .unwrap_or_else(|| "shop_fraisier_rh_1_a".to_owned());
+            Ok(fraisier_core::restore_rehearsal::ThrowawayDb {
+                dsn: format!("postgres://app@127.0.0.1/{name}"),
+                name,
+            })
+        }
+
+        async fn teardown(
+            &self,
+            db: &fraisier_core::restore_rehearsal::ThrowawayDb,
+        ) -> Result<(), String> {
+            self.record(format!("teardown:{}", db.name));
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fraisier_core::drill::DrillDb for FakeServer {
+        fn live_database(&self, _live_dsn: &str) -> Result<String, String> {
+            Ok("shop".to_owned())
+        }
+
+        async fn table_count(
+            &self,
+            _db: &fraisier_core::restore_rehearsal::ThrowawayDb,
+        ) -> Result<u64, String> {
+            Ok(self.tables)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::DrillServer for FakeServer {
+        async fn live_bytes(&self, _live_dsn: &str) -> Result<u64, String> {
+            Ok(self.live_bytes)
+        }
+    }
+
+    /// A drill config: the command migration adapter runs `up`, and `[backup].dir`
+    /// is `<dir>/backups`.
+    fn drill_config(dir: &Path, up: &str, drill: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir.join("backups")).expect("mkdir");
+        write(
+            dir,
+            "fraisier.toml",
+            &format!(
+                "[deploy]\nname = \"demo\"\nenvironment = \"test\"\n\n\
+                 [migration]\nadapter = \"command\"\ndatabase_url_env = \"FRAISIER_DRILL_DSN\"\n\n\
+                 [migration.settings.commands]\nup = \"{up}\"\ncurrent_revision = \"true\"\n\n\
+                 [backup]\ndir = \"{}\"\n\n[drill]\n{drill}",
+                dir.join("backups").display()
+            ),
+        )
+    }
+
+    /// An archive in `<dir>/backups` taken at `stamp`, holding `body`.
+    fn drill_archive(dir: &Path, stamp: &str, body: &[u8]) -> std::path::PathBuf {
+        let path = dir.join(format!("backups/demo-test-{stamp}.pgdump"));
+        std::fs::write(&path, body).expect("write");
+        path
+    }
+
+    fn drill(dir: &Path, config: &Path, server: &FakeServer) -> super::CommandOutput {
+        let _guard = crate::test_env::env_guard();
+        std::env::set_var("FRAISIER_DRILL_DSN", "postgres://app:s3cret@127.0.0.1/shop");
+        let out = block_on(super::backup_drill_with(
+            config,
+            &dir.join("state"),
+            server,
+            &fake_pg_tools().pg_restore,
+            prune_now(),
+        ))
+        .expect("run");
+        std::env::remove_var("FRAISIER_DRILL_DSN");
+        out
+    }
+
+    fn receipt(dir: &Path) -> serde_json::Value {
+        let text =
+            std::fs::read_to_string(dir.join("state/drills/demo-test.json")).expect("a receipt");
+        serde_json::from_str(&text).expect("json")
+    }
+
+    #[test]
+    fn a_drill_restores_the_newest_archive_migrates_it_and_drops_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "min_tables = 1\n");
+        drill_archive(dir.path(), "20261025T031500Z", b"PGDMP");
+        let newest = drill_archive(dir.path(), "20261026T021500Z", b"PGDMP");
+        let server = FakeServer {
+            tables: 4,
+            ..FakeServer::default()
+        };
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 0, "{}", out.pretty);
+        assert_eq!(
+            server.calls(),
+            [
+                format!(
+                    "provision:{:?}",
+                    fraisier_core::restore_rehearsal::BackupSource::Archive(newest.clone())
+                ),
+                "teardown:shop_fraisier_rh_1_a".to_owned(),
+            ]
+        );
+        let receipt = receipt(dir.path());
+        assert_eq!(receipt["ok"], serde_json::json!(true));
+        assert_eq!(
+            receipt["archive"],
+            serde_json::json!(newest.display().to_string())
+        );
+        assert_eq!(receipt["tables"], serde_json::json!(4));
+        assert!(!out.pretty.contains("s3cret"), "{}", out.pretty);
+    }
+
+    #[test]
+    fn a_corrupt_newest_archive_fails_before_anything_is_created() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "");
+        drill_archive(dir.path(), "20261026T021500Z", b"BAD");
+        let server = FakeServer::default();
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(server.calls().is_empty(), "{:?}", server.calls());
+        assert!(
+            out.pretty.contains("not a readable archive"),
+            "{}",
+            out.pretty
+        );
+        assert_eq!(receipt(dir.path())["ok"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn a_stale_newest_archive_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "max_age_hours = 24\n");
+        drill_archive(dir.path(), "20261024T031500Z", b"PGDMP");
+        let server = FakeServer::default();
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(server.calls().is_empty(), "{:?}", server.calls());
+        assert!(out.pretty.contains("max_age_hours"), "{}", out.pretty);
+    }
+
+    #[test]
+    fn a_drill_with_no_archive_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "");
+        let server = FakeServer::default();
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(out.pretty.contains("no archive"), "{}", out.pretty);
+        let calls = server.calls();
+        assert!(calls.is_empty(), "{calls:?}");
+    }
+
+    #[test]
+    fn too_little_room_beside_the_data_dir_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(
+            dir.path(),
+            "true",
+            &format!("data_dir = \"{}\"\n", dir.path().display()),
+        );
+        drill_archive(dir.path(), "20261026T021500Z", b"PGDMP");
+        let server = FakeServer {
+            live_bytes: u64::MAX / 2,
+            ..FakeServer::default()
+        };
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(out.pretty.contains("free"), "{}", out.pretty);
+        assert!(server.calls().is_empty(), "{:?}", server.calls());
+    }
+
+    #[test]
+    fn failing_migrations_fail_the_drill_and_the_copy_is_still_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "false", "");
+        drill_archive(dir.path(), "20261026T021500Z", b"PGDMP");
+        let server = FakeServer::default();
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(server
+            .calls()
+            .contains(&"teardown:shop_fraisier_rh_1_a".to_owned()));
+        assert!(out.pretty.contains("migrations failed"), "{}", out.pretty);
+    }
+
+    #[test]
+    fn too_few_tables_fail_the_drill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "min_tables = 10\n");
+        drill_archive(dir.path(), "20261026T021500Z", b"PGDMP");
+        let server = FakeServer {
+            tables: 2,
+            ..FakeServer::default()
+        };
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(out.pretty.contains("min_tables"), "{}", out.pretty);
+    }
+
+    #[test]
+    fn an_unmarked_throwaway_is_left_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "");
+        drill_archive(dir.path(), "20261026T021500Z", b"PGDMP");
+        let server = FakeServer {
+            throwaway: Some("shop".to_owned()),
+            ..FakeServer::default()
+        };
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(!server.calls().iter().any(|c| c.starts_with("teardown")));
+    }
+
+    /// A config whose `[metrics].textfile_dir` is `<dir>/textfile`, created.
+    fn metrics_section(dir: &Path) -> String {
+        let textfile = dir.join("textfile");
+        std::fs::create_dir_all(&textfile).expect("mkdir");
+        format!("\n[metrics]\ntextfile_dir = \"{}\"\n", textfile.display())
+    }
+
+    fn metrics_file(dir: &Path, name: &str) -> Option<String> {
+        std::fs::read_to_string(dir.join("textfile").join(name)).ok()
+    }
+
+    fn sample(text: &str, name: &str) -> String {
+        text.lines()
+            .find(|line| line.starts_with(&format!("{name}{{")))
+            .and_then(|line| line.rsplit_once(' '))
+            .map_or_else(
+                || panic!("no {name} in:\n{text}"),
+                |(_, value)| value.to_owned(),
+            )
+    }
+
+    fn record_deploy(dir: &Path, toml: &str, outcome: &SagaOutcome) -> Option<String> {
+        let config = DeployConfig::from_toml_str(toml).expect("parses");
+        super::record_metrics(
+            &config,
+            "checkout",
+            "production",
+            &super::deploy_metrics(outcome, std::time::Duration::from_millis(1_500)),
+        )
+        .map(|warning| format!("{warning} ({})", dir.display()))
+    }
+
+    #[test]
+    fn a_committed_deploy_writes_its_own_metrics_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let toml = metrics_section(dir.path());
+        assert_eq!(
+            record_deploy(dir.path(), &toml, &SagaOutcome::Committed),
+            None
+        );
+        let text = metrics_file(dir.path(), "fraisier_deploy.prom").expect("a deploy file");
+        assert_eq!(sample(&text, "fraisier_deploy_last_success"), "1");
+        assert_eq!(sample(&text, "fraisier_deploy_last_rolled_back"), "0");
+        assert_eq!(
+            sample(&text, "fraisier_deploy_last_duration_seconds"),
+            "1.5"
+        );
+        assert!(
+            text.contains(r#"{fraise="checkout",environment="production"}"#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_rolled_back_or_partly_rolled_back_deploy_says_so() {
+        for outcome in [
+            SagaOutcome::RolledBack {
+                failed_step: "health".to_owned(),
+                reason: "500".to_owned(),
+            },
+            SagaOutcome::PartialRollback {
+                reason: "restart failed".to_owned(),
+            },
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let toml = metrics_section(dir.path());
+            record_deploy(dir.path(), &toml, &outcome);
+            let text = metrics_file(dir.path(), "fraisier_deploy.prom").expect("a deploy file");
+            assert_eq!(
+                sample(&text, "fraisier_deploy_last_success"),
+                "0",
+                "{outcome:?}"
+            );
+            assert_eq!(
+                sample(&text, "fraisier_deploy_last_rolled_back"),
+                "1",
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_textfile_dir_no_metrics_file_is_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("textfile")).expect("mkdir");
+        assert_eq!(record_deploy(dir.path(), "", &SagaOutcome::Committed), None);
+        let names: Vec<_> = std::fs::read_dir(dir.path().join("textfile"))
+            .expect("list")
+            .collect();
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    #[test]
+    fn a_metrics_file_that_cannot_be_written_is_a_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let toml = format!(
+            "[metrics]\ntextfile_dir = \"{}\"\n",
+            dir.path().join("missing").display()
+        );
+        let warning = record_deploy(dir.path(), &toml, &SagaOutcome::Committed);
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|w| w.contains("fraisier_deploy.prom")),
+            "{warning:?}"
+        );
+    }
+
+    fn backup_with_metrics(dir: &Path, var: &str, fail: bool) -> super::CommandOutput {
+        let _guard = crate::test_env::env_guard();
+        std::env::set_var(var, "postgres://app:s3cret@dbhost/shop");
+        std::fs::create_dir_all(dir.join("backups")).expect("mkdir");
+        let config = write(
+            dir,
+            "fraisier.toml",
+            &format!(
+                "{}\n[backup]\ndir = \"{}\"\n{}",
+                db_ops_config(var),
+                dir.join("backups").display(),
+                metrics_section(dir)
+            ),
+        );
+        if fail {
+            std::fs::write(dir.join("fail"), b"").expect("arm failure");
+        }
+        let out = block_on(super::db_backup_with(
+            &config,
+            None,
+            false,
+            fake_pg_tools(),
+            prune_now(),
+        ))
+        .expect("run");
+        std::env::remove_var(var);
+        out
+    }
+
+    #[test]
+    fn a_backup_writes_its_own_file_and_leaves_the_deploy_file_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let deploy_file = dir.path().join("textfile/fraisier_deploy.prom");
+        std::fs::create_dir_all(dir.path().join("textfile")).expect("mkdir");
+        std::fs::write(&deploy_file, "# the last deploy\n").expect("seed");
+
+        let out = backup_with_metrics(dir.path(), "FRAISIER_METRICS_BACKUP", false);
+        assert_eq!(out.exit_code, 0, "{}", out.pretty);
+        let text = metrics_file(dir.path(), "fraisier_backup.prom").expect("a backup file");
+        assert_eq!(
+            sample(&text, "fraisier_backup_last_success_timestamp_seconds"),
+            "1792984500"
+        );
+        let size = std::fs::metadata(dir.path().join("backups/demo-test-20261026T031500Z.pgdump"))
+            .expect("archive")
+            .len();
+        assert_eq!(
+            sample(&text, "fraisier_backup_last_size_bytes"),
+            size.to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&deploy_file).expect("read"),
+            "# the last deploy\n"
+        );
+    }
+
+    #[test]
+    fn a_failed_backup_leaves_the_last_success_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = backup_with_metrics(dir.path(), "FRAISIER_METRICS_BACKUP_FAIL", true);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert_eq!(metrics_file(dir.path(), "fraisier_backup.prom"), None);
+    }
+
+    #[test]
+    fn a_passed_drill_writes_its_own_file_and_a_failed_one_does_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", &metrics_section(dir.path()));
+        drill_archive(dir.path(), "20261026T021500Z", b"PGDMP");
+        let out = drill(dir.path(), &config, &FakeServer::default());
+        assert_eq!(out.exit_code, 0, "{}", out.pretty);
+        let text = metrics_file(dir.path(), "fraisier_drill.prom").expect("a drill file");
+        assert_eq!(
+            sample(&text, "fraisier_drill_last_success_timestamp_seconds"),
+            "1792984500"
+        );
+
+        let failing = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(failing.path(), "false", &metrics_section(failing.path()));
+        drill_archive(failing.path(), "20261026T021500Z", b"PGDMP");
+        let out = drill(failing.path(), &config, &FakeServer::default());
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert_eq!(metrics_file(failing.path(), "fraisier_drill.prom"), None);
+    }
+
     #[test]
     fn db_ops_error_when_the_dsn_env_is_unset() {
         let _guard = crate::test_env::env_guard();
@@ -4894,7 +6532,7 @@ current_revision = "true"
     fn scheduled_install_plans_then_installs_a_timer_and_service() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg =
-            format!("{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+            format!("{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
 
@@ -4912,6 +6550,69 @@ current_revision = "true"
         assert!(root
             .join("etc/systemd/system/fraisier-checkout-staging-scheduled.service")
             .exists());
+    }
+
+    #[test]
+    fn scheduled_install_serves_a_prune_only_host() {
+        // No [schedule]: the retain units and their alert still install.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = format!(
+            "{VALID}\n[[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"nightly\"\n\
+             schedule = \"daily 05:30\"\nretention_days = 14\n"
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        let done = scheduled_install(&config, &root, true, false, false, false).expect("install");
+        assert_eq!(done.exit_code, 0, "{}", done.pretty);
+        let systemd = root.join("etc/systemd/system");
+        for unit in [
+            "fraisier-checkout-staging-retain-nightly.service",
+            "fraisier-checkout-staging-retain-nightly.timer",
+            "fraisier-checkout-staging-alert@.service",
+        ] {
+            assert!(systemd.join(unit).exists(), "{unit}");
+        }
+    }
+
+    #[test]
+    fn scheduled_install_detects_drift_in_the_alert_unit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = format!(
+            "{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[drill]\n\
+             schedule = \"weekly Sun 04:00\"\n"
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        scheduled_install(&config, &root, true, false, false, false).expect("install");
+        let alert = root.join("etc/systemd/system/fraisier-checkout-staging-alert@.service");
+        let marker = fraisier_scaffold::MARKER;
+        std::fs::write(
+            &alert,
+            format!("# {marker}\n[Service]\nExecStart=/bin/true\n"),
+        )
+        .expect("edit");
+        let out = scheduled_install(&config, &root, true, false, false, false).expect("runs");
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(out.pretty.contains("alert@.service"), "{}", out.pretty);
+    }
+
+    #[test]
+    fn scheduled_install_refuses_an_invalid_retain_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = format!(
+            "{VALID}\n[[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"night ly\"\n\
+             schedule = \"daily 05:30\"\nretention_days = 14\n"
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        let out = scheduled_install(&config, &root, true, false, false, false).expect("runs");
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(
+            out.pretty.contains("backup.retain[0].name"),
+            "{}",
+            out.pretty
+        );
+        assert!(!root.exists(), "nothing installed");
     }
 
     #[test]
@@ -4934,7 +6635,7 @@ current_revision = "true"
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = format!(
             "{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"deploy\"\n\
-             allow_unattended_deploy = true\nnotify = \"systemd-cat -t fraisier\"\n"
+             allow_unattended_deploy = true\n\n[notify]\ncommand = \"systemd-cat -t fraisier\"\n"
         );
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
@@ -4951,14 +6652,19 @@ current_revision = "true"
     fn scheduled_install_list_uninstall_round_trips_clean() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg =
-            format!("{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+            format!("{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
 
         scheduled_install(&config, &root, true, false, false, false).expect("install");
         let listed = scheduled_list(&root).expect("list");
         let units = listed.json["units"].as_array().expect("units array");
-        assert_eq!(units.len(), 2, "timer + service listed: {}", listed.pretty);
+        assert_eq!(
+            units.len(),
+            3,
+            "timer + service + alert listed: {}",
+            listed.pretty
+        );
 
         // Plan only: nothing removed yet.
         let plan = scheduled_uninstall(&config, &root, false).expect("plan");
@@ -4978,7 +6684,7 @@ current_revision = "true"
     fn scheduled_install_fails_closed_on_drift_then_force_overwrites() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg =
-            format!("{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+            format!("{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
         scheduled_install(&config, &root, true, false, false, false).expect("install");
@@ -5007,7 +6713,7 @@ current_revision = "true"
     fn scheduled_install_prune_removes_orphan_marker_units() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg =
-            format!("{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+            format!("{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
         scheduled_install(&config, &root, true, false, false, false).expect("install");
@@ -5038,7 +6744,7 @@ current_revision = "true"
             "echo \"$FRAISIER_NOTIFY_EVENT $FRAISIER_NOTIFY_FRAISE\" > {}",
             out.display()
         );
-        let toml = format!("[schedule]\nnotify = '{command}'\n");
+        let toml = format!("[notify]\ncommand = '{command}'\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         // A rolled-back (sick) deploy fires the hook with a failure payload.
@@ -5104,7 +6810,7 @@ current_revision = "true"
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("captured");
         let command = format!("echo \"$FRAISIER_NOTIFY_EVENT\" > {}", out.display());
-        let toml = format!("[schedule]\nnotify = '{command}'\n");
+        let toml = format!("[notify]\ncommand = '{command}'\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         notify_deploy_failure(
@@ -5132,7 +6838,7 @@ current_revision = "true"
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("captured");
         let command = format!("echo \"$FRAISIER_NOTIFY_EVENT\" > {}", out.display());
-        let toml = format!("[schedule]\nnotify = '{command}'\n");
+        let toml = format!("[notify]\ncommand = '{command}'\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         notify_deploy_failure(
@@ -5151,7 +6857,7 @@ current_revision = "true"
 
     #[tokio::test]
     async fn notify_is_a_noop_without_a_configured_sink() {
-        // No [schedule].notify: a rolled-back deploy must not panic or error.
+        // No [notify].command: a rolled-back deploy must not panic or error.
         let config = DeployConfig::from_toml_str("[deploy]\nname = \"x\"\n").expect("parses");
         notify_deploy_failure(
             &config,

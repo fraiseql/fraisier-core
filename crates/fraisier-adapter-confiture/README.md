@@ -14,6 +14,14 @@ CLI — the native, intimate-integration migration path of the FraiseQL stack
   runs the forward-compat lint): earlier versions reject the `--output` flag the
   adapter passes to every subcommand. 0.22 also froze its exit-code / JSON shapes as
   a stability contract aligned to this adapter.
+- **Exactly the confiture in `tools/confiture-requirements.txt`** to run this crate's
+  tests. `src/exit_codes.vendored.json` is `confiture --exit-codes-json` captured
+  verbatim, and the test that keeps it that way compares the whole document against
+  that release and fails — never skips — when it is missing or is a different one. Put it
+  on `PATH` for the test run; `FRAISIER_CONFITURE_BIN` is honoured too, but an ambient
+  `FRAISIER_*` variable reddens seven unrelated approval tests
+  ([#64](https://github.com/fraiseql/fraisier-core/issues/64)). The two floors above are
+  the adapter's runtime requirement and are unchanged.
 
 ## DSN handoff (secrets via env, never argv)
 

@@ -263,6 +263,7 @@ fn resolve_preflight(config: &DeployConfig) -> (bool, Option<RestoreRehearsalPla
                     .database
                     .as_ref()
                     .and_then(|d| d.admin_url_env.clone()),
+                trigger: fraisier_db::restore::Trigger::Operator,
             });
             (true, Some((db, backup)))
         }

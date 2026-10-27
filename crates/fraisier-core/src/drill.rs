@@ -16,14 +16,40 @@ use std::path::Path;
 use async_trait::async_trait;
 
 use crate::adapter_axes::{AdapterCtx, AdapterError, MigrationAdapter, Revision};
-use crate::restore_rehearsal::{BackupSource, RehearsalDb, ThrowawayDb, DATABASE_URL_SECRET};
+use crate::restore_rehearsal::{RehearsalDb, ThrowawayDb, DATABASE_URL_SECRET};
 
 /// The marker every throwaway database name carries.
 pub const THROWAWAY_MARKER: &str = "_fraisier_rh_";
 
+/// One TVIEW entity the post-restore rebuild filled, and the rows it inserted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TviewRebuilt {
+    /// The pg_tviews entity name.
+    pub entity: String,
+    /// The rows inserted.
+    pub rows: i64,
+}
+
+/// A throwaway database an archive was restored into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredCopy {
+    /// The throwaway, for the migrations, the count and the teardown.
+    pub db: ThrowawayDb,
+    /// What the post-restore TVIEW rebuild filled, when the archive creates
+    /// pg_tviews.
+    pub tviews_rebuilt: Option<Vec<TviewRebuilt>>,
+}
+
 /// The database operations a drill needs beyond a rehearsal's.
 #[async_trait]
 pub trait DrillDb: RehearsalDb {
+    /// Restore `archive` into a new throwaway on the server `live_dsn` names,
+    /// rebuilding its TVIEWs when the archive creates pg_tviews.
+    ///
+    /// # Errors
+    /// The restore was refused or failed; a throwaway it created is gone again.
+    async fn restore_copy(&self, live_dsn: &str, archive: &Path) -> Result<RestoredCopy, String>;
+
     /// The name of the database `live_dsn` connects to.
     ///
     /// # Errors
@@ -47,6 +73,9 @@ pub struct DrillReport {
     pub applied: Vec<Revision>,
     /// The tables the migrated copy holds.
     pub tables: u64,
+    /// What the post-restore TVIEW rebuild filled, when the archive creates
+    /// pg_tviews.
+    pub tviews_rebuilt: Option<Vec<TviewRebuilt>>,
     /// Set when the drill passed but the throwaway could not be dropped, so it
     /// leaked and should be removed by hand.
     pub teardown_warning: Option<String>,
@@ -129,10 +158,13 @@ pub async fn run_restore_drill(
     let live = db
         .live_database(&live_dsn)
         .map_err(DrillError::LiveDatabase)?;
-    let throwaway = db
-        .provision(&live_dsn, &BackupSource::Archive(archive.to_owned()))
+    let RestoredCopy {
+        db: throwaway,
+        tviews_rebuilt,
+    } = db
+        .restore_copy(&live_dsn, archive)
         .await
-        .map_err(|error| DrillError::Restore(error.to_string()))?;
+        .map_err(DrillError::Restore)?;
     // Checked before anything runs against it: a copy that may not be dropped
     // must not be migrated either.
     if let Err(reason) = teardown_guard(&throwaway.name, &live) {
@@ -170,6 +202,7 @@ pub async fn run_restore_drill(
         throwaway: throwaway.name,
         applied,
         tables,
+        tviews_rebuilt,
         teardown_warning: dropped.err(),
     })
 }
@@ -181,7 +214,9 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use super::{run_restore_drill, teardown_guard, DrillDb, DrillError};
+    use super::{
+        run_restore_drill, teardown_guard, DrillDb, DrillError, RestoredCopy, TviewRebuilt,
+    };
     use crate::adapter_axes::{
         AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, MigrationAdapter,
         MigrationOutcome, Revision, VerifyReport,
@@ -199,6 +234,7 @@ mod tests {
         provision_fails: bool,
         tables: u64,
         teardown_fails: bool,
+        tviews_rebuilt: Option<Vec<TviewRebuilt>>,
     }
 
     impl Fake {
@@ -249,6 +285,21 @@ mod tests {
 
     #[async_trait]
     impl DrillDb for Fake {
+        async fn restore_copy(
+            &self,
+            live_dsn: &str,
+            archive: &Path,
+        ) -> Result<RestoredCopy, String> {
+            let db = self
+                .provision(live_dsn, &BackupSource::Archive(archive.to_owned()))
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(RestoredCopy {
+                db,
+                tviews_rebuilt: self.tviews_rebuilt.clone(),
+            })
+        }
+
         fn live_database(&self, live_dsn: &str) -> Result<String, String> {
             live_dsn
                 .rsplit('/')
@@ -386,6 +437,30 @@ mod tests {
                 "teardown:app_fraisier_rh_1_a".to_owned(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_drill_reports_the_tviews_its_restore_rebuilt() {
+        let rebuilt = vec![TviewRebuilt {
+            entity: "item".to_owned(),
+            rows: 2,
+        }];
+        let db = Fake {
+            tviews_rebuilt: Some(rebuilt.clone()),
+            ..Fake::default()
+        };
+        let report = drill(&db, &Migration::new(false), None)
+            .await
+            .expect("passes");
+        assert_eq!(report.tviews_rebuilt, Some(rebuilt));
+    }
+
+    #[tokio::test]
+    async fn a_drill_of_a_plain_archive_rebuilds_nothing() {
+        let report = drill(&Fake::default(), &Migration::new(false), None)
+            .await
+            .expect("passes");
+        assert_eq!(report.tviews_rebuilt, None);
     }
 
     #[tokio::test]

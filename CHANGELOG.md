@@ -8,6 +8,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`backup drill` restores a pg_tviews archive.** It now restores as
+  `[database].admin_url_env` when that is set, then rebuilds the TVIEWs the
+  restore left empty. The receipt records the rebuild under `tviews_rebuilt`.
+  Without the admin identity, the drill refuses such an archive before it
+  creates anything, and the refusal names the setting. A TVIEW that is still
+  empty over a populated view after the rebuild fails the drill.
+- **Every restore goes through one primitive in `fraisier-db`.** `db restore`,
+  the restore rehearsal and the drill share one identity choice, archive
+  listing, pg_tviews precheck, rebuild and teardown guard.
+  - **The rehearsal** now refuses a pg_tviews archive it cannot restore before
+    it creates the throwaway. Before, `pg_restore` failed halfway. It still does
+    not rebuild TVIEWs: it proves the migrations, not the TVIEW contents.
+  - **`db restore`** now reports any TVIEW still empty over a populated view
+    after its rebuild, and points at `fraisier db tviews rebuild --all`.
+
 - **Breaking: the failure sink moved from `[schedule].notify` to
   `[notify].command`.** A host that only prunes has no `[schedule]`, yet its
   failures need somewhere to go, so the sink now belongs to the deployable. The

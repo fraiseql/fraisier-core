@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-beta.12] - 2026-10-27
+
 ### Changed
 
 - **`backup drill` restores a pg_tviews archive.** It now restores as
@@ -89,6 +91,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ```
 
 ### Added
+
+- **`[health].require_capabilities`: a deploy is healthy only when FraiseQL's
+  capabilities are running.** On the `http` health adapter,
+  `require_capabilities = ["observers", …]` makes a response with the expected
+  status healthy only if the JSON `/health` body reports each listed capability
+  as compiled in, started, and not unhealthy. A failure is an unhealthy result,
+  retried within `attempts` like a wrong status, and the final detail names every
+  failing capability with its reported fields. It fails closed: a body that is
+  not JSON, has no `capabilities` object (FraiseQL before 2.18), or omits a
+  listed name is unhealthy. Without the key, the body is never read. Validation
+  rejects an empty list, blank or duplicate names, and the key on any other
+  adapter; names are not checked against a fixed list, because FraiseQL owns
+  that registry. Part of
+  [#82](https://github.com/fraiseql/fraisier-core/issues/82).
 
 - **Stacks: `fraisier stack deploy` and `fraisier stack status`.** A
   `stack.<env>.toml` references each member's own config by path, with
@@ -306,17 +322,28 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Every current confiture was refused `window_safe` and `risk_tier`.** Since
+  confiture 0.50.0, `confiture --version` prints several lines (the version,
+  then the parser and native-extension lines). fraisier read the last token of
+  the output as the version, so every confiture from 0.50.0 on described itself
+  as `grammar)` or `yes`, and no capability floor admitted it. With a
+  `[policy]` section, every deploy was denied ("does not advertise
+  `risk_tier`"); blue-green's window-safety baseline refused every swap.
+  `doctor`, which parses the first dotted token, certified the same binaries.
+  The version is now read from the `confiture version` line; output without
+  that line is `unknown`, which still fails closed.
+
 - **`preflight_mode = "off"` now turns the lint off on multi-host deploys and
   `db migrate` too.** Both read only the legacy `forward_compatible_lint` flag,
   so `"off"` still linted there while `deploy --dry-run` said preflight was
   off. `preflight_mode = "restore_rehearsal"` beside `[hosts]` now warns that
   the multi-host rollout lints live instead of rehearsing.
-||||||| eac43bc
+
 - **`stack deploy` validates every member before deploying any.** A member's
   config was validated only when its own deploy began, so an invalid third
   member refused after the first two were already live. The stack is now
   refused up front, naming each invalid member and its errors.
-||||||| eac43bc
+
 - **A notify hook that fails is no longer reported as sent.** `fraisier
   notify` (the `OnFailure=` alert unit) printed "sent" and exited 0 whatever
   `[notify].command` did, and the hook's exit status went only to a log line
@@ -1158,7 +1185,8 @@ migration-safe rollback across one host or a fleet.
 - **GitHub Actions CI** that runs `cargo xtask ci`.
 
 [c197]: https://github.com/fraiseql/confiture/issues/197
-[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.11...HEAD
+[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.12...HEAD
+[1.0.0-beta.12]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.11...fraisier-v1.0.0-beta.12
 [1.0.0-beta.11]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.10...fraisier-v1.0.0-beta.11
 [1.0.0-beta.10]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.9...fraisier-v1.0.0-beta.10
 [1.0.0-beta.9]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.8...fraisier-v1.0.0-beta.9

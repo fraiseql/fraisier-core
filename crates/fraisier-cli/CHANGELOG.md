@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.12](https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.11...fraisier-v1.0.0-beta.12) - 2026-10-27
+
+### Added
+
+- *(webhook)* a webhook deploy never resolves the admin identity
+
+### Fixed
+
+- *(stack)* validate every member before deploying any
+- *(cli)* a drill whose rebuild filled nothing says so
+- *(saga)* a database-less deployable rolls back cleanly (adapter = "none")
+- *(test)* an ambient FRAISIER_* variable no longer fails seven tests
+
+### Other
+
+- Merge main into chore/strip-plan-labels
+- Merge main into fix/rehearsal-teardown-guard
+- Merge main into fix/ops-env-file
+- Merge main into fix/retain-prune-scope
+- Merge main into fix/preflight-mode-multi-host
+- Merge main into fix/stack-validate-members-first
+- Merge main into feat/85-stack
+- Merge feat/06c-restore-primitive into feat/56-deep-classification
+- *(cli)* db restore, the rehearsal and the drill call the primitive
+- Merge main into feat/84-alerts
+- Merge main into feat/86-metrics
+- Merge main into feat/84-drill
+- Merge main into feat/84-retention
+- Merge main into feat/88-tviews-gate
+- Merge main into feat/83-pg-readiness
+- Merge main into feat/82-require-capabilities
+- Merge main into fix/no-database-migration
+- Merge remote-tracking branch 'origin/main' into fix/64-ambient-env
+- release v1.0.0-beta.11
+
 ## [1.0.0-beta.11](https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.10...fraisier-v1.0.0-beta.11) - 2026-09-26
 
 ### Other

@@ -2,7 +2,7 @@
 //! `OnFailure=` names. Golden files: each test pins one unit byte for byte.
 
 use fraisier_config::DeployConfig;
-use fraisier_scaffold::{generate_scheduled, GeneratedFile, MARKER};
+use fraisier_scaffold::{generate, generate_scheduled, GeneratedFile, MARKER};
 
 const BASE: &str = r#"
 [deploy]
@@ -79,7 +79,10 @@ fn the_alert_unit_is_exactly_this_template() {
              # Sends the failed unit's record through [notify].command, once. This\n\
              # unit has no OnFailure=: a failed alert is logged, never re-alerted.\n\
              ExecStart=fraisier notify --config /etc/fraisier/checkout.toml --unit %i\n\
-             EnvironmentFile=-/etc/checkout/production.env\n"
+             EnvironmentFile=-/etc/checkout/production.env\n\
+             # Operator-only secrets such as [database].admin_url_env; the app\n\
+             # unit never loads this file.\n\
+             EnvironmentFile=-/etc/checkout/production.ops.env\n"
         )
     );
     assert_eq!(
@@ -107,6 +110,9 @@ fn a_retain_entry_gets_a_prune_service_and_timer() {
              # unit only names the [[backup.retain]] entry.\n\
              ExecStart=fraisier backup prune --config /etc/fraisier/checkout.toml --name nightly --apply --failure-record %n\n\
              EnvironmentFile=-/etc/checkout/production.env\n\
+             # Operator-only secrets such as [database].admin_url_env; the app\n\
+             # unit never loads this file.\n\
+             EnvironmentFile=-/etc/checkout/production.ops.env\n\
              # A failed run leaves its redacted reason here for the alert unit.\n\
              RuntimeDirectory=fraisier/failures\n\
              RuntimeDirectoryPreserve=yes\n"
@@ -150,6 +156,9 @@ fn a_scheduled_drill_gets_a_service_and_timer() {
              Type=oneshot\n\
              ExecStart=fraisier backup drill --config /etc/fraisier/checkout.toml --failure-record %n\n\
              EnvironmentFile=-/etc/checkout/production.env\n\
+             # Operator-only secrets such as [database].admin_url_env; the app\n\
+             # unit never loads this file.\n\
+             EnvironmentFile=-/etc/checkout/production.ops.env\n\
              # A failed run leaves its redacted reason here for the alert unit.\n\
              RuntimeDirectory=fraisier/failures\n\
              RuntimeDirectoryPreserve=yes\n"
@@ -284,4 +293,43 @@ fn a_custom_config_path_reaches_every_unit() {
             "{name}"
         );
     }
+}
+
+/// The `EnvironmentFile=` lines of `file`, in order.
+fn env_files(file: &GeneratedFile) -> Vec<&str> {
+    file.contents
+        .lines()
+        .filter_map(|line| line.strip_prefix("EnvironmentFile=-"))
+        .collect()
+}
+
+#[test]
+fn every_scheduled_unit_loads_the_ops_env_file_after_the_shared_one() {
+    // The ops file comes second so a value in it wins over the shared one.
+    let all = units(&format!(
+        "{BACKUP}\n[drill]\nschedule = \"weekly Sun 04:00\"\n{RETAIN}"
+    ));
+    for file in all
+        .iter()
+        .filter(|f| f.rel_path.extension().is_some_and(|e| e == "service"))
+    {
+        assert_eq!(
+            env_files(file),
+            vec![
+                "/etc/checkout/production.env",
+                "/etc/checkout/production.ops.env"
+            ],
+            "{}",
+            file.rel_path.display()
+        );
+    }
+}
+
+#[test]
+fn the_app_unit_never_loads_the_ops_env_file() {
+    // An admin DSN set for the drill must not reach the application.
+    let config = DeployConfig::from_toml_str(BASE).expect("parses");
+    let files = generate(&config).expect("generates");
+    let app = unit(&files, "checkout.service");
+    assert_eq!(env_files(app), vec!["/etc/checkout/production.env"]);
 }

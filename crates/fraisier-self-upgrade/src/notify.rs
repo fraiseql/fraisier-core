@@ -121,6 +121,7 @@ impl Notifier for ExecHookNotifier {
         };
         let json = serde_json::to_string(payload).unwrap_or_default();
         let mut command = tokio::process::Command::new("sh");
+        fraisier_core::child_env::scrub(command.as_std_mut());
         command
             .arg("-c")
             .arg(&self.command)

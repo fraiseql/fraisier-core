@@ -34,6 +34,7 @@ impl SystemctlSupervisor {
     /// systemd manager; converted to a tokio command only to run it).
     fn command(&self, verb: &str) -> std::process::Command {
         let mut command = std::process::Command::new("systemctl");
+        fraisier_core::child_env::scrub(&mut command);
         if self.user {
             command.arg("--user");
         }

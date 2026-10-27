@@ -93,6 +93,17 @@ and restore into it as the admin. Migrations, health checks and everything else
 keep running as the app role. The admin DSN reaches `psql` and `pg_restore`
 through `PG*` variables, never argv, and is never printed.
 
+No other child process inherits the variable. Once a config names it, fraisier
+removes it from the environment of every command it runs: the migration tool,
+hooks, the approval and notify commands, an exec token provider, an IPC
+adapter, `systemctl`. A hook that needs a superuser has to be given one some
+other way.
+
+On a host set up with `fraisier scheduled install`, put the DSN in
+`/etc/<name>/<env>.ops.env`. Every unit that command writes (backup, prune, drill,
+a scheduled deploy, and the alert unit) loads that file; the app unit loads only `/etc/<name>/<env>.env`, so the application never
+sees the superuser DSN.
+
 **A deploy started by the webhook never uses it.** `fraisier webhook-server`
 answers the network, so nothing it starts can reach a database superuser: its
 deploys do not even read the variable. Their restore rehearsal creates and

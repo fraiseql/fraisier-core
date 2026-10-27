@@ -83,8 +83,24 @@ fn redact_json(value: Value) -> Value {
 pub(crate) fn load(config_path: &Path) -> Result<DeployConfig> {
     let toml = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading config {}", config_path.display()))?;
-    DeployConfig::from_toml_str(&toml)
-        .with_context(|| format!("parsing config {}", config_path.display()))
+    let config = DeployConfig::from_toml_str(&toml)
+        .with_context(|| format!("parsing config {}", config_path.display()))?;
+    withhold_admin_env(&config);
+    Ok(config)
+}
+
+/// Keep `[database].admin_url_env` out of every child fraisier spawns: the
+/// superuser DSN is for fraisier's own restores, never for a migration tool, a
+/// hook or a notifier. The restore tools get it as `PG*` variables, set
+/// explicitly.
+pub(crate) fn withhold_admin_env(config: &DeployConfig) {
+    if let Some(name) = config
+        .database
+        .as_ref()
+        .and_then(|d| d.admin_url_env.as_deref())
+    {
+        fraisier_core::child_env::withhold(name);
+    }
 }
 
 fn render_issues(report: &ValidationReport) -> String {
@@ -3652,6 +3668,7 @@ async fn sync_reclaim(store: &FilesystemStateStore, remote: &str) -> Result<Comm
 /// construction is unit-testable without a systemd manager present).
 fn systemctl_restart_command(unit: &str, user: bool) -> std::process::Command {
     let mut command = std::process::Command::new("systemctl");
+    fraisier_core::child_env::scrub(&mut command);
     if user {
         command.arg("--user");
     }
@@ -7121,6 +7138,88 @@ current_revision = "true"
         assert!(identity.uses_admin());
         // The admin restores into the app's database, not its own.
         assert_eq!(identity.restorer("shop").database(), "shop");
+    }
+
+    #[test]
+    fn a_loaded_admin_identity_never_reaches_a_child_process() {
+        // The admin DSN is for fraisier's own restores. A migration tool, a hook
+        // or a notifier is someone else's code: none of them may inherit it.
+        use fraisier_core::adapter_axes::MigrationAdapter as _;
+        use fraisier_core::policy::ApprovalHook as _;
+        use fraisier_self_upgrade::Notifier as _;
+
+        const ADMIN: &str = "FRAISIER_TEST_CHILD_ADMIN_URL";
+        let _env = crate::test_env::env_guard();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("fraisier.toml");
+        std::fs::write(
+            &config,
+            format!("[deploy]\nname = \"a\"\nenvironment = \"b\"\n\n[database]\nadmin_url_env = \"{ADMIN}\"\n"),
+        )
+        .expect("writes");
+        std::env::set_var(ADMIN, "postgres://postgres:secret@127.0.0.1/postgres");
+        super::load(&config).expect("loads");
+
+        let seen = |child: &str| dir.path().join(child);
+        let dump = |child: &str| format!("env > {}", seen(child).display());
+        let confiture = dir.path().join("confiture");
+        std::fs::write(
+            &confiture,
+            format!(
+                "#!/bin/sh\n{}\necho 'confiture version 1.36.0'\n",
+                dump("confiture")
+            ),
+        )
+        .expect("writes");
+        std::fs::set_permissions(
+            &confiture,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        crate::test_env::block_on(async {
+            let _ = crate::approval::ExecApproval::new(
+                format!("{}; exit 1", dump("approval")),
+                std::time::Duration::from_secs(30),
+            )
+            .request(&fraisier_core::policy::ApprovalRequest::new(
+                "a",
+                "b",
+                Vec::new(),
+            ))
+            .await;
+            fraisier_self_upgrade::ExecHookNotifier::new(dump("notify"))
+                .notify(&fraisier_self_upgrade::FailurePayload {
+                    event: "deploy-failed".to_owned(),
+                    failed: None,
+                    restored: None,
+                    reason: "test".to_owned(),
+                })
+                .await;
+            let _ = fraisier_adapter_support::run_command(
+                "sh".as_ref(),
+                &["-c".into(), dump("command").into()],
+                &[],
+                None,
+                "command",
+                "test",
+            )
+            .await;
+            let _ = fraisier_adapter_confiture::ConfitureMigration::with_program(&confiture)
+                .describe()
+                .await;
+        });
+        std::env::remove_var(ADMIN);
+
+        for child in ["approval", "notify", "command", "confiture"] {
+            let env = std::fs::read_to_string(seen(child))
+                .unwrap_or_else(|error| panic!("the {child} child did not run: {error}"));
+            assert!(
+                !env.lines()
+                    .any(|line| line.starts_with(&format!("{ADMIN}="))),
+                "the {child} child inherited {ADMIN}"
+            );
+        }
     }
 
     #[test]

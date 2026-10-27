@@ -59,6 +59,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`[health].require_capabilities`: a deploy is healthy only when FraiseQL's
+  capabilities are running.** On the `http` health adapter,
+  `require_capabilities = ["observers", …]` makes a response with the expected
+  status healthy only if the JSON `/health` body reports each listed capability
+  as compiled in, started, and not unhealthy. A failure is an unhealthy result,
+  retried within `attempts` like a wrong status, and the final detail names every
+  failing capability with its reported fields. It fails closed: a body that is
+  not JSON, has no `capabilities` object (FraiseQL before 2.18), or omits a
+  listed name is unhealthy. Without the key, the body is never read. Validation
+  rejects an empty list, blank or duplicate names, and the key on any other
+  adapter; names are not checked against a fixed list, because FraiseQL owns
+  that registry. Part of
+  [#82](https://github.com/fraiseql/fraisier-core/issues/82).
+
 - **Stacks: `fraisier stack deploy` and `fraisier stack status`.** A
   `stack.<env>.toml` references each member's own config by path, with
   `depends_on`; a member's name is its `[deploy].name`, and every member must
@@ -260,6 +274,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   archives and picks the latest by the timestamp in the name, never by mtime.
 
 ### Fixed
+
+- **Every current confiture was refused `window_safe` and `risk_tier`.** Since
+  confiture 0.50.0, `confiture --version` prints several lines (the version,
+  then the parser and native-extension lines). fraisier read the last token of
+  the output as the version, so every confiture from 0.50.0 on described itself
+  as `grammar)` or `yes`, and no capability floor admitted it. With a
+  `[policy]` section, every deploy was denied ("does not advertise
+  `risk_tier`"); blue-green's window-safety baseline refused every swap.
+  `doctor`, which parses the first dotted token, certified the same binaries.
+  The version is now read from the `confiture version` line; output without
+  that line is `unknown`, which still fails closed.
 
 - **A restore rehearsal that never ran the migrations no longer blames them.**
   Every rehearsal failure used to end in "The pending migrations did not apply

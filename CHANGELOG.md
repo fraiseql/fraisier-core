@@ -37,6 +37,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Stacks: `fraisier stack deploy` and `fraisier stack status`.** A
+  `stack.<env>.toml` references each member's own config by path, with
+  `depends_on`; a member's name is its `[deploy].name`, and every member must
+  deploy to the stack's environment. `stack deploy` deploys the members in
+  dependency order (ties by name), each as `fraisier deploy` would, and stops at
+  the first failure; there is no rollback across members. `stack status` shows
+  each member's health, version and last deploy, and one row per database the
+  members declare `[database.requires]` for; it exits 1 when anything is
+  unhealthy. With `[stack].router`, both check each subgraph's live
+  `{ _service { sdl } }` against the SDL file in the router's release and fail
+  on a difference. See `docs/stacks.md`. Part of
+  [#85](https://github.com/fraiseql/fraisier-core/issues/85).
+
 - **`deploy --dry-run --deep`: the deep classification is previewed only on
   request.** Under a fresh-dump restore rehearsal, a plain `--dry-run`
   classifies statically and says so; it never dumps the live database.

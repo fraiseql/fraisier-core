@@ -919,6 +919,24 @@ pub fn build_health_probe(config: &DeployConfig) -> Result<HealthProbePlan> {
     Ok(HealthProbePlan { health, ctx, hosts })
 }
 
+/// The context a request made as `config`'s deployable carries: its
+/// `[health]` headers and `token_provider`, with the provider's secret mapped
+/// to its environment variable (never resolved here).
+pub fn health_ctx(config: &DeployConfig) -> AdapterCtx {
+    let deploy = config.deploy.as_ref();
+    let mut ctx = AdapterCtx::new(
+        deploy
+            .and_then(|d| d.name.clone())
+            .unwrap_or_else(|| "<none>".to_owned()),
+        deploy
+            .and_then(|d| d.environment.clone())
+            .unwrap_or_else(|| "<none>".to_owned()),
+    );
+    ctx.settings = settings_map(config, None);
+    add_token_provider_secrets(config, &mut ctx.env_secrets);
+    ctx
+}
+
 /// A ready-to-run artifact probe: the adapter, a base context, and the hosts to
 /// query for their live active artifact (`deployment-status --per-host`).
 pub struct ArtifactProbePlan {
@@ -935,6 +953,18 @@ pub struct ArtifactProbePlan {
 /// # Errors
 /// Fails if `[artifact].source` is missing or unsupported in this build.
 pub fn build_artifact_probe(config: &DeployConfig) -> Result<ArtifactProbePlan> {
+    build_artifact_probe_at(config, None)
+}
+
+/// [`build_artifact_probe`], with the artifact settings at `app_version`: what
+/// staging that release needs.
+///
+/// # Errors
+/// Fails if `[artifact].source` is missing or unsupported in this build.
+pub fn build_artifact_probe_at(
+    config: &DeployConfig,
+    app_version: Option<&str>,
+) -> Result<ArtifactProbePlan> {
     let transport = build_transport(config);
     let launcher = build_launcher(config);
     let artifact = build_artifact(config, &transport, &launcher)?;
@@ -947,7 +977,7 @@ pub fn build_artifact_probe(config: &DeployConfig) -> Result<ArtifactProbePlan> 
         .unwrap_or_else(|| "<none>".to_owned());
     let mut ctx = AdapterCtx::new(fraise, environment);
     ctx.workdir = PathBuf::from(".");
-    ctx.settings = settings_map(config, None);
+    ctx.settings = settings_map(config, app_version);
     let hosts = config.host_inventory().map_or_else(
         || vec![(HostId::new("localhost"), None)],
         |inventory| {

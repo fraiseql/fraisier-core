@@ -2717,13 +2717,17 @@ fn drill_result(
                 report.tables
             );
             if let Some(rows) = &report.tviews_rebuilt {
+                let rows: Vec<fraisier_db::tviews::Rebuilt> = rows
+                    .iter()
+                    .map(|r| fraisier_db::tviews::Rebuilt {
+                        entity: r.entity.clone(),
+                        rows: r.rows,
+                    })
+                    .collect();
                 let _ = writeln!(
                     pretty,
                     "post-restore TVIEW rebuild: {}",
-                    rows.iter()
-                        .map(|r| format!("{} {} row(s)", r.entity, r.rows))
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    describe_rebuilt(&rows)
                 );
             }
             if let Some(warning) = &report.teardown_warning {
@@ -6031,6 +6035,24 @@ current_revision = "true"
         assert_eq!(
             receipt(dir.path())["tviews_rebuilt"],
             serde_json::json!([{ "entity": "item", "rows": 2 }])
+        );
+    }
+
+    #[test]
+    fn a_drill_whose_rebuild_filled_nothing_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "");
+        drill_archive(dir.path(), "20261026T021500Z", b"PGDMP");
+        let server = FakeServer {
+            tviews_rebuilt: Some(Vec::new()),
+            ..FakeServer::default()
+        };
+        let out = drill(dir.path(), &config, &server);
+        assert!(
+            out.pretty
+                .contains("post-restore TVIEW rebuild: nothing needed rebuilding"),
+            "{}",
+            out.pretty
         );
     }
 

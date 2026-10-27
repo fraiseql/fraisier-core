@@ -24,6 +24,9 @@ mod metrics;
 mod pg_readiness;
 mod pg_rehearsal;
 mod preview;
+mod stack;
+mod stack_sdl;
+mod stack_status;
 #[cfg(test)]
 mod test_env;
 
@@ -101,6 +104,10 @@ enum Command {
     /// Database lifecycle operations (migrate / restore / reset).
     #[command(subcommand)]
     Db(DbCommand),
+
+    /// A stack: one environment's deployables, deployed in dependency order.
+    #[command(subcommand)]
+    Stack(StackCommand),
 
     /// Report a failed scheduled backup, prune or drill through
     /// `[notify].command`: the body of the `OnFailure=` alert unit.
@@ -324,6 +331,10 @@ struct InitArgs {
     force: bool,
 }
 
+// Reason: independent deploy flags (--dry-run / --skip-preflight /
+// --fail-on-block / --deep); clap reads them as switches, and `deploy` takes
+// the dry-run pair as one `Option<Depth>`.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args)]
 struct DeployArgs {
     /// Path to the `fraisier.toml`.
@@ -358,6 +369,12 @@ struct DeployArgs {
     /// real deploy, which a policy block fails outright.
     #[arg(long)]
     fail_on_block: bool,
+
+    /// With `--dry-run` under a fresh-dump restore rehearsal, classify against a
+    /// throwaway restored from a fresh dump of the live database, as the deploy
+    /// will. Without it the dry run classifies statically and dumps nothing.
+    #[arg(long, requires = "dry_run")]
+    deep: bool,
 }
 
 #[derive(Debug, Args)]
@@ -442,6 +459,50 @@ enum DbCommand {
     /// pg_tviews maintenance.
     #[command(subcommand)]
     Tviews(DbTviewsCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum StackCommand {
+    /// Deploy every member in dependency order, stopping at the first failure.
+    Deploy(StackDeployArgs),
+    /// Each member's health, version and last deploy, and each database's
+    /// readiness. Exits non-zero when anything is unhealthy.
+    Status(StackStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct StackStatusArgs {
+    /// Path to the stack file (`stack.<env>.toml`).
+    #[arg(long)]
+    stack: PathBuf,
+
+    /// The state store directory every member shares.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct StackDeployArgs {
+    /// Path to the stack file (`stack.<env>.toml`).
+    #[arg(long)]
+    stack: PathBuf,
+
+    /// The state store directory every member shares.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+
+    /// A member's version, as `<member>=<version>`. Repeatable; a member without
+    /// one deploys as `fraisier deploy` would without `--app-version`.
+    #[arg(long, value_name = "MEMBER=VERSION")]
+    app_version: Vec<String>,
+
+    /// Plan each member's deploy without executing it.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Skip each member's migration preflight.
+    #[arg(long)]
+    skip_preflight: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -833,7 +894,11 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
                 &args.state_dir,
                 args.host.as_deref(),
                 args.app_version.as_deref(),
-                args.dry_run,
+                args.dry_run.then_some(if args.deep {
+                    preview::Depth::Deep
+                } else {
+                    preview::Depth::Static
+                }),
                 args.skip_preflight,
                 args.fail_on_block,
             )
@@ -926,6 +991,27 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         }
         Command::Db(DbCommand::Reset(args)) => {
             commands::db_reset(&args.config, &args.state_dir, args.yes).await
+        }
+        Command::Stack(StackCommand::Deploy(args)) => {
+            stack::stack_deploy(
+                &args.stack,
+                &args.app_version,
+                &stack::Deployer {
+                    state_dir: args.state_dir.clone(),
+                    dry_run: args.dry_run,
+                    skip_preflight: args.skip_preflight,
+                },
+            )
+            .await
+        }
+        Command::Stack(StackCommand::Status(args)) => {
+            stack_status::stack_status(
+                &args.stack,
+                &stack_status::LiveProbe {
+                    state_dir: args.state_dir.clone(),
+                },
+            )
+            .await
         }
         Command::Providers => Ok(commands::providers()),
         Command::ProviderTest(args) => commands::provider_test(&args.name).await,
@@ -1242,6 +1328,19 @@ mod cli_tests {
     fn deploy_accepts_fail_on_block_beside_dry_run() {
         assert!(
             Cli::try_parse_from(["fraisier", "deploy", "--dry-run", "--fail-on-block"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn deploy_accepts_deep_beside_dry_run() {
+        assert!(Cli::try_parse_from(["fraisier", "deploy", "--dry-run", "--deep"]).is_ok());
+    }
+
+    #[test]
+    fn deploy_refuses_deep_without_dry_run() {
+        assert!(
+            Cli::try_parse_from(["fraisier", "deploy", "--deep"]).is_err(),
+            "a real deploy always classifies the way its config says"
         );
     }
 

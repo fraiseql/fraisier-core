@@ -68,15 +68,16 @@ pub mod calendar;
 mod error;
 mod preset;
 mod schema;
+pub mod stack;
 mod validate;
 
 pub use error::ConfigError;
 pub use preset::SpecqlPreset;
 pub use schema::{
     ArtifactSection, BackupSection, BlueGreenSection, CheckSection, DatabaseRequires,
-    DatabaseSection, DatabaseTviews, DeployConfig, DeploySection, DrillSection, HealthSection,
-    HostSpec, HostsSection, LbSection, MetricsSection, MigrationSection, NotifySection,
-    PolicySection, RetainEntry, ScheduleSection, ServiceSection, SshSection,
+    DatabaseSection, DatabaseTviews, DeployConfig, DeploySection, DrillSection, FederationSection,
+    HealthSection, HostSpec, HostsSection, LbSection, MetricsSection, MigrationSection,
+    NotifySection, PolicySection, RetainEntry, ScheduleSection, ServiceSection, SshSection,
     DEFAULT_APPROVAL_TIMEOUT_SECS, UNCLASSIFIED_ACTIONS,
 };
 pub use validate::{is_unit_word, ValidationIssue, ValidationReport};

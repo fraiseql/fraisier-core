@@ -458,6 +458,25 @@ mod kinds {
     pub const UNREADABLE_CHANGE_SET: &str = "unreadable_change_set";
 }
 
+/// The capability of a preflight whose change-set covers only the migrations
+/// the target database has not applied yet.
+///
+/// Without it, the change-set covers every migration file, applied ones
+/// included. A destructive migration that has already run is then judged again
+/// on every later deploy, so one approved `DROP COLUMN` refuses every deploy
+/// that follows it. The gate reads the change-set either way; this capability
+/// is what tells a plan which of the two it is looking at.
+pub const PENDING_SCOPE: &str = "pending_scope";
+
+/// Whether the adapter judges only the pending migrations ([`PENDING_SCOPE`]).
+#[must_use]
+pub fn judges_pending_only(described: &AdapterDescription) -> bool {
+    described
+        .capabilities
+        .iter()
+        .any(|capability| capability == PENDING_SCOPE)
+}
+
 /// What the adapter says it can do — the capability strings this gate reads.
 ///
 /// A struct rather than loose booleans because they are read by different
@@ -756,6 +775,19 @@ pub async fn inspect(
     ctx: &AdapterCtx,
 ) -> Result<Inspection, AdapterError> {
     let described = migration.describe().await?;
+    inspect_described(migration, ctx, described).await
+}
+
+/// [`inspect`], for a caller that has already asked the adapter to describe
+/// itself (to decide which database to inspect against).
+///
+/// # Errors
+/// The adapter's own `preflight` [`AdapterError`], unchanged.
+pub async fn inspect_described(
+    migration: &dyn MigrationAdapter,
+    ctx: &AdapterCtx,
+    described: AdapterDescription,
+) -> Result<Inspection, AdapterError> {
     let capabilities = Capabilities::from_advertised(&described.capabilities);
     let report = if capabilities.preflight {
         Some(migration.preflight(ctx).await?)

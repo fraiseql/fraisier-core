@@ -185,8 +185,13 @@ impl HttpHealth {
 
     /// Resolve the request headers for a probe: the static `[health].headers`
     /// plus, if configured, the token provider's injected header (resolved once
-    /// per deploy via [`Self::token`]).
-    async fn resolve_headers(
+    /// per adapter, cached on this adapter). Other requests made as the deployable,
+    /// such as a stack's SDL query, send the same headers.
+    ///
+    /// # Errors
+    /// [`AdapterError`] if the token provider is misconfigured or fails. The
+    /// token never appears in the error.
+    pub async fn resolve_headers(
         &self,
         ctx: &AdapterCtx,
     ) -> Result<Vec<(String, String)>, AdapterError> {

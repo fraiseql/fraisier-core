@@ -5892,10 +5892,11 @@ current_revision = "true"
                 .throwaway
                 .clone()
                 .unwrap_or_else(|| "shop_fraisier_rh_1_a".to_owned());
-            Ok(fraisier_core::restore_rehearsal::ThrowawayDb {
-                dsn: format!("postgres://app@127.0.0.1/{name}"),
+            Ok(fraisier_core::restore_rehearsal::ThrowawayDb::new(
+                format!("postgres://app@127.0.0.1/{name}"),
                 name,
-            })
+                "shop",
+            ))
         }
 
         async fn teardown(

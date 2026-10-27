@@ -71,13 +71,33 @@ pub enum BackupSource {
 
 /// A provisioned throwaway database the rehearsal migrates against. Handed back to
 /// [`RehearsalDb::teardown`] for cleanup.
+///
+/// It records the live database it was copied from, so a teardown can refuse to
+/// drop a throwaway that turns out to be the live database itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ThrowawayDb {
     /// A DSN that resolves to the throwaway database (carries the password, like
     /// any DSN — kept in-process, never logged).
     pub dsn: String,
     /// The throwaway database name, for diagnostics and teardown.
     pub name: String,
+    /// The name of the live database the throwaway was copied from. A teardown
+    /// never drops a database by this name.
+    pub live: String,
+}
+
+impl ThrowawayDb {
+    /// A throwaway `name`, reached through `dsn`, copied from the live database
+    /// `live`.
+    #[must_use]
+    pub fn new(dsn: impl Into<String>, name: impl Into<String>, live: impl Into<String>) -> Self {
+        Self {
+            dsn: dsn.into(),
+            name: name.into(),
+            live: live.into(),
+        }
+    }
 }
 
 /// The outcome of a successful rehearsal.
@@ -288,10 +308,11 @@ mod tests {
                 .lock()
                 .expect("calls")
                 .push(format!("provision:{live_dsn}:{backup:?}"));
-            Ok(ThrowawayDb {
-                dsn: THROWAWAY_DSN.to_owned(),
-                name: "app_fraisier_rehearsal".to_owned(),
-            })
+            Ok(ThrowawayDb::new(
+                THROWAWAY_DSN,
+                "app_fraisier_rehearsal",
+                "app",
+            ))
         }
 
         async fn teardown(&self, db: &ThrowawayDb) -> Result<(), String> {

@@ -57,6 +57,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   docs.rs `all-features` metadata, so docs.rs builds them with default features
   and a feature-gated path cannot be a working intra-doc link there.
 
+- **BREAKING (library users): the restore rehearsal never drops the live
+  database.** Its teardown used to check only that the name carried the
+  throwaway marker. Like the drill, it now also refuses a throwaway whose name
+  is the live database's. To make that check impossible to skip:
+  - `fraisier_core::restore_rehearsal::ThrowawayDb` carries `live`, the name of
+    the database it was copied from. It is now `#[non_exhaustive]`, so later
+    fields are additive, and is built with `ThrowawayDb::new(dsn, name, live)`
+    instead of a struct literal.
+  - `fraisier_db::restore::drop_throwaway` and `teardown_guard` take
+    `live: &str` instead of `Option<&str>`.
+
+  ```rust
+  // before
+  ThrowawayDb { dsn, name }
+  drop_throwaway(server, identity, name, None)
+  // after
+  ThrowawayDb::new(dsn, name, live)
+  drop_throwaway(server, identity, name, live)
+  ```
+
 ### Added
 
 - **Stacks: `fraisier stack deploy` and `fraisier stack status`.** A

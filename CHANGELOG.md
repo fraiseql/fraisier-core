@@ -6,6 +6,35 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`backup drill` restores a pg_tviews archive.** It now restores as
+  `[database].admin_url_env` when that is set, then rebuilds the TVIEWs the
+  restore left empty. The receipt records the rebuild under `tviews_rebuilt`.
+  Without the admin identity, the drill refuses such an archive before it
+  creates anything, and the refusal names the setting. A TVIEW that is still
+  empty over a populated view after the rebuild fails the drill.
+- **A deploy started by the webhook never uses `[database].admin_url_env`.**
+  The webhook answers the network, so nothing it starts may reach a database
+  superuser; its deploys do not even read the variable. Their restore rehearsal
+  runs as the app role. On a pg_tviews database, the rehearsal refuses before it
+  creates anything, and says to run the deploy from the CLI or its timer. CLI
+  and timer deploys are unchanged.
+- **Every restore goes through one primitive in `fraisier-db`.** `db restore`,
+  the restore rehearsal and the drill share one identity choice, archive
+  listing, pg_tviews precheck, rebuild and teardown guard.
+  - **The rehearsal** now refuses a pg_tviews archive it cannot restore before
+    it creates the throwaway. Before, `pg_restore` failed halfway. It still does
+    not rebuild TVIEWs: it proves the migrations, not the TVIEW contents.
+  - **`db restore`** now reports any TVIEW still empty over a populated view
+    after its rebuild, and points at `fraisier db tviews rebuild --all`.
+
+- **Breaking: the failure sink moved from `[schedule].notify` to
+  `[notify].command`.** A host that only prunes has no `[schedule]`, yet its
+  failures need somewhere to go, so the sink now belongs to the deployable. The
+  old key is refused with a validation error that names the new one. There is
+  no alias: two spellings of one sink would drift.
+
 ### Added
 
 - **`deploy --dry-run --deep`: the deep classification is previewed only on
@@ -14,6 +43,41 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--deep` previews the classification the deploy will make, against a
   throwaway restored from a fresh dump. See
   [docs/schema-risk-policy.md](docs/schema-risk-policy.md#deep-classification-under-restore-rehearsal).
+
+- **A failed scheduled backup, prune or drill notifies exactly once.**
+  - **The units.** `fraisier scheduled install` now also writes a prune timer per
+    `[[backup.retain]]` entry, and a drill timer when `[drill].schedule` is set.
+    It no longer needs a `[schedule]` section to do so. Each of those services,
+    and a scheduled backup's, sets
+    `OnFailure=fraisier-<name>-<env>-alert@%n.service`. The alert template is
+    always installed alongside.
+  - **The record.** The failing run (`--failure-record %n`) leaves a redacted
+    record keyed by its invocation ID: mode 0600, at most 4 KiB, under
+    `/run/fraisier/failures`. The run itself notifies nothing.
+  - **The alert.** `fraisier notify --unit` finds the record by
+    `$MONITOR_INVOCATION_ID`, sends it once through `[notify].command`, and
+    deletes it. Without a record, it still notifies, with a journalctl pointer.
+  - **Events.** `scheduled-backup-failed`, `scheduled-prune-failed` and
+    `scheduled-drill-failed`.
+  - **Deploys.** A scheduled deploy keeps notifying in-process and gets no
+    `OnFailure=`.
+  - **Docs.** See [docs/backups.md](docs/backups.md#scheduling-and-failure-alerts).
+
+- **`[metrics].textfile_dir`: deploy, backup and drill write Prometheus textfile
+  metrics.**
+  - **One file per command.** The files are `fraisier_deploy.prom`,
+    `fraisier_backup.prom` and `fraisier_drill.prom`, for node_exporter's
+    textfile collector. Each is renamed into place, so a scrape never reads half
+    a file, and a command never overwrites another command's file.
+  - **Gauges of the last run.** Deploy records its finish time, whether it
+    committed, whether it rolled back (fully or partly), and how long it took.
+    Backup records its success time and archive size. Drill records its
+    success time. A failed backup or drill leaves its file alone, so the last
+    success time stays true.
+  - **Labels.** Every sample carries exactly `fraise` and `environment`.
+  - **Failures.** A file that cannot be written is a warning, never a failed
+    command.
+  - **Docs.** See [docs/metrics.md](docs/metrics.md).
 
 - **`fraisier backup drill`: the newest archive is proven to restore.**
   - **What it does.** It restores the newest archive in `[backup].dir` into a
@@ -63,6 +127,92 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     both backup and prune use.
   - **Config.** `[backup]` now needs `dir` or at least one retain entry.
 
+- **Empty pg_tviews TVIEWs refuse a deploy, and `fraisier db tviews rebuild`
+  refills them.** With `[database.requires] pg_tviews = true`, preflight and
+  `doctor` check every TVIEW against its backing view, after readiness passes.
+  `[database.tviews] on_empty = "fail"` (the default) refuses the deploy, and
+  `"warn"` reports it and continues. The check fails closed. `db tviews rebuild`
+  refills the empty UNLOGGED TVIEWs, or every TVIEW with `--all`. It refuses on a
+  standby and without `EXECUTE`, and exits 1 when a TVIEW stays empty.
+  Part of [#88](https://github.com/fraiseql/fraisier-core/issues/88).
+
+- **`[database].admin_url_env`: a superuser identity for restore-class
+  operations only.** `db restore`, `db tviews rebuild` and a `restore_rehearsal`
+  preflight use it; nothing else does. `db restore` now refuses a pg_tviews
+  archive before changing anything when the restoring identity is not a
+  superuser (a non-superuser restore loads the tables and silently drops the
+  extension), and rebuilds the TVIEWs after a restore. The rehearsal creates its
+  throwaway through the admin, owned by the app role. `doctor` checks the
+  identity (`database_admin`): it connects, is a superuser, and reaches the app
+  DSN's cluster. Peer authentication over the Unix socket is the documented
+  setup; see `docs/database-requirements.md`.
+  Part of [#83](https://github.com/fraiseql/fraisier-core/issues/83).
+
+- **`scripts/provision-pg18-tviews.sh`: a documented way to get a Debian host
+  ready for `[database.requires] postgres_major = 18, pg_tviews = true`.**
+  - **What it does.** It installs PostgreSQL 18 from PGDG, after checking the
+    archive key's fingerprint. It builds pg_tviews at a pinned commit
+    (v0.1.0-beta.32) with the pgrx it pins, adds it to
+    `shared_preload_libraries`, and restarts PostgreSQL only when that changed.
+    It creates the database and the extension when they are absent.
+  - **Idempotent.** Every step checks before acting, and the last line counts
+    the changes. A second run reports `0 change(s)` and does not restart
+    PostgreSQL.
+  - **Acceptance.** `scripts/hetzner-pg18-tviews.sh` runs on a fresh Debian 12
+    VPS. It provisions twice, runs fraisier's `database_ready` check, proves a
+    TVIEW registers, and checks that dropping the extension and removing the
+    preload each fail the check with the right reason until a re-run repairs
+    it.
+  - **Docs.** See `docs/database-requirements.md`.
+
+- **`[database.requires]`: declare what the database server must offer, and
+  fraisier refuses a server that does not.** `postgres_major` sets a PostgreSQL
+  major-version floor, and `pg_tviews = true` requires pg_tviews to be in
+  `shared_preload_libraries`, installed, and on read contract 2. The check runs
+  first in every deploy's preflight (single-host, multi-host and blue-green) and
+  in `fraisier doctor` (`database_ready`). It fails closed, and each refusal
+  names the expected and actual value and the fix. fraisier never installs
+  either; see `docs/database-requirements.md`. Without the section nothing
+  changes. Part of [#83](https://github.com/fraiseql/fraisier-core/issues/83).
+
+### Added
+
+- **FraiseQL 2.18.0 is the supported, proven version, pinned in
+  `tools/fraiseql-version`.**
+  - **The proof.** Criterion-1 now deploys a 2.18.0 `fraiseql-server` three
+    times in a row. Every criterion-1 script reads the pin, and refuses a
+    server whose `--version` differs from it.
+  - **The boot schema** is recompiled with 2.18.0, which refuses the old 2.4.0
+    one.
+  - **`deploy-local.sh`** now:
+    - recreates a scratch database named `fraisier_criterion1_*`;
+    - reaches Postgres through `PG*` variables instead of a DSN on `psql`'s
+      argv;
+    - takes the server and fraisier binaries from the environment.
+  - **The Hetzner orchestrator** ships this repository's assets and the pin. It
+    no longer ships hand-copied ones.
+  - **Real captures.** These sit in
+    `crates/fraisier-adapter-http/tests/fixtures/fraiseql-2.18.0/`, with a test
+    pinning what they show. They are 2.18's `/health` bodies for a capability
+    that is running, one configured but failed to start, and one not configured.
+    Two facts matter:
+    - `/health` answers 200 even when a configured capability failed to start;
+    - the observers runtime never reports `serving`.
+  - **Docs.** See [docs/fraiseql.md](docs/fraiseql.md).
+
+- **Releases carry a `SHA256SUMS` file and a CycloneDX SBOM per target.**
+  `release-binaries.yml` now attaches `fraisier-<target>.cdx.json` next to each
+  tarball, and a final job hashes every tarball and SBOM *as the release serves
+  them* into `SHA256SUMS`. If any target fails to build, no `SHA256SUMS` is
+  written, so it can never silently omit a binary. Check a download with
+  `sha256sum --check --ignore-missing SHA256SUMS`. Part of
+  [#81](https://github.com/fraiseql/fraisier-core/issues/81).
+- **`SECURITY.md`**: private vulnerability reporting through GitHub, and the
+  supported-version policy (the latest beta only, until 1.0.0).
+- **`docs/security.md` states that the binary makes no call-home**, and lists
+  every outbound connection with the setting that turns it on. It also gains an
+  offline install procedure.
+
 - **`[backup].dir`: each backup writes a new, timestamped archive into a
   directory**, named `<fraise>-<environment>-<yyyymmddThhmmssZ>.pgdump` (UTC, to
   the second). `pg_dump` writes into a hidden `.<name>.partial` file beside it,
@@ -75,6 +225,61 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a warning. `--output` still writes exactly where it says, and without
   `[backup].dir` the command behaves as before. `fraisier_db::archive` lists the
   archives and picks the latest by the timestamp in the name, never by mtime.
+
+### Fixed
+
+- **The vendored confiture exit-code contract is confiture's again, and a test keeps
+  it so.** `crates/fraisier-adapter-confiture/src/exit_codes.vendored.json` is meant
+  to be `confiture --exit-codes-json` captured verbatim. Measured against confiture
+  1.19.0, it was stale in eight of its nine exit entries: every `symbolic_codes` list
+  but exit 2's, and the `meaning` of exit 1 ("ambiguous-change advisory") and exit 6
+  ("lock or connection-pool contention"). Exit 1 claimed eight codes where confiture
+  lists `SQL_001` alone, exit 6 claimed the two `POOL_*` codes confiture does not put
+  there, and exits 3, 4 and 5 were missing the codes confiture has added since. The
+  two `ExitClass` doc comments repeated the stale wording, and the test matrix used
+  `MIGR_105` as an example after confiture had dropped that code entirely. No
+  behaviour changes: `classify` keys on the exit integer and nothing dispatches on a
+  symbolic code. The file is regenerated and the comments now match it.
+
+  Both guards had stayed green. The always-on one reduces the document to
+  `{exit_int: class}`, which never drifted; the live one compared that same reduced map
+  and returned a printed `skip:` whenever confiture was absent or too old, and CI
+  installed no confiture, so it had never run. It is replaced by a test that compares
+  the whole document and fails, rather than skipping, when confiture is missing or is
+  not the pinned release — with the drifted fields named one per line. The pin is
+  `tools/confiture-requirements.txt` (exact and transitive, on confiture's own 3.14
+  floor), and the CI gate installs it and puts it on `PATH` before `cargo xtask ci` — on
+  `PATH` rather than in `FRAISIER_CONFITURE_BIN`, because an ambient `FRAISIER_*` variable
+  fails the approval hook test and poisons six more
+  ([#64](https://github.com/fraiseql/fraisier-core/issues/64)).
+
+  The pin is confiture **1.33.0**, the release fraisier pins. Since 1.19.0 exit 0 has
+  gained `DIFFER_404` and exit 5 `CONFIG_014`, `DIFFER_403` and `VALID_003`–`VALID_009`;
+  no exit integer changed class, so `classify` and the `AdapterErrorKind` projection are
+  unchanged. Closes [#63](https://github.com/fraiseql/fraisier-core/issues/63).
+
+- **The exit-code contract follows confiture 1.35.0.** The pin moves from 1.33.0, and
+  the regenerated file adds five codes and changes nothing else. Exit 0 gains
+  `DIFFER_405` (an index on a table neither tree declares), `DIFFER_407` (an index on
+  a TVIEW) and `DIFFER_408` (an index written before its relation). Exit 5 gains
+  `CONFIG_015` (`preflight --scope pending` finds the ledger only in another schema)
+  and `DIFFER_406` (an index on a relation the desired tree does not declare, which a
+  migration would drop). No exit integer changes class.
+
+- **The exit-code contract follows confiture 1.36.0.** The pin moves from 1.35.0. A
+  failed migration, a duplicate version and an embedded `COMMIT` (`MIGR_001`,
+  `MIGR_004`, `MIGR_100`, `MIGR_102`, `MIGR_106`–`MIGR_108`) and `GEN_001` move from
+  exit 3 to exit 1, so exit 3 (`db_unreachable`) now means `CONFIG_006` alone
+  ([fraiseql/confiture#727](https://github.com/fraiseql/confiture/issues/727)). Exit 0
+  loses `DIFFER_407`, retired because a TVIEW's indexes are now compared. Exit 5
+  gains `DIFFER_409` (a definition change with no statement) and `DIFFER_410` (a tree
+  index under a name pg_tviews owns). No exit integer changes class and only
+  `LockContention` is retriable, so `classify` and the `AdapterErrorKind` projection
+  are unchanged: those migration failures read as `InternalError` instead of
+  `DbUnreachable`. The re-frozen transitive set also moves `pydantic` to 2.14.1 and
+  `pydantic-core` to 2.50.1.
+
+### Changed
 
 - **The Rust toolchain is pinned to an exact release, 1.99.0, and the MSRV is
   now 1.99** (it was a declared 1.95 that nothing ever built with). A floating

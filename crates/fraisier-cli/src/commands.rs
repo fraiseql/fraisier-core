@@ -78,7 +78,7 @@ fn redact_json(value: Value) -> Value {
     }
 }
 
-fn load(config_path: &Path) -> Result<DeployConfig> {
+pub(crate) fn load(config_path: &Path) -> Result<DeployConfig> {
     let toml = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading config {}", config_path.display()))?;
     DeployConfig::from_toml_str(&toml)
@@ -757,18 +757,24 @@ pub(crate) fn scheduled_install(
 ) -> Result<CommandOutput> {
     let config = load(config_path)?;
 
-    // The unattended-deploy gate: refuse to install a schedule whose [schedule]
-    // section is invalid — in particular `command = "deploy"` without
-    // `allow_unattended_deploy = true` + a notify sink. The validator carries the
-    // policy; here we refuse (with the located reasons) rather than install.
+    // The unattended-deploy gate: refuse to install units whose sections are
+    // invalid — in particular `command = "deploy"` without
+    // `allow_unattended_deploy = true` + a `[notify].command` sink, or a retain
+    // entry whose name cannot name a unit. The validator carries the policy;
+    // here we refuse (with the located reasons) rather than install.
     let report = config.validate();
     let schedule_errors: Vec<&fraisier_config::ValidationIssue> = report
         .issues
         .iter()
-        .filter(|issue| issue.severity == Severity::Error && issue.path.starts_with("schedule"))
+        .filter(|issue| {
+            issue.severity == Severity::Error
+                && ["schedule", "notify", "backup", "drill"]
+                    .iter()
+                    .any(|section| issue.path.starts_with(section))
+        })
         .collect();
     if !schedule_errors.is_empty() {
-        let mut pretty = String::from("refusing to install: invalid [schedule] config\n");
+        let mut pretty = String::from("refusing to install: invalid scheduling config\n");
         for issue in &schedule_errors {
             let _ = writeln!(pretty, "  [error] {}: {}", issue.path, issue.message);
         }
@@ -1661,6 +1667,31 @@ async fn preview_schema(
     .await
 }
 
+/// What one deploy is asked to do, and what asked for it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeployRequest<'a> {
+    pub(crate) host: Option<&'a str>,
+    pub(crate) app_version: Option<&'a str>,
+    pub(crate) dry_run: Option<Depth>,
+    pub(crate) skip_preflight: bool,
+    pub(crate) fail_on_block: bool,
+    pub(crate) trigger: fraisier_db::restore::Trigger,
+}
+
+impl<'a> DeployRequest<'a> {
+    /// The live deploy a verified webhook POST asks for.
+    pub(crate) const fn webhook(app_version: Option<&'a str>) -> Self {
+        Self {
+            host: None,
+            app_version,
+            dry_run: None,
+            skip_preflight: false,
+            fail_on_block: false,
+            trigger: fraisier_db::restore::Trigger::Webhook,
+        }
+    }
+}
+
 /// `deploy`: validate, then either summarize the plan (`--dry-run`) or run the
 /// single-host deploy against the state store.
 pub(crate) async fn deploy(
@@ -1672,6 +1703,35 @@ pub(crate) async fn deploy(
     skip_preflight: bool,
     fail_on_block: bool,
 ) -> Result<CommandOutput> {
+    run_deploy(
+        config_path,
+        state_dir,
+        DeployRequest {
+            host,
+            app_version,
+            dry_run,
+            skip_preflight,
+            fail_on_block,
+            trigger: fraisier_db::restore::Trigger::Operator,
+        },
+    )
+    .await
+}
+
+/// [`deploy`] as `request` asks.
+async fn run_deploy(
+    config_path: &Path,
+    state_dir: &Path,
+    request: DeployRequest<'_>,
+) -> Result<CommandOutput> {
+    let DeployRequest {
+        host,
+        app_version,
+        dry_run,
+        skip_preflight,
+        fail_on_block,
+        ..
+    } = request;
     let config = load(config_path)?;
     let report = config.validate();
     if !report.ok() {
@@ -1741,7 +1801,24 @@ pub(crate) async fn deploy(
         return run_multi_host(&config, store, app_version, &report).await;
     }
 
-    let resolved = factory::build(&config, host, app_version)?;
+    run_single_host(&config, store, request).await
+}
+
+/// Build and run the single-host deploy `request` asks for, mapping its
+/// outcome onto a [`CommandOutput`].
+async fn run_single_host(
+    config: &DeployConfig,
+    store: FilesystemStateStore,
+    request: DeployRequest<'_>,
+) -> Result<CommandOutput> {
+    let DeployRequest {
+        host,
+        app_version,
+        skip_preflight,
+        trigger,
+        ..
+    } = request;
+    let resolved = factory::build_for(config, host, app_version, trigger)?;
     // `--skip-preflight` is the per-run escape hatch: it forces every preflight off
     // regardless of `[migration].preflight_mode`.
     let mut builder = SingleHostDeploy::builder(
@@ -1760,12 +1837,22 @@ pub(crate) async fn deploy(
         if let Some((db, backup)) = resolved.restore_rehearsal {
             builder = builder.restore_rehearsal(db, backup);
         }
+        if let Some(probe) = resolved.database_readiness {
+            builder = builder.database_readiness(probe);
+        }
     }
     let plan = builder.build()?;
 
+    let started = std::time::Instant::now();
     let run = plan.run_reporting(store).await?;
     let outcome = run.outcome;
-    notify_deploy_failure(&config, &resolved.fraise, &resolved.environment, &outcome).await;
+    notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
+    let metrics_warning = record_metrics(
+        config,
+        &resolved.fraise,
+        &resolved.environment,
+        &deploy_metrics(&outcome, started.elapsed()),
+    );
     let (exit_code, label, detail) = outcome_result(&outcome);
     let mut pretty = String::new();
     for warning in &run.warnings {
@@ -1780,11 +1867,14 @@ pub(crate) async fn deploy(
     if !run.warnings.is_empty() {
         json["warnings"] = json!(run.warnings);
     }
-    Ok(CommandOutput {
-        exit_code,
-        pretty,
-        json,
-    })
+    Ok(with_metrics_warning(
+        CommandOutput {
+            exit_code,
+            pretty,
+            json,
+        },
+        metrics_warning,
+    ))
 }
 
 /// Build and run the multi-host rollout, mapping its outcome onto a
@@ -1797,7 +1887,7 @@ async fn run_multi_host(
     report: &ValidationReport,
 ) -> Result<CommandOutput> {
     let resolved = factory::build_multi_host(config, app_version)?;
-    let deploy = MultiHostDeploy::builder(
+    let mut builder = MultiHostDeploy::builder(
         resolved.fraise.clone(),
         resolved.environment.clone(),
         resolved.plan,
@@ -1809,11 +1899,21 @@ async fn run_multi_host(
     .migration(resolved.migration)
     .service(resolved.service)
     .health(resolved.health)
-    .lb(resolved.lb)
-    .build()?;
+    .lb(resolved.lb);
+    if let Some(probe) = resolved.database_readiness {
+        builder = builder.database_readiness(probe);
+    }
+    let deploy = builder.build()?;
 
+    let started = std::time::Instant::now();
     let outcome = deploy.run(store).await?;
     notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
+    let metrics_warning = record_metrics(
+        config,
+        &resolved.fraise,
+        &resolved.environment,
+        &deploy_metrics(&outcome, started.elapsed()),
+    );
     let (exit_code, label, detail) = outcome_result(&outcome);
     let mut pretty = render_warnings(report);
     let _ = writeln!(
@@ -1821,15 +1921,18 @@ async fn run_multi_host(
         "multi-host deploy of {}/{} {label}{detail}",
         resolved.fraise, resolved.environment
     );
-    Ok(CommandOutput {
-        exit_code,
-        pretty,
-        json: json!({ "outcome": label, "detail": detail.trim(), "multi_host": true }),
-    })
+    Ok(with_metrics_warning(
+        CommandOutput {
+            exit_code,
+            pretty,
+            json: json!({ "outcome": label, "detail": detail.trim(), "multi_host": true }),
+        },
+        metrics_warning,
+    ))
 }
 
 /// Run (or, with `dry_run`, summarize) an HTTP-tier blue-green deploy. On a
-/// non-committed outcome the `[schedule].notify` failure sink fires (unattended
+/// non-committed outcome the `[notify].command` failure sink fires (unattended
 /// path), exactly as the rolling/single deploys do.
 async fn run_blue_green(
     config: &DeployConfig,
@@ -1876,17 +1979,27 @@ async fn run_blue_green(
 
     let store = FilesystemStateStore::new(state_dir)
         .with_context(|| format!("opening state store at {}", state_dir.display()))?;
+    let started = std::time::Instant::now();
     let outcome = resolved.deploy.run(store).await?;
     notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
+    let metrics_warning = record_metrics(
+        config,
+        &resolved.fraise,
+        &resolved.environment,
+        &deploy_metrics(&outcome, started.elapsed()),
+    );
     let (exit_code, label, detail) = outcome_result(&outcome);
-    Ok(CommandOutput {
-        exit_code,
-        pretty: format!(
-            "blue-green deploy of {}/{} {label}{detail}\n",
-            resolved.fraise, resolved.environment
-        ),
-        json: json!({ "strategy": "blue-green", "outcome": label, "detail": detail.trim() }),
-    })
+    Ok(with_metrics_warning(
+        CommandOutput {
+            exit_code,
+            pretty: format!(
+                "blue-green deploy of {}/{} {label}{detail}\n",
+                resolved.fraise, resolved.environment
+            ),
+            json: json!({ "strategy": "blue-green", "outcome": label, "detail": detail.trim() }),
+        },
+        metrics_warning,
+    ))
 }
 
 /// Refuse a database operation whose `[deploy]`/`[migration]` config is invalid,
@@ -2045,6 +2158,26 @@ fn resolve_pg_conn(config: &DeployConfig) -> Result<fraisier_db::PgConn> {
     fraisier_db::PgConn::parse(&dsn).context("parsing the database DSN")
 }
 
+/// The identity an operator's restore-class command runs as: the app DSN, plus
+/// `[database].admin_url_env` when one is configured. A configured identity
+/// whose env var is unset is an error, never a silent fall back to the app DSN:
+/// the operator asked for the restore to run as that identity.
+///
+/// # Errors
+/// The app DSN does not resolve, the admin env var is unset, or a DSN does not
+/// parse.
+fn restore_identity(config: &DeployConfig) -> Result<fraisier_db::restore::RestoreIdentity> {
+    fraisier_db::restore::RestoreIdentity::from_env(
+        resolve_pg_conn(config)?,
+        config
+            .database
+            .as_ref()
+            .and_then(|d| d.admin_url_env.as_deref()),
+        fraisier_db::restore::Trigger::Operator,
+    )
+    .map_err(anyhow::Error::msg)
+}
+
 /// A clean exit-1 [`CommandOutput`] for an expected db-op configuration error
 /// (missing/unset DSN, non-postgres DSN), so `--json` still renders.
 fn db_config_error(error: &anyhow::Error) -> CommandOutput {
@@ -2110,7 +2243,18 @@ async fn db_backup_with(
                 tools,
             )
             .await;
-            return Ok(archive_backup_output(&conn, written));
+            let metrics_warning = written.as_ref().ok().and_then(|written| {
+                record_metrics(
+                    &config,
+                    &fraise,
+                    &environment,
+                    &crate::metrics::Metrics::backup(now, written.bytes),
+                )
+            });
+            return Ok(with_metrics_warning(
+                archive_backup_output(&conn, written),
+                metrics_warning,
+            ));
         }
     }
     let default_path = PathBuf::from(format!("{fraise}-{environment}.pgdump"));
@@ -2131,11 +2275,25 @@ async fn db_backup_with(
         .await
         .context("running pg_dump")?;
     if outcome.succeeded() {
-        Ok(CommandOutput {
-            exit_code: 0,
-            pretty: format!("backed up {} → {}\n", conn.redacted(), out_path.display()),
-            json: json!({ "ok": true, "output": out_path.display().to_string() }),
-        })
+        let metrics_warning = match std::fs::metadata(out_path) {
+            Ok(written) => record_metrics(
+                &config,
+                &fraise,
+                &environment,
+                &crate::metrics::Metrics::backup(now, written.len()),
+            ),
+            Err(error) => Some(format!(
+                "the backup's size could not be read for its metrics: {error}"
+            )),
+        };
+        Ok(with_metrics_warning(
+            CommandOutput {
+                exit_code: 0,
+                pretty: format!("backed up {} → {}\n", conn.redacted(), out_path.display()),
+                json: json!({ "ok": true, "output": out_path.display().to_string() }),
+            },
+            metrics_warning,
+        ))
     } else {
         Ok(CommandOutput {
             exit_code: 1,
@@ -2489,14 +2647,28 @@ pub(crate) trait DrillServer: fraisier_core::drill::DrillDb {
 /// or fewer than `[drill].min_tables` tables come back. Every run that gets past
 /// loading the config writes a receipt to `<state_dir>/drills/`.
 pub(crate) async fn backup_drill(config_path: &Path, state_dir: &Path) -> Result<CommandOutput> {
+    let config = load(config_path)?;
     backup_drill_with(
         config_path,
         state_dir,
-        &crate::pg_rehearsal::PgRehearsalDb,
+        &drill_server(&config),
         &fraisier_db::archive::ArchiveTools::default().pg_restore,
         std::time::SystemTime::now(),
     )
     .await
+}
+
+/// The server a drill restores on: as `[database].admin_url_env` when one is
+/// configured, which a pg_tviews archive needs. A drill is an operator's run
+/// (the CLI or its timer), never the webhook's.
+fn drill_server(config: &DeployConfig) -> crate::pg_rehearsal::PgRehearsalDb {
+    crate::pg_rehearsal::PgRehearsalDb {
+        admin_url_env: config
+            .database
+            .as_ref()
+            .and_then(|d| d.admin_url_env.clone()),
+        trigger: fraisier_db::restore::Trigger::Operator,
+    }
 }
 
 /// [`backup_drill`] with the server, `pg_restore` and the clock supplied by the
@@ -2554,7 +2726,43 @@ async fn backup_drill_with(
         "archive_taken_at": archive.as_ref().map(|a| a.stamp.as_str().to_owned()),
         "ok": outcome.is_ok(),
     });
-    let (exit_code, pretty) = match &outcome {
+    let (exit_code, pretty) = drill_result(&outcome, archive.as_ref(), &mut receipt);
+    let written = write_drill_receipt(state_dir, &fraise, &environment, &receipt);
+    let mut pretty = pretty;
+    if let Err(error) = &written {
+        let _ = writeln!(
+            pretty,
+            "warning: the drill receipt was not written: {error}"
+        );
+    }
+    let metrics_warning = outcome
+        .is_ok()
+        .then(|| {
+            record_metrics(
+                &config,
+                &fraise,
+                &environment,
+                &crate::metrics::Metrics::drill(now),
+            )
+        })
+        .flatten();
+    Ok(with_metrics_warning(
+        CommandOutput {
+            exit_code,
+            pretty,
+            json: receipt,
+        },
+        metrics_warning,
+    ))
+}
+
+/// The exit code and rendering of a drill's `outcome`, recording it in `receipt`.
+fn drill_result(
+    outcome: &std::result::Result<fraisier_core::drill::DrillReport, (&'static str, String)>,
+    archive: Option<&fraisier_db::archive::Archive>,
+    receipt: &mut Value,
+) -> (i32, String) {
+    match outcome {
         Ok(report) => {
             receipt["throwaway"] = json!(report.throwaway);
             receipt["applied"] = json!(report
@@ -2563,17 +2771,32 @@ async fn backup_drill_with(
                 .map(ToString::to_string)
                 .collect::<Vec<_>>());
             receipt["tables"] = json!(report.tables);
+            receipt["tviews_rebuilt"] =
+                report.tviews_rebuilt.as_ref().map_or(Value::Null, |rows| {
+                    json!(rows
+                        .iter()
+                        .map(|r| json!({ "entity": r.entity, "rows": r.rows }))
+                        .collect::<Vec<_>>())
+                });
             receipt["teardown_warning"] = json!(report.teardown_warning);
             let mut pretty = format!(
                 "drill passed: restored {} into {}, applied {} migration(s), found {} \
-                 table(s), and dropped it\n",
-                archive
-                    .as_ref()
-                    .map_or_else(String::new, |a| a.path.display().to_string()),
+             table(s), and dropped it\n",
+                archive.map_or_else(String::new, |a| a.path.display().to_string()),
                 report.throwaway,
                 report.applied.len(),
                 report.tables
             );
+            if let Some(rows) = &report.tviews_rebuilt {
+                let _ = writeln!(
+                    pretty,
+                    "post-restore TVIEW rebuild: {}",
+                    rows.iter()
+                        .map(|r| format!("{} {} row(s)", r.entity, r.rows))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
             if let Some(warning) = &report.teardown_warning {
                 let _ = writeln!(
                     pretty,
@@ -2585,23 +2808,11 @@ async fn backup_drill_with(
         }
         Err((step, message)) => {
             receipt["failed_step"] = json!(step);
-            receipt["error"] = json!(fraisier_saga::redact::credentials(message));
+            let message = fraisier_saga::redact::credentials(message);
+            receipt["error"] = json!(message);
             (1, format!("drill failed at {step}: {message}\n"))
         }
-    };
-    let written = write_drill_receipt(state_dir, &fraise, &environment, &receipt);
-    let mut pretty = pretty;
-    if let Err(error) = &written {
-        let _ = writeln!(
-            pretty,
-            "warning: the drill receipt was not written: {error}"
-        );
     }
-    Ok(CommandOutput {
-        exit_code,
-        pretty,
-        json: receipt,
-    })
 }
 
 /// The drill's steps up to and including [`fraisier_core::drill::run_restore_drill`],
@@ -2728,10 +2939,11 @@ pub(crate) async fn db_restore(
     if let Some(refusal) = refuse_invalid_db_config(&config, "restore") {
         return Ok(refusal);
     }
-    let conn = match resolve_pg_conn(&config) {
-        Ok(conn) => conn,
+    let identity = match restore_identity(&config) {
+        Ok(identity) => identity,
         Err(error) => return Ok(db_config_error(&error)),
     };
+    let conn = identity.restorer(identity.app().database());
 
     if !execute {
         return Ok(CommandOutput {
@@ -2758,24 +2970,166 @@ pub(crate) async fn db_restore(
         });
     }
 
-    let outcome = fraisier_db::run(fraisier_db::restore_command(&conn, input, true))
-        .await
-        .context("running pg_restore")?;
-    let (exit_code, ok) = (i32::from(!outcome.succeeded()), outcome.succeeded());
-    let mut pretty = if ok {
-        format!("restored {} → {}\n", input.display(), conn.redacted())
-    } else {
-        format!("pg_restore failed:\n{}\n", outcome.stderr.trim())
+    let restored = match fraisier_db::restore::restore_in_place(
+        &fraisier_db::restore::Postgres,
+        &identity,
+        input,
+    )
+    .await
+    {
+        Ok(restored) => restored,
+        Err(fraisier_db::restore::RestoreError::Refused(refusal)) => {
+            return Ok(CommandOutput {
+                exit_code: 1,
+                pretty: format!("refusing to restore: {refusal}\n"),
+                json: json!({ "ok": false, "executed": false, "refused": refusal }),
+            })
+        }
+        Err(failure) => {
+            return Ok(CommandOutput {
+                exit_code: 1,
+                pretty: format!("pg_restore failed:\n{failure}\n"),
+                json: json!({
+                    "ok": false,
+                    "executed": true,
+                    "input": input.display().to_string(),
+                    "tviews_rebuilt": Value::Null,
+                }),
+            })
+        }
     };
-    if ok && !outcome.stderr.trim().is_empty() {
+    Ok(render_restored(input, &conn, restored))
+}
+
+/// The rendering of a successful in-place restore of `input` into `conn`.
+fn render_restored(
+    input: &Path,
+    conn: &fraisier_db::PgConn,
+    restored: fraisier_db::restore::Restored,
+) -> CommandOutput {
+    let mut exit_code = 0;
+    let mut pretty = format!("restored {} → {}\n", input.display(), conn.redacted());
+    if !restored.warnings.is_empty() {
         // pg_restore can emit non-fatal warnings on stderr while still exiting 0.
-        let _ = writeln!(pretty, "(warnings)\n{}", outcome.stderr.trim());
+        let _ = writeln!(pretty, "(warnings)\n{}", restored.warnings);
     }
-    Ok(CommandOutput {
+    let mut rebuilt_json = Value::Null;
+    match restored.tviews {
+        None => {}
+        Some(Ok(rebuild)) => {
+            let _ = writeln!(
+                pretty,
+                "post-restore TVIEW rebuild: {}",
+                describe_rebuilt(&rebuild.rebuilt)
+            );
+            if !rebuild.still_empty.is_empty() {
+                let _ = writeln!(
+                    pretty,
+                    "still empty over a populated view: {} — run `fraisier db tviews \
+                     rebuild --all`",
+                    rebuild.still_empty.join(", ")
+                );
+            }
+            rebuilt_json = json!(rebuild
+                .rebuilt
+                .iter()
+                .map(|r| json!({ "entity": r.entity, "rows": r.rows }))
+                .collect::<Vec<_>>());
+        }
+        Some(Err(error)) => {
+            exit_code = 1;
+            let _ = writeln!(
+                pretty,
+                "the restore succeeded but the post-restore TVIEW rebuild failed: {error}\n\
+                 run `fraisier db tviews rebuild` once it is fixed"
+            );
+        }
+    }
+    CommandOutput {
         exit_code,
         pretty,
-        json: json!({ "ok": ok, "executed": true, "input": input.display().to_string() }),
-    })
+        json: json!({
+            "ok": exit_code == 0,
+            "executed": true,
+            "input": input.display().to_string(),
+            "tviews_rebuilt": rebuilt_json,
+        }),
+    }
+}
+
+/// `item 2, order 0`, or `nothing needed rebuilding`.
+fn describe_rebuilt(rows: &[fraisier_db::tviews::Rebuilt]) -> String {
+    if rows.is_empty() {
+        return "nothing needed rebuilding".to_owned();
+    }
+    rows.iter()
+        .map(|r| format!("{} {} row(s)", r.entity, r.rows))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `db tviews rebuild`: refill TVIEWs from their backing views. Without `all`
+/// only the empty UNLOGGED ones PostgreSQL reset; with it, every TVIEW.
+///
+/// Runs as the admin identity when one is configured, otherwise the app role,
+/// after the same privilege precheck either way.
+pub(crate) async fn db_tviews_rebuild(config_path: &Path, all: bool) -> Result<CommandOutput> {
+    let config = load(config_path)?;
+    if let Some(refusal) = refuse_invalid_db_config(&config, "rebuild TVIEWs") {
+        return Ok(refusal);
+    }
+    let conn = match restore_identity(&config) {
+        Ok(identity) => identity.restorer(identity.app().database()),
+        Err(error) => return Ok(db_config_error(&error)),
+    };
+    let rebuilt =
+        fraisier_db::restore::RestoreServer::rebuild(&fraisier_db::restore::Postgres, &conn, !all)
+            .await;
+    match rebuilt {
+        Ok(rows) => {
+            let mut pretty = format!(
+                "rebuilt TVIEWs in {}: {}\n",
+                conn.redacted(),
+                describe_rebuilt(&rows)
+            );
+            // What `only_empty` leaves behind (a LOGGED TVIEW, one emptied by
+            // hand) is worth saying, since this is the command the gate names.
+            let still = match fraisier_db::tviews::usable_schema(Path::new("psql"), &conn).await {
+                Ok(Some(schema)) => {
+                    fraisier_db::tviews::find_empty(Path::new("psql"), &conn, &schema)
+                        .await
+                        .map(|found| found.empty)
+                        .unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
+            if !still.is_empty() {
+                let names: Vec<String> = still
+                    .iter()
+                    .map(fraisier_db::tviews::Tview::qualified)
+                    .collect();
+                let _ = writeln!(
+                    pretty,
+                    "still empty over a populated view: {} — run again with --all",
+                    names.join(", ")
+                );
+            }
+            Ok(CommandOutput {
+                exit_code: i32::from(!still.is_empty()),
+                pretty,
+                json: json!({
+                    "ok": still.is_empty(),
+                    "rebuilt": rows.iter().map(|r| json!({ "entity": r.entity, "rows": r.rows })).collect::<Vec<_>>(),
+                    "still_empty": still.iter().map(fraisier_db::tviews::Tview::qualified).collect::<Vec<_>>(),
+                }),
+            })
+        }
+        Err(error) => Ok(CommandOutput {
+            exit_code: 1,
+            pretty: format!("TVIEW rebuild refused or failed: {error}\n"),
+            json: json!({ "ok": false, "error": error }),
+        }),
+    }
 }
 
 /// `db reset`: drop every user schema and re-apply migrations from scratch.
@@ -2980,14 +3334,11 @@ impl fraisier_webhook::WebhookHandler for DeployHandler {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         });
-        let out = deploy(
+        // A webhook deploy never resolves the admin identity (D14).
+        let out = run_deploy(
             &self.config,
             &self.state_dir,
-            None,
-            version.as_deref(),
-            None,
-            false,
-            false,
+            DeployRequest::webhook(version.as_deref()),
         )
         .await
         .map_err(|error| error_detail(&error))?;
@@ -3438,7 +3789,53 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
     }
 }
 
-/// Fire the configured `[schedule].notify` failure sink when a deploy did not
+/// The deploy metrics for `outcome`: committed, or rolled back fully or partly.
+fn deploy_metrics(outcome: &SagaOutcome, took: std::time::Duration) -> crate::metrics::Metrics {
+    crate::metrics::Metrics::deploy(
+        std::time::SystemTime::now(),
+        matches!(outcome, SagaOutcome::Committed),
+        matches!(
+            outcome,
+            SagaOutcome::RolledBack { .. } | SagaOutcome::PartialRollback { .. }
+        ),
+        took,
+    )
+}
+
+/// Write `metrics` into `[metrics].textfile_dir`, when it is set, returning a
+/// warning for the command's output when the write fails. A failed write never
+/// fails the command: the deploy or backup it describes already happened.
+fn record_metrics(
+    config: &DeployConfig,
+    fraise: &str,
+    environment: &str,
+    metrics: &crate::metrics::Metrics,
+) -> Option<String> {
+    let dir = config.metrics.as_ref()?.textfile_dir.as_deref()?;
+    let labels = crate::metrics::Labels {
+        fraise,
+        environment,
+    };
+    metrics.write(dir, &labels).err().map(|error| {
+        format!(
+            "the metrics file {} was not written: {error}",
+            dir.join(metrics.file()).display()
+        )
+    })
+}
+
+/// `out` with a metrics-write warning appended, if there is one.
+fn with_metrics_warning(mut out: CommandOutput, warning: Option<String>) -> CommandOutput {
+    if let Some(warning) = warning {
+        let _ = writeln!(out.pretty, "warning: {warning}");
+        if let Some(json) = out.json.as_object_mut() {
+            json.insert("metrics_warning".to_owned(), json!(warning));
+        }
+    }
+    out
+}
+
+/// Fire the configured `[notify].command` failure sink when a deploy did not
 /// commit. This is the unattended-failure path: a scheduled (operator-unwatched)
 /// deploy of a sick build rolls back **and** emits a notification, reusing the
 /// self-upgrade notify primitive. A committed deploy, or a config with no notify
@@ -3458,7 +3855,7 @@ async fn notify_deploy_failure(
     if matches!(outcome, SagaOutcome::Committed) {
         return;
     }
-    let Some(command) = config.schedule.as_ref().and_then(|s| s.notify.as_deref()) else {
+    let Some(command) = config.notify.as_ref().and_then(|n| n.command.as_deref()) else {
         return;
     };
     let (_, label, detail) = outcome_result(outcome);
@@ -3595,18 +3992,18 @@ url = "http://127.0.0.1:8080/health"
     fn notify_deploy_failure_carries_the_rollback_reason() {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("payload.txt");
-        // A [schedule].notify sink that records the reason the webhook carries.
+        // A [notify].command sink that records the reason the webhook carries.
         // A TOML literal string sidesteps escaping the shell's double quotes.
         let notify = format!(
-            "notify = 'printf \"%s\" \"$FRAISIER_NOTIFY_REASON\" > {}'",
+            "command = 'printf \"%s\" \"$FRAISIER_NOTIFY_REASON\" > {}'",
             out.display()
         );
-        let toml = format!("{VALID}\n[schedule]\n{notify}\n");
+        let toml = format!("{VALID}\n[notify]\n{notify}\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         // The named perf detail rides in via HealthStatus.detail → SagaError.message
         // → RolledBack.reason → FailurePayload.reason (the recommended zero-API-change
-        // path, Decision 3); with [schedule].notify set it reaches the webhook sink.
+        // path, Decision 3); with [notify].command set it reaches the webhook sink.
         // The reason here is the shape CommandHealth produces from a --json scan.
         let outcome = SagaOutcome::RolledBack {
             failed_step: "health".to_owned(),
@@ -3630,10 +4027,10 @@ url = "http://127.0.0.1:8080/health"
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("payload.txt");
         let notify = format!(
-            "notify = 'printf \"%s\" \"$FRAISIER_NOTIFY_REASON\" > {}'",
+            "command = 'printf \"%s\" \"$FRAISIER_NOTIFY_REASON\" > {}'",
             out.display()
         );
-        let toml = format!("{VALID}\n[schedule]\n{notify}\n");
+        let toml = format!("{VALID}\n[notify]\n{notify}\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         // Issue #62: the confiture adapter folds the first line of stderr into
@@ -3689,10 +4086,10 @@ url = "http://127.0.0.1:8080/health"
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("event.txt");
         let notify = format!(
-            "notify = 'printf \"%s\" \"$FRAISIER_NOTIFY_EVENT\" > {}'",
+            "command = 'printf \"%s\" \"$FRAISIER_NOTIFY_EVENT\" > {}'",
             out.display()
         );
-        let toml = format!("{VALID}\n[schedule]\n{notify}\n");
+        let toml = format!("{VALID}\n[notify]\n{notify}\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         let outcome = SagaOutcome::RolledBack {
@@ -5436,6 +5833,7 @@ current_revision = "true"
         throwaway: Option<String>,
         tables: u64,
         live_bytes: u64,
+        tviews_rebuilt: Option<Vec<fraisier_core::drill::TviewRebuilt>>,
     }
 
     impl FakeServer {
@@ -5479,6 +5877,25 @@ current_revision = "true"
 
     #[async_trait::async_trait]
     impl fraisier_core::drill::DrillDb for FakeServer {
+        async fn restore_copy(
+            &self,
+            live_dsn: &str,
+            archive: &Path,
+        ) -> Result<fraisier_core::drill::RestoredCopy, String> {
+            use fraisier_core::restore_rehearsal::RehearsalDb as _;
+            let db = self
+                .provision(
+                    live_dsn,
+                    &fraisier_core::restore_rehearsal::BackupSource::Archive(archive.to_owned()),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(fraisier_core::drill::RestoredCopy {
+                db,
+                tviews_rebuilt: self.tviews_rebuilt.clone(),
+            })
+        }
+
         fn live_database(&self, _live_dsn: &str) -> Result<String, String> {
             Ok("shop".to_owned())
         }
@@ -5675,6 +6092,250 @@ current_revision = "true"
         let out = drill(dir.path(), &config, &server);
         assert_eq!(out.exit_code, 1, "{}", out.pretty);
         assert!(!server.calls().iter().any(|c| c.starts_with("teardown")));
+    }
+
+    #[test]
+    fn a_drill_of_a_pg_tviews_archive_records_what_it_rebuilt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "");
+        drill_archive(dir.path(), "20261026T021500Z", b"PGDMP");
+        let server = FakeServer {
+            tviews_rebuilt: Some(vec![fraisier_core::drill::TviewRebuilt {
+                entity: "item".to_owned(),
+                rows: 2,
+            }]),
+            ..FakeServer::default()
+        };
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 0, "{}", out.pretty);
+        assert!(
+            out.pretty
+                .contains("post-restore TVIEW rebuild: item 2 row(s)"),
+            "{}",
+            out.pretty
+        );
+        assert_eq!(
+            receipt(dir.path())["tviews_rebuilt"],
+            serde_json::json!([{ "entity": "item", "rows": 2 }])
+        );
+    }
+
+    #[test]
+    fn a_drill_of_a_plain_archive_records_no_rebuild() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "");
+        drill_archive(dir.path(), "20261026T021500Z", b"PGDMP");
+        let out = drill(dir.path(), &config, &FakeServer::default());
+        assert_eq!(out.exit_code, 0, "{}", out.pretty);
+        assert_eq!(
+            receipt(dir.path())["tviews_rebuilt"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn a_drill_restores_as_the_configured_admin_identity() {
+        let config = DeployConfig::from_toml_str(
+            "[deploy]\nname = \"a\"\nenvironment = \"b\"\n\n[database]\n\
+             admin_url_env = \"SHOP_ADMIN_URL\"\n",
+        )
+        .expect("parses");
+        let server = super::drill_server(&config);
+        assert_eq!(server.admin_url_env.as_deref(), Some("SHOP_ADMIN_URL"));
+        assert_eq!(server.trigger, fraisier_db::restore::Trigger::Operator);
+    }
+
+    /// A config whose `[metrics].textfile_dir` is `<dir>/textfile`, created.
+    fn metrics_section(dir: &Path) -> String {
+        let textfile = dir.join("textfile");
+        std::fs::create_dir_all(&textfile).expect("mkdir");
+        format!("\n[metrics]\ntextfile_dir = \"{}\"\n", textfile.display())
+    }
+
+    fn metrics_file(dir: &Path, name: &str) -> Option<String> {
+        std::fs::read_to_string(dir.join("textfile").join(name)).ok()
+    }
+
+    fn sample(text: &str, name: &str) -> String {
+        text.lines()
+            .find(|line| line.starts_with(&format!("{name}{{")))
+            .and_then(|line| line.rsplit_once(' '))
+            .map_or_else(
+                || panic!("no {name} in:\n{text}"),
+                |(_, value)| value.to_owned(),
+            )
+    }
+
+    fn record_deploy(dir: &Path, toml: &str, outcome: &SagaOutcome) -> Option<String> {
+        let config = DeployConfig::from_toml_str(toml).expect("parses");
+        super::record_metrics(
+            &config,
+            "checkout",
+            "production",
+            &super::deploy_metrics(outcome, std::time::Duration::from_millis(1_500)),
+        )
+        .map(|warning| format!("{warning} ({})", dir.display()))
+    }
+
+    #[test]
+    fn a_committed_deploy_writes_its_own_metrics_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let toml = metrics_section(dir.path());
+        assert_eq!(
+            record_deploy(dir.path(), &toml, &SagaOutcome::Committed),
+            None
+        );
+        let text = metrics_file(dir.path(), "fraisier_deploy.prom").expect("a deploy file");
+        assert_eq!(sample(&text, "fraisier_deploy_last_success"), "1");
+        assert_eq!(sample(&text, "fraisier_deploy_last_rolled_back"), "0");
+        assert_eq!(
+            sample(&text, "fraisier_deploy_last_duration_seconds"),
+            "1.5"
+        );
+        assert!(
+            text.contains(r#"{fraise="checkout",environment="production"}"#),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_rolled_back_or_partly_rolled_back_deploy_says_so() {
+        for outcome in [
+            SagaOutcome::RolledBack {
+                failed_step: "health".to_owned(),
+                reason: "500".to_owned(),
+            },
+            SagaOutcome::PartialRollback {
+                reason: "restart failed".to_owned(),
+            },
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let toml = metrics_section(dir.path());
+            record_deploy(dir.path(), &toml, &outcome);
+            let text = metrics_file(dir.path(), "fraisier_deploy.prom").expect("a deploy file");
+            assert_eq!(
+                sample(&text, "fraisier_deploy_last_success"),
+                "0",
+                "{outcome:?}"
+            );
+            assert_eq!(
+                sample(&text, "fraisier_deploy_last_rolled_back"),
+                "1",
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_textfile_dir_no_metrics_file_is_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("textfile")).expect("mkdir");
+        assert_eq!(record_deploy(dir.path(), "", &SagaOutcome::Committed), None);
+        let names: Vec<_> = std::fs::read_dir(dir.path().join("textfile"))
+            .expect("list")
+            .collect();
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    #[test]
+    fn a_metrics_file_that_cannot_be_written_is_a_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let toml = format!(
+            "[metrics]\ntextfile_dir = \"{}\"\n",
+            dir.path().join("missing").display()
+        );
+        let warning = record_deploy(dir.path(), &toml, &SagaOutcome::Committed);
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|w| w.contains("fraisier_deploy.prom")),
+            "{warning:?}"
+        );
+    }
+
+    fn backup_with_metrics(dir: &Path, var: &str, fail: bool) -> super::CommandOutput {
+        let _guard = crate::test_env::env_guard();
+        std::env::set_var(var, "postgres://app:s3cret@dbhost/shop");
+        std::fs::create_dir_all(dir.join("backups")).expect("mkdir");
+        let config = write(
+            dir,
+            "fraisier.toml",
+            &format!(
+                "{}\n[backup]\ndir = \"{}\"\n{}",
+                db_ops_config(var),
+                dir.join("backups").display(),
+                metrics_section(dir)
+            ),
+        );
+        if fail {
+            std::fs::write(dir.join("fail"), b"").expect("arm failure");
+        }
+        let out = block_on(super::db_backup_with(
+            &config,
+            None,
+            false,
+            fake_pg_tools(),
+            prune_now(),
+        ))
+        .expect("run");
+        std::env::remove_var(var);
+        out
+    }
+
+    #[test]
+    fn a_backup_writes_its_own_file_and_leaves_the_deploy_file_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let deploy_file = dir.path().join("textfile/fraisier_deploy.prom");
+        std::fs::create_dir_all(dir.path().join("textfile")).expect("mkdir");
+        std::fs::write(&deploy_file, "# the last deploy\n").expect("seed");
+
+        let out = backup_with_metrics(dir.path(), "FRAISIER_METRICS_BACKUP", false);
+        assert_eq!(out.exit_code, 0, "{}", out.pretty);
+        let text = metrics_file(dir.path(), "fraisier_backup.prom").expect("a backup file");
+        assert_eq!(
+            sample(&text, "fraisier_backup_last_success_timestamp_seconds"),
+            "1792984500"
+        );
+        let size = std::fs::metadata(dir.path().join("backups/demo-test-20261026T031500Z.pgdump"))
+            .expect("archive")
+            .len();
+        assert_eq!(
+            sample(&text, "fraisier_backup_last_size_bytes"),
+            size.to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&deploy_file).expect("read"),
+            "# the last deploy\n"
+        );
+    }
+
+    #[test]
+    fn a_failed_backup_leaves_the_last_success_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = backup_with_metrics(dir.path(), "FRAISIER_METRICS_BACKUP_FAIL", true);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert_eq!(metrics_file(dir.path(), "fraisier_backup.prom"), None);
+    }
+
+    #[test]
+    fn a_passed_drill_writes_its_own_file_and_a_failed_one_does_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", &metrics_section(dir.path()));
+        drill_archive(dir.path(), "20261026T021500Z", b"PGDMP");
+        let out = drill(dir.path(), &config, &FakeServer::default());
+        assert_eq!(out.exit_code, 0, "{}", out.pretty);
+        let text = metrics_file(dir.path(), "fraisier_drill.prom").expect("a drill file");
+        assert_eq!(
+            sample(&text, "fraisier_drill_last_success_timestamp_seconds"),
+            "1792984500"
+        );
+
+        let failing = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(failing.path(), "false", &metrics_section(failing.path()));
+        drill_archive(failing.path(), "20261026T021500Z", b"PGDMP");
+        let out = drill(failing.path(), &config, &FakeServer::default());
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert_eq!(metrics_file(failing.path(), "fraisier_drill.prom"), None);
     }
 
     #[test]
@@ -6028,6 +6689,69 @@ current_revision = "true"
     }
 
     #[test]
+    fn scheduled_install_serves_a_prune_only_host() {
+        // No [schedule]: the retain units and their alert still install.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = format!(
+            "{VALID}\n[[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"nightly\"\n\
+             schedule = \"daily 05:30\"\nretention_days = 14\n"
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        let done = scheduled_install(&config, &root, true, false, false, false).expect("install");
+        assert_eq!(done.exit_code, 0, "{}", done.pretty);
+        let systemd = root.join("etc/systemd/system");
+        for unit in [
+            "fraisier-checkout-staging-retain-nightly.service",
+            "fraisier-checkout-staging-retain-nightly.timer",
+            "fraisier-checkout-staging-alert@.service",
+        ] {
+            assert!(systemd.join(unit).exists(), "{unit}");
+        }
+    }
+
+    #[test]
+    fn scheduled_install_detects_drift_in_the_alert_unit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = format!(
+            "{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[drill]\n\
+             schedule = \"weekly Sun 04:00\"\n"
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        scheduled_install(&config, &root, true, false, false, false).expect("install");
+        let alert = root.join("etc/systemd/system/fraisier-checkout-staging-alert@.service");
+        let marker = fraisier_scaffold::MARKER;
+        std::fs::write(
+            &alert,
+            format!("# {marker}\n[Service]\nExecStart=/bin/true\n"),
+        )
+        .expect("edit");
+        let out = scheduled_install(&config, &root, true, false, false, false).expect("runs");
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(out.pretty.contains("alert@.service"), "{}", out.pretty);
+    }
+
+    #[test]
+    fn scheduled_install_refuses_an_invalid_retain_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = format!(
+            "{VALID}\n[[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"night ly\"\n\
+             schedule = \"daily 05:30\"\nretention_days = 14\n"
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        let out = scheduled_install(&config, &root, true, false, false, false).expect("runs");
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(
+            out.pretty.contains("backup.retain[0].name"),
+            "{}",
+            out.pretty
+        );
+        assert!(!root.exists(), "nothing installed");
+    }
+
+    #[test]
     fn scheduled_install_refuses_an_unattended_deploy_without_the_optin() {
         let dir = tempfile::tempdir().expect("tempdir");
         // command = "deploy" without allow_unattended_deploy + notify: refused.
@@ -6047,7 +6771,7 @@ current_revision = "true"
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = format!(
             "{VALID}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"deploy\"\n\
-             allow_unattended_deploy = true\nnotify = \"systemd-cat -t fraisier\"\n"
+             allow_unattended_deploy = true\n\n[notify]\ncommand = \"systemd-cat -t fraisier\"\n"
         );
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let root = dir.path().join("root");
@@ -6071,7 +6795,12 @@ current_revision = "true"
         scheduled_install(&config, &root, true, false, false, false).expect("install");
         let listed = scheduled_list(&root).expect("list");
         let units = listed.json["units"].as_array().expect("units array");
-        assert_eq!(units.len(), 2, "timer + service listed: {}", listed.pretty);
+        assert_eq!(
+            units.len(),
+            3,
+            "timer + service + alert listed: {}",
+            listed.pretty
+        );
 
         // Plan only: nothing removed yet.
         let plan = scheduled_uninstall(&config, &root, false).expect("plan");
@@ -6151,7 +6880,7 @@ current_revision = "true"
             "echo \"$FRAISIER_NOTIFY_EVENT $FRAISIER_NOTIFY_FRAISE\" > {}",
             out.display()
         );
-        let toml = format!("[schedule]\nnotify = '{command}'\n");
+        let toml = format!("[notify]\ncommand = '{command}'\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         // A rolled-back (sick) deploy fires the hook with a failure payload.
@@ -6217,7 +6946,7 @@ current_revision = "true"
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("captured");
         let command = format!("echo \"$FRAISIER_NOTIFY_EVENT\" > {}", out.display());
-        let toml = format!("[schedule]\nnotify = '{command}'\n");
+        let toml = format!("[notify]\ncommand = '{command}'\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         notify_deploy_failure(
@@ -6245,7 +6974,7 @@ current_revision = "true"
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("captured");
         let command = format!("echo \"$FRAISIER_NOTIFY_EVENT\" > {}", out.display());
-        let toml = format!("[schedule]\nnotify = '{command}'\n");
+        let toml = format!("[notify]\ncommand = '{command}'\n");
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
 
         notify_deploy_failure(
@@ -6264,7 +6993,7 @@ current_revision = "true"
 
     #[tokio::test]
     async fn notify_is_a_noop_without_a_configured_sink() {
-        // No [schedule].notify: a rolled-back deploy must not panic or error.
+        // No [notify].command: a rolled-back deploy must not panic or error.
         let config = DeployConfig::from_toml_str("[deploy]\nname = \"x\"\n").expect("parses");
         notify_deploy_failure(
             &config,
@@ -6292,6 +7021,70 @@ current_revision = "true"
             out.pretty.contains("secret_env"),
             "names the missing field: {}",
             out.pretty
+        );
+    }
+
+    #[test]
+    fn a_webhook_deploy_is_a_webhook_triggered_live_deploy() {
+        let request = super::DeployRequest::webhook(Some("1.2.3"));
+        assert_eq!(request.trigger, fraisier_db::restore::Trigger::Webhook);
+        assert_eq!(request.app_version, Some("1.2.3"));
+        assert_eq!(request.host, None);
+        assert_eq!(request.dry_run, None);
+        assert!(!request.skip_preflight && !request.fail_on_block);
+    }
+
+    /// A config whose app DSN is `FRAISIER_TEST_APP_URL`, plus `extra`.
+    fn identity_config(extra: &str) -> DeployConfig {
+        DeployConfig::from_toml_str(&format!(
+            "[deploy]\nname = \"a\"\nenvironment = \"b\"\n\n[migration]\n\
+             database_url_env = \"FRAISIER_TEST_APP_URL\"\n{extra}"
+        ))
+        .expect("parses")
+    }
+
+    #[test]
+    fn no_admin_identity_restores_as_the_app_role() {
+        let _env = crate::test_env::env_guard();
+        std::env::set_var("FRAISIER_TEST_APP_URL", "postgres://app@127.0.0.1/shop");
+        let identity = super::restore_identity(&identity_config("")).expect("resolves");
+        std::env::remove_var("FRAISIER_TEST_APP_URL");
+        assert!(!identity.uses_admin());
+        assert_eq!(
+            identity.restorer("shop").redacted(),
+            "postgres://app@127.0.0.1/shop"
+        );
+    }
+
+    #[test]
+    fn a_configured_admin_identity_is_read_from_its_env_var() {
+        let _env = crate::test_env::env_guard();
+        let config = identity_config("\n[database]\nadmin_url_env = \"FRAISIER_TEST_ADMIN_URL\"\n");
+        std::env::set_var("FRAISIER_TEST_APP_URL", "postgres://app@127.0.0.1/shop");
+        std::env::set_var(
+            "FRAISIER_TEST_ADMIN_URL",
+            "postgresql:///postgres?host=/var/run/postgresql",
+        );
+        let identity = super::restore_identity(&config).expect("resolves");
+        std::env::remove_var("FRAISIER_TEST_ADMIN_URL");
+        std::env::remove_var("FRAISIER_TEST_APP_URL");
+        assert!(identity.uses_admin());
+        // The admin restores into the app's database, not its own.
+        assert_eq!(identity.restorer("shop").database(), "shop");
+    }
+
+    #[test]
+    fn an_unset_admin_env_var_is_an_error_not_a_fallback() {
+        let _env = crate::test_env::env_guard();
+        std::env::remove_var("FRAISIER_TEST_ADMIN_UNSET");
+        std::env::set_var("FRAISIER_TEST_APP_URL", "postgres://app@127.0.0.1/shop");
+        let config =
+            identity_config("\n[database]\nadmin_url_env = \"FRAISIER_TEST_ADMIN_UNSET\"\n");
+        let error = super::restore_identity(&config).expect_err("unset");
+        std::env::remove_var("FRAISIER_TEST_APP_URL");
+        assert!(
+            error.to_string().contains("FRAISIER_TEST_ADMIN_UNSET"),
+            "{error}"
         );
     }
 }

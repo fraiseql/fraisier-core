@@ -696,8 +696,11 @@ dependencies = [
 name = "fraisier-db"
 version = "1.0.0-beta.11"
 dependencies = [
+ "async-trait",
  "nix",
  "percent-encoding",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

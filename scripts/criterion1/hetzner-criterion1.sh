@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 # Orchestrate the §10.3 criterion-1 deploy on a throwaway Hetzner pid-1 host:
 # provision debian-13 (glibc >= 2.39 for the prebuilt binaries), install docker +
-# confiture, ship the stripped fraisier + fraiseql-server binaries + schema/config/
-# migrations + criterion1-host.sh, and run it. Host deleted on exit unless --keep.
+# confiture, ship the stripped fraisier + fraiseql-server binaries + this directory's
+# schema/config/migrations + criterion1-host.sh + the version pin, and run it. Host
+# deleted on exit unless --keep.
+#
+# Binaries (environment): FRAISIER_BIN (default: this repo's debug build) and
+# FRAISEQL_SERVER (default: ~/code/fraiseql's release build), whose --version must match
+# tools/fraiseql-version. Both are stripped into a temporary directory before shipping.
 set -euo pipefail
-SCRATCH="$HOME/code/partb-materialize-scratch"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+FRAISIER_REPO="$(cd "$HERE/../.." && pwd)"
+PIN="$FRAISIER_REPO/tools/fraiseql-version"
+FRAISEQL_VERSION="$(tr -d '[:space:]' < "$PIN")"
+FRAISIER="${FRAISIER_BIN:-$FRAISIER_REPO/target/debug/fraisier}"
+SERVER="${FRAISEQL_SERVER:-$HOME/code/fraiseql/target/release/fraiseql-server}"
 SSH_KEY="${SSH_KEY:-fraisier-checkpoint}"
 SSH_IDENTITY="${SSH_IDENTITY:-$HOME/.ssh/hetzner_fraisier}"
 TYPE="${TYPE:-cpx22}"
@@ -23,15 +33,24 @@ command -v rsync  >/dev/null || die "rsync not found"
 hcloud server list >/dev/null 2>&1 || die "hcloud not authenticated"
 hcloud ssh-key describe "$SSH_KEY" >/dev/null 2>&1 || die "ssh-key '$SSH_KEY' not in project"
 [ -r "$SSH_IDENTITY" ] || die "ssh identity '$SSH_IDENTITY' not readable"
-for f in fraisier.bin fraiseql-server.bin schema.compiled.json server.config.toml criterion1-host.sh; do
-  [ -e "$SCRATCH/$f" ] || die "missing $SCRATCH/$f"
+for f in "$FRAISIER" "$SERVER" "$HERE/schema.compiled.json" "$HERE/server.config.toml" \
+  "$HERE/criterion1-host.sh"; do
+  [ -e "$f" ] || die "missing $f"
 done
-[ -d "$SCRATCH/ecom-confiture" ] || die "missing ecom-confiture migrations"
+[ -d "$HERE/ecom-confiture" ] || die "missing ecom-confiture migrations"
+# Fail before spending anything when the server is not the pinned version.
+served="$("$SERVER" --version 2>&1 | head -1)"
+[ "$served" = "fraiseql-server ${FRAISEQL_VERSION#v}" ] \
+  || die "$SERVER reports '$served'; tools/fraiseql-version pins $FRAISEQL_VERSION"
+BINS="$(mktemp -d)"
+cp "$FRAISIER" "$BINS/fraisier"; cp "$SERVER" "$BINS/fraiseql-server"
+strip "$BINS/fraisier" "$BINS/fraiseql-server"
 
 # Delete a stale host of the same name (idempotent re-runs)
 hcloud server delete "$NAME" >/dev/null 2>&1 || true
 
 teardown(){ set +e
+  rm -rf "$BINS"
   if [ "$KEEP" = 1 ]; then say "leaving $NAME up (--keep). Delete: hcloud server delete $NAME"
   else hcloud server delete "$NAME" >/dev/null 2>&1 && ok "host deleted" \
        || printf '\033[1;31mWARNING:\033[0m could not delete %s — delete manually!\n' "$NAME" >&2
@@ -70,12 +89,13 @@ ok "deps installed"
 say "shipping binaries + assets (stripped; rsync -z)"
 remote 'mkdir -p /root/criterion1/migrations'
 RS=(-az -e "ssh ${SSH_OPTS[*]}")
-rsync "${RS[@]}" "$SCRATCH/fraisier.bin"          "root@$IP:/root/criterion1/fraisier"
-rsync "${RS[@]}" "$SCRATCH/fraiseql-server.bin"   "root@$IP:/root/criterion1/fraiseql-server"
-rsync "${RS[@]}" "$SCRATCH/schema.compiled.json"  "root@$IP:/root/criterion1/schema.compiled.json"
-rsync "${RS[@]}" "$SCRATCH/server.config.toml"    "root@$IP:/root/criterion1/server.config.toml"
-rsync "${RS[@]}" "$SCRATCH/criterion1-host.sh"    "root@$IP:/root/criterion1/criterion1-host.sh"
-rsync "${RS[@]}" "$SCRATCH/ecom-confiture/"       "root@$IP:/root/criterion1/migrations/"
+rsync "${RS[@]}" "$BINS/fraisier"               "root@$IP:/root/criterion1/fraisier"
+rsync "${RS[@]}" "$BINS/fraiseql-server"        "root@$IP:/root/criterion1/fraiseql-server"
+rsync "${RS[@]}" "$HERE/schema.compiled.json"   "root@$IP:/root/criterion1/schema.compiled.json"
+rsync "${RS[@]}" "$HERE/server.config.toml"     "root@$IP:/root/criterion1/server.config.toml"
+rsync "${RS[@]}" "$HERE/criterion1-host.sh"     "root@$IP:/root/criterion1/criterion1-host.sh"
+rsync "${RS[@]}" "$PIN"                         "root@$IP:/root/criterion1/fraiseql-version"
+rsync "${RS[@]}" "$HERE/ecom-confiture/"        "root@$IP:/root/criterion1/migrations/"
 ok "assets shipped"
 
 say "running criterion-1 deploy on the host (pid-1 systemd, real network)"

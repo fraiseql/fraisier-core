@@ -73,12 +73,13 @@ mod validate;
 pub use error::ConfigError;
 pub use preset::SpecqlPreset;
 pub use schema::{
-    ArtifactSection, BackupSection, BlueGreenSection, CheckSection, DeployConfig, DeploySection,
-    DrillSection, HealthSection, HostSpec, HostsSection, LbSection, MigrationSection,
+    ArtifactSection, BackupSection, BlueGreenSection, CheckSection, DatabaseRequires,
+    DatabaseSection, DatabaseTviews, DeployConfig, DeploySection, DrillSection, HealthSection,
+    HostSpec, HostsSection, LbSection, MetricsSection, MigrationSection, NotifySection,
     PolicySection, RetainEntry, ScheduleSection, ServiceSection, SshSection,
     DEFAULT_APPROVAL_TIMEOUT_SECS, UNCLASSIFIED_ACTIONS,
 };
-pub use validate::{ValidationIssue, ValidationReport};
+pub use validate::{is_unit_word, ValidationIssue, ValidationReport};
 
 // Re-exported so callers can match on issue severity without depending on
 // `fraisier-core` directly.

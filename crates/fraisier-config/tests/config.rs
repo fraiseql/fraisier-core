@@ -849,6 +849,27 @@ fn retain_report(entry: &str) -> fraisier_config::ValidationReport {
 }
 
 #[test]
+fn a_retain_name_must_be_safe_in_a_unit_name() {
+    // The name becomes part of a systemd unit name and an ExecStart= argument.
+    for name in ["night ly", "-nightly", "nightly;rm", "100%", "a/b"] {
+        let report = retain_report(&format!(
+            "[[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"{name}\"\n\
+             schedule = \"daily 05:30\"\nretention_days = 14\n"
+        ));
+        assert!(
+            has_error(&report, "backup.retain[0].name"),
+            "{name:?}: {report}"
+        );
+    }
+    // A name taken from `dir` is held to the same rule.
+    let report = retain_report(
+        "[[backup.retain]]\ndir = \"/var/backups/check out\"\n\
+         schedule = \"daily 05:30\"\nretention_days = 14\n",
+    );
+    assert!(has_error(&report, "backup.retain[0].name"), "{report}");
+}
+
+#[test]
 fn a_retain_entry_parses_with_its_defaults_and_needs_no_backup_dir() {
     let config =
         DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{RETAIN}")).expect("parses");
@@ -1072,6 +1093,28 @@ fn a_drill_needs_a_backup_dir_to_take_archives_from() {
 }
 
 #[test]
+fn a_drill_schedule_is_kept_in_the_calendar_vocabulary() {
+    let config = DeployConfig::from_toml_str(&format!(
+        "{SCHEDULE_BASE}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[drill]\n\
+         schedule = \"weekly Sun 04:00\"\n"
+    ))
+    .expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    assert_eq!(
+        config.drill.and_then(|d| d.schedule).as_deref(),
+        Some("weekly Sun 04:00")
+    );
+}
+
+#[test]
+fn a_malformed_drill_schedule_is_an_error() {
+    assert!(has_error(
+        &drill_report("schedule = \"every tuesday\"\n"),
+        "drill.schedule"
+    ));
+}
+
+#[test]
 fn drill_max_age_hours_must_be_at_least_one() {
     assert!(has_error(
         &drill_report("max_age_hours = 0\n"),
@@ -1093,6 +1136,42 @@ fn drill_data_dir_must_be_absolute() {
         &drill_report("data_dir = \"pgdata\"\n"),
         "drill.data_dir"
     ));
+}
+
+fn metrics_config(section: &str) -> DeployConfig {
+    DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n[metrics]\n{section}")).expect("parses")
+}
+
+#[test]
+fn a_metrics_textfile_dir_is_kept() {
+    let config = metrics_config("textfile_dir = \"/var/lib/node_exporter/textfile\"\n");
+    assert!(config.validate().ok(), "{}", config.validate());
+    assert_eq!(
+        config.metrics.expect("[metrics]").textfile_dir.as_deref(),
+        Some(std::path::Path::new("/var/lib/node_exporter/textfile"))
+    );
+}
+
+#[test]
+fn a_metrics_section_needs_a_textfile_dir() {
+    let config = metrics_config("");
+    assert!(
+        has_error(&config.validate(), "metrics.textfile_dir"),
+        "{}",
+        config.validate()
+    );
+}
+
+#[test]
+fn the_metrics_textfile_dir_must_be_absolute() {
+    let config = metrics_config("textfile_dir = \"textfile\"\n");
+    for report in [
+        config.validate(),
+        config.validate_db_ops(),
+        config.validate_backup_ops(),
+    ] {
+        assert!(has_error(&report, "metrics.textfile_dir"), "{report}");
+    }
 }
 
 #[test]
@@ -1146,15 +1225,60 @@ fn unattended_deploy_requires_the_optin_and_a_notify_sink() {
         has_error(&report, "schedule.allow_unattended_deploy"),
         "{report}"
     );
-    assert!(has_error(&report, "schedule.notify"), "{report}");
+    assert!(has_error(&report, "notify.command"), "{report}");
 
     // With both, it validates clean.
     let ok = format!(
         "{SCHEDULE_BASE}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"deploy\"\n\
-         allow_unattended_deploy = true\nnotify = \"systemd-cat -t fraisier\"\n"
+         allow_unattended_deploy = true\n\n[notify]\ncommand = \"systemd-cat -t fraisier\"\n"
     );
     let report = DeployConfig::from_toml_str(&ok).expect("parses").validate();
     assert!(report.ok(), "opted-in unattended deploy is valid: {report}");
+}
+
+#[test]
+fn schedule_notify_is_refused_with_a_pointer_to_notify_command() {
+    // The sink moved: one spelling, so the old key is a targeted error, not an alias.
+    let toml = format!(
+        "{SCHEDULE_BASE}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"deploy\"\n\
+         allow_unattended_deploy = true\nnotify = \"systemd-cat -t fraisier\"\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    let issue = report
+        .issues
+        .iter()
+        .find(|i| i.path == "schedule.notify" && i.severity == Severity::Error)
+        .unwrap_or_else(|| panic!("{report}"));
+    assert!(
+        issue.message.contains("moved to `[notify].command`"),
+        "{}",
+        issue.message
+    );
+}
+
+#[test]
+fn a_notify_section_needs_a_command() {
+    for body in ["", "command = \"  \"\n"] {
+        let report = DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n[notify]\n{body}"))
+            .expect("parses")
+            .validate();
+        assert!(has_error(&report, "notify.command"), "{body:?}: {report}");
+    }
+}
+
+#[test]
+fn a_notify_command_is_kept() {
+    let config = DeployConfig::from_toml_str(&format!(
+        "{SCHEDULE_BASE}\n[notify]\ncommand = \"systemd-cat -t fraisier\"\n"
+    ))
+    .expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    assert_eq!(
+        config.notify.and_then(|n| n.command).as_deref(),
+        Some("systemd-cat -t fraisier")
+    );
 }
 
 const BLUE_GREEN: &str = r#"
@@ -1415,6 +1539,80 @@ fn http_health_still_requires_url() {
     assert!(has_error(&report, "health.url"), "{report}");
 }
 
+#[test]
+fn http_health_require_capabilities_parses_and_validates() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n\
+         require_capabilities = [\"observers\", \"mcp\"]\n"
+    );
+    let cfg = DeployConfig::from_toml_str(&toml).expect("parses");
+    assert!(cfg.validate().ok(), "{}", cfg.validate());
+    assert_eq!(
+        cfg.health.and_then(|h| h.require_capabilities),
+        Some(vec!["observers".to_owned(), "mcp".to_owned()])
+    );
+}
+
+#[test]
+fn require_capabilities_rejects_an_empty_list() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n\
+         require_capabilities = []\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(
+        has_error(&report, "health.require_capabilities"),
+        "{report}"
+    );
+}
+
+#[test]
+fn require_capabilities_rejects_duplicates() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n\
+         require_capabilities = [\"observers\", \"observers\"]\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(
+        has_error(&report, "health.require_capabilities"),
+        "{report}"
+    );
+}
+
+#[test]
+fn require_capabilities_rejects_a_blank_name() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n\
+         require_capabilities = [\" \"]\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(
+        has_error(&report, "health.require_capabilities"),
+        "{report}"
+    );
+}
+
+#[test]
+fn require_capabilities_applies_only_to_the_http_adapter() {
+    let toml = format!(
+        "{HEALTH_BASE}\n[health]\nadapter = \"command\"\ncommand = \"scan\"\n\
+         require_capabilities = [\"observers\"]\n"
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(
+        has_error(&report, "health.require_capabilities"),
+        "{report}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The [policy] section — the risk-keyed policy gate (issue #45)
 // ---------------------------------------------------------------------------
@@ -1578,4 +1776,213 @@ fn no_policy_section_means_no_policy_at_all() {
     let cfg = DeployConfig::from_toml_str(PRD_7_1).expect("parses");
     assert!(cfg.policy.is_none());
     assert!(cfg.validate().ok(), "{}", cfg.validate());
+}
+
+/// A base whose `[migration]` names the DSN env var the readiness probe reads.
+const REQUIRES_BASE: &str = r#"
+[deploy]
+name = "checkout"
+environment = "production"
+
+[artifact]
+source = "local"
+path = "/srv/checkout/build"
+active_path = "/srv/checkout/current"
+
+[migration]
+adapter = "confiture"
+database_url_env = "CHECKOUT_DATABASE_URL"
+
+[service]
+adapter = "systemd"
+unit = "checkout.service"
+
+[health]
+adapter = "http"
+url = "http://127.0.0.1:8080/health"
+"#;
+
+#[test]
+fn database_requires_parses_and_validates_clean() {
+    let toml =
+        format!("{REQUIRES_BASE}\n[database.requires]\npostgres_major = 18\npg_tviews = true\n");
+    let config = DeployConfig::from_toml_str(&toml).expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    let requires = config
+        .database
+        .and_then(|database| database.requires)
+        .expect("requires");
+    assert_eq!(
+        (requires.postgres_major, requires.pg_tviews),
+        (Some(18), Some(true))
+    );
+}
+
+#[test]
+fn an_empty_database_requires_is_an_error() {
+    let toml = format!("{REQUIRES_BASE}\n[database.requires]\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "database.requires"), "{report}");
+}
+
+#[test]
+fn a_postgres_major_below_10_is_an_error() {
+    // server_version_num's two-part numbering starts at 10; 9.6 is "906xx".
+    let toml = format!("{REQUIRES_BASE}\n[database.requires]\npostgres_major = 9\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(
+        has_error(&report, "database.requires.postgres_major"),
+        "{report}"
+    );
+}
+
+#[test]
+fn database_requires_needs_the_dsn_env_var() {
+    let toml = format!(
+        "{}\n[database.requires]\npg_tviews = true\n",
+        REQUIRES_BASE
+            .replace("database_url_env = \"CHECKOUT_DATABASE_URL\"\n", "")
+            .replace("adapter = \"confiture\"", "adapter = \"command\"")
+    );
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "migration.database_url_env"), "{report}");
+}
+
+fn database_report(section: &str) -> fraisier_config::ValidationReport {
+    DeployConfig::from_toml_str(&format!("{REQUIRES_BASE}\n{section}"))
+        .expect("parses")
+        .validate()
+}
+
+#[test]
+fn an_admin_url_env_is_kept() {
+    let config = DeployConfig::from_toml_str(&format!(
+        "{REQUIRES_BASE}\n[database]\nadmin_url_env = \"CHECKOUT_ADMIN_URL\"\n"
+    ))
+    .expect("parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    assert_eq!(
+        config.database.and_then(|d| d.admin_url_env).as_deref(),
+        Some("CHECKOUT_ADMIN_URL")
+    );
+}
+
+#[test]
+fn a_blank_admin_url_env_is_an_error() {
+    let report = database_report("[database]\nadmin_url_env = \" \"\n");
+    assert!(has_error(&report, "database.admin_url_env"), "{report}");
+}
+
+#[test]
+fn the_admin_identity_cannot_be_the_migration_dsn() {
+    // A separate identity is the point: the same env var would make the app
+    // role the superuser, or the superuser run migrations.
+    let report = database_report("[database]\nadmin_url_env = \"CHECKOUT_DATABASE_URL\"\n");
+    assert!(has_error(&report, "database.admin_url_env"), "{report}");
+}
+
+#[test]
+fn on_empty_takes_fail_or_warn() {
+    for value in ["fail", "warn"] {
+        let report = database_report(&format!(
+            "[database.requires]\npg_tviews = true\n\n[database.tviews]\non_empty = \"{value}\"\n"
+        ));
+        assert!(report.ok(), "{value}: {report}");
+    }
+    let config = DeployConfig::from_toml_str(&format!(
+        "{REQUIRES_BASE}\n[database.requires]\npg_tviews = true\n\n[database.tviews]\non_empty = \"warn\"\n"
+    ))
+    .expect("parses");
+    assert_eq!(
+        config
+            .database
+            .and_then(|d| d.tviews)
+            .and_then(|t| t.on_empty)
+            .as_deref(),
+        Some("warn")
+    );
+}
+
+#[test]
+fn on_empty_cannot_switch_the_gate_off() {
+    for value in ["off", "ignore", ""] {
+        let report = database_report(&format!(
+            "[database.requires]\npg_tviews = true\n\n[database.tviews]\non_empty = \"{value}\"\n"
+        ));
+        assert!(
+            has_error(&report, "database.tviews.on_empty"),
+            "{value:?}: {report}"
+        );
+    }
+}
+
+#[test]
+fn a_tviews_section_without_declaring_pg_tviews_is_an_error() {
+    // The gate is declared by [database.requires].pg_tviews; a knob for a gate
+    // that is not there would read as protection it does not give.
+    let report = database_report("[database.tviews]\non_empty = \"warn\"\n");
+    assert!(has_error(&report, "database.tviews"), "{report}");
+}
+
+#[test]
+fn an_unknown_requirement_is_a_parse_error() {
+    let toml = format!("{REQUIRES_BASE}\n[database.requires]\npostgis = true\n");
+    assert!(DeployConfig::from_toml_str(&toml).is_err());
+}
+
+fn database_less(extra: &str) -> String {
+    format!(
+        r#"
+[deploy]
+name = "gateway"
+environment = "production"
+[artifact]
+source = "local"
+path = "/srv/gateway"
+[migration]
+adapter = "none"
+{extra}
+[service]
+adapter = "systemd"
+unit = "gateway.service"
+[health]
+adapter = "http"
+url = "http://127.0.0.1/readiness"
+"#
+    )
+}
+
+/// `adapter = "none"` declares a deployable that owns no database.
+#[test]
+fn a_database_less_migration_axis_validates() {
+    let cfg = DeployConfig::from_toml_str(&database_less("")).expect("parses");
+    let report = cfg.validate();
+    assert!(report.ok(), "got {:?}", report.issues);
+}
+
+/// A database-less axis takes no DSN and no settings: either one means the
+/// config believes there is a database after all.
+#[test]
+fn a_database_less_axis_refuses_a_dsn_or_settings() {
+    for (extra, path) in [
+        ("database_url_env = \"X_DB\"", "migration.database_url_env"),
+        ("[migration.settings]\nup = \"true\"", "migration.settings"),
+    ] {
+        let cfg = DeployConfig::from_toml_str(&database_less(extra)).expect("parses");
+        let report = cfg.validate();
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.path == path && i.severity == Severity::Error),
+            "expected an error at {path}, got {:?}",
+            report.issues
+        );
+    }
 }

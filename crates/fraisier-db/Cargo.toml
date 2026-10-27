@@ -16,8 +16,11 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = "0.1.89"
 nix = { version = "0.31.3", features = ["fs"] }
 percent-encoding = "2.3.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
 thiserror = "2.0.17"
 tokio = { version = "1.52.3", features = ["process"] }
 url = "2.5.8"

@@ -92,6 +92,14 @@ pub struct DeployConfig {
     /// calendar schedule. Absent when nothing is scheduled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ScheduleSection>,
+    /// The `[notify]` section: the one failure sink every unattended run
+    /// reports to. Absent, a failure is only logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<NotifySection>,
+    /// The `[database]` section: what the database server must offer. Absent
+    /// leaves the server unchecked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<DatabaseSection>,
     /// The `[backup]` section: where `fraisier backup` keeps its archives.
     /// Absent keeps the single `<fraise>-<environment>.pgdump` output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,6 +108,10 @@ pub struct DeployConfig {
     /// against the newest archive in `[backup].dir`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drill: Option<DrillSection>,
+    /// The `[metrics]` section: where each command writes its Prometheus
+    /// textfile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<MetricsSection>,
     /// The `[sync]` section: the git remote the deploy ledger is shared through
     /// (experimental). Absent when state is not shared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -438,6 +450,13 @@ pub struct HealthSection {
     /// template `Bearer {token}`). Resolved once per deploy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_provider: Option<TokenProvider>,
+    /// `http`: FraiseQL capabilities the server must report as running in its
+    /// `/health` body (`compiled_in`, `started`, and not `healthy = false`). A
+    /// capability that is not running makes the probe unhealthy, retried like a
+    /// wrong status. Names are not checked here: FraiseQL owns its registry, and
+    /// a name the server does not report fails at probe time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_capabilities: Option<Vec<String>>,
 }
 
 /// The `[ssh]` section: the connection parameters fraisier uses to run per-host
@@ -547,10 +566,71 @@ pub struct ScheduleSection {
     /// scheduled deploy is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_unattended_deploy: Option<bool>,
-    /// A failure-notification exec hook (run via `sh -c`) fired when an unattended
-    /// deploy rolls back — the required sink for `command = "deploy"`.
+    /// No longer read: the failure sink moved to [`NotifySection::command`].
+    /// Kept only so that a config still setting it gets a validation error
+    /// saying where it went, rather than an unknown-field parse error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify: Option<String>,
+}
+
+/// The `[notify]` section: where unattended failures are reported.
+///
+/// A scheduled deploy that rolls back notifies in-process; a failed scheduled
+/// backup, prune or drill notifies through its `OnFailure=` alert unit
+/// (`fraisier notify`). Both deliver the same payload to the same command.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifySection {
+    /// The exec hook, run via `sh -c`, with the payload as JSON on stdin and in
+    /// `FRAISIER_NOTIFY_*` environment variables. Required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+/// The `[database]` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseSection {
+    /// `[database.requires]`: what the server must offer before fraisier deploys
+    /// onto it. fraisier checks and refuses; it never installs what is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires: Option<DatabaseRequires>,
+    /// The env var holding a superuser DSN — meant for peer auth over the Unix
+    /// socket, with no password — that fraisier uses **only** for
+    /// restore-class operations: creating and dropping throwaway and restore
+    /// target databases, `pg_restore`, and the post-restore TVIEW rebuild.
+    /// Never for migrations or deploy steps. Absent, those use the app DSN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_url_env: Option<String>,
+    /// `[database.tviews]`: the empty-TVIEW gate's one knob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tviews: Option<DatabaseTviews>,
+}
+
+/// `[database.tviews]`: what an empty TVIEW over a populated view costs a
+/// deploy. The gate itself is declared by `[database.requires].pg_tviews`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseTviews {
+    /// `"fail"` (the default) refuses the deploy at preflight; `"warn"` reports
+    /// and continues. A probe that cannot run is treated the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_empty: Option<String>,
+}
+
+/// `[database.requires]`: checked first in every deploy's preflight, and by
+/// `fraisier doctor`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseRequires {
+    /// The lowest PostgreSQL major version the server may run (`18` admits 18.x
+    /// and later).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgres_major: Option<u32>,
+    /// Whether pg_tviews must be preloaded (`shared_preload_libraries`),
+    /// installed in the database, and on the read contract this fraisier speaks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pg_tviews: Option<bool>,
 }
 
 /// The `[backup]` section: where `fraisier backup` keeps its archives.
@@ -588,6 +668,11 @@ pub struct DrillSection {
     /// for another copy of the live database plus 2 GB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<PathBuf>,
+    /// When `scheduled install` runs the drill, in the `[schedule].calendar`
+    /// vocabulary (`daily HH:MM`, `weekly DOW HH:MM`, …). Absent, the drill runs
+    /// only when invoked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
 }
 
 impl DrillSection {
@@ -599,6 +684,20 @@ impl DrillSection {
     pub fn max_age_hours(&self) -> u32 {
         self.max_age_hours.unwrap_or(Self::DEFAULT_MAX_AGE_HOURS)
     }
+}
+
+/// The `[metrics]` section: Prometheus textfile metrics.
+///
+/// Each command writes its own file (`fraisier_deploy.prom`,
+/// `fraisier_backup.prom`, `fraisier_drill.prom`) into `textfile_dir`, for
+/// `node_exporter`'s textfile collector to serve.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsSection {
+    /// The directory `node_exporter`'s `--collector.textfile.directory` reads.
+    /// Required, and absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub textfile_dir: Option<PathBuf>,
 }
 
 /// One `[[backup.retain]]` entry: which archives in a directory are kept.

@@ -132,8 +132,11 @@ impl DeployConfig {
         validate_lb(self, &mut report);
         validate_webhook(self, &mut report);
         validate_schedule(self, &mut report);
+        validate_notify(self, &mut report);
+        validate_database(self, &mut report);
         validate_backup(self, &mut report);
         validate_drill(self, &mut report);
+        validate_metrics(self, &mut report);
         validate_sync(self, &mut report);
         validate_blue_green(self, &mut report);
         validate_checks(self, &mut report);
@@ -153,6 +156,8 @@ impl DeployConfig {
         let mut report = ValidationReport::default();
         validate_deploy(self, &mut report);
         validate_migration(self, &mut report);
+        validate_metrics(self, &mut report);
+        validate_database(self, &mut report);
         report
     }
 
@@ -167,6 +172,7 @@ impl DeployConfig {
         validate_deploy(self, &mut report);
         validate_backup(self, &mut report);
         validate_drill(self, &mut report);
+        validate_metrics(self, &mut report);
         report
     }
 
@@ -428,6 +434,22 @@ fn validate_migration(cfg: &DeployConfig, report: &mut ValidationReport) {
              (the name of the env var holding the database DSN)",
         );
     }
+    // `none` declares a deployable that owns no database; a DSN or settings
+    // beside it contradict that.
+    if adapter == Some("none") {
+        if is_set(migration.database_url_env.as_ref()) {
+            report.error(
+                "migration.database_url_env",
+                "adapter = \"none\" declares no database; remove database_url_env",
+            );
+        }
+        if !migration.settings.is_empty() {
+            report.error(
+                "migration.settings",
+                "adapter = \"none\" takes no settings; remove [migration.settings]",
+            );
+        }
+    }
     if migration.forward_compatible_lint == Some(true) && adapter == Some("command") {
         report.warn(
             "migration.forward_compatible_lint",
@@ -525,6 +547,9 @@ fn validate_health(cfg: &DeployConfig, report: &mut ValidationReport) {
             );
         }
     }
+    if let Some(required) = &health.require_capabilities {
+        validate_require_capabilities(health.adapter.as_deref(), required, report);
+    }
     if let Some(provider) = &health.token_provider {
         // A token provider only makes sense injecting a header into the http probe.
         if health.adapter.as_deref() != Some("http") {
@@ -541,6 +566,38 @@ fn validate_health(cfg: &DeployConfig, report: &mut ValidationReport) {
             provider.validate_against_headers(health.headers.keys().map(String::as_str))
         {
             report.error("health.token_provider.header", error.to_string());
+        }
+    }
+}
+
+fn validate_require_capabilities(
+    adapter: Option<&str>,
+    required: &[String],
+    report: &mut ValidationReport,
+) {
+    const PATH: &str = "health.require_capabilities";
+    if adapter != Some("http") {
+        report.error(
+            PATH,
+            "require_capabilities applies only to the http adapter (it reads the \
+             /health body)",
+        );
+    }
+    if required.is_empty() {
+        report.error(
+            PATH,
+            "require_capabilities is empty; list a capability or remove the key",
+        );
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for name in required {
+        if name.trim().is_empty() {
+            report.error(PATH, "require_capabilities contains a blank name");
+        } else if !seen.insert(name.as_str()) {
+            report.error(
+                PATH,
+                format!("require_capabilities lists '{name}' more than once"),
+            );
         }
     }
 }
@@ -714,14 +771,130 @@ fn validate_schedule(cfg: &DeployConfig, report: &mut ValidationReport) {
                      (it removes the operator-is-watching protection by construction)",
                 );
             }
-            if !is_set(schedule.notify.as_ref()) {
+            if !is_set(cfg.notify.as_ref().and_then(|n| n.command.as_ref())) {
                 report.error(
-                    "schedule.notify",
-                    "an unattended scheduled deploy requires a `notify` failure sink",
+                    "notify.command",
+                    "an unattended scheduled deploy requires a failure sink: \
+                     set [notify].command",
                 );
             }
         }
         Some(_) => {}
+    }
+    if schedule.notify.is_some() {
+        report.error(
+            "schedule.notify",
+            "[schedule].notify moved to `[notify].command`, the one sink every \
+             unattended run reports to",
+        );
+    }
+}
+
+fn validate_notify(cfg: &DeployConfig, report: &mut ValidationReport) {
+    if let Some(notify) = &cfg.notify {
+        if !is_set(notify.command.as_ref()) {
+            report.error(
+                "notify.command",
+                "the [notify] section requires command (run via `sh -c` on each failure)",
+            );
+        }
+    }
+}
+
+fn validate_database(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(database) = cfg.database.as_ref() else {
+        return; // optional
+    };
+    validate_admin_identity(cfg, report);
+    validate_tviews_gate(database, report);
+    let Some(requires) = database.requires.as_ref() else {
+        return;
+    };
+    if requires.postgres_major.is_none() && requires.pg_tviews != Some(true) {
+        report.error(
+            "database.requires",
+            "[database.requires] declares nothing: set postgres_major and/or pg_tviews = true",
+        );
+    }
+    if let Some(major) = requires.postgres_major.filter(|major| *major < 10) {
+        report.error(
+            "database.requires.postgres_major",
+            format!("postgres_major = {major} is not a PostgreSQL major version fraisier checks (10 or later)"),
+        );
+    }
+    let has_dsn = cfg
+        .migration
+        .as_ref()
+        .is_some_and(|m| is_set(m.database_url_env.as_ref()));
+    if !has_dsn {
+        report.error(
+            "migration.database_url_env",
+            "[database.requires] is checked against the database, so it needs \
+             [migration].database_url_env (the env var holding the DSN)",
+        );
+    }
+}
+
+fn validate_admin_identity(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(admin) = cfg
+        .database
+        .as_ref()
+        .and_then(|d| d.admin_url_env.as_deref())
+    else {
+        return;
+    };
+    if admin.trim().is_empty() {
+        report.error(
+            "database.admin_url_env",
+            "admin_url_env names the env var holding the restore identity's DSN; \
+             it cannot be blank",
+        );
+        return;
+    }
+    let migration = cfg
+        .migration
+        .as_ref()
+        .and_then(|m| m.database_url_env.as_deref());
+    if migration == Some(admin) {
+        report.error(
+            "database.admin_url_env",
+            format!(
+                "admin_url_env is the migration DSN's env var ({admin}); the restore \
+                 identity must be a separate, superuser role, never the app's"
+            ),
+        );
+    }
+}
+
+/// The values `[database.tviews].on_empty` takes. There is no "off": the gate is
+/// declared by `[database.requires].pg_tviews`, and only that switches it.
+const ON_EMPTY: &[&str] = &["fail", "warn"];
+
+fn validate_tviews_gate(database: &crate::DatabaseSection, report: &mut ValidationReport) {
+    let Some(tviews) = database.tviews.as_ref() else {
+        return;
+    };
+    let declared = database
+        .requires
+        .as_ref()
+        .is_some_and(|requires| requires.pg_tviews == Some(true));
+    if !declared {
+        report.error(
+            "database.tviews",
+            "[database.tviews] tunes the empty-TVIEW gate, which only \
+             [database.requires].pg_tviews = true declares",
+        );
+    }
+    if let Some(value) = tviews.on_empty.as_deref() {
+        if !ON_EMPTY.contains(&value) {
+            report.error(
+                "database.tviews.on_empty",
+                format!(
+                    "on_empty = '{value}' is not one of: fail, warn (the gate cannot be \
+                     switched off while pg_tviews is declared)"
+                ),
+            );
+        }
     }
 }
 
@@ -766,6 +939,15 @@ fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
     for (index, entry) in retain.iter().enumerate() {
         validate_retain_entry(entry, &format!("backup.retain[{index}]"), report);
         if let Some(name) = entry.name() {
+            if !is_unit_word(&name) {
+                report.error(
+                    &format!("backup.retain[{index}].name"),
+                    format!(
+                        "retain entry name '{name}' names its systemd units, so it may hold \
+                         only letters, digits, '_', '.' and '-', and not start with '-'"
+                    ),
+                );
+            }
             if let Some((_, first)) = names.iter().find(|(seen, _)| *seen == name) {
                 report.error(
                     &format!("backup.retain[{index}].name"),
@@ -779,6 +961,18 @@ fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
             }
         }
     }
+}
+
+/// Whether `word` is safe as part of a systemd unit name and as an
+/// `ExecStart=` argument: letters, digits, `_`, `.` and `-`, not starting with
+/// `-`.
+#[must_use]
+pub fn is_unit_word(word: &str) -> bool {
+    !word.is_empty()
+        && !word.starts_with('-')
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
 fn validate_drill(cfg: &DeployConfig, report: &mut ValidationReport) {
@@ -797,6 +991,11 @@ fn validate_drill(cfg: &DeployConfig, report: &mut ValidationReport) {
              [backup].dir",
         );
     }
+    if let Some(spec) = drill.schedule.as_deref() {
+        if let Err(message) = crate::calendar::to_on_calendar(spec) {
+            report.error("drill.schedule", message);
+        }
+    }
     if drill.max_age_hours == Some(0) {
         report.error("drill.max_age_hours", "max_age_hours must be at least 1");
     }
@@ -813,6 +1012,27 @@ fn validate_drill(cfg: &DeployConfig, report: &mut ValidationReport) {
                 format!("data_dir must be an absolute path, not '{}'", dir.display()),
             );
         }
+    }
+}
+
+fn validate_metrics(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(metrics) = cfg.metrics.as_ref() else {
+        return;
+    };
+    match metrics.textfile_dir.as_deref() {
+        None => report.error(
+            "metrics.textfile_dir",
+            "a [metrics] section needs textfile_dir: the directory node_exporter's textfile \
+             collector reads",
+        ),
+        Some(dir) if !dir.is_absolute() => report.error(
+            "metrics.textfile_dir",
+            format!(
+                "textfile_dir must be an absolute path, not '{}'",
+                dir.display()
+            ),
+        ),
+        Some(_) => {}
     }
 }
 

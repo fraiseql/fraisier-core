@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-beta.12] - 2026-10-27
+
 ### Changed
 
 - **`backup drill` restores a pg_tviews archive.** It now restores as
@@ -1118,7 +1120,8 @@ migration-safe rollback across one host or a fleet.
 - **GitHub Actions CI** that runs `cargo xtask ci`.
 
 [c197]: https://github.com/fraiseql/confiture/issues/197
-[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.11...HEAD
+[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.12...HEAD
+[1.0.0-beta.12]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.11...fraisier-v1.0.0-beta.12
 [1.0.0-beta.11]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.10...fraisier-v1.0.0-beta.11
 [1.0.0-beta.10]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.9...fraisier-v1.0.0-beta.10
 [1.0.0-beta.9]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.8...fraisier-v1.0.0-beta.9

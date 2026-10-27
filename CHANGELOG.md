@@ -72,6 +72,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on a difference. See `docs/stacks.md`. Part of
   [#85](https://github.com/fraiseql/fraisier-core/issues/85).
 
+- **`[migration] adapter = "none"`: a deployable that owns no database.** A
+  router or a static front end used to fill the migration axis with no-op
+  commands, and a no-op whose `current_revision` printed nothing turned every
+  failed deploy into `partial_rollback`, because migrate cannot undo an
+  "initial" migration. Declaring `none` tells the saga there is nothing to
+  compensate on that axis, so the deploy ends `rolled_back`. The adapter takes
+  no `database_url_env` and no `[migration.settings]`; either one is a
+  validation error.
+
 - **`deploy --dry-run --deep`: the deep classification is previewed only on
   request.** Under a fresh-dump restore rehearsal, a plain `--dry-run`
   classifies statically and says so; it never dumps the live database.

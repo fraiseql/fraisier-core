@@ -1984,6 +1984,22 @@ fn a_database_less_migration_axis_validates() {
     assert!(report.ok(), "got {:?}", report.issues);
 }
 
+/// The router example in `docs/stacks.md` is the shape operators copy for a
+/// stack's router member, so it must load and declare that it owns no database.
+#[test]
+fn the_documented_router_example_owns_no_database() {
+    let page = include_str!("../../../docs/stacks.md");
+    let after = page
+        .split_once("<!-- router-example -->\n```toml\n")
+        .expect("the marked example")
+        .1;
+    let example = after.split_once("```").expect("closing fence").0;
+    let config = DeployConfig::from_toml_str(example).expect("the example parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    let migration = config.migration.expect("[migration]");
+    assert_eq!(migration.adapter.as_deref(), Some("none"));
+}
+
 /// A database-less axis takes no DSN and no settings: either one means the
 /// config believes there is a database after all.
 #[test]

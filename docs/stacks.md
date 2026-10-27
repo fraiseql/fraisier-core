@@ -121,6 +121,10 @@ on the file's order. Each member deploys exactly as `fraisier deploy` would,
 with its own preflight, saga and rollback. `--app-version <member>=<version>`
 can repeat; `--dry-run` and `--skip-preflight` apply to every member.
 
+Every member's config is validated before anything is staged or deployed. One
+invalid member refuses the whole stack, naming the member and each error, and
+nothing deploys.
+
 The first member that fails stops the stack:
 
 - the failed member has rolled itself back;

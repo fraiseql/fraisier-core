@@ -261,6 +261,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`stack deploy` validates every member before deploying any.** A member's
+  config was validated only when its own deploy began, so an invalid third
+  member refused after the first two were already live. The stack is now
+  refused up front, naming each invalid member and its errors.
+
 - **A restore rehearsal that never ran the migrations no longer blames them.**
   Every rehearsal failure used to end in "The pending migrations did not apply
   cleanly on a fresh restore. Fix the migrations". That included a throwaway

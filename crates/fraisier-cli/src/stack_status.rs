@@ -238,7 +238,7 @@ pub(crate) async fn stack_status_with(
     sdl: &dyn SdlSource,
     env: &(dyn Fn(&str) -> Option<String> + Sync),
 ) -> Result<CommandOutput> {
-    let stack = match Stack::load(stack_path) {
+    let stack = match crate::stack::load(stack_path) {
         Ok(stack) => stack,
         Err(error) => {
             let message = error.to_string();
@@ -277,7 +277,7 @@ pub(crate) async fn stack_status_with(
 }
 
 /// The real probe: `fraisier health` per member, the state store, and the
-/// Phase 06 readiness probe.
+/// database readiness probe.
 pub(crate) struct LiveProbe {
     /// The state store directory every member shares.
     pub(crate) state_dir: PathBuf,

@@ -362,7 +362,7 @@ impl crate::stack_sdl::SdlSource for ServesNewSdl {
     }
 }
 
-/// D12: the stack's SDL check sits in the subgraph's own health step, so a
+/// The stack's SDL check sits in the subgraph's own health step, so a
 /// subgraph that is up but serves an SDL the router's candidate release does
 /// not hold rolls itself back through its saga, like any unhealthy release.
 #[tokio::test]

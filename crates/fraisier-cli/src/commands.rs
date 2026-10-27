@@ -83,8 +83,24 @@ fn redact_json(value: Value) -> Value {
 pub(crate) fn load(config_path: &Path) -> Result<DeployConfig> {
     let toml = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading config {}", config_path.display()))?;
-    DeployConfig::from_toml_str(&toml)
-        .with_context(|| format!("parsing config {}", config_path.display()))
+    let config = DeployConfig::from_toml_str(&toml)
+        .with_context(|| format!("parsing config {}", config_path.display()))?;
+    withhold_admin_env(&config);
+    Ok(config)
+}
+
+/// Keep `[database].admin_url_env` out of every child fraisier spawns: the
+/// superuser DSN is for fraisier's own restores, never for a migration tool, a
+/// hook or a notifier. The restore tools get it as `PG*` variables, set
+/// explicitly.
+pub(crate) fn withhold_admin_env(config: &DeployConfig) {
+    if let Some(name) = config
+        .database
+        .as_ref()
+        .and_then(|d| d.admin_url_env.as_deref())
+    {
+        fraisier_core::child_env::withhold(name);
+    }
 }
 
 fn render_issues(report: &ValidationReport) -> String {
@@ -1596,11 +1612,11 @@ fn render_multi_host_summary(
 /// Inspect the migration adapter for a `--dry-run`, degrading rather than
 /// aborting.
 ///
-/// Every way of failing to see the schema — the operator turned preflight off,
-/// the config did, the adapter cannot be built, the database is unreachable —
-/// yields a plan carrying an explicit unavailability instead of an error exit
-/// (rule 2, D8). The one thing it never does is produce a plan that reads as
-/// clean.
+/// Every way of failing to see the schema — the operator turned preflight off, the
+/// config did, the adapter cannot be built, the database is unreachable — yields a
+/// plan carrying an explicit unavailability instead of an error exit (a dry-run
+/// that cannot see still owes the operator the plan). The one thing it never does
+/// is produce a plan that reads as clean.
 ///
 /// `single_host` previews a restore-rehearsal config the way its single-host
 /// deploy classifies: against a fresh copy of the live database when it can
@@ -1628,8 +1644,8 @@ async fn preview_schema(
     let target = match factory::build_preview(config, host, app_version) {
         Ok(target) => target,
         // An unset DSN env var is the common one. Today's dry-run never resolves
-        // secrets, so this is a failure mode the plan did not have before D8 —
-        // and it must not turn a plan into an error exit.
+        // secrets, so this is a failure mode the plan did not have before it
+        // inspected the schema — and it must not turn a plan into an error exit.
         Err(error) => {
             return uninspected(Unavailable::new(
                 Unavailable::ADAPTER_UNAVAILABLE,
@@ -1872,7 +1888,8 @@ async fn run_single_host(
     let started = std::time::Instant::now();
     let run = plan.run_reporting(store).await?;
     let outcome = run.outcome;
-    notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
+    let notify_warning =
+        notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
     let metrics_warning = record_metrics(
         config,
         &resolved.fraise,
@@ -1893,13 +1910,16 @@ async fn run_single_host(
     if !run.warnings.is_empty() {
         json["warnings"] = json!(run.warnings);
     }
-    Ok(with_metrics_warning(
-        CommandOutput {
-            exit_code,
-            pretty,
-            json,
-        },
-        metrics_warning,
+    Ok(with_notify_warning(
+        with_metrics_warning(
+            CommandOutput {
+                exit_code,
+                pretty,
+                json,
+            },
+            metrics_warning,
+        ),
+        notify_warning,
     ))
 }
 
@@ -1934,7 +1954,8 @@ async fn run_multi_host(
 
     let started = std::time::Instant::now();
     let outcome = deploy.run(store).await?;
-    notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
+    let notify_warning =
+        notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
     let metrics_warning = record_metrics(
         config,
         &resolved.fraise,
@@ -1948,13 +1969,16 @@ async fn run_multi_host(
         "multi-host deploy of {}/{} {label}{detail}",
         resolved.fraise, resolved.environment
     );
-    Ok(with_metrics_warning(
-        CommandOutput {
-            exit_code,
-            pretty,
-            json: json!({ "outcome": label, "detail": detail.trim(), "multi_host": true }),
-        },
-        metrics_warning,
+    Ok(with_notify_warning(
+        with_metrics_warning(
+            CommandOutput {
+                exit_code,
+                pretty,
+                json: json!({ "outcome": label, "detail": detail.trim(), "multi_host": true }),
+            },
+            metrics_warning,
+        ),
+        notify_warning,
     ))
 }
 
@@ -2008,7 +2032,8 @@ async fn run_blue_green(
         .with_context(|| format!("opening state store at {}", state_dir.display()))?;
     let started = std::time::Instant::now();
     let outcome = resolved.deploy.run(store).await?;
-    notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
+    let notify_warning =
+        notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
     let metrics_warning = record_metrics(
         config,
         &resolved.fraise,
@@ -2016,16 +2041,19 @@ async fn run_blue_green(
         &deploy_metrics(&outcome, started.elapsed()),
     );
     let (exit_code, label, detail) = outcome_result(&outcome);
-    Ok(with_metrics_warning(
-        CommandOutput {
-            exit_code,
-            pretty: format!(
-                "blue-green deploy of {}/{} {label}{detail}\n",
-                resolved.fraise, resolved.environment
-            ),
-            json: json!({ "strategy": "blue-green", "outcome": label, "detail": detail.trim() }),
-        },
-        metrics_warning,
+    Ok(with_notify_warning(
+        with_metrics_warning(
+            CommandOutput {
+                exit_code,
+                pretty: format!(
+                    "blue-green deploy of {}/{} {label}{detail}\n",
+                    resolved.fraise, resolved.environment
+                ),
+                json: json!({ "strategy": "blue-green", "outcome": label, "detail": detail.trim() }),
+            },
+            metrics_warning,
+        ),
+        notify_warning,
     ))
 }
 
@@ -3365,7 +3393,8 @@ impl fraisier_webhook::WebhookHandler for DeployHandler {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         });
-        // A webhook deploy never resolves the admin identity (D14).
+        // A webhook deploy never resolves the admin identity: it answers the
+        // network, so nothing it starts may reach a database superuser.
         let out = run_deploy(
             &self.config,
             &self.state_dir,
@@ -3652,6 +3681,7 @@ async fn sync_reclaim(store: &FilesystemStateStore, remote: &str) -> Result<Comm
 /// construction is unit-testable without a systemd manager present).
 fn systemctl_restart_command(unit: &str, user: bool) -> std::process::Command {
     let mut command = std::process::Command::new("systemctl");
+    fraisier_core::child_env::scrub(&mut command);
     if user {
         command.arg("--user");
     }
@@ -3867,11 +3897,23 @@ fn with_metrics_warning(mut out: CommandOutput, warning: Option<String>) -> Comm
     out
 }
 
+/// `out` with a notify hook that did not deliver named in it, so a failure
+/// whose alert never left the host does not read as alerted.
+fn with_notify_warning(mut out: CommandOutput, warning: Option<String>) -> CommandOutput {
+    if let Some(warning) = warning {
+        let _ = writeln!(out.pretty, "warning: {warning}");
+        if let Some(json) = out.json.as_object_mut() {
+            json.insert("notify_warning".to_owned(), json!(warning));
+        }
+    }
+    out
+}
+
 /// Fire the configured `[notify].command` failure sink when a deploy did not
 /// commit. This is the unattended-failure path: a scheduled (operator-unwatched)
 /// deploy of a sick build rolls back **and** emits a notification, reusing the
 /// self-upgrade notify primitive. A committed deploy, or a config with no notify
-/// sink, fires nothing.
+/// sink, fires nothing. A hook that did not deliver comes back as a warning.
 ///
 /// A deploy the **schema policy** blocked is reported as its own event: it is
 /// not "the deploy broke", it is "a pending migration needs a human", and an
@@ -3882,14 +3924,11 @@ async fn notify_deploy_failure(
     fraise: &str,
     environment: &str,
     outcome: &SagaOutcome,
-) {
-    use fraisier_self_upgrade::Notifier as _;
+) -> Option<String> {
     if matches!(outcome, SagaOutcome::Committed) {
-        return;
+        return None;
     }
-    let Some(command) = config.notify.as_ref().and_then(|n| n.command.as_deref()) else {
-        return;
-    };
+    let command = config.notify.as_ref().and_then(|n| n.command.as_deref())?;
     let (_, label, detail) = outcome_result(outcome);
     let payload = fraisier_self_upgrade::FailurePayload {
         event: if detail.contains(fraisier_core::policy::REFUSED) {
@@ -3910,8 +3949,9 @@ async fn notify_deploy_failure(
     fraisier_self_upgrade::ExecHookNotifier::new(command)
         .with_context("FRAISIER_NOTIFY_FRAISE", fraise)
         .with_context("FRAISIER_NOTIFY_ENVIRONMENT", environment)
-        .notify(&payload)
-        .await;
+        .deliver(&payload)
+        .await
+        .err()
 }
 
 #[cfg(test)]
@@ -4651,7 +4691,7 @@ url = "http://127.0.0.1:8080/health"
         assert_eq!(out.json["host"], serde_json::json!("127.0.0.1"));
     }
 
-    /// Today's dry-run plan, byte for byte. Rule 1: `--skip-preflight` is the
+    /// Today's dry-run plan, byte for byte. `--skip-preflight` is the
     /// documented way back to the pure offline check, so a CI job that used
     /// `--dry-run` as a cheap config gate keeps its exact output.
     const OFFLINE_PLAN: &str = "deploy plan for checkout/staging → host 127.0.0.1\n  \
@@ -4746,8 +4786,8 @@ url = "http://127.0.0.1:8080/health"
 
     #[tokio::test]
     async fn no_policy_section_renders_no_policy_line() {
-        // D6 again, at the CLI: an operator who has not opted in sees the
-        // change-set (or why there is none) and nothing else.
+        // The opt-in policy again, at the CLI: an operator who has not opted in
+        // sees the change-set (or why there is none) and nothing else.
         let dir = tempfile::tempdir().expect("tempdir");
         let config = write(dir.path(), "fraisier.toml", VALID);
         let out = deploy(
@@ -4769,10 +4809,10 @@ url = "http://127.0.0.1:8080/health"
 
     #[tokio::test]
     async fn a_missing_dsn_degrades_rather_than_aborting() {
-        // The IPC path resolves the DSN env var when it builds the adapter, so
-        // an unset one fails the build. Today's dry-run never resolved secrets;
-        // under D8 it does, and that new failure mode must not turn a plan into
-        // an error exit.
+        // The IPC path resolves the DSN env var when it builds the adapter, so an
+        // unset one fails the build. Today's dry-run never resolved secrets; now
+        // that it inspects the schema it does, and that new failure mode must not
+        // turn a plan into an error exit.
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = VALID.replace(
             "adapter = \"confiture\"\ndatabase_url_env = \"CHECKOUT_DATABASE_URL\"",
@@ -4898,7 +4938,7 @@ url = "http://127.0.0.1:8080/health"
 
     #[tokio::test]
     async fn blue_green_dry_run_shows_the_window_safety_verdict() {
-        // The baseline is not opt-in (the D3 carve-out), so blue-green always
+        // The window-safety baseline is not opt-in, so blue-green always
         // has a verdict to report — with no `[policy]` section anywhere.
         let dir = tempfile::tempdir().expect("tempdir");
         let config = blue_green_config(dir.path(), VALID);
@@ -5580,11 +5620,13 @@ current_revision = "true"
         std::time::UNIX_EPOCH + std::time::Duration::from_mins(29_883_075)
     }
 
-    /// A config with one `[[backup.retain]]` entry per `(name, dir, extra)`.
+    /// A config with one `[[backup.retain]]` entry per `(name, dir, extra)`, and
+    /// `dir` as `[backup].dir`: every corpus must sit within it.
     fn prune_config(dir: &Path, entries: &[(&str, &Path, &str)]) -> std::path::PathBuf {
         use std::fmt::Write as _;
 
         let mut body = db_ops_config("FRAISIER_PRUNE_UNUSED_DSN");
+        let _ = write!(body, "\n[backup]\ndir = \"{}\"\n", dir.display());
         for (name, corpus, extra) in entries {
             let _ = write!(
                 body,
@@ -5892,10 +5934,11 @@ current_revision = "true"
                 .throwaway
                 .clone()
                 .unwrap_or_else(|| "shop_fraisier_rh_1_a".to_owned());
-            Ok(fraisier_core::restore_rehearsal::ThrowawayDb {
-                dsn: format!("postgres://app@127.0.0.1/{name}"),
+            Ok(fraisier_core::restore_rehearsal::ThrowawayDb::new(
+                format!("postgres://app@127.0.0.1/{name}"),
                 name,
-            })
+                "shop",
+            ))
         }
 
         async fn teardown(
@@ -6743,7 +6786,8 @@ current_revision = "true"
         // No [schedule]: the retain units and their alert still install.
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = format!(
-            "{VALID}\n[[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"nightly\"\n\
+            "{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n\
+             [[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"nightly\"\n\
              schedule = \"daily 05:30\"\nretention_days = 14\n"
         );
         let config = write(dir.path(), "fraisier.toml", &cfg);
@@ -6786,7 +6830,8 @@ current_revision = "true"
     fn scheduled_install_refuses_an_invalid_retain_entry() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = format!(
-            "{VALID}\n[[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"night ly\"\n\
+            "{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n\
+             [[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"night ly\"\n\
              schedule = \"daily 05:30\"\nretention_days = 14\n"
         );
         let config = write(dir.path(), "fraisier.toml", &cfg);
@@ -6957,6 +7002,23 @@ current_revision = "true"
     }
 
     #[tokio::test]
+    async fn a_failing_notify_hook_comes_back_as_a_warning() {
+        let config = DeployConfig::from_toml_str("[notify]\ncommand = 'exit 3'\n").expect("parses");
+        let warning = notify_deploy_failure(
+            &config,
+            "checkout",
+            "production",
+            &SagaOutcome::RolledBack {
+                failed_step: "health".to_owned(),
+                reason: "500".to_owned(),
+            },
+        )
+        .await
+        .expect("the failed hook is reported");
+        assert!(warning.contains("exit status: 3"), "{warning}");
+    }
+
+    #[tokio::test]
     async fn a_policy_block_exits_nonzero_and_names_the_cause() {
         // End-to-end through the real wiring: config → factory → builder → saga
         // → exit code. The `command` migration adapter advertises only the
@@ -7121,6 +7183,88 @@ current_revision = "true"
         assert!(identity.uses_admin());
         // The admin restores into the app's database, not its own.
         assert_eq!(identity.restorer("shop").database(), "shop");
+    }
+
+    #[test]
+    fn a_loaded_admin_identity_never_reaches_a_child_process() {
+        // The admin DSN is for fraisier's own restores. A migration tool, a hook
+        // or a notifier is someone else's code: none of them may inherit it.
+        use fraisier_core::adapter_axes::MigrationAdapter as _;
+        use fraisier_core::policy::ApprovalHook as _;
+        use fraisier_self_upgrade::Notifier as _;
+
+        const ADMIN: &str = "FRAISIER_TEST_CHILD_ADMIN_URL";
+        let _env = crate::test_env::env_guard();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("fraisier.toml");
+        std::fs::write(
+            &config,
+            format!("[deploy]\nname = \"a\"\nenvironment = \"b\"\n\n[database]\nadmin_url_env = \"{ADMIN}\"\n"),
+        )
+        .expect("writes");
+        std::env::set_var(ADMIN, "postgres://postgres:secret@127.0.0.1/postgres");
+        super::load(&config).expect("loads");
+
+        let seen = |child: &str| dir.path().join(child);
+        let dump = |child: &str| format!("env > {}", seen(child).display());
+        let confiture = dir.path().join("confiture");
+        std::fs::write(
+            &confiture,
+            format!(
+                "#!/bin/sh\n{}\necho 'confiture version 1.36.0'\n",
+                dump("confiture")
+            ),
+        )
+        .expect("writes");
+        std::fs::set_permissions(
+            &confiture,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("chmod");
+
+        crate::test_env::block_on(async {
+            let _ = crate::approval::ExecApproval::new(
+                format!("{}; exit 1", dump("approval")),
+                std::time::Duration::from_secs(30),
+            )
+            .request(&fraisier_core::policy::ApprovalRequest::new(
+                "a",
+                "b",
+                Vec::new(),
+            ))
+            .await;
+            fraisier_self_upgrade::ExecHookNotifier::new(dump("notify"))
+                .notify(&fraisier_self_upgrade::FailurePayload {
+                    event: "deploy-failed".to_owned(),
+                    failed: None,
+                    restored: None,
+                    reason: "test".to_owned(),
+                })
+                .await;
+            let _ = fraisier_adapter_support::run_command(
+                "sh".as_ref(),
+                &["-c".into(), dump("command").into()],
+                &[],
+                None,
+                "command",
+                "test",
+            )
+            .await;
+            let _ = fraisier_adapter_confiture::ConfitureMigration::with_program(&confiture)
+                .describe()
+                .await;
+        });
+        std::env::remove_var(ADMIN);
+
+        for child in ["approval", "notify", "command", "confiture"] {
+            let env = std::fs::read_to_string(seen(child))
+                .unwrap_or_else(|error| panic!("the {child} child did not run: {error}"));
+            assert!(
+                !env.lines()
+                    .any(|line| line.starts_with(&format!("{ADMIN}="))),
+                "the {child} child inherited {ADMIN}"
+            );
+        }
     }
 
     #[test]

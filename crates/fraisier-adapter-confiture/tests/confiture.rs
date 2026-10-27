@@ -1179,9 +1179,9 @@ const SCOPE_PENDING: &str = include_str!("fixtures/scope/pending-1.35.0.json");
 #[cfg(unix)]
 const SCOPE_CAPTURED_FROM: &str = "1.35.0";
 
-/// The scenario D13 (i) names: one applied, `irreversible` migration and one
-/// pending, `additive` one, under the default policy. The deploy applies only
-/// the additive one, so it is admitted.
+/// The scenario that motivates judging only pending migrations: one applied,
+/// `irreversible` migration and one pending, `additive` one, under the default
+/// policy. The deploy applies only the additive one, so it is admitted.
 ///
 /// Judging every migration instead would refuse every deploy after the first
 /// destructive one, for a change that has already happened.

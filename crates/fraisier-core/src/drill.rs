@@ -264,10 +264,11 @@ mod tests {
                     "pg_restore: bad archive".to_owned(),
                 ));
             }
-            Ok(ThrowawayDb {
-                dsn: format!("postgres://u:pw@db.internal/{}", self.name()),
-                name: self.name(),
-            })
+            Ok(ThrowawayDb::new(
+                format!("postgres://u:pw@db.internal/{}", self.name()),
+                self.name(),
+                "app",
+            ))
         }
 
         async fn teardown(&self, db: &ThrowawayDb) -> Result<(), String> {

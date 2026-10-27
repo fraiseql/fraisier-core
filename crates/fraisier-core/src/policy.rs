@@ -634,8 +634,8 @@ fn baseline_verdict(
 ///
 /// `baseline` selects the always-on rule for the deploy strategy and is applied
 /// **first**, with or without a `[policy]` section. `policy` is `None` when no
-/// section is configured, which leaves the tier gate switched off entirely (D6:
-/// configuring the section is the opt-in). `capabilities` is what the adapter
+/// section is configured, which leaves the tier gate switched off entirely
+/// (configuring the section is the opt-in). `capabilities` is what the adapter
 /// advertises; `report` is the preflight result, `None` when preflight did not
 /// run.
 ///
@@ -680,7 +680,7 @@ pub fn evaluate(
             reasons: Vec::new(),
         };
     }
-    // No `[policy]` section ⇒ no tier gate at all (D6). This is the switch that
+    // No `[policy]` section ⇒ no tier gate at all. This is the switch that
     // keeps every existing deploy behaving exactly as it does today.
     let Some(policy) = policy else {
         return PolicyDecision::Allow { changes: 0 };
@@ -810,8 +810,7 @@ pub const REFUSED: &str = "policy refused:";
 ///
 /// The default gate — no policy, no hook — is not an inert one: it still applies
 /// the [`Baseline`] its strategy passes, which is what keeps blue-green's
-/// window-safety rule on for the deploys that never configure `[policy]` (D6's
-/// carve-out).
+/// window-safety rule on for the deploys that never configure `[policy]`.
 #[derive(Clone, Default)]
 pub struct PolicyGate {
     policy: Option<Policy>,
@@ -1144,7 +1143,7 @@ mod tests {
 
     #[test]
     fn without_a_policy_section_the_tier_gate_does_not_run() {
-        // D6: configuring `[policy]` is the opt-in. With no section, an adapter
+        // Configuring `[policy]` is the opt-in. With no section, an adapter
         // that classifies nothing is exactly as deployable as it is today.
         assert_eq!(
             tier_gate(None, NO_TIERS, Some(&unclassified_report())),

@@ -16,7 +16,7 @@ only by capturing again and saying so here.
 
 ## Provenance
 
-Captured 2026-10-26, for "judge only pending migrations" (D13 (i)).
+Captured 2026-10-26, for "judge only pending migrations".
 
 | | |
 |---|---|

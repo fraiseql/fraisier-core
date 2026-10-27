@@ -80,16 +80,16 @@ impl RehearsalDb for PgRehearsalDb {
             .fill(live_dsn, seed, false)
             .await
             .map_err(RehearsalError::Provision)?;
-        Ok(ThrowawayDb {
-            dsn: copy.app.dsn(),
-            name: copy.name,
-        })
+        let live = self
+            .live_database(live_dsn)
+            .map_err(RehearsalError::Provision)?;
+        Ok(ThrowawayDb::new(copy.app.dsn(), copy.name, live))
     }
 
     async fn teardown(&self, db: &ThrowawayDb) -> Result<(), String> {
         let throwaway = PgConn::parse(&db.dsn).map_err(|e| e.to_string())?;
         let identity = self.identity(throwaway)?;
-        restore::drop_throwaway(&Postgres, &identity, &db.name, None).await
+        restore::drop_throwaway(&Postgres, &identity, &db.name, &db.live).await
     }
 }
 
@@ -109,11 +109,9 @@ pub(crate) async fn scalar(conn: &PgConn, sql: &str) -> Result<String, String> {
 impl DrillDb for PgRehearsalDb {
     async fn restore_copy(&self, live_dsn: &str, archive: &Path) -> Result<RestoredCopy, String> {
         let copy = self.fill(live_dsn, Seed::Archive(archive), true).await?;
+        let live = self.live_database(live_dsn)?;
         Ok(RestoredCopy {
-            db: ThrowawayDb {
-                dsn: copy.app.dsn(),
-                name: copy.name,
-            },
+            db: ThrowawayDb::new(copy.app.dsn(), copy.name, live),
             tviews_rebuilt: copy.tviews.map(|rebuild| {
                 rebuild
                     .rebuilt
@@ -191,13 +189,30 @@ mod tests {
     async fn teardown_refuses_a_name_without_the_throwaway_marker() {
         // No server is reachable here: refusing must not need one.
         let refused = NO_ADMIN
-            .teardown(&ThrowawayDb {
-                dsn: "postgres://app:pw@127.0.0.1:1/shop".to_owned(),
-                name: "shop".to_owned(),
-            })
+            .teardown(&ThrowawayDb::new(
+                "postgres://app:pw@127.0.0.1:1/shop",
+                "shop",
+                "shop",
+            ))
             .await
             .expect_err("an unmarked name is never dropped");
         assert!(refused.contains("_fraisier_rh_"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn teardown_refuses_the_live_database_even_with_the_marker() {
+        // No server is reachable here: refusing must not need one, so a drop
+        // that is attempted fails differently.
+        let name = "shop_fraisier_rh_1_a";
+        let refused = NO_ADMIN
+            .teardown(&ThrowawayDb::new(
+                format!("postgres://app:pw@127.0.0.1:1/{name}"),
+                name,
+                name,
+            ))
+            .await
+            .expect_err("the live database is never dropped");
+        assert!(refused.contains("it is the live database"), "{refused}");
     }
 
     /// End-to-end exercise of the real `pg_dump → CREATE DATABASE → pg_restore →
@@ -206,7 +221,7 @@ mod tests {
     /// and run with `cargo test -- --ignored`. (The migration-rehearsal logic over
     /// this lifecycle — including the Python-0.34 backup-behind-tracking scenario —
     /// is unit-tested in `fraisier_core::restore_rehearsal`; the full confiture
-    /// chain runs on the fixture host per the finalize-phase validation checklist.)
+    /// chain runs on the fixture host.)
     #[tokio::test]
     #[ignore = "requires a real Postgres reachable via FRAISIER_REHEARSAL_TEST_DSN"]
     async fn provisions_and_tears_down_a_throwaway_from_a_fresh_dump() {

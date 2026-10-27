@@ -58,7 +58,10 @@ struct Check {
 fn load(config_path: &Path) -> Result<DeployConfig, String> {
     let toml =
         std::fs::read_to_string(config_path).map_err(|error| format!("cannot read: {error}"))?;
-    DeployConfig::from_toml_str(&toml).map_err(|error| format!("parse error: {error}"))
+    let config =
+        DeployConfig::from_toml_str(&toml).map_err(|error| format!("parse error: {error}"))?;
+    crate::commands::withhold_admin_env(&config);
+    Ok(config)
 }
 
 /// Whether the env var named by `source` is set and non-empty in this process.
@@ -228,7 +231,9 @@ fn check_confiture(config: &DeployConfig) -> Check {
     }
     let program =
         std::env::var("FRAISIER_CONFITURE_BIN").unwrap_or_else(|_| "confiture".to_owned());
-    match Command::new(&program).arg("--version").output() {
+    let mut command = Command::new(&program);
+    fraisier_core::child_env::scrub(&mut command);
+    match command.arg("--version").output() {
         Ok(output) if output.status.success() => {
             let text = String::from_utf8_lossy(&output.stdout);
             match parse_version(&text) {

@@ -77,10 +77,11 @@ pub struct PlanSummary {
 
 /// Resolve the `[policy]` section into the gate a deploy runs at preflight.
 ///
-/// An absent section is the D6 opt-out and yields the default gate: no tier
-/// policy at all, and whatever always-on baseline the strategy itself applies.
-/// An `approval_command` becomes the one [`ApprovalHook`] implementation; without
-/// one, anything the policy sends for sign-off is refused rather than passed.
+/// An absent section is the opt-out (the policy is opt-in) and yields the default
+/// gate: no tier policy at all, and whatever always-on baseline the strategy itself
+/// applies. An `approval_command` becomes the one [`ApprovalHook`] implementation;
+/// without one, anything the policy sends for sign-off is refused rather than
+/// passed.
 fn build_policy_gate(config: &DeployConfig) -> PolicyGate {
     let Some(section) = config.policy.as_ref() else {
         return PolicyGate::default();
@@ -249,6 +250,17 @@ fn add_token_provider_secrets(config: &DeployConfig, env_secrets: &mut BTreeMap<
         }
         Some(TokenProvider::Exec(_)) | None => {}
     }
+}
+
+/// Whether the live forward-compat lint runs, by `[migration].preflight_mode`
+/// (or the legacy `forward_compatible_lint` it replaces). A path with no
+/// restore rehearsal, multi-host or migration-only, lints live under
+/// `restore_rehearsal`.
+fn live_lint(config: &DeployConfig) -> bool {
+    config
+        .migration
+        .as_ref()
+        .is_none_or(|m| m.effective_preflight_mode() != PreflightMode::Off)
 }
 
 /// Resolve the preflight knobs from `[migration]`: the live forward-compat lint
@@ -679,11 +691,7 @@ pub fn build_multi_host(
     let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
     add_token_provider_secrets(config, &mut env_secrets);
 
-    let forward_compatible_lint = config
-        .migration
-        .as_ref()
-        .and_then(|m| m.forward_compatible_lint)
-        .unwrap_or(true);
+    let forward_compatible_lint = live_lint(config);
 
     // The host is set per-host by the multi-host composition; leave it None here.
     let mut ctx = AdapterCtx::new(fraise.clone(), environment.clone());
@@ -1103,11 +1111,7 @@ pub fn build_migration_only(config: &DeployConfig) -> Result<ResolvedMigration> 
     let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
     add_token_provider_secrets(config, &mut env_secrets);
 
-    let forward_compatible_lint = config
-        .migration
-        .as_ref()
-        .and_then(|m| m.forward_compatible_lint)
-        .unwrap_or(true);
+    let forward_compatible_lint = live_lint(config);
 
     let mut ctx = AdapterCtx::new(fraise.clone(), environment.clone());
     ctx.workdir = PathBuf::from(".");
@@ -1184,7 +1188,7 @@ fn build_migration(
 }
 
 // ---------------------------------------------------------------------------
-// Blue-green (phase-07) wiring
+// Blue-green wiring
 // ---------------------------------------------------------------------------
 
 use std::time::Duration;
@@ -1240,6 +1244,7 @@ impl AdapterFleet {
 
     async fn stop_unit(&self, unit: &str) -> Result<(), String> {
         let mut command = tokio::process::Command::new("systemctl");
+        fraisier_core::child_env::scrub(command.as_std_mut());
         if self.user {
             command.arg("--user");
         }
@@ -1472,8 +1477,8 @@ pub fn build_blue_green(
 #[cfg(test)]
 mod tests {
     use super::{
-        build, build_for, build_health, build_health_probe, build_multi_host, build_policy_gate,
-        summarize, summarize_multi_host,
+        build, build_for, build_health, build_health_probe, build_migration_only, build_multi_host,
+        build_policy_gate, summarize, summarize_multi_host,
     };
     use fraisier_config::DeployConfig;
     use fraisier_core::adapter_axes::RiskTier;
@@ -1482,7 +1487,7 @@ mod tests {
 
     #[test]
     fn an_absent_policy_section_builds_no_gate() {
-        // The D6 opt-out, at the wiring layer: nothing to configure means
+        // The policy opt-out, at the wiring layer: nothing to configure means
         // nothing to decide, and no approval hook to spawn.
         let config = DeployConfig::from_toml_str(&single_host_with_migration("")).expect("parses");
         let gate = build_policy_gate(&config);
@@ -1588,8 +1593,8 @@ mod tests {
     async fn rehearsal_error(trigger: fraisier_db::restore::Trigger) -> String {
         let toml = single_host_with_migration(
             "preflight_mode = \"restore_rehearsal\"\n\
-             preflight_backup_path = \"/nonexistent/fraisier-d14.dump\"\n",
-        ) + "\n[database]\nadmin_url_env = \"FRAISIER_D14_ADMIN_NEVER_SET\"\n";
+             preflight_backup_path = \"/nonexistent/fraisier-rehearsal.dump\"\n",
+        ) + "\n[database]\nadmin_url_env = \"FRAISIER_ADMIN_NEVER_SET\"\n";
         let config = DeployConfig::from_toml_str(&toml).expect("parses");
         let resolved = build_for(&config, None, None, trigger).expect("builds");
         let (db, backup) = resolved.restore_rehearsal.expect("a rehearsal");
@@ -1602,13 +1607,13 @@ mod tests {
     #[tokio::test]
     async fn a_webhook_deploys_rehearsal_never_resolves_the_admin_identity() {
         let error = rehearsal_error(fraisier_db::restore::Trigger::Webhook).await;
-        assert!(!error.contains("FRAISIER_D14_ADMIN_NEVER_SET"), "{error}");
+        assert!(!error.contains("FRAISIER_ADMIN_NEVER_SET"), "{error}");
     }
 
     #[tokio::test]
     async fn an_operator_deploys_rehearsal_resolves_the_admin_identity() {
         let error = rehearsal_error(fraisier_db::restore::Trigger::Operator).await;
-        assert!(error.contains("FRAISIER_D14_ADMIN_NEVER_SET"), "{error}");
+        assert!(error.contains("FRAISIER_ADMIN_NEVER_SET"), "{error}");
     }
 
     #[test]
@@ -1619,6 +1624,26 @@ mod tests {
         let resolved = build(&config, None, None).expect("builds");
         assert!(!resolved.forward_compatible_lint);
         assert!(resolved.restore_rehearsal.is_none());
+    }
+
+    #[test]
+    fn preflight_mode_off_disables_the_multi_host_lint() {
+        let toml = MULTI_HOST_IPC.replace(
+            "[migration]\nadapter = \"command\"\n",
+            "[migration]\nadapter = \"command\"\npreflight_mode = \"off\"\n",
+        );
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+        let resolved = build_multi_host(&config, Some("1.2.3")).expect("builds multi-host");
+        assert!(!resolved.forward_compatible_lint);
+    }
+
+    #[test]
+    fn preflight_mode_off_disables_the_migration_only_lint() {
+        let config =
+            DeployConfig::from_toml_str(&single_host_with_migration("preflight_mode = \"off\"\n"))
+                .expect("parses");
+        let resolved = build_migration_only(&config).expect("builds");
+        assert!(!resolved.forward_compatible_lint);
     }
 
     /// A single-host config whose `[health]` block is command-driven, with the

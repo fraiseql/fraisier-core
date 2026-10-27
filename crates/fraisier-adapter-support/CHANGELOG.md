@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.12](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-support-v1.0.0-beta.11...fraisier-adapter-support-v1.0.0-beta.12) - 2026-10-27
+
+### Fixed
+
+- *(secrets)* keep the admin DSN out of the app and of every child process
+
+### Other
+
+- *(ci)* gate rustdoc, and fix the nine errors that had accumulated
+
 ## [1.0.0-beta.11](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-support-v1.0.0-beta.10...fraisier-adapter-support-v1.0.0-beta.11) - 2026-09-26
 
 ### Other

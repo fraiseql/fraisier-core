@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.12](https://github.com/fraiseql/fraisier-core/compare/fraisier-scaffold-v1.0.0-beta.11...fraisier-scaffold-v1.0.0-beta.12) - 2026-10-27
+
+### Added
+
+- *(scheduled)* prune and drill timers, and the OnFailure= alert unit every one of them names
+
+### Fixed
+
+- *(secrets)* keep the admin DSN out of the app and of every child process
+- *(backup)* timestamped, atomic archives in [backup].dir, so a scheduled backup works on every run
+- *(lint)* pass clippy on Rust 1.99 (unblocks #65/#76 for #63)
+
 ## [1.0.0-beta.11](https://github.com/fraiseql/fraisier-core/compare/fraisier-scaffold-v1.0.0-beta.10...fraisier-scaffold-v1.0.0-beta.11) - 2026-09-26
 
 ### Other

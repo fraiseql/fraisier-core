@@ -315,12 +315,19 @@ impl MemberDeployer for Deployer {
         gate: Option<&SdlGate>,
     ) -> Result<CommandOutput> {
         let guard = gate.map(|gate| move |health| gate.guard(health));
-        crate::commands::deploy_guarded(
+        crate::commands::run_deploy(
             &member.config_path,
             &self.state_dir,
-            None,
-            app_version,
-            (self.dry_run, self.skip_preflight, false),
+            crate::commands::DeployRequest {
+                host: None,
+                app_version,
+                // A stack's dry run previews each member statically: it dumps no
+                // live database.
+                dry_run: self.dry_run.then_some(crate::preview::Depth::Static),
+                skip_preflight: self.skip_preflight,
+                fail_on_block: false,
+                trigger: fraisier_db::restore::Trigger::Operator,
+            },
             guard
                 .as_ref()
                 .map(|g| g as crate::commands::HealthGuard<'_>),

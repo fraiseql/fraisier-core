@@ -8,6 +8,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`backup drill` restores a pg_tviews archive.** It now restores as
+  `[database].admin_url_env` when that is set, then rebuilds the TVIEWs the
+  restore left empty. The receipt records the rebuild under `tviews_rebuilt`.
+  Without the admin identity, the drill refuses such an archive before it
+  creates anything, and the refusal names the setting. A TVIEW that is still
+  empty over a populated view after the rebuild fails the drill.
+- **A deploy started by the webhook never uses `[database].admin_url_env`.**
+  The webhook answers the network, so nothing it starts may reach a database
+  superuser; its deploys do not even read the variable. Their restore rehearsal
+  runs as the app role. On a pg_tviews database, the rehearsal refuses before it
+  creates anything, and says to run the deploy from the CLI or its timer. CLI
+  and timer deploys are unchanged.
+- **Every restore goes through one primitive in `fraisier-db`.** `db restore`,
+  the restore rehearsal and the drill share one identity choice, archive
+  listing, pg_tviews precheck, rebuild and teardown guard.
+  - **The rehearsal** now refuses a pg_tviews archive it cannot restore before
+    it creates the throwaway. Before, `pg_restore` failed halfway. It still does
+    not rebuild TVIEWs: it proves the migrations, not the TVIEW contents.
+  - **`db restore`** now reports any TVIEW still empty over a populated view
+    after its rebuild, and points at `fraisier db tviews rebuild --all`.
+
 - **Breaking: the failure sink moved from `[schedule].notify` to
   `[notify].command`.** A host that only prunes has no `[schedule]`, yet its
   failures need somewhere to go, so the sink now belongs to the deployable. The
@@ -28,6 +49,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `{ _service { sdl } }` against the SDL file in the router's release and fail
   on a difference. See `docs/stacks.md`. Part of
   [#85](https://github.com/fraiseql/fraisier-core/issues/85).
+
+- **`deploy --dry-run --deep`: the deep classification is previewed only on
+  request.** Under a fresh-dump restore rehearsal, a plain `--dry-run`
+  classifies statically and says so; it never dumps the live database.
+  `--deep` previews the classification the deploy will make, against a
+  throwaway restored from a fresh dump. See
+  [docs/schema-risk-policy.md](docs/schema-risk-policy.md#deep-classification-under-restore-rehearsal).
 
 - **A failed scheduled backup, prune or drill notifies exactly once.**
   - **The units.** `fraisier scheduled install` now also writes a prune timer per
@@ -213,6 +241,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A restore rehearsal that never ran the migrations no longer blames them.**
+  Every rehearsal failure used to end in "The pending migrations did not apply
+  cleanly on a fresh restore. Fix the migrations". That included a throwaway
+  copy that could not be created, such as an app role without `CREATEDB`, and a
+  `DATABASE_URL` that did not resolve. Neither applies a single migration.
+  `RehearsalError::remedy` now gives each failure its own advice. A provisioning
+  failure names `CREATEDB` and `[database].admin_url_env`. Only a failed
+  rehearsed `migrate up` points at the migrations. The `--skip-preflight` escape
+  is unchanged.
+
 - **The vendored confiture exit-code contract is confiture's again, and a test keeps
   it so.** `crates/fraisier-adapter-confiture/src/exit_codes.vendored.json` is meant
   to be `confiture --exit-codes-json` captured verbatim. Measured against confiture
@@ -289,6 +327,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a feature-gated path cannot be a working intra-doc link there.
 
 ### Fixed
+
+- **The policy gate judges only the migrations a deploy will apply.** The
+  confiture adapter passed no `--scope`, so confiture judged every migration
+  file, applied ones included: one approved and applied `DROP COLUMN` refused
+  every later deploy. With **confiture ≥ 1.35.0** the adapter now passes
+  `--scope pending` and advertises `pending_scope`. Older releases reject the
+  flag, so they keep judging every migration; `deploy --dry-run` then says so
+  (`scope = "all"` in the JSON), and `fraisier doctor` now warns below 1.35.0.
 
 - **A scheduled backup no longer fails from its second run on.** The generated
   unit runs `fraisier backup --config …` from `/`, which wrote

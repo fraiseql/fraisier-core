@@ -86,11 +86,19 @@ these:
 admin_url_env = "CHECKOUT_DATABASE_ADMIN_URL"
 ```
 
-It is used by `fraisier db restore`, `fraisier db tviews rebuild`, and a
-`restore_rehearsal` preflight, which creates its throwaway database through it
-(owned by the app role) and restores into it as the admin. Migrations, health
-checks and everything else keep running as the app role. The admin DSN reaches
-`psql` and `pg_restore` through `PG*` variables, never argv, and is never printed.
+It is used by `fraisier db restore`, `fraisier db tviews rebuild`,
+`fraisier backup drill`, and a `restore_rehearsal` preflight. The drill and the
+rehearsal create their throwaway database through it (owned by the app role)
+and restore into it as the admin. Migrations, health checks and everything else
+keep running as the app role. The admin DSN reaches `psql` and `pg_restore`
+through `PG*` variables, never argv, and is never printed.
+
+**A deploy started by the webhook never uses it.** `fraisier webhook-server`
+answers the network, so nothing it starts can reach a database superuser: its
+deploys do not even read the variable. Their restore rehearsal creates and
+restores the throwaway as the app role. On a pg_tviews database, the rehearsal
+refuses before it creates anything, and the refusal says to run the deploy
+from the CLI or its timer. A deploy run from the CLI or a timer is unchanged.
 
 The recommended identity is the `postgres` role over the Unix socket, with peer
 authentication mapped from the OS user fraisier runs as, so no password exists
@@ -122,7 +130,10 @@ variable.
 Before it changes anything, `db restore` lists the archive. When the archive
 creates pg_tviews and the restoring identity is not a superuser, the restore is
 refused and the refusal names `admin_url_env`. After a successful restore it
-rebuilds the empty TVIEWs.
+rebuilds the empty TVIEWs, then names any TVIEW still empty over a populated
+view. `db restore`, `backup drill` and the rehearsal share this precheck; only
+the rehearsal skips the rebuild, because it proves the migrations, not the
+TVIEW contents.
 
 ## Rebuilding TVIEWs: `fraisier db tviews rebuild`
 

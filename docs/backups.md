@@ -131,7 +131,15 @@ Before anything is created, a drill fails when:
 - the newest archive does not read back with `pg_restore --list`;
 - the newest archive is older than `max_age_hours`;
 - `data_dir` is set, and its filesystem lacks the room, or the room could not
-  be measured.
+  be measured;
+- the archive creates pg_tviews and the restoring identity is not a superuser.
+  Set `[database].admin_url_env` (see
+  [the admin identity](database-requirements.md#the-admin-identity-databaseadmin_url_env));
+  the drill then restores as that identity.
+
+After restoring a pg_tviews archive, the drill rebuilds the TVIEWs the restore
+left empty. It fails if the rebuild fails, or if a TVIEW is still empty over a
+populated view afterwards.
 
 After restoring, a drill fails when the migrations fail on the copy, or when it
 holds fewer than `min_tables` tables. The copy is dropped either way.
@@ -157,7 +165,9 @@ It records:
 
 - the archive and when it was taken;
 - `ok`;
-- on success, the throwaway's name, the migrations applied, and the table count;
+- on success, the throwaway's name, the migrations applied, the table count,
+  and `tviews_rebuilt` (what the rebuild filled, or `null` for an archive
+  without pg_tviews);
 - on failure, the failed step and the error, with any credentials redacted.
 
 ## Scheduling and failure alerts

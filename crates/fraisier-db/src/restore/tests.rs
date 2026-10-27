@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use super::{
-    check_room, drop_throwaway, restore_in_place, restore_throwaway, teardown_guard,
+    check_room, drop_throwaway, restore_in_place, restore_throwaway, room_for_copy, teardown_guard,
     throwaway_name, Admin, RestoreError, RestoreIdentity, RestoreServer, Seed, Trigger,
     THROWAWAY_MARKER,
 };
@@ -530,6 +530,25 @@ fn a_copy_needs_the_live_size_plus_headroom() {
     let refused = check_room(1_000_000_000, 2_999_999_999, dir).expect_err("too little");
     assert!(refused.contains("/var/lib/postgresql"), "{refused}");
     assert!(refused.contains("3 GB"), "{refused}");
+}
+
+#[test]
+fn a_copy_that_cannot_fit_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let error = room_for_copy(u64::MAX / 2, dir.path()).expect_err("no filesystem holds that");
+    assert!(error.contains("GB free"), "{error}");
+}
+
+#[test]
+fn a_free_space_that_cannot_be_measured_refuses() {
+    let error = room_for_copy(0, Path::new("/nonexistent/fraisier"))
+        .expect_err("an unmeasurable volume is not a roomy one");
+    assert!(error.contains("could not measure"), "{error}");
+}
+
+#[test]
+fn a_small_copy_fits_in_the_temp_dir() {
+    room_for_copy(0, &std::env::temp_dir()).expect("2 GB free in the temp dir");
 }
 
 #[test]

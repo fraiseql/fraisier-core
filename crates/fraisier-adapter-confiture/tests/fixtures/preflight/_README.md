@@ -44,8 +44,9 @@ here.
 **Why the type change is unclassified**, and why that is not a defect to fix
 here: telling a widening `varchar(10) → varchar(20)` from a narrowing one needs
 the column's current type and the server version. Confiture gathers those only
-when it is asked to compare against a live database, and this adapter does not
-ask — so it declines to guess rather than guessing wrong. The consequence is
+when it is asked to compare against a database, which this capture did not do —
+so it declines to guess rather than guessing wrong. The adapter asks (`--against`)
+only for a fresh-dump restore rehearsal; those captures are in `../against/`. The consequence is
 operator-visible: with a `[policy]` section configured, any deploy containing a
 type change is denied. That is the contract working, not failing.
 

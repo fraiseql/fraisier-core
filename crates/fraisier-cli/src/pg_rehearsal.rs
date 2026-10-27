@@ -59,6 +59,17 @@ impl RehearsalDb for PgRehearsalDb {
         live_dsn: &str,
         backup: &BackupSource,
     ) -> Result<ThrowawayDb, RehearsalError> {
+        if *backup == BackupSource::FreshDump {
+            // The dump lands in the temp dir; refuse before creating anything
+            // when a copy would not fit.
+            let size = crate::commands::DrillServer::live_bytes(self, live_dsn)
+                .await
+                .map_err(|e| {
+                    RehearsalError::Provision(format!("could not size the live database: {e}"))
+                })?;
+            fraisier_db::restore::room_for_copy(size, &std::env::temp_dir())
+                .map_err(RehearsalError::Provision)?;
+        }
         let seed = match backup {
             BackupSource::Archive(path) => Seed::Archive(path),
             BackupSource::FreshDump => Seed::FreshDump,

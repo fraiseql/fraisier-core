@@ -46,12 +46,14 @@ use fraisier_saga::state_store::{FraiseKey, StateStore, StateStoreError};
 use serde::{Deserialize, Serialize};
 
 use crate::adapter_axes::{
-    AdapterCtx, AdapterError, ArtifactAdapter, HealthAdapter, HostId, MigrationAdapter, Revision,
-    ServiceAdapter, Severity, StagedArtifact,
+    AdapterCtx, AdapterDescription, AdapterError, ArtifactAdapter, HealthAdapter, HostId,
+    MigrationAdapter, Revision, ServiceAdapter, Severity, StagedArtifact,
 };
 use crate::policy::{self, Baseline, Inspection, PolicyGate};
 use crate::readiness::{self, DatabaseReadiness};
-use crate::restore_rehearsal::{run_restore_rehearsal, BackupSource, RehearsalDb};
+use crate::restore_rehearsal::{
+    self, run_restore_rehearsal, BackupSource, RehearsalDb, RehearsalError, ThrowawayDb,
+};
 
 /// Which preflight a deploy runs before touching the live database.
 ///
@@ -177,6 +179,18 @@ impl SingleHostDeploy {
     /// (de)serialization). A clean rollback is `Ok(SagaOutcome::RolledBack)`, and
     /// an unrecoverable one is `Ok(SagaOutcome::PartialRollback)`.
     pub async fn run<S: StateStore + Clone>(&self, store: S) -> Result<SagaOutcome, DeployError> {
+        Ok(self.run_reporting(store).await?.outcome)
+    }
+
+    /// [`run`](Self::run), also returning what went wrong without failing the
+    /// run — today, a restore-rehearsal throwaway that could not be dropped.
+    ///
+    /// # Errors
+    /// As [`run`](Self::run).
+    pub async fn run_reporting<S: StateStore + Clone>(
+        &self,
+        store: S,
+    ) -> Result<DeployRun, DeployError> {
         let key = FraiseKey::new(self.fraise.clone(), self.environment.clone());
 
         let prior = match store.current_snapshot(&key).await? {
@@ -204,7 +218,10 @@ impl SingleHostDeploy {
                 .await?;
         }
 
-        Ok(outcome)
+        Ok(DeployRun {
+            outcome,
+            warnings: runtime.warnings,
+        })
     }
 }
 
@@ -393,6 +410,17 @@ pub enum DeployBuildError {
     MissingAdapter(&'static str),
 }
 
+/// A finished run: its outcome, and what went wrong without failing it.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct DeployRun {
+    /// How the saga ended.
+    pub outcome: SagaOutcome,
+    /// Problems an operator must act on that did not fail the run, such as a
+    /// throwaway database left behind.
+    pub warnings: Vec<String>,
+}
+
 /// The deploy state shared by every step: the adapters, the call context, and
 /// the durable rollback target (`prior`). All fields are immutable for the run —
 /// the mutable in-run captures live in [`DeployRuntime`], which the saga engine
@@ -428,6 +456,8 @@ struct DeployRuntime {
     previous_revision: Option<Revision>,
     /// The revision live after `up` — recorded into the new ledger on commit.
     new_revision: Option<Revision>,
+    /// Non-fatal problems, returned by [`SingleHostDeploy::run_reporting`].
+    warnings: Vec<String>,
 }
 
 impl DeployRuntime {
@@ -517,43 +547,133 @@ impl DeployShared {
     /// should not first be told about lint findings in a change the operator is
     /// not permitted to make anyway. Both read one [`Inspection`], so the adapter
     /// is asked once.
-    async fn run_preflight(&self) -> Result<(), SagaError> {
-        // First, before the adapter is even asked what it can do. A deliberate
-        // rollback is not held behind it, for the policy gate's reason: refusing
-        // an emergency rollback protects nothing.
+    ///
+    /// **Deep classification.** With a fresh-dump restore rehearsal and an
+    /// adapter that advertises
+    /// [`DEEP_CLASSIFICATION`](restore_rehearsal::DEEP_CLASSIFICATION), the
+    /// throwaway is provisioned *first*, so the gate rules on a classification
+    /// made against a copy of the live data: provision → inspect against it →
+    /// gate → lint → rehearse on the same throwaway → teardown, always. Archive
+    /// mode keeps the static order: an archive behind live has a different
+    /// pending set, so a gate ruling on it would rule on changes this deploy
+    /// will not apply.
+    ///
+    /// **Readiness first.** `[database.requires]` is checked before the adapter
+    /// is asked anything and before a throwaway is provisioned: a database that
+    /// is not ready is not worth copying.
+    async fn run_preflight(&self, runtime: &mut DeployRuntime) -> Result<(), SagaError> {
+        // A deliberate rollback is not held behind it, for the policy gate's
+        // reason: refusing an emergency rollback protects nothing.
         if let Some(probe) = &self.database_readiness {
             if self.rollback_to.is_none() {
                 readiness::check(probe.as_ref(), &self.ctx).await?;
             }
         }
-        let inspection = self.inspect().await?;
+        let described = if let Some(db) = self.deep_rehearsal() {
+            let description = self
+                .migration
+                .describe()
+                .await
+                .map_err(|e| Self::failed("preflight", &e))?;
+            if restore_rehearsal::classifies_deeply(&description) {
+                return self.run_deep_preflight(db, description, runtime).await;
+            }
+            Some(description)
+        } else {
+            None
+        };
+        let inspection = self.inspect(described).await?;
         self.run_policy_gate(&inspection).await?;
         Self::run_forward_compat_lint(&inspection)?;
         // The restore rehearsal proves a *forward* migrate applies; it is irrelevant
         // to a deliberate rollback (which migrates `down`), so skip it there.
         if let Some(db) = &self.restore_rehearsal {
             if self.rollback_to.is_none() {
-                self.run_restore_rehearsal_step(db.as_ref()).await?;
+                self.run_restore_rehearsal_step(db.as_ref(), runtime)
+                    .await?;
             }
         }
         Ok(())
     }
 
+    /// The rehearsal database, when this run classifies deeply: a forward deploy
+    /// that lints, with a restore rehearsal seeded from a fresh dump.
+    fn deep_rehearsal(&self) -> Option<&dyn RehearsalDb> {
+        let db = self.restore_rehearsal.as_deref()?;
+        (self.forward_compatible_lint
+            && self.rollback_to.is_none()
+            && self.backup_source == BackupSource::FreshDump)
+            .then_some(db)
+    }
+
+    /// The deep preflight: everything between provisioning and teardown runs
+    /// against one throwaway, which is dropped whatever happened in between —
+    /// a gate refusal, an approval denial, a lint finding, a failed rehearsal.
+    async fn run_deep_preflight(
+        &self,
+        db: &dyn RehearsalDb,
+        described: AdapterDescription,
+        runtime: &mut DeployRuntime,
+    ) -> Result<(), SagaError> {
+        let throwaway = restore_rehearsal::provision(db, &self.ctx, &self.backup_source)
+            .await
+            .map_err(Self::rehearsal_failed)?;
+        let result = self.deep_checks(described, &throwaway).await;
+        if let Err(error) = db.teardown(&throwaway).await {
+            runtime.warnings.push(Self::leaked(&throwaway, &error));
+        }
+        result
+    }
+
+    async fn deep_checks(
+        &self,
+        described: AdapterDescription,
+        throwaway: &ThrowawayDb,
+    ) -> Result<(), SagaError> {
+        let against = restore_rehearsal::against_throwaway(&self.ctx, throwaway);
+        let inspection = policy::inspect_described(self.migration.as_ref(), &against, described)
+            .await
+            .map_err(|e| Self::failed("preflight", &e))?;
+        self.run_policy_gate(&inspection).await?;
+        Self::run_forward_compat_lint(&inspection)?;
+        restore_rehearsal::rehearse_on(self.migration.as_ref(), &self.ctx, throwaway)
+            .await
+            .map(|_applied| ())
+            .map_err(Self::rehearsal_failed)
+    }
+
+    /// The warning for a throwaway that could not be dropped.
+    fn leaked(throwaway: &ThrowawayDb, error: &str) -> String {
+        format!(
+            "the restore-rehearsal throwaway database '{}' was not dropped and must be removed \
+             by hand: {error}",
+            throwaway.name
+        )
+    }
+
     /// Ask the migration adapter what it can do and, when it lints, run its
-    /// preflight — **once** for the whole step.
+    /// preflight — **once** for the whole step. `described` is the adapter's
+    /// description when the caller already asked for it.
     ///
     /// Opting out of the lint (`[migration].preflight_mode = "off"` /
     /// `--skip-preflight`) means no adapter call at all, so nothing inspected
     /// the pending changes. A configured `[policy]` then refuses on exactly that
     /// basis, which is why that combination is a config-time warning rather than
     /// a silent pass.
-    async fn inspect(&self) -> Result<Inspection, SagaError> {
+    async fn inspect(
+        &self,
+        described: Option<AdapterDescription>,
+    ) -> Result<Inspection, SagaError> {
         if !self.forward_compatible_lint {
             return Ok(Inspection::default());
         }
-        policy::inspect(self.migration.as_ref(), &self.ctx)
-            .await
-            .map_err(|e| Self::failed("preflight", &e))
+        let inspection = match described {
+            Some(described) => {
+                policy::inspect_described(self.migration.as_ref(), &self.ctx, described).await
+            }
+            None => policy::inspect(self.migration.as_ref(), &self.ctx).await,
+        };
+        inspection.map_err(|e| Self::failed("preflight", &e))
     }
 
     /// Apply the schema policy gate to this deploy.
@@ -594,37 +714,64 @@ impl DeployShared {
         let Some(report) = inspection.report.as_ref() else {
             return Ok(());
         };
-        let blocking = report
+        let blocking: Vec<String> = report
             .issues
             .iter()
             .filter(|issue| issue.severity == Severity::Error)
-            .count();
-        if blocking > 0 {
-            return Err(SagaError::StepFailed {
-                step: "preflight".to_owned(),
-                message: format!(
-                    "forward-compatibility preflight found {blocking} blocking issue(s)"
-                ),
-            });
+            .map(|issue| {
+                let place = issue
+                    .migration
+                    .as_ref()
+                    .map_or_else(String::new, |migration| format!(" ({migration})"));
+                format!("{}{place}: {}", issue.code, issue.message)
+            })
+            .collect();
+        if blocking.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        Err(SagaError::StepFailed {
+            step: "preflight".to_owned(),
+            message: format!(
+                "forward-compatibility preflight found {} blocking issue(s): {}",
+                blocking.len(),
+                blocking.join("; ")
+            ),
+        })
     }
 
     /// Rehearse a restore + migrate on a throwaway copy of the database before the
     /// live deploy touches anything. A failure aborts the deploy (it is the first
     /// step, so nothing has changed yet) with a message naming the escape hatch.
-    async fn run_restore_rehearsal_step(&self, db: &dyn RehearsalDb) -> Result<(), SagaError> {
-        run_restore_rehearsal(db, self.migration.as_ref(), &self.ctx, &self.backup_source)
-            .await
-            .map(|_report| ())
-            .map_err(|error| SagaError::StepFailed {
-                step: "preflight".to_owned(),
-                message: format!(
-                    "restore-rehearsal preflight failed: {error}. {}, or bypass this check with \
-                     `--skip-preflight` (or `[migration].preflight_mode = \"off\"`).",
-                    error.remedy()
-                ),
-            })
+    async fn run_restore_rehearsal_step(
+        &self,
+        db: &dyn RehearsalDb,
+        runtime: &mut DeployRuntime,
+    ) -> Result<(), SagaError> {
+        let report =
+            run_restore_rehearsal(db, self.migration.as_ref(), &self.ctx, &self.backup_source)
+                .await
+                .map_err(Self::rehearsal_failed)?;
+        if let Some(warning) = report.teardown_warning {
+            runtime.warnings.push(format!(
+                "the restore-rehearsal throwaway database was not dropped and must be removed \
+                 by hand: {warning}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The preflight failure for a rehearsal that could not provision or apply.
+    // Reason: the shape `map_err` takes; the error is rendered, not kept.
+    #[allow(clippy::needless_pass_by_value)]
+    fn rehearsal_failed(error: RehearsalError) -> SagaError {
+        SagaError::StepFailed {
+            step: "preflight".to_owned(),
+            message: format!(
+                "restore-rehearsal preflight failed: {error}. {}, or bypass this check with \
+                 `--skip-preflight` (or `[migration].preflight_mode = \"off\"`).",
+                error.remedy()
+            ),
+        }
     }
 
     async fn run_fetch(&self, runtime: &mut DeployRuntime) -> Result<(), SagaError> {
@@ -814,7 +961,7 @@ impl Step<DeployRuntime> for DeployStep {
         runtime: &mut DeployRuntime,
     ) -> Result<(), SagaError> {
         match self.phase {
-            Phase::Preflight => self.shared.run_preflight().await,
+            Phase::Preflight => self.shared.run_preflight(runtime).await,
             Phase::Fetch => self.shared.run_fetch(runtime).await,
             Phase::Migrate => self.shared.run_migrate(runtime).await,
             Phase::Activate => self.shared.run_activate(runtime).await,
@@ -862,6 +1009,9 @@ mod tests {
 
     /// An ordered log of every adapter call, shared across the fakes.
     type Trail = Arc<Mutex<Vec<String>>>;
+
+    /// `(call, DATABASE_URL, AGAINST_DATABASE_URL)` per migration call.
+    type SeenDsns = Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>;
 
     fn log(trail: &Trail, entry: impl Into<String>) {
         trail.lock().expect("trail").push(entry.into());
@@ -988,6 +1138,9 @@ mod tests {
         /// The `ctx.workdir` seen by each migration call, for asserting the
         /// migrate step runs from the staged release directory.
         seen_workdirs: Arc<Mutex<Vec<PathBuf>>>,
+        /// `(call, DATABASE_URL, AGAINST_DATABASE_URL)` as each `preflight` and
+        /// `up` saw them, for asserting which database a call targeted.
+        seen_dsns: SeenDsns,
     }
 
     impl FakeMigration {
@@ -1003,7 +1156,27 @@ mod tests {
                 window_unsafe: false,
                 change_set: None,
                 seen_workdirs: Arc::new(Mutex::new(Vec::new())),
+                seen_dsns: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// A classifying adapter that can also classify against a seeded copy.
+        fn deep(trail: &Trail, changes: Vec<SchemaChange>) -> Self {
+            let mut migration = Self::classifying(trail, changes);
+            migration
+                .capabilities
+                .push(crate::restore_rehearsal::DEEP_CLASSIFICATION.to_owned());
+            migration
+        }
+
+        fn record_dsns(&self, call: &str, ctx: &AdapterCtx) {
+            self.seen_dsns.lock().expect("dsns").push((
+                call.to_owned(),
+                ctx.secret(crate::restore_rehearsal::DATABASE_URL_SECRET)
+                    .ok(),
+                ctx.secret(crate::restore_rehearsal::AGAINST_DATABASE_URL_SECRET)
+                    .ok(),
+            ));
         }
 
         /// A healthy adapter that classifies its pending changes.
@@ -1054,6 +1227,7 @@ mod tests {
             target: Option<Revision>,
         ) -> Result<MigrationOutcome, AdapterError> {
             self.record_workdir(ctx);
+            self.record_dsns("up", ctx);
             log(&self.trail, "up");
             if self.decline_targeted_up && target.is_some() {
                 return Err(exec_error(
@@ -1086,7 +1260,8 @@ mod tests {
             Ok(self.verify.clone())
         }
 
-        async fn preflight(&self, _ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {
+        async fn preflight(&self, ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {
+            self.record_dsns("preflight", ctx);
             log(&self.trail, "preflight");
             let issues = if self.preflight_blocking {
                 vec![PreflightIssue {
@@ -1535,6 +1710,7 @@ mod tests {
     struct FakeRehearsalDb {
         trail: Trail,
         fail: bool,
+        fail_teardown: bool,
     }
 
     #[async_trait]
@@ -1554,8 +1730,11 @@ mod tests {
             })
         }
 
-        async fn teardown(&self, _db: &ThrowawayDb) -> Result<(), String> {
+        async fn teardown(&self, db: &ThrowawayDb) -> Result<(), String> {
             log(&self.trail, "rehearsal:teardown");
+            if self.fail_teardown {
+                return Err(format!("DROP DATABASE {} failed: in use", db.name));
+            }
             Ok(())
         }
     }
@@ -1593,6 +1772,7 @@ mod tests {
                 Arc::new(FakeRehearsalDb {
                     trail: trail.clone(),
                     fail: false,
+                    fail_teardown: false,
                 }),
                 BackupSource::FreshDump,
             )
@@ -1652,6 +1832,7 @@ mod tests {
                 Arc::new(FakeRehearsalDb {
                     trail: trail.clone(),
                     fail: true,
+                    fail_teardown: false,
                 }),
                 BackupSource::FreshDump,
             )
@@ -1668,6 +1849,480 @@ mod tests {
             !trail.iter().any(|e| e == "stage"),
             "the live deploy never started after a failed rehearsal: {trail:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Deep classification under restore rehearsal (#56): with a fresh dump, the
+    // throwaway is provisioned first and the gate rules on its classification.
+    // -----------------------------------------------------------------------
+
+    /// The throwaway [`FakeRehearsalDb`] provisions from [`ctx_with_dsn`].
+    const THROWAWAY: &str = "postgres://u:pw@h/app_rehearsal";
+
+    /// An approval hook that records when it was asked.
+    struct LoggedApproval {
+        trail: Trail,
+        approve: bool,
+    }
+
+    #[async_trait]
+    impl crate::policy::ApprovalHook for LoggedApproval {
+        async fn request(
+            &self,
+            _request: &crate::policy::ApprovalRequest,
+        ) -> crate::policy::ApprovalVerdict {
+            log(&self.trail, "approval");
+            if self.approve {
+                crate::policy::ApprovalVerdict::Approved {
+                    approver: "oncall".to_owned(),
+                }
+            } else {
+                crate::policy::ApprovalVerdict::Denied {
+                    reason: "not during the freeze".to_owned(),
+                }
+            }
+        }
+    }
+
+    struct Rehearsed {
+        trail: Trail,
+        dsns: SeenDsns,
+        plan: SingleHostDeploy,
+    }
+
+    fn rehearsed(
+        migration: impl FnOnce(&Trail) -> FakeMigration,
+        gate: impl FnOnce(&Trail) -> PolicyGate,
+        backup: BackupSource,
+        fail_teardown: bool,
+    ) -> Rehearsed {
+        let trail = Trail::default();
+        let migration = migration(&trail);
+        let gate = gate(&trail);
+        let dsns = Arc::clone(&migration.seen_dsns);
+        let plan = SingleHostDeploy::builder("checkout", "production", HostId::new("localhost"))
+            .context(ctx_with_dsn())
+            .policy(gate)
+            .artifact(Arc::new(FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            }))
+            .migration(Arc::new(migration))
+            .service(Arc::new(FakeService {
+                trail: trail.clone(),
+                fail_restarts: Arc::new(Mutex::new(0)),
+            }))
+            .health(Arc::new(FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            }))
+            .restore_rehearsal(
+                Arc::new(FakeRehearsalDb {
+                    trail: trail.clone(),
+                    fail: false,
+                    fail_teardown,
+                }),
+                backup,
+            )
+            .build()
+            .expect("all adapters provided");
+        Rehearsed { trail, dsns, plan }
+    }
+
+    /// The trail up to (not including) the live fetch, or all of it.
+    fn before_stage(trail: &Trail) -> Vec<String> {
+        drain(trail)
+            .into_iter()
+            .take_while(|e| e != "stage")
+            .collect()
+    }
+
+    fn narrowing() -> SchemaChange {
+        SchemaChange::new("alter_column_type", "public.tb_order.note")
+            .with_tier(RiskTier::Irreversible)
+    }
+
+    #[tokio::test]
+    async fn a_fresh_dump_rehearsal_provisions_before_it_inspects() {
+        let (_dir, store) = store();
+        let run = rehearsed(
+            |t| FakeMigration::deep(t, vec![add_nickname()]),
+            |_| PolicyGate::default(),
+            BackupSource::FreshDump,
+            false,
+        );
+        let outcome = run.plan.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+        assert_eq!(
+            before_stage(&run.trail),
+            vec![
+                "describe",
+                "rehearsal:provision",
+                "preflight",
+                "up",
+                "rehearsal:teardown"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_deep_preflight_and_the_rehearsal_target_the_same_throwaway() {
+        let (_dir, store) = store();
+        let run = rehearsed(
+            |t| FakeMigration::deep(t, vec![add_nickname()]),
+            |_| PolicyGate::default(),
+            BackupSource::FreshDump,
+            false,
+        );
+        run.plan.run(store).await.expect("run");
+        let dsns = run.dsns.lock().expect("dsns").clone();
+        let throwaway = Some(THROWAWAY.to_owned());
+        assert_eq!(
+            dsns[0],
+            ("preflight".to_owned(), throwaway.clone(), throwaway.clone()),
+            "the env DSN and --against both name the throwaway"
+        );
+        assert_eq!(
+            dsns[1],
+            ("up".to_owned(), throwaway, None),
+            "the rehearsal migrates the provisioned throwaway, not a second one"
+        );
+        // The live migrate sees neither redirect.
+        assert_eq!(dsns[2].1.as_deref(), Some("postgres://u:pw@h/app"));
+        assert_eq!(dsns[2].2, None);
+        assert_eq!(
+            drain(&run.trail)
+                .iter()
+                .filter(|e| *e == "rehearsal:provision")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gate_denial_on_the_deep_tier_still_tears_down() {
+        let (_dir, store) = store();
+        let run = rehearsed(
+            |t| FakeMigration::deep(t, vec![narrowing()]),
+            |_| PolicyGate::new(Policy::default()),
+            BackupSource::FreshDump,
+            false,
+        );
+        let outcome = run.plan.run(store).await.expect("run");
+        let SagaOutcome::RolledBack {
+            failed_step,
+            reason,
+        } = &outcome
+        else {
+            panic!("expected a refusal at preflight, got {outcome:?}");
+        };
+        assert_eq!(failed_step, "preflight");
+        assert!(reason.contains(REFUSED), "{reason}");
+        assert!(reason.contains("irreversible"), "{reason}");
+        assert_eq!(
+            drain(&run.trail),
+            vec![
+                "describe",
+                "rehearsal:provision",
+                "preflight",
+                "rehearsal:teardown"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lint_failure_on_the_deep_report_still_tears_down() {
+        let (_dir, store) = store();
+        let run = rehearsed(
+            |t| FakeMigration {
+                preflight_blocking: true,
+                ..FakeMigration::deep(t, vec![add_nickname()])
+            },
+            |_| PolicyGate::default(),
+            BackupSource::FreshDump,
+            false,
+        );
+        let outcome = run.plan.run(store).await.expect("run");
+        assert!(
+            matches!(&outcome, SagaOutcome::RolledBack { failed_step, .. } if failed_step == "preflight"),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            drain(&run.trail),
+            vec![
+                "describe",
+                "rehearsal:provision",
+                "preflight",
+                "rehearsal:teardown"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_rehearsal_on_the_deep_path_still_tears_down() {
+        let (_dir, store) = store();
+        let run = rehearsed(
+            |t| FakeMigration {
+                fail_up: true,
+                ..FakeMigration::deep(t, vec![add_nickname()])
+            },
+            |_| PolicyGate::default(),
+            BackupSource::FreshDump,
+            false,
+        );
+        let outcome = run.plan.run(store).await.expect("run");
+        let SagaOutcome::RolledBack {
+            failed_step,
+            reason,
+        } = &outcome
+        else {
+            panic!("expected a failure at preflight, got {outcome:?}");
+        };
+        assert_eq!(failed_step, "preflight");
+        assert!(reason.contains("restore-rehearsal"), "{reason}");
+        assert_eq!(
+            drain(&run.trail),
+            vec![
+                "describe",
+                "rehearsal:provision",
+                "preflight",
+                "up",
+                "rehearsal:teardown"
+            ]
+        );
+    }
+
+    fn logged_approval(approve: bool) -> impl FnOnce(&Trail) -> PolicyGate {
+        move |trail| {
+            PolicyGate::new(Policy::default().with_approval_hook(true)).with_hook(Some(Arc::new(
+                LoggedApproval {
+                    trail: trail.clone(),
+                    approve,
+                },
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_throwaway_outlives_the_approval_wait() {
+        let (_dir, store) = store();
+        let run = rehearsed(
+            |t| FakeMigration::deep(t, vec![drop_legacy_flag()]),
+            logged_approval(true),
+            BackupSource::FreshDump,
+            false,
+        );
+        let outcome = run.plan.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+        assert_eq!(
+            before_stage(&run.trail),
+            vec![
+                "describe",
+                "rehearsal:provision",
+                "preflight",
+                "approval",
+                "up",
+                "rehearsal:teardown"
+            ],
+            "the rehearsal ran after the approved gate, on the same throwaway"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_approval_tears_the_throwaway_down() {
+        let (_dir, store) = store();
+        let run = rehearsed(
+            |t| FakeMigration::deep(t, vec![drop_legacy_flag()]),
+            logged_approval(false),
+            BackupSource::FreshDump,
+            false,
+        );
+        let outcome = run.plan.run(store).await.expect("run");
+        assert!(
+            matches!(&outcome, SagaOutcome::RolledBack { failed_step, .. } if failed_step == "preflight"),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            drain(&run.trail),
+            vec![
+                "describe",
+                "rehearsal:provision",
+                "preflight",
+                "approval",
+                "rehearsal:teardown"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deep_provisioning_failure_fails_closed_before_the_gate() {
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let plan = SingleHostDeploy::builder("checkout", "production", HostId::new("localhost"))
+            .context(ctx_with_dsn())
+            .policy(PolicyGate::new(Policy::default()))
+            .artifact(Arc::new(FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            }))
+            .migration(Arc::new(FakeMigration::deep(&trail, vec![add_nickname()])))
+            .service(Arc::new(FakeService {
+                trail: trail.clone(),
+                fail_restarts: Arc::new(Mutex::new(0)),
+            }))
+            .health(Arc::new(FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            }))
+            .restore_rehearsal(
+                Arc::new(FakeRehearsalDb {
+                    trail: trail.clone(),
+                    fail: true,
+                    fail_teardown: false,
+                }),
+                BackupSource::FreshDump,
+            )
+            .build()
+            .expect("all adapters provided");
+        let outcome = plan.run(store).await.expect("run");
+        let SagaOutcome::RolledBack {
+            failed_step,
+            reason,
+        } = &outcome
+        else {
+            panic!("expected a failure at preflight, got {outcome:?}");
+        };
+        assert_eq!(failed_step, "preflight");
+        assert!(reason.contains("could not provision"), "{reason}");
+        assert_eq!(drain(&trail), vec!["describe", "rehearsal:provision"]);
+    }
+
+    #[tokio::test]
+    async fn a_lint_failure_names_each_blocking_issue() {
+        let (_dir, store) = store();
+        let run = rehearsed(
+            |t| FakeMigration {
+                preflight_blocking: true,
+                ..FakeMigration::deep(t, vec![add_nickname()])
+            },
+            |_| PolicyGate::default(),
+            BackupSource::FreshDump,
+            false,
+        );
+        let outcome = run.plan.run(store).await.expect("run");
+        let SagaOutcome::RolledBack { reason, .. } = &outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert!(reason.contains("non_reversible (003)"), "{reason}");
+        assert!(reason.contains("migration 003 has no down"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_rollback_provisions_nothing() {
+        let (_dir, store) = store();
+        let run = rehearsed(
+            |t| FakeMigration::deep(t, vec![add_nickname()]),
+            |_| PolicyGate::default(),
+            BackupSource::FreshDump,
+            false,
+        );
+        let plan = SingleHostDeploy {
+            rollback_to: Some(Revision::new("rev-old")),
+            ..run.plan
+        };
+        plan.run(store).await.expect("run");
+        let trail = drain(&run.trail);
+        assert!(
+            !trail.iter().any(|e| e.starts_with("rehearsal:")),
+            "a rollback neither provisions nor rehearses: {trail:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_mode_keeps_the_static_order() {
+        let (_dir, store) = store();
+        let run = rehearsed(
+            |t| FakeMigration::deep(t, vec![add_nickname()]),
+            |_| PolicyGate::default(),
+            BackupSource::Archive(PathBuf::from("/backups/app.dump")),
+            false,
+        );
+        run.plan.run(store).await.expect("run");
+        assert_eq!(
+            before_stage(&run.trail),
+            vec![
+                "describe",
+                "preflight",
+                "rehearsal:provision",
+                "up",
+                "rehearsal:teardown"
+            ]
+        );
+        let dsns = run.dsns.lock().expect("dsns").clone();
+        assert_eq!(dsns[0].2, None, "archive mode classifies statically");
+    }
+
+    #[tokio::test]
+    async fn an_adapter_below_the_deep_floor_keeps_the_static_order() {
+        let (_dir, store) = store();
+        let run = rehearsed(
+            |t| FakeMigration::classifying(t, vec![add_nickname()]),
+            |_| PolicyGate::default(),
+            BackupSource::FreshDump,
+            false,
+        );
+        run.plan.run(store).await.expect("run");
+        assert_eq!(
+            before_stage(&run.trail),
+            vec![
+                "describe",
+                "preflight",
+                "rehearsal:provision",
+                "up",
+                "rehearsal:teardown"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_teardown_failure_after_a_clean_rehearsal_is_reported_not_swallowed() {
+        let (_dir, store) = store();
+        let run = rehearsed(
+            |t| FakeMigration::deep(t, vec![add_nickname()]),
+            |_| PolicyGate::default(),
+            BackupSource::FreshDump,
+            true,
+        );
+        let report = run.plan.run_reporting(store).await.expect("run");
+        assert!(
+            matches!(report.outcome, SagaOutcome::Committed),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains("throwaway"),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn a_teardown_failure_after_a_denial_is_reported_too() {
+        let (_dir, store) = store();
+        let run = rehearsed(
+            |t| FakeMigration::deep(t, vec![narrowing()]),
+            |_| PolicyGate::new(Policy::default()),
+            BackupSource::FreshDump,
+            true,
+        );
+        let report = run.plan.run_reporting(store).await.expect("run");
+        assert!(
+            matches!(&report.outcome, SagaOutcome::RolledBack { failed_step, .. } if failed_step == "preflight"),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
     }
 
     #[tokio::test]
@@ -1695,6 +2350,7 @@ mod tests {
                 Arc::new(FakeRehearsalDb {
                     trail: trail.clone(),
                     fail: true,
+                    fail_teardown: false,
                 }),
                 BackupSource::FreshDump,
             )

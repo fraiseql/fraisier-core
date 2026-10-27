@@ -18,7 +18,7 @@ use fraisier_saga::state_store::{FilesystemStateStore, FraiseKey, StateStore};
 use serde_json::{json, Value};
 
 use crate::factory;
-use crate::preview::{self, SchemaPreview, Unavailable};
+use crate::preview::{self, Depth, SchemaPreview, Unavailable};
 
 /// The result of a command: an exit code and both renderings of its output.
 pub(crate) struct CommandOutput {
@@ -265,7 +265,7 @@ pub(crate) async fn ship(args: ShipArgs<'_>) -> Result<CommandOutput> {
         args.state_dir,
         args.host,
         Some(&report.new_version),
-        false,
+        None,
         false,
         false,
     )
@@ -1599,12 +1599,18 @@ fn render_multi_host_summary(
 /// yields a plan carrying an explicit unavailability instead of an error exit
 /// (rule 2, D8). The one thing it never does is produce a plan that reads as
 /// clean.
+///
+/// `single_host` previews a restore-rehearsal config the way its single-host
+/// deploy classifies: against a fresh copy of the live database when it can
+/// ([`preview::gather_rehearsed`]). The other strategies run no rehearsal.
 async fn preview_schema(
     config: &DeployConfig,
     host: Option<&str>,
     app_version: Option<&str>,
     baseline: Baseline,
     skip_preflight: bool,
+    single_host: bool,
+    depth: Depth,
 ) -> SchemaPreview {
     let (gate, approval_command) = factory::preview_gate(config);
     let approval_command = approval_command.as_deref();
@@ -1638,6 +1644,19 @@ async fn preview_schema(
              itself will not inspect the pending schema changes either",
         ));
     }
+    if let (true, Some((db, backup))) = (single_host, &target.restore_rehearsal) {
+        return preview::gather_rehearsed(
+            db.as_ref(),
+            backup,
+            target.migration.as_ref(),
+            &target.ctx,
+            &gate,
+            approval_command,
+            baseline,
+            depth,
+        )
+        .await;
+    }
     preview::gather(
         target.migration.as_ref(),
         &target.ctx,
@@ -1653,7 +1672,7 @@ async fn preview_schema(
 pub(crate) struct DeployRequest<'a> {
     pub(crate) host: Option<&'a str>,
     pub(crate) app_version: Option<&'a str>,
-    pub(crate) dry_run: bool,
+    pub(crate) dry_run: Option<Depth>,
     pub(crate) skip_preflight: bool,
     pub(crate) fail_on_block: bool,
     pub(crate) trigger: fraisier_db::restore::Trigger,
@@ -1665,7 +1684,7 @@ impl<'a> DeployRequest<'a> {
         Self {
             host: None,
             app_version,
-            dry_run: false,
+            dry_run: None,
             skip_preflight: false,
             fail_on_block: false,
             trigger: fraisier_db::restore::Trigger::Webhook,
@@ -1680,7 +1699,7 @@ pub(crate) async fn deploy(
     state_dir: &Path,
     host: Option<&str>,
     app_version: Option<&str>,
-    dry_run: bool,
+    dry_run: Option<Depth>,
     skip_preflight: bool,
     fail_on_block: bool,
 ) -> Result<CommandOutput> {
@@ -1711,7 +1730,7 @@ async fn run_deploy(
         dry_run,
         skip_preflight,
         fail_on_block,
-        trigger,
+        ..
     } = request;
     let config = load(config_path)?;
     let report = config.validate();
@@ -1727,18 +1746,33 @@ async fn run_deploy(
 
     // `[deploy].strategy = "blue-green"` selects the HTTP-tier traffic-swap flow.
     if config.deploy.as_ref().and_then(|d| d.strategy.as_deref()) == Some("blue-green") {
-        return run_blue_green(&config, app_version, state_dir, dry_run, fail_on_block).await;
+        return run_blue_green(
+            &config,
+            app_version,
+            state_dir,
+            dry_run.is_some(),
+            fail_on_block,
+        )
+        .await;
     }
 
     // A config with [hosts] runs the multi-host rollout — unless an explicit
     // --host override pins it to a single host (the existing single-host path).
     let multi_host = config.hosts.is_some() && host.is_none();
 
-    if dry_run {
+    if let Some(depth) = dry_run {
         // Single-host and multi-host run one version at a time against the
         // database, so neither has a shared hold window to certify.
-        let schema =
-            preview_schema(&config, host, app_version, Baseline::None, skip_preflight).await;
+        let schema = preview_schema(
+            &config,
+            host,
+            app_version,
+            Baseline::None,
+            skip_preflight,
+            !multi_host,
+            depth,
+        )
+        .await;
         // A plan *was* produced, so the command succeeds — terraform semantics.
         // `--fail-on-block` is the pipeline's opt-in to the stricter reading.
         let exit_code = i32::from(fail_on_block && preview::would_block(&schema));
@@ -1767,7 +1801,24 @@ async fn run_deploy(
         return run_multi_host(&config, store, app_version, &report).await;
     }
 
-    let resolved = factory::build_for(&config, host, app_version, trigger)?;
+    run_single_host(&config, store, request).await
+}
+
+/// Build and run the single-host deploy `request` asks for, mapping its
+/// outcome onto a [`CommandOutput`].
+async fn run_single_host(
+    config: &DeployConfig,
+    store: FilesystemStateStore,
+    request: DeployRequest<'_>,
+) -> Result<CommandOutput> {
+    let DeployRequest {
+        host,
+        app_version,
+        skip_preflight,
+        trigger,
+        ..
+    } = request;
+    let resolved = factory::build_for(config, host, app_version, trigger)?;
     // `--skip-preflight` is the per-run escape hatch: it forces every preflight off
     // regardless of `[migration].preflight_mode`.
     let mut builder = SingleHostDeploy::builder(
@@ -1793,23 +1844,34 @@ async fn run_deploy(
     let plan = builder.build()?;
 
     let started = std::time::Instant::now();
-    let outcome = plan.run(store).await?;
-    notify_deploy_failure(&config, &resolved.fraise, &resolved.environment, &outcome).await;
+    let run = plan.run_reporting(store).await?;
+    let outcome = run.outcome;
+    notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
     let metrics_warning = record_metrics(
-        &config,
+        config,
         &resolved.fraise,
         &resolved.environment,
         &deploy_metrics(&outcome, started.elapsed()),
     );
     let (exit_code, label, detail) = outcome_result(&outcome);
+    let mut pretty = String::new();
+    for warning in &run.warnings {
+        let _ = writeln!(pretty, "  [warning] preflight: {warning}");
+    }
+    let _ = writeln!(
+        pretty,
+        "deploy of {}/{} {label}{detail}",
+        resolved.fraise, resolved.environment
+    );
+    let mut json = json!({ "outcome": label, "detail": detail.trim() });
+    if !run.warnings.is_empty() {
+        json["warnings"] = json!(run.warnings);
+    }
     Ok(with_metrics_warning(
         CommandOutput {
             exit_code,
-            pretty: format!(
-                "deploy of {}/{} {label}{detail}\n",
-                resolved.fraise, resolved.environment
-            ),
-            json: json!({ "outcome": label, "detail": detail.trim() }),
+            pretty,
+            json,
         },
         metrics_warning,
     ))
@@ -1885,7 +1947,16 @@ async fn run_blue_green(
         // so its plan answers the question no other strategy has to ask — and
         // `--skip-preflight` is deliberately not honoured here, because the live
         // blue-green preflight does not honour it either.
-        let schema = preview_schema(config, None, app_version, Baseline::WindowSafety, false).await;
+        let schema = preview_schema(
+            config,
+            None,
+            app_version,
+            Baseline::WindowSafety,
+            false,
+            false,
+            Depth::Static,
+        )
+        .await;
         let mut lines = vec![format!(
             "blue-green deploy plan for {}/{}:",
             resolved.fraise, resolved.environment
@@ -2825,8 +2896,7 @@ async fn drill_steps(
 }
 
 /// Refuse a drill when the filesystem holding `data_dir` cannot take another
-/// copy of the live database plus 2 GB. A measurement that fails refuses too: a
-/// copy that fills the disk can stop the live server beside it.
+/// copy of the live database ([`fraisier_db::restore::room_for_copy`]).
 async fn drill_room(
     server: &dyn DrillServer,
     live_dsn: &str,
@@ -2838,16 +2908,7 @@ async fn drill_room(
             format!("could not size the live database: {error}"),
         )
     })?;
-    let free = fraisier_db::retention::available_bytes(data_dir).map_err(|error| {
-        (
-            "free space",
-            format!(
-                "could not measure free space in {}: {error}",
-                data_dir.display()
-            ),
-        )
-    })?;
-    fraisier_db::restore::check_room(live, free, data_dir).map_err(|error| ("free space", error))
+    fraisier_db::restore::room_for_copy(live, data_dir).map_err(|error| ("free space", error))
 }
 
 /// Write `receipt` to `<state_dir>/drills/<fraise>-<environment>.json`, replacing
@@ -3832,7 +3893,8 @@ mod tests {
         deploy, discover_adapters, health, init, list, notify_deploy_failure, provider_test,
         providers, render_check_report, render_failed_output, rollback, scaffold, scaffold_install,
         scheduled_install, scheduled_list, scheduled_uninstall, ship, slugify, status, sync,
-        validate_config, version_bump, version_show, webhook_server, write_check_log, ShipArgs,
+        validate_config, version_bump, version_show, webhook_server, write_check_log, Depth,
+        ShipArgs,
     };
     use fraisier_config::DeployConfig;
     use fraisier_core::single_host::DeployRecord;
@@ -4547,7 +4609,7 @@ url = "http://127.0.0.1:8080/health"
             &state,
             Some("127.0.0.1"),
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             false,
         )
@@ -4579,7 +4641,7 @@ url = "http://127.0.0.1:8080/health"
             &dir.path().join("state"),
             Some("127.0.0.1"),
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             true,
             false,
         )
@@ -4623,7 +4685,7 @@ url = "http://127.0.0.1:8080/health"
             &dir.path().join("state"),
             Some("127.0.0.1"),
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             false,
         )
@@ -4643,7 +4705,7 @@ url = "http://127.0.0.1:8080/health"
             &dir.path().join("state"),
             Some("127.0.0.1"),
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             true,
         )
@@ -4665,7 +4727,7 @@ url = "http://127.0.0.1:8080/health"
             &dir.path().join("state"),
             Some("127.0.0.1"),
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             true,
         )
@@ -4694,7 +4756,7 @@ url = "http://127.0.0.1:8080/health"
             &dir.path().join("state"),
             Some("127.0.0.1"),
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             false,
         )
@@ -4732,9 +4794,17 @@ url = "http://127.0.0.1:8080/health"
         let config = write(dir.path(), "fraisier.toml", &cfg);
         let state = dir.path().join("state");
         // Dry run: the strategy is recognized and routed; nothing is executed.
-        let out = deploy(&config, &state, None, Some("1.2.3"), true, false, false)
-            .await
-            .expect("dry run");
+        let out = deploy(
+            &config,
+            &state,
+            None,
+            Some("1.2.3"),
+            Some(Depth::Static),
+            false,
+            false,
+        )
+        .await
+        .expect("dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
         assert_eq!(out.json["strategy"], serde_json::json!("blue-green"));
         assert_eq!(out.json["dry_run"], serde_json::json!(true));
@@ -4774,7 +4844,7 @@ url = "http://127.0.0.1:8080/health"
             &dir.path().join("state"),
             None,
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             false,
         )
@@ -4809,7 +4879,7 @@ url = "http://127.0.0.1:8080/health"
             &dir.path().join("state"),
             None,
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             false,
         )
@@ -4834,7 +4904,7 @@ url = "http://127.0.0.1:8080/health"
             &dir.path().join("state"),
             None,
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             true,
         )
@@ -4849,7 +4919,7 @@ url = "http://127.0.0.1:8080/health"
         let bad = VALID.replace("database_url_env = \"CHECKOUT_DATABASE_URL\"\n", "");
         let config = write(dir.path(), "fraisier.toml", &bad);
         let state = dir.path().join("state");
-        let out = deploy(&config, &state, None, None, false, false, false)
+        let out = deploy(&config, &state, None, None, None, false, false)
             .await
             .expect("run");
         assert_eq!(out.exit_code, 1);
@@ -5126,9 +5196,17 @@ upstream = "checkout_upstream"
         let config = write(dir.path(), "fraisier.toml", MULTI_HOST);
         let state = dir.path().join("state");
         // No --host override: [hosts] selects the multi-host path.
-        let out = deploy(&config, &state, None, Some("1.2.3"), true, false, false)
-            .await
-            .expect("multi-host dry run");
+        let out = deploy(
+            &config,
+            &state,
+            None,
+            Some("1.2.3"),
+            Some(Depth::Static),
+            false,
+            false,
+        )
+        .await
+        .expect("multi-host dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
         assert_eq!(out.json["strategy"], serde_json::json!("rolling(1)"));
         assert_eq!(out.json["lb"], serde_json::json!("nginx"));
@@ -5161,7 +5239,7 @@ upstream = "checkout_upstream"
             &state,
             Some("web1.internal"),
             Some("1.2.3"),
-            true,
+            Some(Depth::Static),
             false,
             false,
         )
@@ -5179,9 +5257,17 @@ upstream = "checkout_upstream"
         let pull = MULTI_HOST.replace("source = \"release\"", "source = \"pull\"");
         let config = write(dir.path(), "fraisier.toml", &pull);
         let state = dir.path().join("state");
-        let out = deploy(&config, &state, None, Some("1.2.3"), true, false, false)
-            .await
-            .expect("multi-host pull dry run");
+        let out = deploy(
+            &config,
+            &state,
+            None,
+            Some("1.2.3"),
+            Some(Depth::Static),
+            false,
+            false,
+        )
+        .await
+        .expect("multi-host pull dry run");
         assert_eq!(out.exit_code, 0, "pretty: {}", out.pretty);
         assert_eq!(out.json["artifact"], serde_json::json!("pull"));
         assert!(
@@ -6861,7 +6947,7 @@ current_revision = "true"
         let config = write(dir.path(), "fraisier.toml", &toml);
         let state = dir.path().join("state");
 
-        let out = deploy(&config, &state, None, Some("1.2.3"), false, false, false)
+        let out = deploy(&config, &state, None, Some("1.2.3"), None, false, false)
             .await
             .expect("the deploy runs and is refused");
         assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
@@ -6966,7 +7052,8 @@ current_revision = "true"
         assert_eq!(request.trigger, fraisier_db::restore::Trigger::Webhook);
         assert_eq!(request.app_version, Some("1.2.3"));
         assert_eq!(request.host, None);
-        assert!(!request.dry_run && !request.skip_preflight && !request.fail_on_block);
+        assert_eq!(request.dry_run, None);
+        assert!(!request.skip_preflight && !request.fail_on_block);
     }
 
     /// A config whose app DSN is `FRAISIER_TEST_APP_URL`, plus `extra`.

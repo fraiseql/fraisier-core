@@ -42,6 +42,22 @@ A tier listed in **neither** list is denied. That is deliberate: a tier added to
 the taxonomy in a later release must not silently auto-apply on a config written
 today.
 
+### Only the pending migrations are judged
+
+The gate judges the migrations this deploy will apply, not the ones the
+database has already run. With the confiture adapter that needs **confiture ≥
+1.35.0**, the first release that accepts `migrate preflight --scope pending`;
+the adapter then advertises `pending_scope` and passes the flag. The pending set
+comes from the ledger of the database the preflight reads: the live one, or the
+throwaway under deep classification, whose ledger is a copy of it.
+
+Below 1.35.0 the change-set covers **every** migration file, applied ones
+included. One `DROP COLUMN` that was approved and applied long ago is then
+judged again on every later deploy, and refuses each of them. The plan says so
+(`judged every migration file, applied ones included`) and its JSON carries
+`scope = "all"`; with a new enough confiture it carries `scope = "pending"`.
+`fraisier doctor` warns about any confiture below 1.35.0 for this reason.
+
 ### Absence is never safety
 
 Every way of not knowing is a refusal, and the refusal says which one it was:
@@ -58,12 +74,61 @@ Every way of not knowing is a refusal, and the refusal says which one it was:
 
 The last row is the one you are most likely to meet, and with the confiture
 adapter it has a specific and common cause: **an `ALTER COLUMN … TYPE` is
-unclassified.** Telling a widening `varchar(10) → varchar(20)` from a narrowing
-one needs the column's current type and the server version; confiture gathers
-those only when it is asked to compare against a live database, and fraisier does
-not ask. So it declines to guess rather than guessing wrong, and a configured
-`[policy]` refuses the deploy. That is the contract working as designed — see
-*How to unblock a refused deploy* below.
+unclassified** unless the deploy classifies deeply (below). Telling a widening
+`varchar(10) → varchar(20)` from a narrowing one needs the column's current type
+and the server version, which confiture gathers only when it is asked to compare
+against a database. Without that it declines to guess rather than guessing
+wrong, and a configured `[policy]` refuses the deploy. That is the contract
+working as designed — see *How to unblock a refused deploy* below.
+
+## Deep classification under restore rehearsal
+
+With `[migration].preflight_mode = "restore_rehearsal"` and no
+`preflight_backup_path` (a fresh dump), a single-host deploy classifies against
+a copy of the live data instead of the migration files alone. Its preflight
+runs in this order:
+
+1. **provision** a throwaway database from a fresh `pg_dump` of the live one,
+   after checking that the temp directory has room for a copy of the live
+   database plus 2 GB;
+2. **inspect** the pending migrations with `confiture migrate preflight
+   --against <throwaway>`. The throwaway is also the tracking database, so the
+   pending set is the throwaway's own;
+3. **gate** on that classification, waiting for the approval hook if a tier
+   needs it;
+4. **lint**: a migration the throwaway's data cannot take
+   (`PFLIGHT_REPLAY_FAILED`) is a blocking finding, and the deploy is refused;
+5. **rehearse** `migrate up` on the same throwaway;
+6. **tear down** the throwaway, whatever happened in steps 2–5. A throwaway that
+   cannot be dropped is reported as a warning naming it.
+
+A type change then arrives tiered: a widening such as `integer → bigint` is
+`lock_risky` (it rewrites the table), and a narrowing such as `varchar(200) →
+varchar(20)` is `irreversible`.
+
+What it costs, and what it does not change:
+
+- The dump happens **before** the gate, so a deploy the gate refuses still pays
+  for one.
+- A plain `--dry-run` of such a config **does not dump the live database**. It
+  classifies statically and says so (`classified statically: a dry run does not
+  dump the live database`), with `classification.kind = "static"` in the JSON.
+  A column type change may then show as unclassified although the deploy would
+  tier it.
+- `--dry-run --deep` previews the classification the deploy will make: it
+  provisions and drops a throwaway, the plan says `classified against a fresh
+  copy of the live database`, and the JSON carries `classification.kind =
+  "deep"`. `--deep` is refused without `--dry-run`.
+- The live role's password reaches confiture through `PGPASSWORD`, never argv:
+  `--against` gets the throwaway's URL without it.
+- It needs a confiture that advertises `deep_classification` (≥ 0.44.0, the
+  same floor as `risk_tier`). Below it, the classification is static and the
+  plan says so.
+- An **archive** rehearsal (`preflight_backup_path` set) stays static: an archive
+  behind live has a different pending set, so a gate ruling on it would rule on
+  changes this deploy will not apply. The plan says that too.
+- A **rollback** provisions nothing: it is not gated and not rehearsed.
+- Multi-host and blue-green run no rehearsal, so they classify statically.
 
 Configuring `[policy]` together with `[migration].preflight_mode = "off"`
 therefore refuses **every** deploy. `fraisier validate-config` warns about that
@@ -259,11 +324,11 @@ to gate on and never fires.
    through the hook instead. That is the option for a producer with no upgrade
    path, not the general answer to a refusal.
 
-5. If the refused change is an `ALTER COLUMN … TYPE`, nothing is broken.
-   Confiture will not guess whether a type change widens or narrows without the
-   column's current type, and it gathers that only when comparing against a live
-   database — which fraisier does not ask it to do. The change arrives
-   unclassified and is refused. Approve it through the hook, or split it into
+5. If the refused change is an unclassified `ALTER COLUMN … TYPE`, nothing is
+   broken. Confiture will not guess whether a type change widens or narrows
+   without the column's current type. On a single host, switch to a fresh-dump
+   `restore_rehearsal` preflight (see *Deep classification* above) and the change
+   arrives tiered. Otherwise approve it through the hook, or split it into
    expand → backfill → contract, which classifies cleanly at every step.
 
 ## Audit

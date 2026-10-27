@@ -18,7 +18,7 @@
 //! 5. for a throwaway, the **teardown guard** ([`teardown_guard`]): only a name
 //!    carrying [`THROWAWAY_MARKER`] that is not the live database is dropped.
 //!
-//! The free-space check before a copy is [`check_room`]. The orchestration is
+//! The free-space check before a copy is [`room_for_copy`]. The orchestration is
 //! generic over a [`RestoreServer`], so its order and refusals are unit-tested
 //! with a fake; [`Postgres`] is the real one, over `psql`/`pg_dump`/`pg_restore`
 //! with every secret in the child's environment, never on argv.
@@ -496,6 +496,19 @@ pub fn check_room(live_bytes: u64, free_bytes: u64, dir: &Path) -> Result<(), St
         ));
     }
     Ok(())
+}
+
+/// [`check_room`] for a copy into the filesystem holding `dir`, measuring its
+/// free space. This is the one free-space rule every copy goes through, a
+/// drill's restore and a rehearsal's dump alike.
+///
+/// # Errors
+/// Why there is not room, or why the free space could not be measured: an
+/// unmeasurable volume is not a roomy one.
+pub fn room_for_copy(live_bytes: u64, dir: &Path) -> Result<(), String> {
+    let free = crate::retention::available_bytes(dir)
+        .map_err(|error| format!("could not measure free space in {}: {error}", dir.display()))?;
+    check_room(live_bytes, free, dir)
 }
 
 /// The real [`RestoreServer`], over `psql`, `pg_dump` and `pg_restore` on

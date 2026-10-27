@@ -37,6 +37,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`deploy --dry-run --deep`: the deep classification is previewed only on
+  request.** Under a fresh-dump restore rehearsal, a plain `--dry-run`
+  classifies statically and says so; it never dumps the live database.
+  `--deep` previews the classification the deploy will make, against a
+  throwaway restored from a fresh dump. See
+  [docs/schema-risk-policy.md](docs/schema-risk-policy.md#deep-classification-under-restore-rehearsal).
+
 - **A failed scheduled backup, prune or drill notifies exactly once.**
   - **The units.** `fraisier scheduled install` now also writes a prune timer per
     `[[backup.retain]]` entry, and a drill timer when `[drill].schedule` is set.
@@ -307,6 +314,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a feature-gated path cannot be a working intra-doc link there.
 
 ### Fixed
+
+- **The policy gate judges only the migrations a deploy will apply.** The
+  confiture adapter passed no `--scope`, so confiture judged every migration
+  file, applied ones included: one approved and applied `DROP COLUMN` refused
+  every later deploy. With **confiture ≥ 1.35.0** the adapter now passes
+  `--scope pending` and advertises `pending_scope`. Older releases reject the
+  flag, so they keep judging every migration; `deploy --dry-run` then says so
+  (`scope = "all"` in the JSON), and `fraisier doctor` now warns below 1.35.0.
 
 - **A scheduled backup no longer fails from its second run on.** The generated
   unit runs `fraisier backup --config …` from `/`, which wrote

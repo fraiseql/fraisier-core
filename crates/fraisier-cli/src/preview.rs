@@ -968,10 +968,11 @@ mod tests {
             if self.fail_provision {
                 return Err(RehearsalError::Provision("pg_dump failed".to_owned()));
             }
-            Ok(ThrowawayDb {
-                dsn: "postgres://u:pw@h/app_fraisier_rh_1".to_owned(),
-                name: "app_fraisier_rh_1".to_owned(),
-            })
+            Ok(ThrowawayDb::new(
+                "postgres://u:pw@h/app_fraisier_rh_1",
+                "app_fraisier_rh_1",
+                "app",
+            ))
         }
 
         async fn teardown(&self, db: &ThrowawayDb) -> Result<(), String> {

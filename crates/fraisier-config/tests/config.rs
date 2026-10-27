@@ -363,6 +363,43 @@ unit = "x.service"
     assert!(!cfg.validate().ok(), "token_provider needs http adapter");
 }
 
+/// A multi-host rollout has no restore rehearsal: it lints live instead. The
+/// config must say so rather than let the rehearsal quietly not happen.
+#[test]
+fn restore_rehearsal_on_a_multi_host_config_warns_it_lints_live() {
+    let toml = r#"
+[deploy]
+name = "x"
+environment = "production"
+[hosts]
+strategy = "rolling"
+inventory = [ { name = "web-1", address = "10.0.0.1" } ]
+[ssh]
+user = "deploy"
+[artifact]
+source = "local"
+path = "/srv/x"
+[migration]
+adapter = "confiture"
+database_url_env = "X_DATABASE_URL"
+preflight_mode = "restore_rehearsal"
+[service]
+adapter = "systemd"
+unit = "x.service"
+[health]
+adapter = "http"
+url = "http://{host.address}/health"
+"#;
+    let cfg = DeployConfig::from_toml_str(toml).expect("parses");
+    let report = cfg.validate();
+    let issue = report
+        .issues
+        .iter()
+        .find(|i| i.path == "migration.preflight_mode" && i.severity == Severity::Warning)
+        .unwrap_or_else(|| panic!("expected a preflight_mode warning, got {report}"));
+    assert!(issue.message.contains("[hosts]"), "{}", issue.message);
+}
+
 /// `preflight_mode = "restore_rehearsal"` requires the confiture adapter, since
 /// the rehearsal composes a generic-Postgres restore.
 #[test]
@@ -839,11 +876,14 @@ fn an_absolute_backup_dir_validates_clean() {
     );
 }
 
+const BACKUP_DIR: &str = "[backup]\ndir = \"/var/backups/checkout\"\n\n";
+
 const RETAIN: &str = "[[backup.retain]]\ndir = \"/var/backups/checkout\"\n\
                       schedule = \"daily 05:30\"\nretention_days = 3\n";
 
+/// Validates `entry` under a `[backup]` section whose `dir` is RETAIN's.
 fn retain_report(entry: &str) -> fraisier_config::ValidationReport {
-    DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{entry}"))
+    DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{BACKUP_DIR}{entry}"))
         .expect("parses")
         .validate()
 }
@@ -870,9 +910,9 @@ fn a_retain_name_must_be_safe_in_a_unit_name() {
 }
 
 #[test]
-fn a_retain_entry_parses_with_its_defaults_and_needs_no_backup_dir() {
-    let config =
-        DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{RETAIN}")).expect("parses");
+fn a_retain_entry_parses_with_its_defaults() {
+    let config = DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{BACKUP_DIR}{RETAIN}"))
+        .expect("parses");
     assert!(config.validate().ok(), "{}", config.validate());
     let backup = config.backup.expect("[backup]");
     let [entry] = backup.retain.as_slice() else {
@@ -894,7 +934,7 @@ fn a_retain_entry_parses_with_its_defaults_and_needs_no_backup_dir() {
 #[test]
 fn declared_retain_fields_win_over_the_defaults() {
     let config = DeployConfig::from_toml_str(&format!(
-        "{SCHEDULE_BASE}\n{RETAIN}keep_minimum = 5\nkeep_last = 9\n\
+        "{SCHEDULE_BASE}\n{BACKUP_DIR}{RETAIN}keep_minimum = 5\nkeep_last = 9\n\
          match = \"checkout-production-*.pgdump\"\nname = \"prod-full\"\nmin_free_gb = 20\n"
     ))
     .expect("parses");
@@ -964,6 +1004,66 @@ fn a_retain_match_is_confined_to_the_dir() {
             "{bad}: {report}"
         );
     }
+}
+
+#[test]
+fn a_retain_match_selects_archives_only() {
+    // The scheduled prune removes every old file the glob selects, so a glob
+    // that can reach a file other than an archive can delete it.
+    for bad in [
+        "*",
+        "*.sql",
+        "checkout*",
+        "*.pgdump*",
+        "*.pgdump.partial",
+        "*pgdump",
+    ] {
+        let report = retain_report(&format!("{RETAIN}match = \"{bad}\"\n"));
+        assert!(
+            has_error(&report, "backup.retain[0].match"),
+            "{bad}: {report}"
+        );
+    }
+    for good in [
+        "*.pgdump",
+        "checkout-production-*.pgdump",
+        "checkout-?????.pgdump",
+    ] {
+        let report = retain_report(&format!("{RETAIN}match = \"{good}\"\n"));
+        assert!(report.ok(), "{good}: {report}");
+    }
+}
+
+#[test]
+fn a_retain_dir_must_be_within_the_backup_dir() {
+    for bad in [
+        "/srv/app",
+        "/var/backups",
+        "/var/backups/checkout2",
+        "/var/backups/checkout-old",
+    ] {
+        let report = retain_report(&RETAIN.replace("/var/backups/checkout", bad));
+        assert!(
+            has_error(&report, "backup.retain[0].dir"),
+            "{bad}: {report}"
+        );
+    }
+    for good in [
+        "/var/backups/checkout/",
+        "/var/backups/checkout/weekly",
+        "/var/backups/./checkout",
+    ] {
+        let report = retain_report(&RETAIN.replace("/var/backups/checkout", good));
+        assert!(report.ok(), "{good}: {report}");
+    }
+}
+
+#[test]
+fn a_retain_entry_requires_a_backup_dir() {
+    let report = DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{RETAIN}"))
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "backup.dir"), "{report}");
 }
 
 #[test]
@@ -1042,7 +1142,9 @@ fn the_documented_retain_example_validates() {
 
 #[test]
 fn a_backup_section_with_neither_dir_nor_retain_is_still_an_error() {
-    let report = retain_report("[backup]\nretain = []\n");
+    let report = DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n[backup]\nretain = []\n"))
+        .expect("parses")
+        .validate();
     assert!(has_error(&report, "backup.dir"), "{report}");
 }
 
@@ -1982,6 +2084,22 @@ fn a_database_less_migration_axis_validates() {
     let cfg = DeployConfig::from_toml_str(&database_less("")).expect("parses");
     let report = cfg.validate();
     assert!(report.ok(), "got {:?}", report.issues);
+}
+
+/// The router example in `docs/stacks.md` is the shape operators copy for a
+/// stack's router member, so it must load and declare that it owns no database.
+#[test]
+fn the_documented_router_example_owns_no_database() {
+    let page = include_str!("../../../docs/stacks.md");
+    let after = page
+        .split_once("<!-- router-example -->\n```toml\n")
+        .expect("the marked example")
+        .1;
+    let example = after.split_once("```").expect("closing fence").0;
+    let config = DeployConfig::from_toml_str(example).expect("the example parses");
+    assert!(config.validate().ok(), "{}", config.validate());
+    let migration = config.migration.expect("[migration]");
+    assert_eq!(migration.adapter.as_deref(), Some("none"));
 }
 
 /// A database-less axis takes no DSN and no settings: either one means the

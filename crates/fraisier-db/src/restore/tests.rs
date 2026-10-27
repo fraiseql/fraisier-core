@@ -477,27 +477,25 @@ async fn a_throwaway_left_with_an_empty_tview_fails_and_is_dropped() {
 
 #[test]
 fn the_guard_admits_a_marked_name_that_is_not_live() {
-    assert_eq!(teardown_guard("shop_fraisier_rh_1_a", Some("shop")), Ok(()));
-    assert_eq!(teardown_guard("shop_fraisier_rh_1_a", None), Ok(()));
+    assert_eq!(teardown_guard("shop_fraisier_rh_1_a", "shop"), Ok(()));
 }
 
 #[test]
 fn the_guard_refuses_a_name_without_the_marker() {
-    let reason = teardown_guard("shop_copy", None).expect_err("no marker");
+    let reason = teardown_guard("shop_copy", "shop").expect_err("no marker");
     assert!(reason.contains(THROWAWAY_MARKER), "{reason}");
 }
 
 #[test]
 fn the_guard_refuses_the_live_database_even_with_the_marker() {
-    let reason =
-        teardown_guard("shop_fraisier_rh_x", Some("shop_fraisier_rh_x")).expect_err("live");
+    let reason = teardown_guard("shop_fraisier_rh_x", "shop_fraisier_rh_x").expect_err("live");
     assert!(reason.contains("live"), "{reason}");
 }
 
 #[tokio::test]
 async fn a_guarded_drop_runs_nothing() {
     let fake = Fake::default();
-    let refused = drop_throwaway(&fake, &operator(None), "shop", None)
+    let refused = drop_throwaway(&fake, &operator(None), "shop", "live")
         .await
         .expect_err("refused");
     assert!(refused.contains(THROWAWAY_MARKER), "{refused}");
@@ -511,7 +509,7 @@ async fn a_throwaway_is_dropped_as_the_identity_that_created_it() {
         &fake,
         &operator(Some(admin())),
         "shop_fraisier_rh_1_a",
-        Some("shop"),
+        "shop",
     )
     .await
     .expect("dropped");

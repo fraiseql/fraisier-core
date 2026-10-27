@@ -160,6 +160,7 @@ pub fn generate_scheduled(config: &DeployConfig) -> Result<Vec<GeneratedFile>, S
         environment: &environment,
         config_path: &config_path,
         env_file: format!("/etc/{name}/{environment}.env"),
+        ops_env_file: format!("/etc/{name}/{environment}.ops.env"),
     };
     let mut files = Vec::new();
     let mut alerting = false;
@@ -208,6 +209,7 @@ struct Units<'a> {
     environment: &'a str,
     config_path: &'a str,
     env_file: String,
+    ops_env_file: String,
 }
 
 impl Units<'_> {
@@ -218,6 +220,10 @@ impl Units<'_> {
             .replace("{environment}", self.environment)
             .replace("{config_path}", self.config_path)
             .replace("{env_file}", &self.env_file)
+            .replace(
+                "{ops_env}",
+                &OPS_ENV.replace("{ops_env_file}", &self.ops_env_file),
+            )
     }
 
     /// The unit `fraisier-<name>-<environment>-<suffix>`, under the marker.
@@ -519,7 +525,7 @@ Type=oneshot
 # Runs fraisier on the host; edit --config / add flags as needed.
 {notes}ExecStart=fraisier {command} --config {config_path}{flag}
 EnvironmentFile=-{env_file}
-{failure}";
+{ops_env}{failure}";
 
 const SCHEDULED_TIMER: &str = "[Unit]
 Description=fraisier scheduled {command} timer for {name} ({environment})
@@ -530,6 +536,14 @@ Persistent=true
 
 [Install]
 WantedBy=timers.target
+";
+
+/// The second `EnvironmentFile=` of every scheduled unit, loaded after the
+/// shared one so its values win. The app unit never loads it, so a secret only
+/// fraisier's own runs need (the restore identity) stays out of the app.
+const OPS_ENV: &str = "# Operator-only secrets such as [database].admin_url_env; the app
+# unit never loads this file.
+EnvironmentFile=-{ops_env_file}
 ";
 
 /// The `[Unit]` line of every unit that alerts through a failure record.
@@ -551,7 +565,7 @@ Type=oneshot
 # unit only names the [[backup.retain]] entry.
 ExecStart=fraisier backup prune --config {config_path} --name {retain} --apply --failure-record %n
 EnvironmentFile=-{env_file}
-{failure}";
+{ops_env}{failure}";
 
 const RETAIN_TIMER: &str = "[Unit]
 Description=fraisier prune timer of {retain} archives for {name} ({environment})
@@ -578,7 +592,7 @@ OnFailure=fraisier-{name}-{environment}-alert@%n.service
 Type=oneshot
 ExecStart=fraisier backup drill --config {config_path} --failure-record %n
 EnvironmentFile=-{env_file}
-{failure}";
+{ops_env}{failure}";
 
 const DRILL_TIMER: &str = "[Unit]
 Description=fraisier restore drill timer for {name} ({environment})
@@ -602,7 +616,7 @@ Type=oneshot
 # unit has no OnFailure=: a failed alert is logged, never re-alerted.
 ExecStart=fraisier notify --config {config_path} --unit %i
 EnvironmentFile=-{env_file}
-";
+{ops_env}";
 
 const NGINX_SITE: &str = "upstream {upstream} {
 {server_block}
@@ -846,6 +860,9 @@ upstream = "checkout_upstream"
                  ExecStart=fraisier backup --config /etc/fraisier/checkout.toml \
                  --failure-record %n\n\
                  EnvironmentFile=-/etc/checkout/production.env\n\
+                 # Operator-only secrets such as [database].admin_url_env; the app\n\
+                 # unit never loads this file.\n\
+                 EnvironmentFile=-/etc/checkout/production.ops.env\n\
                  # A failed run leaves its redacted reason here for the alert unit.\n\
                  RuntimeDirectory=fraisier/failures\n\
                  RuntimeDirectoryPreserve=yes\n"

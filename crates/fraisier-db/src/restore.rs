@@ -437,13 +437,14 @@ async fn fill_throwaway(
         }),
         Err(error) => {
             // Best-effort cleanup of the half-provisioned database.
-            let _ = drop_throwaway(server, identity, &name, Some(live.database())).await;
+            let _ = drop_throwaway(server, identity, &name, live.database()).await;
             Err(RestoreError::Failed(error))
         }
     }
 }
 
-/// Drop the throwaway `name`, after [`teardown_guard`] admits it.
+/// Drop the throwaway `name`, copied from the live database `live`, after
+/// [`teardown_guard`] admits it.
 ///
 /// # Errors
 /// The guard refused it, or the drop failed.
@@ -451,7 +452,7 @@ pub async fn drop_throwaway(
     server: &dyn RestoreServer,
     identity: &RestoreIdentity,
     name: &str,
-    live: Option<&str>,
+    live: &str,
 ) -> Result<(), String> {
     teardown_guard(name, live).map_err(|reason| format!("refusing to drop '{name}': {reason}"))?;
     server
@@ -460,19 +461,18 @@ pub async fn drop_throwaway(
         .map_err(|error| format!("DROP DATABASE {name} failed: {error}"))
 }
 
-/// Whether `throwaway` may be dropped when the live database is `live` (when
-/// known).
+/// Whether `throwaway` may be dropped when the live database is `live`.
 ///
 /// # Errors
 /// Why it may not: its name lacks [`THROWAWAY_MARKER`], or it is the live
 /// database.
-pub fn teardown_guard(throwaway: &str, live: Option<&str>) -> Result<(), String> {
+pub fn teardown_guard(throwaway: &str, live: &str) -> Result<(), String> {
     if !throwaway.contains(THROWAWAY_MARKER) {
         return Err(format!(
             "its name does not carry the throwaway marker '{THROWAWAY_MARKER}'"
         ));
     }
-    if live == Some(throwaway) {
+    if live == throwaway {
         return Err("it is the live database".to_owned());
     }
     Ok(())

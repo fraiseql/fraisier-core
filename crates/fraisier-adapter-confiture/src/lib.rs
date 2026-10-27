@@ -343,6 +343,7 @@ impl ConfitureMigration {
         let plan = plan(subcommand, ctx, extra, &output_path)?;
 
         let mut command = tokio::process::Command::new(&self.program);
+        fraisier_core::child_env::scrub(command.as_std_mut());
         command
             .args(&plan.args)
             .env(CONFITURE_DSN_ENV, &plan.database_url)
@@ -1122,7 +1123,9 @@ fn version_triple(version: &str) -> Option<(u32, u32, u32)> {
 #[async_trait]
 impl MigrationAdapter for ConfitureMigration {
     async fn describe(&self) -> Result<AdapterDescription, AdapterError> {
-        let output = tokio::process::Command::new(&self.program)
+        let mut command = tokio::process::Command::new(&self.program);
+        fraisier_core::child_env::scrub(command.as_std_mut());
+        let output = command
             .arg("--version")
             .output()
             .await

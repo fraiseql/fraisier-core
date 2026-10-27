@@ -1724,10 +1724,11 @@ mod tests {
             if self.fail {
                 return Err(RehearsalError::Provision("seed restore failed".to_owned()));
             }
-            Ok(ThrowawayDb {
-                dsn: format!("{live_dsn}_rehearsal"),
-                name: "throwaway".to_owned(),
-            })
+            Ok(ThrowawayDb::new(
+                format!("{live_dsn}_rehearsal"),
+                "throwaway",
+                "live",
+            ))
         }
 
         async fn teardown(&self, db: &ThrowawayDb) -> Result<(), String> {

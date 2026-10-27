@@ -221,6 +221,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A restore rehearsal that never ran the migrations no longer blames them.**
+  Every rehearsal failure used to end in "The pending migrations did not apply
+  cleanly on a fresh restore. Fix the migrations". That included a throwaway
+  copy that could not be created, such as an app role without `CREATEDB`, and a
+  `DATABASE_URL` that did not resolve. Neither applies a single migration.
+  `RehearsalError::remedy` now gives each failure its own advice. A provisioning
+  failure names `CREATEDB` and `[database].admin_url_env`. Only a failed
+  rehearsed `migrate up` points at the migrations. The `--skip-preflight` escape
+  is unchanged.
+
 - **The vendored confiture exit-code contract is confiture's again, and a test keeps
   it so.** `crates/fraisier-adapter-confiture/src/exit_codes.vendored.json` is meant
   to be `confiture --exit-codes-json` captured verbatim. Measured against confiture

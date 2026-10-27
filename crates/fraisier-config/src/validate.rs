@@ -225,7 +225,7 @@ fn validate_checks(cfg: &DeployConfig, report: &mut ValidationReport) {
 /// Validate the `[policy]` section: the tier lists name real tiers, no tier is
 /// claimed by both, and the approval hook matches what the policy asks for.
 ///
-/// An absent section is not an error — it is the D6 opt-out, and the tier gate
+/// An absent section is not an error — the policy is opt-in, and the tier gate
 /// simply does not run.
 fn validate_policy(cfg: &DeployConfig, report: &mut ValidationReport) {
     let Some(policy) = &cfg.policy else {

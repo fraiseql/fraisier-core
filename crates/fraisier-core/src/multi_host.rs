@@ -441,8 +441,8 @@ impl MultiHostDeployBuilder {
     /// Apply `gate` — the resolved `[policy]` section and its approval hook — to
     /// this rollout's preflight step.
     ///
-    /// Absent, the tier gate does not run at all (D6), and the rollout behaves
-    /// exactly as it does without a policy.
+    /// Absent, the tier gate does not run at all (the policy is opt-in), and the
+    /// rollout behaves exactly as it does without a policy.
     #[must_use]
     pub fn policy(mut self, gate: PolicyGate) -> Self {
         self.policy = gate;
@@ -723,7 +723,7 @@ impl RolloutShared {
     /// Apply the schema policy gate to this rollout. Multi-host rolls one
     /// version at a time against the database, so there is no shared hold window
     /// to certify: the baseline is [`Baseline::None`] and the gate is entirely
-    /// opt-in through `[policy]` (D6).
+    /// opt-in through `[policy]`.
     async fn run_policy_gate(&self, inspection: &Inspection) -> Result<(), SagaError> {
         self.policy
             .admit(
@@ -2269,7 +2269,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_multi_host_rollout_with_no_policy_section_is_unchanged() {
-        // The D6 guarantee for the fleet path: the same irreversible change,
+        // The opt-in guarantee for the fleet path: the same irreversible change,
         // with no `[policy]` section, still rolls out exactly as it does today.
         let (_dir, store) = store();
         let trail = Trail::default();

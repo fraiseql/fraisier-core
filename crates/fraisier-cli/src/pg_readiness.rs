@@ -147,7 +147,7 @@ impl DatabaseReadiness for PgReadiness {
 
 // The Python implementation warned, rather than refused, when the probe could
 // not run under the default gate. That case is deliberately not carried over:
-// D2 makes `fail` the default, and a probe that could not run has cleared
+// `fail` is the default, and a probe that could not run has cleared
 // nothing, so it costs what emptiness costs (see `judge`).
 #[cfg(test)]
 mod tests {

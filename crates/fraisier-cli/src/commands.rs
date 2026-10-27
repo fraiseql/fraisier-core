@@ -1596,11 +1596,11 @@ fn render_multi_host_summary(
 /// Inspect the migration adapter for a `--dry-run`, degrading rather than
 /// aborting.
 ///
-/// Every way of failing to see the schema — the operator turned preflight off,
-/// the config did, the adapter cannot be built, the database is unreachable —
-/// yields a plan carrying an explicit unavailability instead of an error exit
-/// (rule 2, D8). The one thing it never does is produce a plan that reads as
-/// clean.
+/// Every way of failing to see the schema — the operator turned preflight off, the
+/// config did, the adapter cannot be built, the database is unreachable — yields a
+/// plan carrying an explicit unavailability instead of an error exit (a dry-run
+/// that cannot see still owes the operator the plan). The one thing it never does
+/// is produce a plan that reads as clean.
 ///
 /// `single_host` previews a restore-rehearsal config the way its single-host
 /// deploy classifies: against a fresh copy of the live database when it can
@@ -1628,8 +1628,8 @@ async fn preview_schema(
     let target = match factory::build_preview(config, host, app_version) {
         Ok(target) => target,
         // An unset DSN env var is the common one. Today's dry-run never resolves
-        // secrets, so this is a failure mode the plan did not have before D8 —
-        // and it must not turn a plan into an error exit.
+        // secrets, so this is a failure mode the plan did not have before it
+        // inspected the schema — and it must not turn a plan into an error exit.
         Err(error) => {
             return uninspected(Unavailable::new(
                 Unavailable::ADAPTER_UNAVAILABLE,
@@ -3365,7 +3365,8 @@ impl fraisier_webhook::WebhookHandler for DeployHandler {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         });
-        // A webhook deploy never resolves the admin identity (D14).
+        // A webhook deploy never resolves the admin identity: it answers the
+        // network, so nothing it starts may reach a database superuser.
         let out = run_deploy(
             &self.config,
             &self.state_dir,
@@ -4651,7 +4652,7 @@ url = "http://127.0.0.1:8080/health"
         assert_eq!(out.json["host"], serde_json::json!("127.0.0.1"));
     }
 
-    /// Today's dry-run plan, byte for byte. Rule 1: `--skip-preflight` is the
+    /// Today's dry-run plan, byte for byte. `--skip-preflight` is the
     /// documented way back to the pure offline check, so a CI job that used
     /// `--dry-run` as a cheap config gate keeps its exact output.
     const OFFLINE_PLAN: &str = "deploy plan for checkout/staging → host 127.0.0.1\n  \
@@ -4746,8 +4747,8 @@ url = "http://127.0.0.1:8080/health"
 
     #[tokio::test]
     async fn no_policy_section_renders_no_policy_line() {
-        // D6 again, at the CLI: an operator who has not opted in sees the
-        // change-set (or why there is none) and nothing else.
+        // The opt-in policy again, at the CLI: an operator who has not opted in
+        // sees the change-set (or why there is none) and nothing else.
         let dir = tempfile::tempdir().expect("tempdir");
         let config = write(dir.path(), "fraisier.toml", VALID);
         let out = deploy(
@@ -4769,10 +4770,10 @@ url = "http://127.0.0.1:8080/health"
 
     #[tokio::test]
     async fn a_missing_dsn_degrades_rather_than_aborting() {
-        // The IPC path resolves the DSN env var when it builds the adapter, so
-        // an unset one fails the build. Today's dry-run never resolved secrets;
-        // under D8 it does, and that new failure mode must not turn a plan into
-        // an error exit.
+        // The IPC path resolves the DSN env var when it builds the adapter, so an
+        // unset one fails the build. Today's dry-run never resolved secrets; now
+        // that it inspects the schema it does, and that new failure mode must not
+        // turn a plan into an error exit.
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = VALID.replace(
             "adapter = \"confiture\"\ndatabase_url_env = \"CHECKOUT_DATABASE_URL\"",
@@ -4898,7 +4899,7 @@ url = "http://127.0.0.1:8080/health"
 
     #[tokio::test]
     async fn blue_green_dry_run_shows_the_window_safety_verdict() {
-        // The baseline is not opt-in (the D3 carve-out), so blue-green always
+        // The window-safety baseline is not opt-in, so blue-green always
         // has a verdict to report — with no `[policy]` section anywhere.
         let dir = tempfile::tempdir().expect("tempdir");
         let config = blue_green_config(dir.path(), VALID);

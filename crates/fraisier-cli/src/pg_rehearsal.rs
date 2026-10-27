@@ -206,7 +206,7 @@ mod tests {
     /// and run with `cargo test -- --ignored`. (The migration-rehearsal logic over
     /// this lifecycle — including the Python-0.34 backup-behind-tracking scenario —
     /// is unit-tested in `fraisier_core::restore_rehearsal`; the full confiture
-    /// chain runs on the fixture host per the finalize-phase validation checklist.)
+    /// chain runs on the fixture host.)
     #[tokio::test]
     #[ignore = "requires a real Postgres reachable via FRAISIER_REHEARSAL_TEST_DSN"]
     async fn provisions_and_tears_down_a_throwaway_from_a_fresh_dump() {

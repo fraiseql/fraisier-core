@@ -2892,7 +2892,7 @@ async fn drill_steps(
 }
 
 /// Refuse a drill when the filesystem holding `data_dir` cannot take another
-/// copy of the live database ([`fraisier_db::retention::room_for_copy`]).
+/// copy of the live database ([`fraisier_db::restore::room_for_copy`]).
 async fn drill_room(
     server: &dyn DrillServer,
     live_dsn: &str,
@@ -2904,7 +2904,7 @@ async fn drill_room(
             format!("could not size the live database: {error}"),
         )
     })?;
-    fraisier_db::retention::room_for_copy(live, data_dir).map_err(|error| ("free space", error))
+    fraisier_db::restore::room_for_copy(live, data_dir).map_err(|error| ("free space", error))
 }
 
 /// Write `receipt` to `<state_dir>/drills/<fraise>-<environment>.json`, replacing

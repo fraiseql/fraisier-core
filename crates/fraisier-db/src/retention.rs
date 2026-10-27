@@ -292,33 +292,6 @@ fn stamp_in_name(name: &str) -> Option<UtcStamp> {
     UtcStamp::parse(stamp)
 }
 
-/// The headroom a copy of a database needs beyond the database's own size.
-pub const COPY_HEADROOM_BYTES: u64 = 2_000_000_000;
-
-/// Refuse when the filesystem holding `dir` cannot take a copy of a database of
-/// `live_bytes` plus [`COPY_HEADROOM_BYTES`].
-///
-/// A measurement that fails refuses too: a copy that fills the disk can stop the
-/// live server beside it. This is the one free-space rule every copy goes
-/// through, a drill's restore and a rehearsal's dump alike.
-///
-/// # Errors
-/// Why there is not room, or why the free space could not be measured.
-pub fn room_for_copy(live_bytes: u64, dir: &Path) -> Result<(), String> {
-    let free = available_bytes(dir)
-        .map_err(|error| format!("could not measure free space in {}: {error}", dir.display()))?;
-    let needed = live_bytes.saturating_add(COPY_HEADROOM_BYTES);
-    if free < needed {
-        return Err(format!(
-            "{} has {} GB free; a copy of the database needs about {} GB (its size plus 2 GB)",
-            dir.display(),
-            free / 1_000_000_000,
-            needed.div_ceil(1_000_000_000)
-        ));
-    }
-    Ok(())
-}
-
 /// The bytes an unprivileged writer can still use on the filesystem holding
 /// `path`.
 ///
@@ -887,27 +860,5 @@ mod tests {
             assert!(link.symlink_metadata().is_err());
             assert!(real.exists());
         }
-    }
-
-    #[test]
-    fn a_copy_that_cannot_fit_is_refused() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let error = crate::retention::room_for_copy(u64::MAX / 2, dir.path())
-            .expect_err("no filesystem holds that");
-        assert!(error.contains("GB free"), "{error}");
-    }
-
-    #[test]
-    fn a_free_space_that_cannot_be_measured_refuses() {
-        let error =
-            crate::retention::room_for_copy(0, std::path::Path::new("/nonexistent/fraisier"))
-                .expect_err("an unmeasurable volume is not a roomy one");
-        assert!(error.contains("could not measure"), "{error}");
-    }
-
-    #[test]
-    fn a_small_copy_fits_in_the_temp_dir() {
-        crate::retention::room_for_copy(0, &std::env::temp_dir())
-            .expect("2 GB free in the temp dir");
     }
 }

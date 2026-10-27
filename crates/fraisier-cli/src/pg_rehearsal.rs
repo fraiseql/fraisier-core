@@ -67,7 +67,7 @@ impl RehearsalDb for PgRehearsalDb {
                 .map_err(|e| {
                     RehearsalError::Provision(format!("could not size the live database: {e}"))
                 })?;
-            fraisier_db::retention::room_for_copy(size, &std::env::temp_dir())
+            fraisier_db::restore::room_for_copy(size, &std::env::temp_dir())
                 .map_err(RehearsalError::Provision)?;
         }
         let seed = match backup {

@@ -251,6 +251,17 @@ fn add_token_provider_secrets(config: &DeployConfig, env_secrets: &mut BTreeMap<
     }
 }
 
+/// Whether the live forward-compat lint runs, by `[migration].preflight_mode`
+/// (or the legacy `forward_compatible_lint` it replaces). A path with no
+/// restore rehearsal, multi-host or migration-only, lints live under
+/// `restore_rehearsal`.
+fn live_lint(config: &DeployConfig) -> bool {
+    config
+        .migration
+        .as_ref()
+        .is_none_or(|m| m.effective_preflight_mode() != PreflightMode::Off)
+}
+
 /// Resolve the preflight knobs from `[migration]`: the live forward-compat lint
 /// toggle and the optional restore-rehearsal `(db, backup)` pair.
 fn resolve_preflight(
@@ -679,11 +690,7 @@ pub fn build_multi_host(
     let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
     add_token_provider_secrets(config, &mut env_secrets);
 
-    let forward_compatible_lint = config
-        .migration
-        .as_ref()
-        .and_then(|m| m.forward_compatible_lint)
-        .unwrap_or(true);
+    let forward_compatible_lint = live_lint(config);
 
     // The host is set per-host by the multi-host composition; leave it None here.
     let mut ctx = AdapterCtx::new(fraise.clone(), environment.clone());
@@ -1103,11 +1110,7 @@ pub fn build_migration_only(config: &DeployConfig) -> Result<ResolvedMigration> 
     let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
     add_token_provider_secrets(config, &mut env_secrets);
 
-    let forward_compatible_lint = config
-        .migration
-        .as_ref()
-        .and_then(|m| m.forward_compatible_lint)
-        .unwrap_or(true);
+    let forward_compatible_lint = live_lint(config);
 
     let mut ctx = AdapterCtx::new(fraise.clone(), environment.clone());
     ctx.workdir = PathBuf::from(".");
@@ -1472,8 +1475,8 @@ pub fn build_blue_green(
 #[cfg(test)]
 mod tests {
     use super::{
-        build, build_for, build_health, build_health_probe, build_multi_host, build_policy_gate,
-        summarize, summarize_multi_host,
+        build, build_for, build_health, build_health_probe, build_migration_only, build_multi_host,
+        build_policy_gate, summarize, summarize_multi_host,
     };
     use fraisier_config::DeployConfig;
     use fraisier_core::adapter_axes::RiskTier;
@@ -1619,6 +1622,26 @@ mod tests {
         let resolved = build(&config, None, None).expect("builds");
         assert!(!resolved.forward_compatible_lint);
         assert!(resolved.restore_rehearsal.is_none());
+    }
+
+    #[test]
+    fn preflight_mode_off_disables_the_multi_host_lint() {
+        let toml = MULTI_HOST_IPC.replace(
+            "[migration]\nadapter = \"command\"\n",
+            "[migration]\nadapter = \"command\"\npreflight_mode = \"off\"\n",
+        );
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+        let resolved = build_multi_host(&config, Some("1.2.3")).expect("builds multi-host");
+        assert!(!resolved.forward_compatible_lint);
+    }
+
+    #[test]
+    fn preflight_mode_off_disables_the_migration_only_lint() {
+        let config =
+            DeployConfig::from_toml_str(&single_host_with_migration("preflight_mode = \"off\"\n"))
+                .expect("parses");
+        let resolved = build_migration_only(&config).expect("builds");
+        assert!(!resolved.forward_compatible_lint);
     }
 
     /// A single-host config whose `[health]` block is command-driven, with the

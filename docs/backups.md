@@ -222,7 +222,10 @@ missing unit fails silently.
    notifies nothing.
 2. systemd then starts the alert unit. Its `fraisier notify --unit %i` finds the
    record by `$MONITOR_INVOCATION_ID` and redacts the reason again on read.
-   It runs `[notify].command` once, then deletes the record.
+   It runs `[notify].command` once, then deletes the record. A hook that
+   cannot run or exits non-zero makes the alert unit fail too, naming the
+   hook's exit status, so `systemctl --failed` shows an alert that never left
+   the host.
 3. Sometimes there is no record: the run was killed before it could write one,
    or it ran without the flag. The alert still fires, with the reason
    `no failure record; see journalctl _SYSTEMD_INVOCATION_ID=<id>` (or

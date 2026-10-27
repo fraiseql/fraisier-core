@@ -469,6 +469,16 @@ fn validate_migration(cfg: &DeployConfig, report: &mut ValidationReport) {
              (it rehearses a real Postgres restore + migrate on a throwaway database)",
         );
     }
+    if migration.effective_preflight_mode() == PreflightMode::RestoreRehearsal
+        && cfg.hosts.is_some()
+    {
+        report.warn(
+            "migration.preflight_mode",
+            "preflight_mode = \"restore_rehearsal\" runs only on a single-host deploy; \
+             with [hosts], the multi-host rollout lints live instead (pass --host to \
+             rehearse against one host)",
+        );
+    }
 }
 
 fn validate_service(cfg: &DeployConfig, report: &mut ValidationReport) {

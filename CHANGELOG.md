@@ -261,6 +261,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`preflight_mode = "off"` now turns the lint off on multi-host deploys and
+  `db migrate` too.** Both read only the legacy `forward_compatible_lint` flag,
+  so `"off"` still linted there while `deploy --dry-run` said preflight was
+  off. `preflight_mode = "restore_rehearsal"` beside `[hosts]` now warns that
+  the multi-host rollout lints live instead of rehearsing.
+
 - **A restore rehearsal that never ran the migrations no longer blames them.**
   Every rehearsal failure used to end in "The pending migrations did not apply
   cleanly on a fresh restore. Fix the migrations". That included a throwaway

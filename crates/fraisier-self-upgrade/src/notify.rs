@@ -108,9 +108,16 @@ impl ExecHookNotifier {
     }
 }
 
-#[async_trait]
-impl Notifier for ExecHookNotifier {
-    async fn notify(&self, payload: &FailurePayload) {
+impl ExecHookNotifier {
+    /// Run the hook for `payload` and report whether it delivered: `Err` names
+    /// a hook that could not be spawned or did not exit 0.
+    ///
+    /// [`Notifier::notify`] stays best-effort on top of this; a caller that
+    /// must not report a failed hook as sent (an alert unit) calls this instead.
+    ///
+    /// # Errors
+    /// When the hook cannot be spawned or waited on, or exits non-zero.
+    pub async fn deliver(&self, payload: &FailurePayload) -> Result<(), String> {
         emit_event(payload);
 
         // One redacted copy drives both channels, so the env var and the JSON on
@@ -138,20 +145,27 @@ impl Notifier for ExecHookNotifier {
             command.env(key, value);
         }
 
-        match command.spawn() {
-            Ok(mut child) => {
-                if let Some(mut stdin) = child.stdin.take() {
-                    use tokio::io::AsyncWriteExt as _;
-                    let _ = stdin.write_all(json.as_bytes()).await;
-                    drop(stdin); // close stdin so the hook sees EOF
-                }
-                match child.wait().await {
-                    Ok(status) if status.success() => {}
-                    Ok(status) => tracing::warn!("notify hook exited {status}"),
-                    Err(error) => tracing::warn!("notify hook wait failed: {error}"),
-                }
-            }
-            Err(error) => tracing::warn!("notify hook failed to spawn: {error}"),
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("the notify hook could not be spawned: {error}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt as _;
+            let _ = stdin.write_all(json.as_bytes()).await;
+            drop(stdin); // close stdin so the hook sees EOF
+        }
+        match child.wait().await {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(format!("the notify hook exited with {status}, expected 0")),
+            Err(error) => Err(format!("waiting for the notify hook failed: {error}")),
+        }
+    }
+}
+
+#[async_trait]
+impl Notifier for ExecHookNotifier {
+    async fn notify(&self, payload: &FailurePayload) {
+        if let Err(error) = self.deliver(payload).await {
+            tracing::warn!("{error}");
         }
     }
 }
@@ -245,6 +259,24 @@ mod tests {
             std::fs::read_to_string(&out).expect("output"),
             "fraisier-webhook.service"
         );
+    }
+
+    #[tokio::test]
+    async fn deliver_reports_a_hook_that_exits_nonzero() {
+        let error = ExecHookNotifier::new("exit 3")
+            .deliver(&payload())
+            .await
+            .expect_err("a hook that exits 3 did not deliver");
+        assert!(error.contains("exit status: 3"), "{error}");
+        assert!(error.contains("expected 0"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn deliver_succeeds_when_the_hook_exits_zero() {
+        ExecHookNotifier::new("true")
+            .deliver(&payload())
+            .await
+            .expect("delivered");
     }
 
     #[tokio::test]

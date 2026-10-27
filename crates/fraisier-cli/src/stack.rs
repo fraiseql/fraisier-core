@@ -52,6 +52,10 @@ pub(crate) trait MemberDeployer: Send + Sync {
     /// Stage `router`'s release at `app_version` without activating it, and
     /// say where it is.
     async fn stage(&self, router: &Member, app_version: Option<&str>) -> Result<PathBuf>;
+
+    /// Why `member`'s own config would refuse to deploy, one `path: message`
+    /// per error; empty when it would not.
+    fn invalid(&self, member: &Member) -> Vec<String>;
 }
 
 /// What happened to one member.
@@ -143,6 +147,40 @@ pub(crate) async fn stack_deploy(
     .await
 }
 
+/// The stack at `stack_path` and its parsed `--app-version`s, or the refusal
+/// that stops it before anything is staged or deployed.
+fn ready(
+    stack_path: &Path,
+    versions: &[String],
+    deployer: &dyn MemberDeployer,
+) -> Result<(Stack, BTreeMap<String, String>), CommandOutput> {
+    let stack = load(stack_path).map_err(|error| refused(&error.to_string()))?;
+    let versions = parse_versions(&stack, versions).map_err(|message| refused(&message))?;
+    invalid_members(&stack, deployer).map_or(Ok((stack, versions)), Err)
+}
+
+/// The refusal for a stack with an invalid member. Each member's deploy
+/// validates its own config too, but only when its turn comes: by then the
+/// members before it are live.
+fn invalid_members(stack: &Stack, deployer: &dyn MemberDeployer) -> Option<CommandOutput> {
+    let invalid: Vec<String> = stack
+        .members
+        .iter()
+        .flat_map(|member| {
+            deployer
+                .invalid(member)
+                .into_iter()
+                .map(move |why| format!("member '{}': {why}", member.name))
+        })
+        .collect();
+    (!invalid.is_empty()).then(|| {
+        refused(&format!(
+            "refusing to deploy: a member's config is invalid, so nothing deployed\n  {}",
+            invalid.join("\n  ")
+        ))
+    })
+}
+
 fn refused(message: &str) -> CommandOutput {
     CommandOutput {
         exit_code: 1,
@@ -208,13 +246,9 @@ pub(crate) async fn stack_deploy_with(
 ) -> Result<CommandOutput> {
     use crate::stack_sdl::{SdlFinding, Verdict};
 
-    let stack = match load(stack_path) {
-        Ok(stack) => stack,
-        Err(error) => return Ok(refused(&error.to_string())),
-    };
-    let versions = match parse_versions(&stack, versions) {
-        Ok(versions) => versions,
-        Err(message) => return Ok(refused(&message)),
+    let (stack, versions) = match ready(stack_path, versions, deployer) {
+        Ok(ready) => ready,
+        Err(refusal) => return Ok(refusal),
     };
     let candidate = candidate(&stack, &versions, deployer, dry_run).await;
     let gates: BTreeMap<String, SdlGate> = match &candidate {
@@ -361,6 +395,15 @@ impl MemberDeployer for Deployer {
         ctx.host = Some(host.clone());
         Ok(plan.artifact.stage(&ctx, &host).await?.path)
     }
+
+    fn invalid(&self, member: &Member) -> Vec<String> {
+        member
+            .config
+            .validate()
+            .errors()
+            .map(|issue| format!("{}: {}", issue.path, issue.message))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -386,6 +429,8 @@ mod tests {
     struct Fake {
         deployed: Mutex<Vec<String>>,
         fail: Vec<&'static str>,
+        /// Members whose own config is invalid.
+        invalid: Vec<&'static str>,
         /// What staging the router answers; `None` fails it.
         candidate: Option<PathBuf>,
     }
@@ -458,6 +503,14 @@ mod tests {
             self.candidate
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("download of the router release failed"))
+        }
+
+        fn invalid(&self, member: &Member) -> Vec<String> {
+            if self.invalid.contains(&member.name.as_str()) {
+                vec!["artifact.source: an artifact source is required".to_owned()]
+            } else {
+                Vec::new()
+            }
         }
     }
 
@@ -888,6 +941,27 @@ mod tests {
         ))
         .expect("runs");
         assert_eq!(out.exit_code, 0, "{}", out.pretty);
+    }
+
+    #[test]
+    fn a_member_with_an_invalid_config_deploys_nothing() {
+        // Validating each member only inside its own deploy would leave the
+        // members before it live.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = stack_dir(dir.path());
+        let fake = Fake {
+            invalid: vec!["billing"],
+            ..Fake::default()
+        };
+        let out = block_on(stack_deploy_with(&path, &[], &fake, sdl(false), false)).expect("runs");
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(out.pretty.contains("member 'billing'"), "{}", out.pretty);
+        assert!(out.pretty.contains("artifact.source"), "{}", out.pretty);
+        assert!(
+            fake.deployed.lock().expect("log").is_empty(),
+            "{}",
+            out.pretty
+        );
     }
 
     #[test]

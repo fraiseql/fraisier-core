@@ -1888,7 +1888,8 @@ async fn run_single_host(
     let started = std::time::Instant::now();
     let run = plan.run_reporting(store).await?;
     let outcome = run.outcome;
-    notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
+    let notify_warning =
+        notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
     let metrics_warning = record_metrics(
         config,
         &resolved.fraise,
@@ -1909,13 +1910,16 @@ async fn run_single_host(
     if !run.warnings.is_empty() {
         json["warnings"] = json!(run.warnings);
     }
-    Ok(with_metrics_warning(
-        CommandOutput {
-            exit_code,
-            pretty,
-            json,
-        },
-        metrics_warning,
+    Ok(with_notify_warning(
+        with_metrics_warning(
+            CommandOutput {
+                exit_code,
+                pretty,
+                json,
+            },
+            metrics_warning,
+        ),
+        notify_warning,
     ))
 }
 
@@ -1950,7 +1954,8 @@ async fn run_multi_host(
 
     let started = std::time::Instant::now();
     let outcome = deploy.run(store).await?;
-    notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
+    let notify_warning =
+        notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
     let metrics_warning = record_metrics(
         config,
         &resolved.fraise,
@@ -1964,13 +1969,16 @@ async fn run_multi_host(
         "multi-host deploy of {}/{} {label}{detail}",
         resolved.fraise, resolved.environment
     );
-    Ok(with_metrics_warning(
-        CommandOutput {
-            exit_code,
-            pretty,
-            json: json!({ "outcome": label, "detail": detail.trim(), "multi_host": true }),
-        },
-        metrics_warning,
+    Ok(with_notify_warning(
+        with_metrics_warning(
+            CommandOutput {
+                exit_code,
+                pretty,
+                json: json!({ "outcome": label, "detail": detail.trim(), "multi_host": true }),
+            },
+            metrics_warning,
+        ),
+        notify_warning,
     ))
 }
 
@@ -2024,7 +2032,8 @@ async fn run_blue_green(
         .with_context(|| format!("opening state store at {}", state_dir.display()))?;
     let started = std::time::Instant::now();
     let outcome = resolved.deploy.run(store).await?;
-    notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
+    let notify_warning =
+        notify_deploy_failure(config, &resolved.fraise, &resolved.environment, &outcome).await;
     let metrics_warning = record_metrics(
         config,
         &resolved.fraise,
@@ -2032,16 +2041,19 @@ async fn run_blue_green(
         &deploy_metrics(&outcome, started.elapsed()),
     );
     let (exit_code, label, detail) = outcome_result(&outcome);
-    Ok(with_metrics_warning(
-        CommandOutput {
-            exit_code,
-            pretty: format!(
-                "blue-green deploy of {}/{} {label}{detail}\n",
-                resolved.fraise, resolved.environment
-            ),
-            json: json!({ "strategy": "blue-green", "outcome": label, "detail": detail.trim() }),
-        },
-        metrics_warning,
+    Ok(with_notify_warning(
+        with_metrics_warning(
+            CommandOutput {
+                exit_code,
+                pretty: format!(
+                    "blue-green deploy of {}/{} {label}{detail}\n",
+                    resolved.fraise, resolved.environment
+                ),
+                json: json!({ "strategy": "blue-green", "outcome": label, "detail": detail.trim() }),
+            },
+            metrics_warning,
+        ),
+        notify_warning,
     ))
 }
 
@@ -3884,11 +3896,23 @@ fn with_metrics_warning(mut out: CommandOutput, warning: Option<String>) -> Comm
     out
 }
 
+/// `out` with a notify hook that did not deliver named in it, so a failure
+/// whose alert never left the host does not read as alerted.
+fn with_notify_warning(mut out: CommandOutput, warning: Option<String>) -> CommandOutput {
+    if let Some(warning) = warning {
+        let _ = writeln!(out.pretty, "warning: {warning}");
+        if let Some(json) = out.json.as_object_mut() {
+            json.insert("notify_warning".to_owned(), json!(warning));
+        }
+    }
+    out
+}
+
 /// Fire the configured `[notify].command` failure sink when a deploy did not
 /// commit. This is the unattended-failure path: a scheduled (operator-unwatched)
 /// deploy of a sick build rolls back **and** emits a notification, reusing the
 /// self-upgrade notify primitive. A committed deploy, or a config with no notify
-/// sink, fires nothing.
+/// sink, fires nothing. A hook that did not deliver comes back as a warning.
 ///
 /// A deploy the **schema policy** blocked is reported as its own event: it is
 /// not "the deploy broke", it is "a pending migration needs a human", and an
@@ -3899,14 +3923,11 @@ async fn notify_deploy_failure(
     fraise: &str,
     environment: &str,
     outcome: &SagaOutcome,
-) {
-    use fraisier_self_upgrade::Notifier as _;
+) -> Option<String> {
     if matches!(outcome, SagaOutcome::Committed) {
-        return;
+        return None;
     }
-    let Some(command) = config.notify.as_ref().and_then(|n| n.command.as_deref()) else {
-        return;
-    };
+    let command = config.notify.as_ref().and_then(|n| n.command.as_deref())?;
     let (_, label, detail) = outcome_result(outcome);
     let payload = fraisier_self_upgrade::FailurePayload {
         event: if detail.contains(fraisier_core::policy::REFUSED) {
@@ -3927,8 +3948,9 @@ async fn notify_deploy_failure(
     fraisier_self_upgrade::ExecHookNotifier::new(command)
         .with_context("FRAISIER_NOTIFY_FRAISE", fraise)
         .with_context("FRAISIER_NOTIFY_ENVIRONMENT", environment)
-        .notify(&payload)
-        .await;
+        .deliver(&payload)
+        .await
+        .err()
 }
 
 #[cfg(test)]
@@ -5597,11 +5619,13 @@ current_revision = "true"
         std::time::UNIX_EPOCH + std::time::Duration::from_mins(29_883_075)
     }
 
-    /// A config with one `[[backup.retain]]` entry per `(name, dir, extra)`.
+    /// A config with one `[[backup.retain]]` entry per `(name, dir, extra)`, and
+    /// `dir` as `[backup].dir`: every corpus must sit within it.
     fn prune_config(dir: &Path, entries: &[(&str, &Path, &str)]) -> std::path::PathBuf {
         use std::fmt::Write as _;
 
         let mut body = db_ops_config("FRAISIER_PRUNE_UNUSED_DSN");
+        let _ = write!(body, "\n[backup]\ndir = \"{}\"\n", dir.display());
         for (name, corpus, extra) in entries {
             let _ = write!(
                 body,
@@ -6760,7 +6784,8 @@ current_revision = "true"
         // No [schedule]: the retain units and their alert still install.
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = format!(
-            "{VALID}\n[[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"nightly\"\n\
+            "{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n\
+             [[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"nightly\"\n\
              schedule = \"daily 05:30\"\nretention_days = 14\n"
         );
         let config = write(dir.path(), "fraisier.toml", &cfg);
@@ -6803,7 +6828,8 @@ current_revision = "true"
     fn scheduled_install_refuses_an_invalid_retain_entry() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = format!(
-            "{VALID}\n[[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"night ly\"\n\
+            "{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n\
+             [[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"night ly\"\n\
              schedule = \"daily 05:30\"\nretention_days = 14\n"
         );
         let config = write(dir.path(), "fraisier.toml", &cfg);
@@ -6971,6 +6997,23 @@ current_revision = "true"
         std::fs::remove_file(&out).expect("rm");
         notify_deploy_failure(&config, "checkout", "production", &SagaOutcome::Committed).await;
         assert!(!out.exists(), "no notify on a committed deploy");
+    }
+
+    #[tokio::test]
+    async fn a_failing_notify_hook_comes_back_as_a_warning() {
+        let config = DeployConfig::from_toml_str("[notify]\ncommand = 'exit 3'\n").expect("parses");
+        let warning = notify_deploy_failure(
+            &config,
+            "checkout",
+            "production",
+            &SagaOutcome::RolledBack {
+                failed_step: "health".to_owned(),
+                reason: "500".to_owned(),
+            },
+        )
+        .await
+        .expect("the failed hook is reported");
+        assert!(warning.contains("exit status: 3"), "{warning}");
     }
 
     #[tokio::test]

@@ -22,6 +22,11 @@ Each `[[backup.retain]]` entry is a policy for one directory. `fraisier backup
 prune` applies every entry. It is a dry run that only lists what it would remove;
 pass `--apply` to remove. Pass `--name <entry>` to prune a single entry.
 
+A prune removes every old file its entry selects, so an entry can only select
+archives. Its `dir` must be `[backup].dir` or a directory below it, so
+`[backup].dir` is required once any entry is declared. Its `match` must end in
+`.pgdump`. A config that breaks either rule fails validation.
+
 <!-- retain-example -->
 ```toml
 [backup]
@@ -40,12 +45,12 @@ min_free_gb = 20
 
 | Key | Meaning |
 |---|---|
-| `dir` | The corpus directory. Required. Must be absolute. |
+| `dir` | The corpus directory. Required. Must be absolute, and be `[backup].dir` or below it. |
 | `schedule` | When the prune runs. Required. Uses the `[schedule].calendar` vocabulary, such as `daily HH:MM` or `hourly`. |
 | `retention_days` | Archives older than this are removed. Required, at least 1. |
 | `keep_minimum` | The newest this many **valid** archives are kept however old they are. Default 3; 0 means no floor. |
 | `keep_last` | At most this many archives are kept, however young the rest are. Optional. At least 1, and not below `keep_minimum`. |
-| `match` | A file-name glob (`*`, `?`) choosing the corpus within `dir`. Default `*.pgdump`. It cannot contain `/`. |
+| `match` | A file-name glob (`*`, `?`) choosing the corpus within `dir`. Default `*.pgdump`. It cannot contain `/`, and must end in `.pgdump`. |
 | `min_free_gb` | Warn when the volume holding `dir` has less than this much free space. Optional. |
 | `name` | Names the entry and its units. Defaults to the last component of `dir`. Must be unique. |
 
@@ -223,7 +228,10 @@ missing unit fails silently.
    notifies nothing.
 2. systemd then starts the alert unit. Its `fraisier notify --unit %i` finds the
    record by `$MONITOR_INVOCATION_ID` and redacts the reason again on read.
-   It runs `[notify].command` once, then deletes the record.
+   It runs `[notify].command` once, then deletes the record. A hook that
+   cannot run or exits non-zero makes the alert unit fail too, naming the
+   hook's exit status, so `systemctl --failed` shows an alert that never left
+   the host.
 3. Sometimes there is no record: the run was killed before it could write one,
    or it ran without the flag. The alert still fires, with the reason
    `no failure record; see journalctl _SYSTEMD_INVOCATION_ID=<id>` (or

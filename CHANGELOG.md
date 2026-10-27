@@ -83,6 +83,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on a difference. See `docs/stacks.md`. Part of
   [#85](https://github.com/fraiseql/fraisier-core/issues/85).
 
+- **`[migration] adapter = "none"`: a deployable that owns no database.** A
+  router or a static front end used to fill the migration axis with no-op
+  commands, and a no-op whose `current_revision` printed nothing turned every
+  failed deploy into `partial_rollback`, because migrate cannot undo an
+  "initial" migration. Declaring `none` tells the saga there is nothing to
+  compensate on that axis, so the deploy ends `rolled_back`. The adapter takes
+  no `database_url_env` and no `[migration.settings]`; either one is a
+  validation error.
+
 - **`deploy --dry-run --deep`: the deep classification is previewed only on
   request.** Under a fresh-dump restore rehearsal, a plain `--dry-run`
   classifies statically and says so; it never dumps the live database.
@@ -155,6 +164,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
       kept;
     - an optional `keep_last` cap: at most that many are kept, however young.
       It is rejected when below the floor.
+  - **Only archives can be selected.** A prune removes every old file its
+    entry selects, so `dir` must be `[backup].dir` or below it (making
+    `[backup].dir` required once an entry exists), and `match` must end in
+    `.pgdump`. `match = "*"` or a `dir` outside the backups is a validation
+    error.
   - **The floor comes first.** It is applied before the age rule, so a producer
     that has stopped never ages the whole corpus out. An archive `pg_restore
     --list` rejects gives up its floor slot. One that cannot be checked keeps
@@ -271,6 +285,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   archives and picks the latest by the timestamp in the name, never by mtime.
 
 ### Fixed
+
+- **`preflight_mode = "off"` now turns the lint off on multi-host deploys and
+  `db migrate` too.** Both read only the legacy `forward_compatible_lint` flag,
+  so `"off"` still linted there while `deploy --dry-run` said preflight was
+  off. `preflight_mode = "restore_rehearsal"` beside `[hosts]` now warns that
+  the multi-host rollout lints live instead of rehearsing.
+||||||| eac43bc
+- **`stack deploy` validates every member before deploying any.** A member's
+  config was validated only when its own deploy began, so an invalid third
+  member refused after the first two were already live. The stack is now
+  refused up front, naming each invalid member and its errors.
+||||||| eac43bc
+- **A notify hook that fails is no longer reported as sent.** `fraisier
+  notify` (the `OnFailure=` alert unit) printed "sent" and exited 0 whatever
+  `[notify].command` did, and the hook's exit status went only to a log line
+  the CLI never prints. It now exits 1 and names the status, so the alert unit
+  fails visibly. A deploy whose failure notification did not deliver says so
+  in a `warning:` line and a `notify_warning` JSON field.
+  `ExecHookNotifier::deliver` returns the outcome; `Notifier::notify` stays
+  best-effort.
 
 - **A restore rehearsal that never ran the migrations no longer blames them.**
   Every rehearsal failure used to end in "The pending migrations did not apply

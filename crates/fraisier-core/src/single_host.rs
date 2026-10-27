@@ -767,9 +767,9 @@ impl DeployShared {
         SagaError::StepFailed {
             step: "preflight".to_owned(),
             message: format!(
-                "restore-rehearsal preflight failed: {error}. The pending migrations did not \
-                 apply cleanly on a fresh restore. Fix the migrations, or bypass this check \
-                 with `--skip-preflight` (or `[migration].preflight_mode = \"off\"`)."
+                "restore-rehearsal preflight failed: {error}. {}, or bypass this check with \
+                 `--skip-preflight` (or `[migration].preflight_mode = \"off\"`).",
+                error.remedy()
             ),
         }
     }
@@ -2323,6 +2323,52 @@ mod tests {
             report.outcome
         );
         assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    }
+
+    #[tokio::test]
+    async fn a_rehearsal_that_could_not_provision_does_not_blame_the_migrations() {
+        // Provisioning failed, so no migration ran: the refusal must point at
+        // the throwaway copy, not at a pending chain nobody applied.
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let plan = SingleHostDeploy::builder("checkout", "production", HostId::new("localhost"))
+            .context(ctx_with_dsn())
+            .artifact(Arc::new(FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            }))
+            .migration(Arc::new(FakeMigration::healthy(&trail)))
+            .service(Arc::new(FakeService {
+                trail: trail.clone(),
+                fail_restarts: Arc::new(Mutex::new(0)),
+            }))
+            .health(Arc::new(FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            }))
+            .restore_rehearsal(
+                Arc::new(FakeRehearsalDb {
+                    trail: trail.clone(),
+                    fail: true,
+                    fail_teardown: false,
+                }),
+                BackupSource::FreshDump,
+            )
+            .build()
+            .expect("all adapters provided");
+
+        let outcome = plan.run(store).await.expect("run completes");
+        let SagaOutcome::RolledBack { reason, .. } = outcome else {
+            panic!("a failed rehearsal rolls back at preflight; got {outcome:?}");
+        };
+        assert!(
+            !reason.contains("did not apply cleanly"),
+            "a provisioning failure blamed the migrations: {reason}"
+        );
+        assert!(
+            reason.contains("were not rehearsed"),
+            "the refusal says the migrations never ran: {reason}"
+        );
     }
 
     #[tokio::test]

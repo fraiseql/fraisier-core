@@ -363,6 +363,43 @@ unit = "x.service"
     assert!(!cfg.validate().ok(), "token_provider needs http adapter");
 }
 
+/// A multi-host rollout has no restore rehearsal: it lints live instead. The
+/// config must say so rather than let the rehearsal quietly not happen.
+#[test]
+fn restore_rehearsal_on_a_multi_host_config_warns_it_lints_live() {
+    let toml = r#"
+[deploy]
+name = "x"
+environment = "production"
+[hosts]
+strategy = "rolling"
+inventory = [ { name = "web-1", address = "10.0.0.1" } ]
+[ssh]
+user = "deploy"
+[artifact]
+source = "local"
+path = "/srv/x"
+[migration]
+adapter = "confiture"
+database_url_env = "X_DATABASE_URL"
+preflight_mode = "restore_rehearsal"
+[service]
+adapter = "systemd"
+unit = "x.service"
+[health]
+adapter = "http"
+url = "http://{host.address}/health"
+"#;
+    let cfg = DeployConfig::from_toml_str(toml).expect("parses");
+    let report = cfg.validate();
+    let issue = report
+        .issues
+        .iter()
+        .find(|i| i.path == "migration.preflight_mode" && i.severity == Severity::Warning)
+        .unwrap_or_else(|| panic!("expected a preflight_mode warning, got {report}"));
+    assert!(issue.message.contains("[hosts]"), "{}", issue.message);
+}
+
 /// `preflight_mode = "restore_rehearsal"` requires the confiture adapter, since
 /// the rehearsal composes a generic-Postgres restore.
 #[test]

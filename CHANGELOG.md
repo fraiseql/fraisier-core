@@ -270,6 +270,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`preflight_mode = "off"` now turns the lint off on multi-host deploys and
+  `db migrate` too.** Both read only the legacy `forward_compatible_lint` flag,
+  so `"off"` still linted there while `deploy --dry-run` said preflight was
+  off. `preflight_mode = "restore_rehearsal"` beside `[hosts]` now warns that
+  the multi-host rollout lints live instead of rehearsing.
+||||||| eac43bc
 - **`stack deploy` validates every member before deploying any.** A member's
   config was validated only when its own deploy began, so an invalid third
   member refused after the first two were already live. The stack is now

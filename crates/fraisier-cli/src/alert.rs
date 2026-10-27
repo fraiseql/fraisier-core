@@ -99,7 +99,8 @@ fn event_for_unit(unit: &str) -> &'static str {
 /// (systemd's `$MONITOR_INVOCATION_ID`), through `[notify].command` once, and
 /// deletes the record. Without a matching record it still notifies, pointing at
 /// the journal. Without a sink it writes the payload to stderr, which the
-/// journal keeps.
+/// journal keeps. A hook that cannot run or exits non-zero makes this exit 1,
+/// so the alert unit fails too rather than reading as sent.
 ///
 /// # Errors
 /// When the config cannot be read.
@@ -109,8 +110,6 @@ pub(crate) async fn notify(
     monitor_invocation_id: Option<&str>,
     dir: &Path,
 ) -> Result<CommandOutput> {
-    use fraisier_self_upgrade::Notifier as _;
-
     let config = crate::commands::load(config_path)?;
     let invocation_id = monitor_invocation_id.filter(|id| failure_record::is_invocation_id(id));
     let found = invocation_id.and_then(|id| failure_record::read(dir, id));
@@ -145,7 +144,7 @@ pub(crate) async fn notify(
     };
 
     let sink = config.notify.as_ref().and_then(|n| n.command.as_deref());
-    let delivered = if let Some(command) = sink {
+    let (delivered, exit_code) = if let Some(command) = sink {
         let mut notifier = fraisier_self_upgrade::ExecHookNotifier::new(command)
             .with_context("FRAISIER_NOTIFY_UNIT", unit);
         for (key, value) in [
@@ -157,8 +156,19 @@ pub(crate) async fn notify(
                 notifier = notifier.with_context(key, value);
             }
         }
-        notifier.notify(&payload).await;
-        format!("sent {} for {unit} through [notify].command", payload.event)
+        match notifier.deliver(&payload).await {
+            Ok(()) => (
+                format!("sent {} for {unit} through [notify].command", payload.event),
+                0,
+            ),
+            Err(error) => (
+                format!(
+                    "[notify].command did not deliver {} for {unit}: {error}",
+                    payload.event
+                ),
+                1,
+            ),
+        }
     } else {
         let line = format!(
             "no [notify].command; {} for {unit}: {}",
@@ -166,7 +176,7 @@ pub(crate) async fn notify(
             serde_json::to_string(&payload).unwrap_or_default()
         );
         eprintln!("{line}");
-        line
+        (line, 0)
     };
     // One attempt, then the record is gone, matched or not: a record left
     // behind could only be sent again.
@@ -175,13 +185,14 @@ pub(crate) async fn notify(
     }
 
     Ok(CommandOutput {
-        exit_code: 0,
+        exit_code,
         pretty: format!("{delivered}\n"),
         json: json!({
             "event": payload.event,
             "unit": unit,
             "record": record.is_some(),
             "sink": sink.is_some(),
+            "delivered": sink.is_some() && exit_code == 0,
         }),
     })
 }
@@ -381,6 +392,26 @@ mod tests {
             )]
         );
         assert!(!path.exists(), "the record is deleted once sent");
+    }
+
+    #[tokio::test]
+    async fn a_hook_that_fails_fails_notify_and_says_why() {
+        // An alert unit that succeeds while its hook failed reads as "sent".
+        let fixture = fixture(false);
+        std::fs::write(
+            &fixture.config,
+            "[deploy]\nname = \"checkout\"\nenvironment = \"production\"\n\n\
+             [notify]\ncommand = 'exit 3'\n",
+        )
+        .expect("config");
+        let path = stored(&fixture, &a_record("drill failed at restore"));
+        let out = notify(&fixture.config, UNIT, Some(ID), &fixture.records)
+            .await
+            .expect("notify");
+        assert_ne!(out.exit_code, 0, "{}", out.pretty);
+        assert!(out.pretty.contains("exit status: 3"), "{}", out.pretty);
+        assert!(!out.pretty.contains("sent "), "{}", out.pretty);
+        assert!(!path.exists(), "one attempt, then the record is gone");
     }
 
     #[tokio::test]

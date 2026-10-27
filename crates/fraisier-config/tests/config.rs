@@ -876,11 +876,14 @@ fn an_absolute_backup_dir_validates_clean() {
     );
 }
 
+const BACKUP_DIR: &str = "[backup]\ndir = \"/var/backups/checkout\"\n\n";
+
 const RETAIN: &str = "[[backup.retain]]\ndir = \"/var/backups/checkout\"\n\
                       schedule = \"daily 05:30\"\nretention_days = 3\n";
 
+/// Validates `entry` under a `[backup]` section whose `dir` is RETAIN's.
 fn retain_report(entry: &str) -> fraisier_config::ValidationReport {
-    DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{entry}"))
+    DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{BACKUP_DIR}{entry}"))
         .expect("parses")
         .validate()
 }
@@ -907,9 +910,9 @@ fn a_retain_name_must_be_safe_in_a_unit_name() {
 }
 
 #[test]
-fn a_retain_entry_parses_with_its_defaults_and_needs_no_backup_dir() {
-    let config =
-        DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{RETAIN}")).expect("parses");
+fn a_retain_entry_parses_with_its_defaults() {
+    let config = DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{BACKUP_DIR}{RETAIN}"))
+        .expect("parses");
     assert!(config.validate().ok(), "{}", config.validate());
     let backup = config.backup.expect("[backup]");
     let [entry] = backup.retain.as_slice() else {
@@ -931,7 +934,7 @@ fn a_retain_entry_parses_with_its_defaults_and_needs_no_backup_dir() {
 #[test]
 fn declared_retain_fields_win_over_the_defaults() {
     let config = DeployConfig::from_toml_str(&format!(
-        "{SCHEDULE_BASE}\n{RETAIN}keep_minimum = 5\nkeep_last = 9\n\
+        "{SCHEDULE_BASE}\n{BACKUP_DIR}{RETAIN}keep_minimum = 5\nkeep_last = 9\n\
          match = \"checkout-production-*.pgdump\"\nname = \"prod-full\"\nmin_free_gb = 20\n"
     ))
     .expect("parses");
@@ -1001,6 +1004,66 @@ fn a_retain_match_is_confined_to_the_dir() {
             "{bad}: {report}"
         );
     }
+}
+
+#[test]
+fn a_retain_match_selects_archives_only() {
+    // The scheduled prune removes every old file the glob selects, so a glob
+    // that can reach a file other than an archive can delete it.
+    for bad in [
+        "*",
+        "*.sql",
+        "checkout*",
+        "*.pgdump*",
+        "*.pgdump.partial",
+        "*pgdump",
+    ] {
+        let report = retain_report(&format!("{RETAIN}match = \"{bad}\"\n"));
+        assert!(
+            has_error(&report, "backup.retain[0].match"),
+            "{bad}: {report}"
+        );
+    }
+    for good in [
+        "*.pgdump",
+        "checkout-production-*.pgdump",
+        "checkout-?????.pgdump",
+    ] {
+        let report = retain_report(&format!("{RETAIN}match = \"{good}\"\n"));
+        assert!(report.ok(), "{good}: {report}");
+    }
+}
+
+#[test]
+fn a_retain_dir_must_be_within_the_backup_dir() {
+    for bad in [
+        "/srv/app",
+        "/var/backups",
+        "/var/backups/checkout2",
+        "/var/backups/checkout-old",
+    ] {
+        let report = retain_report(&RETAIN.replace("/var/backups/checkout", bad));
+        assert!(
+            has_error(&report, "backup.retain[0].dir"),
+            "{bad}: {report}"
+        );
+    }
+    for good in [
+        "/var/backups/checkout/",
+        "/var/backups/checkout/weekly",
+        "/var/backups/./checkout",
+    ] {
+        let report = retain_report(&RETAIN.replace("/var/backups/checkout", good));
+        assert!(report.ok(), "{good}: {report}");
+    }
+}
+
+#[test]
+fn a_retain_entry_requires_a_backup_dir() {
+    let report = DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n{RETAIN}"))
+        .expect("parses")
+        .validate();
+    assert!(has_error(&report, "backup.dir"), "{report}");
 }
 
 #[test]
@@ -1079,7 +1142,9 @@ fn the_documented_retain_example_validates() {
 
 #[test]
 fn a_backup_section_with_neither_dir_nor_retain_is_still_an_error() {
-    let report = retain_report("[backup]\nretain = []\n");
+    let report = DeployConfig::from_toml_str(&format!("{SCHEDULE_BASE}\n[backup]\nretain = []\n"))
+        .expect("parses")
+        .validate();
     assert!(has_error(&report, "backup.dir"), "{report}");
 }
 

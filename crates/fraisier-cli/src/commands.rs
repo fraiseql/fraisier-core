@@ -1648,6 +1648,31 @@ async fn preview_schema(
     .await
 }
 
+/// What one deploy is asked to do, and what asked for it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeployRequest<'a> {
+    pub(crate) host: Option<&'a str>,
+    pub(crate) app_version: Option<&'a str>,
+    pub(crate) dry_run: bool,
+    pub(crate) skip_preflight: bool,
+    pub(crate) fail_on_block: bool,
+    pub(crate) trigger: fraisier_db::restore::Trigger,
+}
+
+impl<'a> DeployRequest<'a> {
+    /// The live deploy a verified webhook POST asks for.
+    pub(crate) const fn webhook(app_version: Option<&'a str>) -> Self {
+        Self {
+            host: None,
+            app_version,
+            dry_run: false,
+            skip_preflight: false,
+            fail_on_block: false,
+            trigger: fraisier_db::restore::Trigger::Webhook,
+        }
+    }
+}
+
 /// `deploy`: validate, then either summarize the plan (`--dry-run`) or run the
 /// single-host deploy against the state store.
 pub(crate) async fn deploy(
@@ -1659,6 +1684,35 @@ pub(crate) async fn deploy(
     skip_preflight: bool,
     fail_on_block: bool,
 ) -> Result<CommandOutput> {
+    run_deploy(
+        config_path,
+        state_dir,
+        DeployRequest {
+            host,
+            app_version,
+            dry_run,
+            skip_preflight,
+            fail_on_block,
+            trigger: fraisier_db::restore::Trigger::Operator,
+        },
+    )
+    .await
+}
+
+/// [`deploy`] as `request` asks.
+async fn run_deploy(
+    config_path: &Path,
+    state_dir: &Path,
+    request: DeployRequest<'_>,
+) -> Result<CommandOutput> {
+    let DeployRequest {
+        host,
+        app_version,
+        dry_run,
+        skip_preflight,
+        fail_on_block,
+        trigger,
+    } = request;
     let config = load(config_path)?;
     let report = config.validate();
     if !report.ok() {
@@ -1713,7 +1767,7 @@ pub(crate) async fn deploy(
         return run_multi_host(&config, store, app_version, &report).await;
     }
 
-    let resolved = factory::build(&config, host, app_version)?;
+    let resolved = factory::build_for(&config, host, app_version, trigger)?;
     // `--skip-preflight` is the per-run escape hatch: it forces every preflight off
     // regardless of `[migration].preflight_mode`.
     let mut builder = SingleHostDeploy::builder(
@@ -3219,14 +3273,11 @@ impl fraisier_webhook::WebhookHandler for DeployHandler {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         });
-        let out = deploy(
+        // A webhook deploy never resolves the admin identity (D14).
+        let out = run_deploy(
             &self.config,
             &self.state_dir,
-            None,
-            version.as_deref(),
-            false,
-            false,
-            false,
+            DeployRequest::webhook(version.as_deref()),
         )
         .await
         .map_err(|error| error_detail(&error))?;
@@ -6885,6 +6936,15 @@ current_revision = "true"
             "names the missing field: {}",
             out.pretty
         );
+    }
+
+    #[test]
+    fn a_webhook_deploy_is_a_webhook_triggered_live_deploy() {
+        let request = super::DeployRequest::webhook(Some("1.2.3"));
+        assert_eq!(request.trigger, fraisier_db::restore::Trigger::Webhook);
+        assert_eq!(request.app_version, Some("1.2.3"));
+        assert_eq!(request.host, None);
+        assert!(!request.dry_run && !request.skip_preflight && !request.fail_on_block);
     }
 
     /// A config whose app DSN is `FRAISIER_TEST_APP_URL`, plus `extra`.

@@ -14,6 +14,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Without the admin identity, the drill refuses such an archive before it
   creates anything, and the refusal names the setting. A TVIEW that is still
   empty over a populated view after the rebuild fails the drill.
+- **A deploy started by the webhook never uses `[database].admin_url_env`.**
+  The webhook answers the network, so nothing it starts may reach a database
+  superuser; its deploys do not even read the variable. Their restore rehearsal
+  runs as the app role. On a pg_tviews database, the rehearsal refuses before it
+  creates anything, and says to run the deploy from the CLI or its timer. CLI
+  and timer deploys are unchanged.
 - **Every restore goes through one primitive in `fraisier-db`.** `db restore`,
   the restore rehearsal and the drill share one identity choice, archive
   listing, pg_tviews precheck, rebuild and teardown guard.

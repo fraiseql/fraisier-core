@@ -35,6 +35,7 @@ use serde_json::Value;
 use crate::approval::ExecApproval;
 use crate::pg_rehearsal::PgRehearsalDb;
 use crate::preview::SchemaPreview;
+use fraisier_db::restore::Trigger;
 
 /// The logical secret name every migration adapter resolves the DSN under.
 const DATABASE_URL_LOGICAL: &str = "DATABASE_URL";
@@ -179,7 +180,7 @@ pub fn build_preview(
     Ok(PreviewTarget {
         migration,
         ctx,
-        forward_compatible_lint: resolve_preflight(config).0,
+        forward_compatible_lint: resolve_preflight(config, Trigger::Operator).0,
     })
 }
 
@@ -246,7 +247,10 @@ fn add_token_provider_secrets(config: &DeployConfig, env_secrets: &mut BTreeMap<
 
 /// Resolve the preflight knobs from `[migration]`: the live forward-compat lint
 /// toggle and the optional restore-rehearsal `(db, backup)` pair.
-fn resolve_preflight(config: &DeployConfig) -> (bool, Option<RestoreRehearsalPlan>) {
+fn resolve_preflight(
+    config: &DeployConfig,
+    trigger: Trigger,
+) -> (bool, Option<RestoreRehearsalPlan>) {
     let Some(migration) = config.migration.as_ref() else {
         return (true, None);
     };
@@ -263,7 +267,7 @@ fn resolve_preflight(config: &DeployConfig) -> (bool, Option<RestoreRehearsalPla
                     .database
                     .as_ref()
                     .and_then(|d| d.admin_url_env.clone()),
-                trigger: fraisier_db::restore::Trigger::Operator,
+                trigger,
             });
             (true, Some((db, backup)))
         }
@@ -526,6 +530,20 @@ pub fn build(
     host_override: Option<&str>,
     app_version: Option<&str>,
 ) -> Result<ResolvedDeploy> {
+    build_for(config, host_override, app_version, Trigger::Operator)
+}
+
+/// [`build`] for a deploy started by `trigger`. A webhook-started deploy's
+/// restore rehearsal never resolves `[database].admin_url_env`.
+///
+/// # Errors
+/// As [`build`].
+pub fn build_for(
+    config: &DeployConfig,
+    host_override: Option<&str>,
+    app_version: Option<&str>,
+    trigger: Trigger,
+) -> Result<ResolvedDeploy> {
     let deploy = config.deploy.as_ref().context("missing [deploy] section")?;
     let fraise = deploy.name.clone().context("[deploy].name is required")?;
     let environment = deploy
@@ -553,7 +571,7 @@ pub fn build(
 
     // The forward-compat lint and (opt-in) restore-rehearsal are selected by
     // `[migration].preflight_mode` (default `live`, legacy flag honoured).
-    let (forward_compatible_lint, restore_rehearsal) = resolve_preflight(config);
+    let (forward_compatible_lint, restore_rehearsal) = resolve_preflight(config, trigger);
 
     let mut ctx = AdapterCtx::new(fraise.clone(), environment.clone());
     ctx.host = Some(host.clone());
@@ -1418,8 +1436,8 @@ pub fn build_blue_green(
 #[cfg(test)]
 mod tests {
     use super::{
-        build, build_health, build_health_probe, build_multi_host, build_policy_gate, summarize,
-        summarize_multi_host,
+        build, build_for, build_health, build_health_probe, build_multi_host, build_policy_gate,
+        summarize, summarize_multi_host,
     };
     use fraisier_config::DeployConfig;
     use fraisier_core::adapter_axes::RiskTier;
@@ -1527,6 +1545,34 @@ mod tests {
             Some((_, other)) => panic!("expected an archive rehearsal, got {other:?}"),
             None => panic!("expected a rehearsal to be configured"),
         }
+    }
+
+    /// The rehearsal's provisioning error for `trigger`, on a config whose
+    /// `admin_url_env` names a variable that is never set.
+    async fn rehearsal_error(trigger: fraisier_db::restore::Trigger) -> String {
+        let toml = single_host_with_migration(
+            "preflight_mode = \"restore_rehearsal\"\n\
+             preflight_backup_path = \"/nonexistent/fraisier-d14.dump\"\n",
+        ) + "\n[database]\nadmin_url_env = \"FRAISIER_D14_ADMIN_NEVER_SET\"\n";
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+        let resolved = build_for(&config, None, None, trigger).expect("builds");
+        let (db, backup) = resolved.restore_rehearsal.expect("a rehearsal");
+        db.provision("postgres://app@127.0.0.1:1/app", &backup)
+            .await
+            .expect_err("nothing to restore")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_webhook_deploys_rehearsal_never_resolves_the_admin_identity() {
+        let error = rehearsal_error(fraisier_db::restore::Trigger::Webhook).await;
+        assert!(!error.contains("FRAISIER_D14_ADMIN_NEVER_SET"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_operator_deploys_rehearsal_resolves_the_admin_identity() {
+        let error = rehearsal_error(fraisier_db::restore::Trigger::Operator).await;
+        assert!(error.contains("FRAISIER_D14_ADMIN_NEVER_SET"), "{error}");
     }
 
     #[test]

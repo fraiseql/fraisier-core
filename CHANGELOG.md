@@ -6,6 +6,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`backup prune` warns when the floor rests on an archive it could not
+  check.** An archive that `pg_restore --list` cannot check (no `pg_restore`,
+  or one older than the `pg_dump` that wrote it) still holds its
+  `keep_minimum` slot, as before, but the prune now warns about each one and
+  lists it under `unverifiable` in its JSON. Before, nothing said that the
+  floor might be keeping unreadable archives. `fraisier_db::retention::Plan`
+  gains an `unverifiable` field.
 ### Added
 
 - **`fraisier validate` warns when an unattended timer has no failure sink.**

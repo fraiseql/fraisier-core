@@ -33,6 +33,8 @@ pub fn credentials(text: &str) -> String {
 fn urls(text: &str) -> String {
     /// What ends a URL's authority section.
     const AUTHORITY_END: [char; 8] = ['/', '?', '#', ' ', '\t', '"', '\'', ','];
+    /// What ends the whole URL in running text.
+    const URL_END: [char; 5] = [' ', '\t', '"', '\'', ','];
     /// What separates a scheme from the authority that may carry credentials.
     const MARK: &str = "://";
 
@@ -42,7 +44,19 @@ fn urls(text: &str) -> String {
         let (head, authority) = rest.split_at(mark + MARK.len());
         out.push_str(head);
         let end = authority.find(AUTHORITY_END).unwrap_or(authority.len());
-        if let Some(at) = authority[..end].rfind('@') {
+        // An unencoded `/`, `?` or `#` in a password ends the authority early, and
+        // a client that rejects such a URL echoes it back: a `user:` before that
+        // early end and an `@` later in the URL mark the rest as the password.
+        // That overreaches on a URL with a port and an `@` in its path, which
+        // hides text rather than leaking a secret.
+        let at = authority[..end].rfind('@').or_else(|| {
+            let url_end = authority.find(URL_END).unwrap_or(authority.len());
+            authority[..end]
+                .contains(':')
+                .then(|| authority[..url_end].rfind('@'))
+                .flatten()
+        });
+        if let Some(at) = at {
             out.push_str("***");
             rest = &authority[at..];
         } else {
@@ -54,7 +68,8 @@ fn urls(text: &str) -> String {
     out
 }
 
-/// Replace the value of every `password=` keyword in `text` with `***`.
+/// Replace the value of every `password=` keyword in `text` with `***`, in any
+/// case: libpq spells it in lower case, but other tools and people do not.
 ///
 /// libpq's keyword/value form separates pairs by whitespace and allows a value to
 /// be single-quoted (`password='a b'`), which is the only way a value may contain
@@ -66,7 +81,11 @@ fn keywords(text: &str) -> String {
 
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(at) = rest.find(KEY) {
+    while let Some(at) = rest
+        .as_bytes()
+        .windows(KEY.len())
+        .position(|window| window.eq_ignore_ascii_case(KEY.as_bytes()))
+    {
         // Only a pair *starts* a keyword: `oldpassword=` is a different keyword,
         // and rewriting inside a longer word would corrupt unrelated prose.
         let boundary = rest[..at]
@@ -168,6 +187,36 @@ mod tests {
         // libpq has no `oldpassword`, but prose and other tools do, and rewriting
         // inside a longer word would corrupt text that holds no secret.
         assert_eq!(credentials("oldpassword=kept"), "oldpassword=kept");
+    }
+
+    #[test]
+    fn an_unencoded_slash_in_a_url_password_does_not_leak_it() {
+        // libpq rejects such a URL, and then echoes it back verbatim.
+        assert_eq!(
+            credentials("invalid URI postgresql://app:pa/ss@db/checkout"),
+            "invalid URI postgresql://***@db/checkout"
+        );
+        assert_eq!(
+            credentials("postgresql://app:pa?ss#w@db/checkout"),
+            "postgresql://***@db/checkout"
+        );
+    }
+
+    #[test]
+    fn an_at_sign_in_a_url_path_is_not_userinfo() {
+        assert_eq!(
+            credentials("GET https://registry.internal/@scope/pkg failed"),
+            "GET https://registry.internal/@scope/pkg failed"
+        );
+    }
+
+    #[test]
+    fn an_uppercase_keyword_password_is_stripped() {
+        assert_eq!(
+            credentials("HOST=db PASSWORD=hunter2 Password=hunter3"),
+            "HOST=db PASSWORD=*** Password=***"
+        );
+        assert_eq!(credentials("OLDPASSWORD=kept"), "OLDPASSWORD=kept");
     }
 
     #[test]

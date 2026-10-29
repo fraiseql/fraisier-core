@@ -14,6 +14,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   runs). The members used to deploy anyway, be reported `UNCHECKED`, and leave
   a live stack behind an exit 1. The stack, and its dry run, are now refused up
   front, naming those members.
+- **A database name can no longer redirect a restore.** `pg_restore` received
+  the target database as `-d <name>`, and libpq reads a `-d` holding an `=` or
+  a URI scheme as a whole connection string. A database named `host=elsewhere`
+  would have restored to another server, ignoring `PGHOST`. The name now goes
+  in as a quoted `dbname='…'` pair, so it is always a name.
+- **Two credential spellings got past redaction.** A URL whose password holds
+  an unencoded `/`, `?` or `#` (`postgresql://app:pa/ss@db/x`) kept its
+  password in failure reasons, notifications and receipts, because the
+  authority seemed to end at that character. And `PASSWORD=` or `Password=`
+  was not matched, only `password=`. Both are now replaced with `***`. An `@`
+  in a URL path with no `user:` before it is still left alone.
 
 ## [1.0.0-beta.12] - 2026-10-27
 

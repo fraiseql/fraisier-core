@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.13](https://github.com/fraiseql/fraisier-core/compare/fraisier-artifact-git-v1.0.0-beta.12...fraisier-artifact-git-v1.0.0-beta.13) - 2026-10-29
+
+### Other
+
+- updated the following local packages: fraisier-core, fraisier-adapter-support
+
 ## [1.0.0-beta.11](https://github.com/fraiseql/fraisier-core/compare/fraisier-artifact-git-v1.0.0-beta.10...fraisier-artifact-git-v1.0.0-beta.11) - 2026-09-26
 
 ### Other

@@ -6,6 +6,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`backup drill` refuses an archive stamped in the future.** A stamp more
+  than five minutes ahead of the clock skipped the `max_age_hours` check, so
+  the drill passed without knowing whether backups were still arriving. It now
+  fails at the `age` step and says to check the clocks.
+- **`backup drill` warns when it cannot check the archive before restoring.**
+  When `pg_restore --list` cannot check the newest archive, the drill still
+  restores it, but now prints a warning and records it under `warnings` in
+  the receipt. Before, it said nothing.
+
 ## [1.0.0-beta.12] - 2026-10-27
 
 ### Changed

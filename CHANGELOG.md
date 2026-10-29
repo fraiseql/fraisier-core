@@ -6,6 +6,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`scheduled install` refuses a config its units would refuse on every
+  run.** It used to check only the `[schedule]`, `[notify]`, `[backup]` and
+  `[drill]` sections, so an invalid `[metrics]`, `[migration]` or `[deploy]`
+  installed timers that then failed on each firing. It now also runs the
+  validation each installed unit's command runs: the full config for a
+  scheduled deploy, the database sections for a scheduled backup and a drill,
+  and the backup sections for a prune. A prune-only host is still not held to
+  the deploy sections.
+
 ## [1.0.0-beta.12] - 2026-10-27
 
 ### Changed

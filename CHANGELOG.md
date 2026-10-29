@@ -8,6 +8,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`[backup].dir` is held to the same rule as `[[backup.retain]].dir`.** It
+  must now be letters, digits, `/`, `.`, `_` and `-` with no `..`, as a retain
+  entry's `dir` already had to be. Before, it only had to be absolute, and the
+  scaffold writes it into the scheduled backup unit, where a newline in it
+  would have started a new unit directive. `db backup` (and every `db` command)
+  now also checks `[backup]`, since `db backup` writes into `[backup].dir`.
 - **`scheduled install` refuses a config its units would refuse on every
   run.** It used to check only the `[schedule]`, `[notify]`, `[backup]` and
   `[drill]` sections, so an invalid `[metrics]`, `[migration]` or `[deploy]`

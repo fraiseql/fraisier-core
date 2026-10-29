@@ -6,6 +6,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-beta.13] - 2026-10-29
+
+### Added
+
+- **`fraisier validate` warns when an unattended timer has no failure sink.**
+  A scheduled backup, a `[[backup.retain]]` prune or a scheduled `[drill]`
+  with no `[notify].command` now gets a warning at `notify.command`. Without
+  one, their alert unit can only write a failure to the journal. A scheduled
+  deploy already required the sink; these stay warnings, since a host may
+  watch its journal.
+
 ### Fixed
 
 - **`backup drill` refuses an archive stamped in the future.** A stamp more
@@ -27,16 +38,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lists it under `unverifiable` in its JSON. Before, nothing said that the
   floor might be keeping unreadable archives. `fraisier_db::retention::Plan`
   gains an `unverifiable` field.
-### Added
-
-- **`fraisier validate` warns when an unattended timer has no failure sink.**
-  A scheduled backup, a `[[backup.retain]]` prune or a scheduled `[drill]`
-  with no `[notify].command` now gets a warning at `notify.command`. Without
-  one, their alert unit can only write a failure to the journal. A scheduled
-  deploy already required the sink; these stay warnings, since a host may
-  watch its journal.
-### Fixed
-
 - **A retain entry's name is checked once, against one rule.** Validation
   checked the name twice, with two charsets: one allowed `.` and the other
   forbade it. So a name like `nightly.v2` was refused with a message that
@@ -1254,7 +1255,8 @@ migration-safe rollback across one host or a fleet.
 - **GitHub Actions CI** that runs `cargo xtask ci`.
 
 [c197]: https://github.com/fraiseql/confiture/issues/197
-[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.12...HEAD
+[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.13...HEAD
+[1.0.0-beta.13]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.12...fraisier-v1.0.0-beta.13
 [1.0.0-beta.12]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.11...fraisier-v1.0.0-beta.12
 [1.0.0-beta.11]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.10...fraisier-v1.0.0-beta.11
 [1.0.0-beta.10]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.9...fraisier-v1.0.0-beta.10

@@ -8,6 +8,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`stack deploy` refuses a `[hosts]` router before anything deploys.** When
+  members declare `sdl` and the router deploys through `[hosts]`, their SDL can
+  never be checked (the router's release is on its hosts, not where fraisier
+  runs). The members used to deploy anyway, be reported `UNCHECKED`, and leave
+  a live stack behind an exit 1. The stack, and its dry run, are now refused up
+  front, naming those members.
 - **A database name can no longer redirect a restore.** `pg_restore` received
   the target database as `-d <name>`, and libpq reads a `-d` holding an `=` or
   a URI scheme as a whole connection string. A database named `host=elsewhere`

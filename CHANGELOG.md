@@ -8,6 +8,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A database name can no longer redirect a restore.** `pg_restore` received
+  the target database as `-d <name>`, and libpq reads a `-d` holding an `=` or
+  a URI scheme as a whole connection string. A database named `host=elsewhere`
+  would have restored to another server, ignoring `PGHOST`. The name now goes
+  in as a quoted `dbname='…'` pair, so it is always a name.
 - **Two credential spellings got past redaction.** A URL whose password holds
   an unencoded `/`, `?` or `#` (`postgresql://app:pa/ss@db/x`) kept its
   password in failure reasons, notifications and receipts, because the

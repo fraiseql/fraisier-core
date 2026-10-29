@@ -6,6 +6,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`[backup].dir` is held to the same rule as `[[backup.retain]].dir`.** It
+  must now be letters, digits, `/`, `.`, `_` and `-` with no `..`, as a retain
+  entry's `dir` already had to be. Before, it only had to be absolute, and the
+  scaffold writes it into the scheduled backup unit, where a newline in it
+  would have started a new unit directive. `db backup` (and every `db` command)
+  now also checks `[backup]`, since `db backup` writes into `[backup].dir`.
+
 ## [1.0.0-beta.12] - 2026-10-27
 
 ### Changed

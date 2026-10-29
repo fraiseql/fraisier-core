@@ -2407,7 +2407,7 @@ pub(crate) struct PruneRun {
 /// It refuses (exit 1) an invalid config, a config with no policy, an unknown
 /// name, and any corpus while a deploy holds the deploy lock. A missing directory
 /// fails that entry and the prune, after every other entry has run. A volume
-/// below `min_free_gb`, an archive `pg_restore` rejects, a symlink out of the
+/// below `min_free_gb`, an archive `pg_restore` rejects or cannot check, a symlink out of the
 /// directory and a corpus only the floor is keeping are warnings, not failures:
 /// failing would stop the pruning that is the one thing that might still help.
 pub(crate) async fn backup_prune(
@@ -2628,6 +2628,10 @@ async fn prune_entry(
                 "path": p.display().to_string(),
                 "reason": reason,
             })).collect::<Vec<_>>(),
+            "unverifiable": plan.unverifiable.iter().map(|(p, reason)| json!({
+                "path": p.display().to_string(),
+                "reason": reason,
+            })).collect::<Vec<_>>(),
             "outside": paths(&corpus.outside),
             "left": left.iter().map(|(p, error)| json!({
                 "path": p.display().to_string(),
@@ -2664,6 +2668,12 @@ fn prune_warnings(
     for (archive, reason) in &plan.invalid {
         warnings.push(format!(
             "{} is not a readable archive and holds no keep_minimum slot: {reason}",
+            archive.display()
+        ));
+    }
+    for (archive, reason) in &plan.unverifiable {
+        warnings.push(format!(
+            "{} could not be verified and holds a keep_minimum slot anyway: {reason}",
             archive.display()
         ));
     }
@@ -5896,6 +5906,40 @@ current_revision = "true"
             run.warnings.iter().any(|w| w.contains("min_free_gb")),
             "{:?}",
             run.warnings
+        );
+    }
+
+    #[test]
+    fn an_unverifiable_archive_holding_a_floor_slot_warns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = prune_corpus(dir.path(), AGED);
+        let config = prune_config(dir.path(), &[("nightly", &corpus, "")]);
+        let run = block_on(super::backup_prune_with(
+            &config,
+            &dir.path().join("state"),
+            None,
+            false,
+            &dir.path().join("no-pg_restore"),
+            prune_now(),
+        ))
+        .expect("run");
+        assert_eq!(run.output.exit_code, 0, "{}", run.output.pretty);
+        assert_eq!(
+            run.warnings
+                .iter()
+                .filter(|w| w.contains("could not be verified"))
+                .count(),
+            2,
+            "{:?}",
+            run.warnings
+        );
+        assert_eq!(
+            run.output.json["entries"][0]["unverifiable"]
+                .as_array()
+                .map(Vec::len),
+            Some(2),
+            "{}",
+            run.output.json
         );
     }
 

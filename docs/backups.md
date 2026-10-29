@@ -70,7 +70,9 @@ The floor counts archives that `pg_restore --list` can read:
 - An archive that cannot be checked keeps its slot. This happens when
   `pg_restore` is not installed, or is older than the `pg_dump` that wrote the
   archive. A missing or outdated binary therefore never changes what is
-  retained.
+  retained. The prune warns about each such archive, and lists it under
+  `unverifiable` in its JSON, because the floor then rests on archives nothing
+  has read.
 
 Only archives competing for a slot are checked. Pruning a large corpus does not
 read every file.
@@ -95,9 +97,10 @@ A prune **warns** on stderr and still exits 0 when:
 - every survivor is older than `retention_days`, so only the floor is keeping
   them;
 - an archive is unreadable;
+- an archive holding a floor slot could not be checked;
 - a matching symlink resolves outside `dir`. Such a link is never removed, and
   neither is what it points to;
-- the volume is below `min_free_gb`.
+- the volume is below `min_free_gb`, or its free space could not be measured.
 
 Exiting non-zero here would stop the pruning, which is the one thing that might
 still help.

@@ -857,6 +857,32 @@ fn the_backup_dir_must_be_absolute() {
 }
 
 #[test]
+fn the_backup_dir_must_be_plain_with_no_parent_component() {
+    // The scaffold writes backup.dir into a unit file, where a newline starts a
+    // new directive; a retain.dir is held to the same rule.
+    for dir in [
+        "/var/backups/../etc",
+        "/var/backups/a b",
+        "/var/backups/x\\nExecStartPre=/bin/evil",
+    ] {
+        let toml = format!("{SCHEDULE_BASE}\n[backup]\ndir = \"{dir}\"\n");
+        let report = DeployConfig::from_toml_str(&toml)
+            .expect("parses")
+            .validate();
+        assert!(has_error(&report, "backup.dir"), "{dir:?}: {report}");
+    }
+}
+
+#[test]
+fn db_backup_validation_checks_the_backup_dir_it_writes_into() {
+    let toml = format!("{SCHEDULE_BASE}\n[backup]\ndir = \"backups\"\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate_db_ops();
+    assert!(has_error(&report, "backup.dir"), "{report}");
+}
+
+#[test]
 fn a_backup_section_without_a_dir_is_an_error() {
     let toml = format!("{SCHEDULE_BASE}\n[backup]\n");
     let report = DeployConfig::from_toml_str(&toml)
@@ -1081,6 +1107,24 @@ fn a_retain_name_must_be_a_safe_identifier() {
             "{bad}: {report}"
         );
     }
+}
+
+#[test]
+fn a_retain_name_may_hold_a_dot_like_the_unit_names_it_forms() {
+    // The scaffold accepts any `is_unit_word`, so validation must too.
+    let report = retain_report(&format!("{RETAIN}name = \"nightly.v2\"\n"));
+    assert!(report.ok(), "{report}");
+}
+
+#[test]
+fn a_bad_retain_name_is_reported_once() {
+    let report = retain_report(&format!("{RETAIN}name = \"night ly\"\n"));
+    let at_name = report
+        .issues
+        .iter()
+        .filter(|issue| issue.path == "backup.retain[0].name")
+        .count();
+    assert_eq!(at_name, 1, "{report}");
 }
 
 #[test]

@@ -97,7 +97,7 @@ A prune **warns** on stderr and still exits 0 when:
 - an archive is unreadable;
 - a matching symlink resolves outside `dir`. Such a link is never removed, and
   neither is what it points to;
-- the volume is below `min_free_gb`.
+- the volume is below `min_free_gb`, or its free space could not be measured.
 
 Exiting non-zero here would stop the pruning, which is the one thing that might
 still help.

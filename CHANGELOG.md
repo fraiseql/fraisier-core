@@ -6,6 +6,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`backup prune` warns when it cannot measure the disk for `min_free_gb`.**
+  Before, a volume whose free space could not be read skipped the check
+  without a word, the same as a volume with room to spare. The prune now warns
+  that the check did not run, and says why.
+
 ## [1.0.0-beta.12] - 2026-10-27
 
 ### Changed

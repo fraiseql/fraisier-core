@@ -12,3 +12,11 @@ git_release_enable = true
 # (release-plz runs cargo-semver-checks) — a guard for the frozen v1.0
 # adapter/saga API. Only takes effect once a crate has a published baseline.
 semver_check = true
+# A crate is updated only when some commit since its last release matches this
+# regex. It matches every commit except release-plz's own `chore: release v…`, so
+# a crate whose only change is the last release's version bump gets no new
+# changelog section (beta.12's #121 added "- release v1.0.0-beta.12" to nine of
+# them). The workspace shares one version, so such a crate is still bumped with
+# the rest; only its changelog is left alone. The `regex` crate has no
+# lookahead, hence the spelled-out "anything but this prefix".
+release_commits = '^(?:[^c]|c[^h]|ch[^o]|cho[^r]|chor[^e]|chore[^:]|chore:[^ ]|chore: [^r]|chore: r[^e]|chore: re[^l]|chore: rel[^e]|chore: rele[^a]|chore: relea[^s]|chore: releas[^e]|chore: release[^ ]|chore: release [^v])'

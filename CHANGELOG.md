@@ -6,6 +6,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A retain entry's name is checked once, against one rule.** Validation
+  checked the name twice, with two charsets: one allowed `.` and the other
+  forbade it. So a name like `nightly.v2` was refused with a message that
+  contradicted the other check, and a bad name got two errors. The name must
+  now be letters, digits, `_`, `.` and `-`, not starting with `-`. That is what
+  the scheduled units it names accept.
+
 ## [1.0.0-beta.12] - 2026-10-27
 
 ### Changed

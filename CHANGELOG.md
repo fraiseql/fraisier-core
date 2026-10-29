@@ -8,6 +8,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`backup drill` refuses an archive stamped in the future.** A stamp more
+  than five minutes ahead of the clock skipped the `max_age_hours` check, so
+  the drill passed without knowing whether backups were still arriving. It now
+  fails at the `age` step and says to check the clocks.
+- **`backup drill` warns when it cannot check the archive before restoring.**
+  When `pg_restore --list` cannot check the newest archive, the drill still
+  restores it, but now prints a warning and records it under `warnings` in
+  the receipt. Before, it said nothing.
 - **`backup prune` warns when it cannot measure the disk for `min_free_gb`.**
   Before, a volume whose free space could not be read skipped the check
   without a word, the same as a volume with room to spare. The prune now warns

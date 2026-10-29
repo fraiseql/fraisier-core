@@ -137,7 +137,9 @@ Before anything is created, a drill fails when:
 - the config is invalid, or `[backup].dir` is unset;
 - there is no archive of this deployable in the directory;
 - the newest archive does not read back with `pg_restore --list`;
-- the newest archive is older than `max_age_hours`;
+- the newest archive is older than `max_age_hours`, or is stamped more than
+  five minutes in the future. A future stamp means a clock is wrong, so the
+  archive's age says nothing about whether backups are still arriving;
 - `data_dir` is set, and its filesystem lacks the room, or the room could not
   be measured;
 - the archive creates pg_tviews and the restoring identity is not a superuser.
@@ -151,6 +153,10 @@ populated view afterwards.
 
 After restoring, a drill fails when the migrations fail on the copy, or when it
 holds fewer than `min_tables` tables. The copy is dropped either way.
+
+If `pg_restore --list` cannot check the newest archive (for example, it is not
+installed), the drill still restores it, prints a warning, and lists the
+warning under `warnings` in its receipt.
 
 ### The teardown guard
 

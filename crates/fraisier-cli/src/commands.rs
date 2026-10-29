@@ -2741,10 +2741,11 @@ pub(crate) trait DrillServer: fraisier_core::drill::DrillDb {
 ///
 /// It fails (exit 1), before creating anything, when there is no archive, when
 /// the newest one does not read back, when it is older than
-/// `[drill].max_age_hours`, or when the filesystem holding `[drill].data_dir`
-/// has no room for the copy. It fails after restoring when the migrations fail
-/// or fewer than `[drill].min_tables` tables come back. Every run that gets past
-/// loading the config writes a receipt to `<state_dir>/drills/`.
+/// `[drill].max_age_hours` or stamped in the future, or when the filesystem
+/// holding `[drill].data_dir` has no room for the copy. It fails after restoring
+/// when the migrations fail or fewer than `[drill].min_tables` tables come back.
+/// Every run that gets past loading the config writes a receipt to
+/// `<state_dir>/drills/`.
 pub(crate) async fn backup_drill(config_path: &Path, state_dir: &Path) -> Result<CommandOutput> {
     let config = load(config_path)?;
     backup_drill_with(
@@ -2805,7 +2806,7 @@ async fn backup_drill_with(
     let deploy = config.deploy.as_ref().context("[deploy] section")?;
     let fraise = deploy.name.clone().unwrap_or_default();
     let environment = deploy.environment.clone().unwrap_or_default();
-    let mut archive = None;
+    let mut found = DrillArchive::default();
     let outcome = drill_steps(
         &config,
         &dir,
@@ -2813,9 +2814,10 @@ async fn backup_drill_with(
         server,
         pg_restore,
         now,
-        &mut archive,
+        &mut found,
     )
     .await;
+    let archive = found.archive;
 
     let mut receipt = json!({
         "fraise": fraise,
@@ -2824,10 +2826,14 @@ async fn backup_drill_with(
         "archive": archive.as_ref().map(|a: &fraisier_db::archive::Archive| a.path.display().to_string()),
         "archive_taken_at": archive.as_ref().map(|a| a.stamp.as_str().to_owned()),
         "ok": outcome.is_ok(),
+        "warnings": found.warnings,
     });
     let (exit_code, pretty) = drill_result(&outcome, archive.as_ref(), &mut receipt);
-    let written = write_drill_receipt(state_dir, &fraise, &environment, &receipt);
     let mut pretty = pretty;
+    for warning in &found.warnings {
+        let _ = writeln!(pretty, "warning: {warning}");
+    }
+    let written = write_drill_receipt(state_dir, &fraise, &environment, &receipt);
     if let Err(error) = &written {
         let _ = writeln!(
             pretty,
@@ -2918,9 +2924,22 @@ fn drill_result(
     }
 }
 
+/// What a drill learned about the archive it picked, whether or not it passed.
+#[derive(Default)]
+struct DrillArchive {
+    /// The newest archive, once it is known.
+    archive: Option<fraisier_db::archive::Archive>,
+    /// What the operator should know that does not fail the drill.
+    warnings: Vec<String>,
+}
+
+/// How far ahead of the clock an archive's stamp may be before its age is
+/// treated as unknown, for a backup written on a host whose clock runs ahead.
+const DRILL_CLOCK_SKEW: std::time::Duration = std::time::Duration::from_mins(5);
+
 /// The drill's steps up to and including [`fraisier_core::drill::run_restore_drill`],
-/// failing with the step's name and why. `archive` is set once the newest archive
-/// is known.
+/// failing with the step's name and why. `found` records the newest archive once
+/// it is known.
 async fn drill_steps(
     config: &DeployConfig,
     dir: &Path,
@@ -2928,7 +2947,7 @@ async fn drill_steps(
     server: &dyn DrillServer,
     pg_restore: &Path,
     now: std::time::SystemTime,
-    archive: &mut Option<fraisier_db::archive::Archive>,
+    found: &mut DrillArchive,
 ) -> std::result::Result<fraisier_core::drill::DrillReport, (&'static str, String)> {
     use fraisier_db::retention::Verdict;
 
@@ -2941,18 +2960,39 @@ async fn drill_steps(
                 format!("no archive of {fraise}/{environment} in {}", dir.display()),
             )
         })?;
-    let path = archive.insert(newest).path.clone();
+    let taken_at = newest.stamp.to_system_time();
+    let path = found.archive.insert(newest).path.clone();
 
     // Before anything is created: an archive that does not read back cannot restore.
-    if let Verdict::Invalid(reason) = fraisier_db::archive::verify_archive(pg_restore, &path).await
-    {
-        return Err((
-            "verify",
-            format!("{} is not a readable archive: {reason}", path.display()),
-        ));
+    match fraisier_db::archive::verify_archive(pg_restore, &path).await {
+        Verdict::Invalid(reason) => {
+            return Err((
+                "verify",
+                format!("{} is not a readable archive: {reason}", path.display()),
+            ));
+        }
+        Verdict::Unverifiable(reason) => found.warnings.push(format!(
+            "{} could not be verified before the restore: {reason}",
+            path.display()
+        )),
+        Verdict::Valid => {}
     }
-    let taken_at = archive.as_ref().map_or(now, |a| a.stamp.to_system_time());
     let max_age = std::time::Duration::from_hours(u64::from(drill.max_age_hours()));
+    // A stamp in the future means a clock is wrong, so the archive's age, and
+    // with it whether backups are still arriving, is unknown.
+    if let Ok(ahead) = taken_at.duration_since(now) {
+        if ahead > DRILL_CLOCK_SKEW {
+            return Err((
+                "age",
+                format!(
+                    "the newest archive, {}, is stamped {} minutes in the future, so its age \
+                     cannot show whether backups are still arriving: check the clocks",
+                    path.display(),
+                    ahead.as_secs() / 60
+                ),
+            ));
+        }
+    }
     if let Ok(age) = now.duration_since(taken_at) {
         if age > max_age {
             return Err((
@@ -6195,6 +6235,44 @@ current_revision = "true"
         assert_eq!(out.exit_code, 1, "{}", out.pretty);
         assert!(server.calls().is_empty(), "{:?}", server.calls());
         assert!(out.pretty.contains("max_age_hours"), "{}", out.pretty);
+    }
+
+    #[test]
+    fn a_future_stamped_newest_archive_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "max_age_hours = 24\n");
+        drill_archive(dir.path(), "20261030T031500Z", b"PGDMP");
+        let server = FakeServer::default();
+        let out = drill(dir.path(), &config, &server);
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(server.calls().is_empty(), "{:?}", server.calls());
+        assert_eq!(receipt(dir.path())["failed_step"], serde_json::json!("age"));
+    }
+
+    #[test]
+    fn an_unverifiable_newest_archive_is_drilled_with_a_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = drill_config(dir.path(), "true", "");
+        drill_archive(dir.path(), "20261025T031500Z", b"PGDMP");
+        let server = FakeServer::default();
+        let _guard = crate::test_env::env_guard();
+        std::env::set_var("FRAISIER_DRILL_DSN", "postgres://app:s3cret@127.0.0.1/shop");
+        let out = block_on(super::backup_drill_with(
+            &config,
+            &dir.path().join("state"),
+            &server,
+            &dir.path().join("no-pg_restore"),
+            prune_now(),
+        ))
+        .expect("run");
+        std::env::remove_var("FRAISIER_DRILL_DSN");
+        assert!(
+            out.pretty.contains("warning: ") && out.pretty.contains("could not be verified"),
+            "{}",
+            out.pretty
+        );
+        let warnings = receipt(dir.path())["warnings"].clone();
+        assert_eq!(warnings.as_array().map(Vec::len), Some(1), "{warnings}");
     }
 
     #[test]

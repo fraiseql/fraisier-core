@@ -14,6 +14,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scaffold writes it into the scheduled backup unit, where a newline in it
   would have started a new unit directive. `db backup` (and every `db` command)
   now also checks `[backup]`, since `db backup` writes into `[backup].dir`.
+- **`scheduled install` refuses a config its units would refuse on every
+  run.** It used to check only the `[schedule]`, `[notify]`, `[backup]` and
+  `[drill]` sections, so an invalid `[metrics]`, `[migration]` or `[deploy]`
+  installed timers that then failed on each firing. It now also runs the
+  validation each installed unit's command runs: the full config for a
+  scheduled deploy, the database sections for a scheduled backup and a drill,
+  and the backup sections for a prune. A prune-only host is still not held to
+  the deploy sections.
+- **`stack deploy` refuses a `[hosts]` router before anything deploys.** When
+  members declare `sdl` and the router deploys through `[hosts]`, their SDL can
+  never be checked (the router's release is on its hosts, not where fraisier
+  runs). The members used to deploy anyway, be reported `UNCHECKED`, and leave
+  a live stack behind an exit 1. The stack, and its dry run, are now refused up
+  front, naming those members.
+- **A database name can no longer redirect a restore.** `pg_restore` received
+  the target database as `-d <name>`, and libpq reads a `-d` holding an `=` or
+  a URI scheme as a whole connection string. A database named `host=elsewhere`
+  would have restored to another server, ignoring `PGHOST`. The name now goes
+  in as a quoted `dbname='…'` pair, so it is always a name.
+- **Two credential spellings got past redaction.** A URL whose password holds
+  an unencoded `/`, `?` or `#` (`postgresql://app:pa/ss@db/x`) kept its
+  password in failure reasons, notifications and receipts, because the
+  authority seemed to end at that character. And `PASSWORD=` or `Password=`
+  was not matched, only `password=`. Both are now replaced with `***`. An `@`
+  in a URL path with no `user:` before it is still left alone.
 
 ## [1.0.0-beta.12] - 2026-10-27
 

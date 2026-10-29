@@ -1110,6 +1110,24 @@ fn a_retain_name_must_be_a_safe_identifier() {
 }
 
 #[test]
+fn a_retain_name_may_hold_a_dot_like_the_unit_names_it_forms() {
+    // The scaffold accepts any `is_unit_word`, so validation must too.
+    let report = retain_report(&format!("{RETAIN}name = \"nightly.v2\"\n"));
+    assert!(report.ok(), "{report}");
+}
+
+#[test]
+fn a_bad_retain_name_is_reported_once() {
+    let report = retain_report(&format!("{RETAIN}name = \"night ly\"\n"));
+    let at_name = report
+        .issues
+        .iter()
+        .filter(|issue| issue.path == "backup.retain[0].name")
+        .count();
+    assert_eq!(at_name, 1, "{report}");
+}
+
+#[test]
 fn a_derived_name_must_also_be_safe() {
     let report = retain_report(&RETAIN.replace("/var/backups/checkout", "/"));
     assert!(has_error(&report, "backup.retain[0].name"), "{report}");

@@ -953,27 +953,33 @@ fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
     let mut names: Vec<(String, usize)> = Vec::new();
     for (index, entry) in retain.iter().enumerate() {
         validate_retain_entry(entry, dir, &format!("backup.retain[{index}]"), report);
-        if let Some(name) = entry.name() {
-            if !is_unit_word(&name) {
-                report.error(
-                    &format!("backup.retain[{index}].name"),
-                    format!(
-                        "retain entry name '{name}' names its systemd units, so it may hold \
-                         only letters, digits, '_', '.' and '-', and not start with '-'"
-                    ),
-                );
-            }
-            if let Some((_, first)) = names.iter().find(|(seen, _)| *seen == name) {
-                report.error(
-                    &format!("backup.retain[{index}].name"),
-                    format!(
-                        "retain entry name '{name}' is already used by backup.retain[{first}]; \
-                         set a distinct `name` on one of them"
-                    ),
-                );
-            } else {
-                names.push((name, index));
-            }
+        let Some(name) = entry.name() else {
+            report.error(
+                &format!("backup.retain[{index}].name"),
+                "a retain entry needs a name for its systemd units: set `name` (its dir \
+                 has no last component to take one from)",
+            );
+            continue;
+        };
+        if !is_unit_word(&name) {
+            report.error(
+                &format!("backup.retain[{index}].name"),
+                format!(
+                    "retain entry name '{name}' names its systemd units, so it may hold \
+                     only letters, digits, '_', '.' and '-', and not start with '-'"
+                ),
+            );
+        }
+        if let Some((_, first)) = names.iter().find(|(seen, _)| *seen == name) {
+            report.error(
+                &format!("backup.retain[{index}].name"),
+                format!(
+                    "retain entry name '{name}' is already used by backup.retain[{first}]; \
+                     set a distinct `name` on one of them"
+                ),
+            );
+        } else {
+            names.push((name, index));
         }
     }
 }
@@ -1186,22 +1192,6 @@ fn validate_retain_entry(
         report.error(
             &format!("{at}.min_free_gb"),
             "min_free_gb must be at least 1 (omit it for no threshold)",
-        );
-    }
-    let name_ok = entry.name().is_some_and(|name| {
-        !name.is_empty()
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    });
-    if !name_ok {
-        report.error(
-            &format!("{at}.name"),
-            format!(
-                "the entry's name ({:?}) names its systemd units, so it must be letters, \
-                 digits, '_' and '-'; set `name` explicitly",
-                entry.name().unwrap_or_default()
-            ),
         );
     }
 }

@@ -857,6 +857,32 @@ fn the_backup_dir_must_be_absolute() {
 }
 
 #[test]
+fn the_backup_dir_must_be_plain_with_no_parent_component() {
+    // The scaffold writes backup.dir into a unit file, where a newline starts a
+    // new directive; a retain.dir is held to the same rule.
+    for dir in [
+        "/var/backups/../etc",
+        "/var/backups/a b",
+        "/var/backups/x\\nExecStartPre=/bin/evil",
+    ] {
+        let toml = format!("{SCHEDULE_BASE}\n[backup]\ndir = \"{dir}\"\n");
+        let report = DeployConfig::from_toml_str(&toml)
+            .expect("parses")
+            .validate();
+        assert!(has_error(&report, "backup.dir"), "{dir:?}: {report}");
+    }
+}
+
+#[test]
+fn db_backup_validation_checks_the_backup_dir_it_writes_into() {
+    let toml = format!("{SCHEDULE_BASE}\n[backup]\ndir = \"backups\"\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate_db_ops();
+    assert!(has_error(&report, "backup.dir"), "{report}");
+}
+
+#[test]
 fn a_backup_section_without_a_dir_is_an_error() {
     let toml = format!("{SCHEDULE_BASE}\n[backup]\n");
     let report = DeployConfig::from_toml_str(&toml)
@@ -1081,6 +1107,24 @@ fn a_retain_name_must_be_a_safe_identifier() {
             "{bad}: {report}"
         );
     }
+}
+
+#[test]
+fn a_retain_name_may_hold_a_dot_like_the_unit_names_it_forms() {
+    // The scaffold accepts any `is_unit_word`, so validation must too.
+    let report = retain_report(&format!("{RETAIN}name = \"nightly.v2\"\n"));
+    assert!(report.ok(), "{report}");
+}
+
+#[test]
+fn a_bad_retain_name_is_reported_once() {
+    let report = retain_report(&format!("{RETAIN}name = \"night ly\"\n"));
+    let at_name = report
+        .issues
+        .iter()
+        .filter(|issue| issue.path == "backup.retain[0].name")
+        .count();
+    assert_eq!(at_name, 1, "{report}");
 }
 
 #[test]
@@ -2121,4 +2165,41 @@ fn a_database_less_axis_refuses_a_dsn_or_settings() {
             report.issues
         );
     }
+}
+
+#[test]
+fn an_unattended_backup_prune_or_drill_without_a_notify_sink_warns() {
+    // With no [notify].command, the alert unit only writes the failure to the
+    // journal: nobody is told.
+    for (what, body) in [
+        (
+            "scheduled backup",
+            "[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n",
+        ),
+        ("prune", RETAIN),
+        ("drill", "[drill]\nschedule = \"weekly Sun 04:00\"\n"),
+    ] {
+        let toml = format!("{SCHEDULE_BASE}\n{BACKUP_DIR}{body}");
+        let report = DeployConfig::from_toml_str(&toml)
+            .expect("parses")
+            .validate();
+        assert!(report.ok(), "{what}: a warning, not an error: {report}");
+        assert!(has_warning(&report, "notify.command"), "{what}: {report}");
+
+        let notified = format!("{toml}\n[notify]\ncommand = \"systemd-cat -t fraisier\"\n");
+        let report = DeployConfig::from_toml_str(&notified)
+            .expect("parses")
+            .validate();
+        assert!(!has_warning(&report, "notify.command"), "{what}: {report}");
+    }
+}
+
+#[test]
+fn a_drill_with_no_schedule_needs_no_notify_sink() {
+    // Run by hand, the drill's failure is on the operator's terminal.
+    let toml = format!("{SCHEDULE_BASE}\n{BACKUP_DIR}[drill]\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(!has_warning(&report, "notify.command"), "{report}");
 }

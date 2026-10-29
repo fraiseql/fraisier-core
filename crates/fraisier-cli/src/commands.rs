@@ -756,6 +756,27 @@ pub(crate) fn scaffold_install(
     })
 }
 
+/// The validation each scheduled unit's command runs before it acts: what a
+/// timer would fail on every run. A prune-only host needs no deploy axes, so
+/// each command is held to its own sections, not to the full [`DeployConfig::validate`].
+fn scheduled_unit_reports(config: &DeployConfig) -> Vec<fraisier_config::ValidationReport> {
+    let mut reports = Vec::new();
+    match config.schedule.as_ref().and_then(|s| s.command.as_deref()) {
+        Some("deploy") => reports.push(config.validate()),
+        Some("backup") => reports.push(config.validate_db_ops()),
+        _ => {}
+    }
+    let retains = config.backup.as_ref().is_some_and(|b| !b.retain.is_empty());
+    let drills = config.drill.as_ref().is_some_and(|d| d.schedule.is_some());
+    if retains || drills {
+        reports.push(config.validate_backup_ops());
+    }
+    if drills {
+        reports.push(config.validate_db_ops());
+    }
+    reports
+}
+
 /// `scheduled install`: generate the systemd timer + service that run fraisier on
 /// a calendar schedule and install them under `root`. Unlike `scaffold-install`
 /// it does **not** prune: scheduled units share the systemd directory (and the
@@ -778,19 +799,26 @@ pub(crate) fn scheduled_install(
     // The unattended-deploy gate: refuse to install units whose sections are
     // invalid — in particular `command = "deploy"` without
     // `allow_unattended_deploy = true` + a `[notify].command` sink, or a retain
-    // entry whose name cannot name a unit. The validator carries the policy;
-    // here we refuse (with the located reasons) rather than install.
+    // entry whose name cannot name a unit — or that the command each unit runs
+    // would refuse on every run. The validator carries the policy; here we
+    // refuse (with the located reasons) rather than install.
     let report = config.validate();
-    let schedule_errors: Vec<&fraisier_config::ValidationIssue> = report
+    let mut schedule_errors: Vec<&fraisier_config::ValidationIssue> = report
         .issues
         .iter()
         .filter(|issue| {
-            issue.severity == Severity::Error
-                && ["schedule", "notify", "backup", "drill"]
-                    .iter()
-                    .any(|section| issue.path.starts_with(section))
+            ["schedule", "notify", "backup", "drill"]
+                .iter()
+                .any(|section| issue.path.starts_with(section))
         })
         .collect();
+    let unit_reports = scheduled_unit_reports(&config);
+    for issue in unit_reports.iter().flat_map(|report| &report.issues) {
+        if !schedule_errors.contains(&issue) {
+            schedule_errors.push(issue);
+        }
+    }
+    schedule_errors.retain(|issue| issue.severity == Severity::Error);
     if !schedule_errors.is_empty() {
         let mut pretty = String::from("refusing to install: invalid scheduling config\n");
         for issue in &schedule_errors {
@@ -6888,6 +6916,44 @@ current_revision = "true"
             out.pretty
         );
         assert!(!root.exists(), "nothing installed");
+    }
+
+    #[test]
+    fn scheduled_install_refuses_a_config_its_scheduled_backup_would_refuse() {
+        // `fraisier backup` refuses an invalid [metrics] on every run, so the
+        // unit must not install.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = format!(
+            "{VALID}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[metrics]\n\n\
+             [schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n"
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        let out = scheduled_install(&config, &root, true, false, false, false).expect("runs");
+        assert_eq!(out.exit_code, 1, "{}", out.pretty);
+        assert!(
+            out.pretty.contains("metrics.textfile_dir"),
+            "{}",
+            out.pretty
+        );
+        assert!(!root.exists(), "nothing installed");
+    }
+
+    #[test]
+    fn scheduled_install_of_a_prune_only_host_ignores_the_deploy_axes() {
+        // `backup prune` never reads [health], so a prune-only host installs
+        // whatever a deploy would say about it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = format!(
+            "{}\n[backup]\ndir = \"/var/backups/checkout\"\n\n\
+             [[backup.retain]]\ndir = \"/var/backups/checkout\"\nname = \"nightly\"\n\
+             schedule = \"daily 05:30\"\nretention_days = 14\n",
+            VALID.replace("url = \"http://127.0.0.1:8080/health\"\n", "")
+        );
+        let config = write(dir.path(), "fraisier.toml", &cfg);
+        let root = dir.path().join("root");
+        let out = scheduled_install(&config, &root, true, false, false, false).expect("runs");
+        assert_eq!(out.exit_code, 0, "{}", out.pretty);
     }
 
     #[test]

@@ -150,8 +150,9 @@ impl DeployConfig {
     /// The `db migrate|backup|restore|reset` commands act on the database alone,
     /// so they require `[deploy]` (for the state-ledger identity) and
     /// `[migration]` (the adapter + DSN source), but **not** the
-    /// artifact/service/health/lb axes a full deploy needs. This is the same pure,
-    /// no-I/O check restricted to those two sections.
+    /// artifact/service/health/lb axes a full deploy needs. `db backup` writes
+    /// into `[backup].dir`, so `[backup]` is checked too. This is the same pure,
+    /// no-I/O check restricted to those sections.
     #[must_use]
     pub fn validate_db_ops(&self) -> ValidationReport {
         let mut report = ValidationReport::default();
@@ -159,6 +160,7 @@ impl DeployConfig {
         validate_migration(self, &mut report);
         validate_metrics(self, &mut report);
         validate_database(self, &mut report);
+        validate_backup(self, &mut report);
         report
     }
 
@@ -809,6 +811,43 @@ fn validate_notify(cfg: &DeployConfig, report: &mut ValidationReport) {
                 "the [notify] section requires command (run via `sh -c` on each failure)",
             );
         }
+        return;
+    }
+    // A scheduled deploy without a sink is an error (`validate_schedule`). The
+    // other timers still run unattended, but their alert unit can only write a
+    // failure to the journal, so say so.
+    let mut unattended = Vec::new();
+    if cfg
+        .schedule
+        .as_ref()
+        .is_some_and(|schedule| schedule.command.as_deref() == Some("backup"))
+    {
+        unattended.push("the scheduled backup");
+    }
+    if cfg
+        .backup
+        .as_ref()
+        .is_some_and(|backup| !backup.retain.is_empty())
+    {
+        unattended.push("the prune");
+    }
+    if cfg
+        .drill
+        .as_ref()
+        .is_some_and(|drill| drill.schedule.is_some())
+    {
+        unattended.push("the drill");
+    }
+    if !unattended.is_empty() {
+        report.warn(
+            "notify.command",
+            format!(
+                "{} run{} unattended with no [notify].command, so a failure only reaches the \
+                 journal; set [notify].command to be told",
+                unattended.join(", "),
+                if unattended.len() == 1 { "s" } else { "" }
+            ),
+        );
     }
 }
 
@@ -924,6 +963,14 @@ fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
                 dir.display()
             ),
         ),
+        Some(dir) if !is_plain_dir(dir) => report.error(
+            "backup.dir",
+            format!(
+                "backup.dir must be a path of letters, digits, '/', '.', '_' and '-' with \
+                 no '..', not {:?}: it is written into the scheduled units",
+                dir.to_string_lossy()
+            ),
+        ),
         None if cfg.backup.is_some() => report.error(
             "backup.dir",
             "the [backup] section requires dir: the directory archives are written to, \
@@ -943,27 +990,33 @@ fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
     let mut names: Vec<(String, usize)> = Vec::new();
     for (index, entry) in retain.iter().enumerate() {
         validate_retain_entry(entry, dir, &format!("backup.retain[{index}]"), report);
-        if let Some(name) = entry.name() {
-            if !is_unit_word(&name) {
-                report.error(
-                    &format!("backup.retain[{index}].name"),
-                    format!(
-                        "retain entry name '{name}' names its systemd units, so it may hold \
-                         only letters, digits, '_', '.' and '-', and not start with '-'"
-                    ),
-                );
-            }
-            if let Some((_, first)) = names.iter().find(|(seen, _)| *seen == name) {
-                report.error(
-                    &format!("backup.retain[{index}].name"),
-                    format!(
-                        "retain entry name '{name}' is already used by backup.retain[{first}]; \
-                         set a distinct `name` on one of them"
-                    ),
-                );
-            } else {
-                names.push((name, index));
-            }
+        let Some(name) = entry.name() else {
+            report.error(
+                &format!("backup.retain[{index}].name"),
+                "a retain entry needs a name for its systemd units: set `name` (its dir \
+                 has no last component to take one from)",
+            );
+            continue;
+        };
+        if !is_unit_word(&name) {
+            report.error(
+                &format!("backup.retain[{index}].name"),
+                format!(
+                    "retain entry name '{name}' names its systemd units, so it may hold \
+                     only letters, digits, '_', '.' and '-', and not start with '-'"
+                ),
+            );
+        }
+        if let Some((_, first)) = names.iter().find(|(seen, _)| *seen == name) {
+            report.error(
+                &format!("backup.retain[{index}].name"),
+                format!(
+                    "retain entry name '{name}' is already used by backup.retain[{first}]; \
+                     set a distinct `name` on one of them"
+                ),
+            );
+        } else {
+            names.push((name, index));
         }
     }
 }
@@ -1049,6 +1102,14 @@ const fn is_plain(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
 }
 
+/// Whether `dir` is made of [`is_plain`] characters and has no `..` component.
+fn is_plain_dir(dir: &Path) -> bool {
+    dir.to_string_lossy().bytes().all(is_plain)
+        && !dir
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+}
+
 /// A retain entry's `dir`: absolute, plain, and `backup_dir` or below it.
 ///
 /// `starts_with` compares whole components, so `/srv/backups2` is not below
@@ -1063,10 +1124,7 @@ fn validate_retain_dir(
         None => report.error(&format!("{at}.dir"), "a retain entry requires dir"),
         Some(dir) => {
             let text = dir.to_string_lossy();
-            let parent = dir
-                .components()
-                .any(|part| part == std::path::Component::ParentDir);
-            if !dir.is_absolute() || parent || !text.bytes().all(is_plain) {
+            if !dir.is_absolute() || !is_plain_dir(dir) {
                 report.error(
                     &format!("{at}.dir"),
                     format!(
@@ -1171,22 +1229,6 @@ fn validate_retain_entry(
         report.error(
             &format!("{at}.min_free_gb"),
             "min_free_gb must be at least 1 (omit it for no threshold)",
-        );
-    }
-    let name_ok = entry.name().is_some_and(|name| {
-        !name.is_empty()
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    });
-    if !name_ok {
-        report.error(
-            &format!("{at}.name"),
-            format!(
-                "the entry's name ({:?}) names its systemd units, so it must be letters, \
-                 digits, '_' and '-'; set `name` explicitly",
-                entry.name().unwrap_or_default()
-            ),
         );
     }
 }

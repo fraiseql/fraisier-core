@@ -156,7 +156,38 @@ fn ready(
 ) -> Result<(Stack, BTreeMap<String, String>), CommandOutput> {
     let stack = load(stack_path).map_err(|error| refused(&error.to_string()))?;
     let versions = parse_versions(&stack, versions).map_err(|message| refused(&message))?;
-    invalid_members(&stack, deployer).map_or(Ok((stack, versions)), Err)
+    if let Some(refusal) = invalid_members(&stack, deployer).or_else(|| router_on_hosts(&stack)) {
+        return Err(refusal);
+    }
+    Ok((stack, versions))
+}
+
+/// The refusal for a stack whose members declare `sdl` while the router
+/// deploys through `[hosts]`. Their SDL could only be found unchecked after
+/// they deployed, so the stack would go live and still exit 1.
+fn router_on_hosts(stack: &Stack) -> Option<CommandOutput> {
+    let router = stack
+        .router
+        .as_deref()
+        .and_then(|router| stack.members.iter().find(|m| m.name == router))
+        .filter(|router| router.config.hosts.is_some())?;
+    let checked: Vec<String> = stack
+        .members
+        .iter()
+        .filter(|m| m.sdl.is_some())
+        .map(|m| format!("'{}'", m.name))
+        .collect();
+    let (noun, verb) = match checked.len() {
+        0 => return None,
+        1 => ("member", "declares"),
+        _ => ("members", "declare"),
+    };
+    Some(refused(&format!(
+        "refusing to deploy: {noun} {} {verb} sdl, but {}. Remove sdl to deploy without \
+         the check. Nothing deployed.",
+        checked.join(", "),
+        crate::stack_sdl::on_hosts(&router.name)
+    )))
 }
 
 /// The refusal for a stack with an invalid member. Each member's deploy
@@ -203,8 +234,8 @@ enum Candidate {
     Failed(String),
 }
 
-/// Stage the router's candidate release, unless nothing is checked, this is a
-/// dry run, or the router deploys through `[hosts]`.
+/// Stage the router's candidate release, unless nothing is checked or this is
+/// a dry run. A router on `[hosts]` never gets here: [`ready`] refuses it.
 async fn candidate(
     stack: &Stack,
     versions: &BTreeMap<String, String>,
@@ -220,9 +251,6 @@ async fn candidate(
     };
     if dry_run {
         return Candidate::NotChecked("dry run".to_owned());
-    }
-    if router.config.hosts.is_some() {
-        return Candidate::Unreadable(crate::stack_sdl::on_hosts(&router.name));
     }
     let version = versions.get(&router.name).map(String::as_str);
     match deployer.stage(router, version).await {
@@ -783,31 +811,39 @@ mod tests {
     }
 
     #[test]
-    fn a_router_on_hosts_is_unchecked_never_green() {
+    fn a_router_on_hosts_with_sdl_members_is_refused_before_anything_deploys() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = routed_stack_dir(
             dir.path(),
             "[hosts]\nstrategy = \"rolling\"\n\
              inventory = [{ name = \"gw-1\", address = \"10.0.0.1\" }]\n",
         );
-        let fake = Fake::default();
-        let source = sdl(false);
-        let out =
-            block_on(stack_deploy_with(&path, &[], &fake, source.clone(), false)).expect("runs");
-        assert_eq!(out.exit_code, 1, "{}", out.pretty);
-        assert_eq!(
-            *fake.deployed.lock().expect("log"),
-            vec!["billing@-", "management@-", "router@-"],
-            "nothing is staged locally for a router on its hosts"
-        );
-        assert!(source.read.lock().expect("read").is_empty());
-        assert!(
-            out.pretty.contains(
-                "  sdl management: UNCHECKED\n      the router 'router' deploys through [hosts]"
-            ),
-            "{}",
-            out.pretty
-        );
+        for dry_run in [false, true] {
+            let fake = Fake::default();
+            let source = sdl(false);
+            let out = block_on(stack_deploy_with(
+                &path,
+                &[],
+                &fake,
+                source.clone(),
+                dry_run,
+            ))
+            .expect("runs");
+            assert_eq!(out.exit_code, 1, "{}", out.pretty);
+            assert!(
+                fake.deployed.lock().expect("log").is_empty(),
+                "nothing deploys (dry run: {dry_run})"
+            );
+            assert!(source.read.lock().expect("read").is_empty());
+            assert!(
+                out.pretty.contains(
+                    "refusing to deploy: member 'management' declares sdl, but the router \
+                     'router' deploys through [hosts]"
+                ),
+                "{}",
+                out.pretty
+            );
+        }
     }
 
     #[test]

@@ -115,9 +115,9 @@ pub enum Verdict {
 
 /// What a policy does to a set of archives.
 ///
-/// `remove`, `keep` and `exempt` partition the candidates. `invalid` and
-/// `removed_by_ceiling` are overlays: each archive they name is also in exactly
-/// one of the three.
+/// `remove`, `keep` and `exempt` partition the candidates. `invalid`,
+/// `unverifiable` and `removed_by_ceiling` are overlays: each archive they name
+/// is also in exactly one of the three.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
     /// Archives to remove.
@@ -130,6 +130,10 @@ pub struct Plan {
     /// the reason. Not a corpus audit: only archives that contested a slot were
     /// checked.
     pub invalid: Vec<(PathBuf, String)>,
+    /// Archives that could not be checked while the floor was allocated, with
+    /// the reason. Each holds the slot it contested, as a valid one would, so
+    /// the floor may rest on archives nothing has read.
+    pub unverifiable: Vec<(PathBuf, String)>,
     /// Archives the ceiling removed that the age rule would have kept. They were
     /// not old, so a report that calls them "old archives" is wrong about them.
     pub removed_by_ceiling: Vec<PathBuf>,
@@ -182,7 +186,13 @@ where
                 // No slot spent, so the next valid archive takes it. Removed only
                 // because it is already past the cutoff.
                 Verdict::Invalid(reason) => plan.invalid.push((path.clone(), reason)),
-                Verdict::Valid | Verdict::Unverifiable(_) => {
+                Verdict::Valid => {
+                    plan.exempt.push(path);
+                    slots += 1;
+                    continue;
+                }
+                Verdict::Unverifiable(reason) => {
+                    plan.unverifiable.push((path.clone(), reason));
                     plan.exempt.push(path);
                     slots += 1;
                     continue;
@@ -485,7 +495,8 @@ mod tests {
     fn all_valid_retains_exactly_as_all_unverifiable() {
         for (ages, floor) in SHAPES {
             let (valid, _) = run(ages, &policy(*floor), &BTreeMap::new());
-            let (blind, _) = run(ages, &policy(*floor), &unverifiable(ages));
+            let (mut blind, _) = run(ages, &policy(*floor), &unverifiable(ages));
+            blind.unverifiable.clear();
             assert_eq!(valid, blind, "{ages:?}, floor {floor}");
         }
     }
@@ -535,6 +546,14 @@ mod tests {
         assert_eq!(plan.exempt, baseline.exempt);
         assert_eq!(plan.remove, baseline.remove);
         assert!(plan.invalid.is_empty(), "{:?}", plan.invalid);
+    }
+
+    #[test]
+    fn an_unverifiable_archive_holding_a_floor_slot_is_named() {
+        let ages: &[(&str, u64)] = &[("a", 50), ("b", 60), ("c", 70)];
+        let (plan, _) = run(ages, &policy(2), &unverifiable(&ages[..1]));
+        assert_eq!(plan.exempt, [path("a"), path("b")]);
+        assert_eq!(plan.unverifiable, [(path("a"), "no pg_restore".to_owned())]);
     }
 
     #[test]

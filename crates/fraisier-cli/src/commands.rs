@@ -2679,10 +2679,10 @@ fn prune_warnings(
 ) -> Vec<String> {
     let mut warnings = Vec::new();
     if let Some(min_free_gb) = entry.min_free_gb {
-        // An unmeasurable volume is not a full one any more than it is an empty
-        // one, so it says nothing.
-        if let Ok(free) = fraisier_db::retention::available_bytes(dir) {
-            if free < min_free_gb.saturating_mul(1_000_000_000) {
+        // An unmeasurable volume may be a full one, so the check that did not run
+        // is reported rather than passed.
+        match fraisier_db::retention::available_bytes(dir) {
+            Ok(free) if free < min_free_gb.saturating_mul(1_000_000_000) => {
                 warnings.push(format!(
                     "{} has {} GB free, below the min_free_gb = {min_free_gb} declared for \
                      {name}; retention bounds this corpus but cannot free a disk something else \
@@ -2691,6 +2691,12 @@ fn prune_warnings(
                     free / 1_000_000_000
                 ));
             }
+            Ok(_) => {}
+            Err(error) => warnings.push(format!(
+                "could not measure the free space on {} against the min_free_gb = \
+                 {min_free_gb} declared for {name}: {error}",
+                dir.display()
+            )),
         }
     }
     for (archive, reason) in &plan.invalid {
@@ -5934,6 +5940,29 @@ current_revision = "true"
             run.warnings.iter().any(|w| w.contains("min_free_gb")),
             "{:?}",
             run.warnings
+        );
+    }
+
+    #[test]
+    fn an_unmeasurable_volume_warns_that_min_free_gb_went_unchecked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gone = dir.path().join("gone");
+        let entry = fraisier_config::RetainEntry {
+            min_free_gb: Some(1),
+            ..fraisier_config::RetainEntry::default()
+        };
+        let warnings = super::prune_warnings(
+            &entry,
+            "nightly",
+            &gone,
+            &[],
+            &fraisier_db::retention::Plan::default(),
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("min_free_gb") && w.contains("could not measure")),
+            "{warnings:?}"
         );
     }
 

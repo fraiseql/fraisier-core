@@ -201,10 +201,12 @@ in output.
 listed as `planned`, never `deployed`.
 
 The candidate is read on the host fraisier runs on. When the router deploys
-through `[hosts]`, its releases are on its hosts, so nothing is staged locally:
-each checked member deploys unchecked, is reported `UNCHECKED` with that
-reason, and the command exits 1. A router whose artifact stages as a file, not
-a directory, is reported the same way.
+through `[hosts]`, its releases are on its hosts, so no member's SDL can be
+checked: `stack deploy` (and its dry run) refuses such a stack before anything
+deploys, naming the members that declare `sdl`, and exits 1. Remove `sdl` from
+them to deploy without the check. A router whose artifact stages as a file,
+not a directory, is found only once staged: each checked member then deploys
+unchecked, is reported `UNCHECKED` with that reason, and the command exits 1.
 
 `stack status` runs the same comparison after the fact, against the router's
 *active* release: it detects a subgraph deployed on its own, outside the stack.

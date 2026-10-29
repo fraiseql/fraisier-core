@@ -4,7 +4,7 @@ name: CI
 # command a developer runs locally — `cargo xtask ci` — so local and CI never drift.
 on:
   push:
-    branches: [main, phase-02]
+    branches: [main]
   pull_request:
 
 concurrency:

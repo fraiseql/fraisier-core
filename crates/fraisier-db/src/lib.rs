@@ -283,16 +283,31 @@ pub fn backup_command(conn: &PgConn, out: &Path) -> Command {
 /// With `clean`, existing objects are dropped first (`--clean --if-exists`). The
 /// target database name (not a secret) is the only connection value on argv;
 /// everything else comes from [`PgConn::pg_env`].
+///
+/// `pg_restore` needs `-d` to restore into a database at all (without it, it
+/// prints a script), and libpq reads a `-d` holding `=` or a URI scheme as a
+/// whole conninfo string. So the name goes in as a quoted `dbname='…'` pair:
+/// always a name, and the `PG*` variables still supply everything else.
 #[must_use]
 pub fn restore_command(conn: &PgConn, archive: &Path, clean: bool) -> Command {
     let mut command = Command::new("pg_restore");
     command.envs(conn.pg_env());
-    command.arg("-w").arg("-d").arg(conn.database());
+    command
+        .arg("-w")
+        .arg("-d")
+        .arg(conninfo_dbname(conn.database()));
     if clean {
         command.arg("--clean").arg("--if-exists");
     }
     command.arg(archive);
     command
+}
+
+/// `name` as a libpq conninfo `dbname` pair, single-quoted with `\` and `'`
+/// escaped.
+fn conninfo_dbname(name: &str) -> String {
+    let escaped = name.replace('\\', r"\\").replace('\'', r"\'");
+    format!("dbname='{escaped}'")
 }
 
 /// Build a non-interactive `psql` command that runs `sql` with
@@ -652,7 +667,7 @@ mod tests {
         let args = args_of(&plain);
         assert!(args.contains(&"-d".to_owned()), "target db flag: {args:?}");
         assert!(
-            args.contains(&"shop".to_owned()),
+            args.contains(&"dbname='shop'".to_owned()),
             "target db name: {args:?}"
         );
         assert!(
@@ -672,6 +687,21 @@ mod tests {
             args.contains(&"--if-exists".to_owned()),
             "if-exists: {args:?}"
         );
+    }
+
+    #[test]
+    fn a_database_name_shaped_like_conninfo_stays_a_name() {
+        // pg_restore hands `-d` to libpq as a conninfo string when it holds an
+        // `=` or starts with a URI scheme, which would override PGHOST & co.
+        let conn = PgConn::parse("postgresql://alice@db.example.com/host%3Devil%20it%27s%5C")
+            .expect("parses");
+        let args = args_of(&restore_command(&conn, Path::new("/b.pgdump"), false));
+        let target = args
+            .iter()
+            .skip_while(|arg| *arg != "-d")
+            .nth(1)
+            .expect("a -d value");
+        assert_eq!(target, r"dbname='host=evil it\'s\\'");
     }
 
     #[test]

@@ -2122,3 +2122,40 @@ fn a_database_less_axis_refuses_a_dsn_or_settings() {
         );
     }
 }
+
+#[test]
+fn an_unattended_backup_prune_or_drill_without_a_notify_sink_warns() {
+    // With no [notify].command, the alert unit only writes the failure to the
+    // journal: nobody is told.
+    for (what, body) in [
+        (
+            "scheduled backup",
+            "[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n",
+        ),
+        ("prune", RETAIN),
+        ("drill", "[drill]\nschedule = \"weekly Sun 04:00\"\n"),
+    ] {
+        let toml = format!("{SCHEDULE_BASE}\n{BACKUP_DIR}{body}");
+        let report = DeployConfig::from_toml_str(&toml)
+            .expect("parses")
+            .validate();
+        assert!(report.ok(), "{what}: a warning, not an error: {report}");
+        assert!(has_warning(&report, "notify.command"), "{what}: {report}");
+
+        let notified = format!("{toml}\n[notify]\ncommand = \"systemd-cat -t fraisier\"\n");
+        let report = DeployConfig::from_toml_str(&notified)
+            .expect("parses")
+            .validate();
+        assert!(!has_warning(&report, "notify.command"), "{what}: {report}");
+    }
+}
+
+#[test]
+fn a_drill_with_no_schedule_needs_no_notify_sink() {
+    // Run by hand, the drill's failure is on the operator's terminal.
+    let toml = format!("{SCHEDULE_BASE}\n{BACKUP_DIR}[drill]\n");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate();
+    assert!(!has_warning(&report, "notify.command"), "{report}");
+}

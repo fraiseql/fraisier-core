@@ -809,6 +809,43 @@ fn validate_notify(cfg: &DeployConfig, report: &mut ValidationReport) {
                 "the [notify] section requires command (run via `sh -c` on each failure)",
             );
         }
+        return;
+    }
+    // A scheduled deploy without a sink is an error (`validate_schedule`). The
+    // other timers still run unattended, but their alert unit can only write a
+    // failure to the journal, so say so.
+    let mut unattended = Vec::new();
+    if cfg
+        .schedule
+        .as_ref()
+        .is_some_and(|schedule| schedule.command.as_deref() == Some("backup"))
+    {
+        unattended.push("the scheduled backup");
+    }
+    if cfg
+        .backup
+        .as_ref()
+        .is_some_and(|backup| !backup.retain.is_empty())
+    {
+        unattended.push("the prune");
+    }
+    if cfg
+        .drill
+        .as_ref()
+        .is_some_and(|drill| drill.schedule.is_some())
+    {
+        unattended.push("the drill");
+    }
+    if !unattended.is_empty() {
+        report.warn(
+            "notify.command",
+            format!(
+                "{} run{} unattended with no [notify].command, so a failure only reaches the \
+                 journal; set [notify].command to be told",
+                unattended.join(", "),
+                if unattended.len() == 1 { "s" } else { "" }
+            ),
+        );
     }
 }
 

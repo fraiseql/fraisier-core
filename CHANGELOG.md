@@ -6,6 +6,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`fraisier validate` warns when an unattended timer has no failure sink.**
+  A scheduled backup, a `[[backup.retain]]` prune or a scheduled `[drill]`
+  with no `[notify].command` now gets a warning at `notify.command`. Without
+  one, their alert unit can only write a failure to the journal. A scheduled
+  deploy already required the sink; these stay warnings, since a host may
+  watch its journal.
+
 ## [1.0.0-beta.12] - 2026-10-27
 
 ### Changed

@@ -23,6 +23,8 @@ pub(crate) enum ScheduledRun {
     Prune,
     /// `fraisier backup drill`.
     Drill,
+    /// `fraisier db refresh`.
+    Refresh,
 }
 
 impl ScheduledRun {
@@ -32,6 +34,7 @@ impl ScheduledRun {
             Self::Backup => "scheduled-backup-failed",
             Self::Prune => "scheduled-prune-failed",
             Self::Drill => "scheduled-drill-failed",
+            Self::Refresh => "scheduled-refresh-failed",
         }
     }
 }
@@ -84,6 +87,8 @@ fn event_for_unit(unit: &str) -> &'static str {
     let name = unit.strip_suffix(".service").unwrap_or(unit);
     if name.ends_with("-drill") {
         ScheduledRun::Drill.event()
+    } else if name.ends_with("-refresh") {
+        ScheduledRun::Refresh.event()
     } else if name.contains("-retain-") {
         ScheduledRun::Prune.event()
     } else if name.ends_with("-scheduled") {
@@ -525,6 +530,18 @@ mod tests {
         assert_eq!(
             failure_record::dir(None),
             Path::new("/run/fraisier/failures").to_path_buf()
+        );
+    }
+
+    #[test]
+    fn a_failed_refresh_unit_is_reported_as_a_refresh() {
+        assert_eq!(
+            super::ScheduledRun::Refresh.event(),
+            "scheduled-refresh-failed"
+        );
+        assert_eq!(
+            super::event_for_unit("fraisier-checkout-staging-refresh.service"),
+            "scheduled-refresh-failed"
         );
     }
 }

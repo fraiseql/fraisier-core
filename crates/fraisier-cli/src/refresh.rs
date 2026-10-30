@@ -14,7 +14,7 @@ mod flag;
 mod run;
 mod units;
 
-pub(crate) use run::{db_refresh, db_refresh_clear_flag};
+pub(crate) use run::{db_refresh, db_refresh_clear_flag, Run};
 
 /// An exit-1 refusal carrying `message`, credentials stripped.
 fn refuse(message: &str) -> CommandOutput {

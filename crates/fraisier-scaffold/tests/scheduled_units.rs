@@ -333,3 +333,87 @@ fn the_app_unit_never_loads_the_ops_env_file() {
     let app = unit(&files, "checkout.service");
     assert_eq!(env_files(app), vec!["/etc/checkout/production.env"]);
 }
+
+const STAGING: &str = r#"
+[deploy]
+name = "checkout"
+environment = "staging"
+production = false
+"#;
+
+const REFRESH: &str = "\n[refresh]\nsource_dir = \"/var/backups/checkout\"\n\
+                       source_environment = \"production\"\n\
+                       sanitize = \"/etc/checkout/sanitize.sql\"\n\
+                       schedule = \"weekly Mon 05:00\"\n";
+
+fn staging_units(extra: &str) -> Vec<GeneratedFile> {
+    let config = DeployConfig::from_toml_str(&format!("{STAGING}{extra}")).expect("parses");
+    generate_scheduled(&config).expect("generates")
+}
+
+#[test]
+fn a_scheduled_refresh_gets_a_service_timer_and_the_alert() {
+    let files = staging_units(REFRESH);
+    assert_eq!(
+        names(&files),
+        vec![
+            "fraisier-checkout-staging-alert@.service".to_owned(),
+            "fraisier-checkout-staging-refresh.service".to_owned(),
+            "fraisier-checkout-staging-refresh.timer".to_owned(),
+        ]
+    );
+    assert_eq!(
+        unit(&files, "fraisier-checkout-staging-refresh.service").contents,
+        format!(
+            "# {MARKER}\n\
+             [Unit]\n\
+             Description=fraisier refresh of checkout (staging)\n\
+             After=network-online.target\n\
+             Wants=network-online.target\n\
+             OnFailure=fraisier-checkout-staging-alert@%n.service\n\
+             \n\
+             [Service]\n\
+             Type=oneshot\n\
+             # Runs as root: the outbound flag's proof reads each unit's\n\
+             # /proc/<pid>/environ. The deploy lock lives in the state directory a\n\
+             # deploy on this host uses, so a refresh never runs under a deploy.\n\
+             StateDirectory=fraisier\n\
+             ExecStart=fraisier db refresh --config /etc/fraisier/checkout.toml --state-dir /var/lib/fraisier/state --yes --skip-if-locked --failure-record %n\n\
+             EnvironmentFile=-/etc/checkout/staging.env\n\
+             # Operator-only secrets such as [database].admin_url_env; the app\n\
+             # unit never loads this file.\n\
+             EnvironmentFile=-/etc/checkout/staging.ops.env\n\
+             # A failed run leaves its redacted reason here for the alert unit.\n\
+             RuntimeDirectory=fraisier/failures\n\
+             RuntimeDirectoryPreserve=yes\n"
+        )
+    );
+    assert_eq!(
+        unit(&files, "fraisier-checkout-staging-refresh.timer").contents,
+        format!(
+            "# {MARKER}\n\
+             [Unit]\n\
+             Description=fraisier refresh timer for checkout (staging)\n\
+             \n\
+             [Timer]\n\
+             # Exactly one OnCalendar=: systemd adds every non-empty assignment as\n\
+             # another trigger rather than replacing the last.\n\
+             OnCalendar=Mon *-*-* 05:00:00\n\
+             # No Persistent=: a refresh missed while the host was down waits for\n\
+             # the next one rather than stopping the services right after boot.\n\
+             \n\
+             [Install]\n\
+             WantedBy=timers.target\n"
+        )
+    );
+}
+
+#[test]
+fn a_refresh_without_a_schedule_gets_no_timer() {
+    let config = DeployConfig::from_toml_str(&format!(
+        "{STAGING}{}",
+        REFRESH.replace("schedule = \"weekly Mon 05:00\"\n", "")
+    ))
+    .expect("parses");
+    assert!(generate_scheduled(&config).is_err(), "nothing is scheduled");
+}

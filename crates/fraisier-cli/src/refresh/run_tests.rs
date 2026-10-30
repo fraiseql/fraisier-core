@@ -9,7 +9,7 @@ use fraisier_db::restore::RestoreServer;
 use fraisier_db::tviews::{Identity, Rebuilt};
 use fraisier_db::PgConn;
 
-use super::{clear_flag_with, db_refresh_with, Machinery};
+use super::{clear_flag_with, db_refresh_with, Machinery, Run};
 use crate::commands::CommandOutput;
 use crate::refresh::units::Units;
 use crate::test_env::{block_on, env_guard};
@@ -28,6 +28,8 @@ fn now() -> SystemTime {
 struct Server {
     marker: Option<&'static str>,
     connections: Vec<String>,
+    /// How many `connections` calls still see the sessions; later ones see none.
+    draining: Mutex<Option<usize>>,
     restore_fails: bool,
     bytes: u64,
     tables: u64,
@@ -39,6 +41,7 @@ impl Default for Server {
         Self {
             marker: Some("checkout/staging"),
             connections: Vec::new(),
+            draining: Mutex::new(None),
             restore_fails: false,
             bytes: 0,
             tables: 3,
@@ -134,7 +137,15 @@ impl MarkerServer for Server {
 impl RefreshServer for Server {
     async fn connections(&self, _m: &PgConn, _db: &str) -> Result<Vec<String>, String> {
         self.record("connections".into());
-        Ok(self.connections.clone())
+        let mut draining = self.draining.lock().expect("draining");
+        match draining.as_mut() {
+            Some(0) => Ok(Vec::new()),
+            Some(left) => {
+                *left -= 1;
+                Ok(self.connections.clone())
+            }
+            None => Ok(self.connections.clone()),
+        }
     }
 
     async fn extensions_problem(
@@ -356,6 +367,16 @@ fn refresh(
     server: &Server,
     units: &FakeUnits,
 ) -> CommandOutput {
+    refresh_opts(dir, config, (execute, false), server, units)
+}
+
+fn refresh_opts(
+    dir: &Path,
+    config: &Path,
+    (execute, skip_if_locked): (bool, bool),
+    server: &Server,
+    units: &FakeUnits,
+) -> CommandOutput {
     let _guard = env_guard();
     std::env::set_var(
         DSN_ENV,
@@ -365,7 +386,10 @@ fn refresh(
     let out = block_on(db_refresh_with(
         config,
         &dir.join("state"),
-        execute,
+        Run {
+            execute,
+            skip_if_locked,
+        },
         &Machinery {
             server,
             units,
@@ -373,6 +397,7 @@ fn refresh(
             etc: &dir.join("etc"),
             operator_uid: std::fs::metadata("/proc/self").expect("proc").uid(),
             now: now(),
+            drain: Duration::from_millis(50),
         },
     ))
     .expect("runs");
@@ -993,4 +1018,39 @@ fn a_held_deploy_lock_is_refused_before_any_unit_stops() {
     assert!(units.of("stop").is_empty(), "{:?}", units.calls());
     assert!(!server.dropped());
     block_on(store.release_lock(guard)).expect("release");
+}
+
+#[test]
+fn a_scheduled_run_skips_quietly_while_a_deploy_holds_the_lock() {
+    use fraisier_saga::state_store::{FilesystemStateStore, FraiseKey, StateStore as _};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = config(dir.path(), Some(false), "true", SKIPPED);
+    archive(dir.path(), "20261026T021500Z");
+    let store = FilesystemStateStore::new(dir.path().join("state")).expect("store");
+    let guard = block_on(store.acquire_lock(&FraiseKey::new("checkout", "staging"))).expect("lock");
+    let (server, units) = (Server::default(), units(dir.path()));
+    let out = refresh_opts(dir.path(), &config, (true, true), &server, &units);
+    assert_eq!(out.exit_code, 0, "{}", out.pretty);
+    assert_eq!(out.json["skipped"], true);
+    assert!(out.pretty.contains("deploy lock"), "{}", out.pretty);
+    assert!(units.of("stop").is_empty(), "{:?}", units.calls());
+    assert!(!server.dropped());
+    block_on(store.release_lock(guard)).expect("release");
+}
+
+#[test]
+fn sessions_that_close_after_the_stop_are_waited_for() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = config(dir.path(), Some(false), "true", SKIPPED);
+    archive(dir.path(), "20261026T021500Z");
+    let server = Server {
+        connections: vec!["app (psql, pid 4242)".to_owned()],
+        draining: Mutex::new(Some(2)),
+        ..Server::default()
+    };
+    let units = units(dir.path());
+    let out = refresh(dir.path(), &config, true, &server, &units);
+    assert_eq!(out.exit_code, 0, "{}", out.pretty);
+    assert!(server.dropped());
 }

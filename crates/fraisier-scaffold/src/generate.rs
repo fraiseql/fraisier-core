@@ -147,9 +147,11 @@ fn refreshed_drop_ins(config: &DeployConfig, file: &str) -> Vec<GeneratedFile> {
 ///   `calendar` vocabulary (translated) or the `on_calendar_raw` escape hatch.
 /// - each `[[backup.retain]]` entry: `…-retain-<entry>.{service,timer}`,
 ///   running `fraisier backup prune --name <entry> --apply`;
-/// - a `[drill]` with a `schedule`: `…-drill.{service,timer}`.
+/// - a `[drill]` with a `schedule`: `…-drill.{service,timer}`;
+/// - a `[refresh]` with a `schedule`: `…-refresh.{service,timer}`, running
+///   `fraisier db refresh --yes --skip-if-locked`.
 ///
-/// A scheduled backup, a prune and a drill each name
+/// A scheduled backup, a prune, a drill and a refresh each name
 /// `fraisier-<name>-<environment>-alert@.service` in `OnFailure=` and run with
 /// `--failure-record %n`; that alert template is generated with them, because
 /// an `OnFailure=` naming a missing unit fails silently. A scheduled deploy
@@ -178,7 +180,16 @@ pub fn generate_scheduled(config: &DeployConfig) -> Result<Vec<GeneratedFile>, S
         .as_ref()
         .and_then(|drill| drill.schedule.as_deref())
         .filter(|spec| !spec.trim().is_empty());
-    if schedule.is_none() && retain.is_empty() && drill_schedule.is_none() {
+    let refresh_schedule = config
+        .refresh
+        .as_ref()
+        .and_then(|refresh| refresh.schedule.as_deref())
+        .filter(|spec| !spec.trim().is_empty());
+    if schedule.is_none()
+        && retain.is_empty()
+        && drill_schedule.is_none()
+        && refresh_schedule.is_none()
+    {
         return Err(ScaffoldError::MissingField {
             section: "schedule",
             field: "calendar",
@@ -231,6 +242,10 @@ pub fn generate_scheduled(config: &DeployConfig) -> Result<Vec<GeneratedFile>, S
         );
         alerting = true;
     }
+    if let Some(spec) = refresh_schedule {
+        files.extend(units.refresh(spec)?);
+        alerting = true;
+    }
     if alerting {
         files.push(units.unit("alert@.service", &units.fill(ALERT_SERVICE)));
     }
@@ -268,6 +283,25 @@ impl Units<'_> {
             install_dest: Some(PathBuf::from(format!("/etc/systemd/system/{unit}"))),
             contents: with_header(body),
         }
+    }
+
+    /// The `[refresh]` service and timer, run at `spec`.
+    fn refresh(&self, spec: &str) -> Result<[GeneratedFile; 2], ScaffoldError> {
+        let on_calendar = translate(spec, "refresh", "schedule")?;
+        Ok([
+            self.unit(
+                "refresh.service",
+                &self
+                    .fill(REFRESH_SERVICE)
+                    .replace("{failure}", FAILURE_RECORD),
+            ),
+            self.unit(
+                "refresh.timer",
+                &self
+                    .fill(REFRESH_TIMER)
+                    .replace("{on_calendar}", &on_calendar),
+            ),
+        ])
     }
 
     /// The `[schedule]` service and timer. Only a backup alerts through a
@@ -654,6 +688,36 @@ Description=fraisier restore drill timer for {name} ({environment})
 # another trigger rather than replacing the last.
 OnCalendar={on_calendar}
 Persistent=true
+
+[Install]
+WantedBy=timers.target
+";
+
+const REFRESH_SERVICE: &str = "[Unit]
+Description=fraisier refresh of {name} ({environment})
+After=network-online.target
+Wants=network-online.target
+OnFailure=fraisier-{name}-{environment}-alert@%n.service
+
+[Service]
+Type=oneshot
+# Runs as root: the outbound flag's proof reads each unit's
+# /proc/<pid>/environ. The deploy lock lives in the state directory a
+# deploy on this host uses, so a refresh never runs under a deploy.
+StateDirectory=fraisier
+ExecStart=fraisier db refresh --config {config_path} --state-dir /var/lib/fraisier/state --yes --skip-if-locked --failure-record %n
+EnvironmentFile=-{env_file}
+{ops_env}{failure}";
+
+const REFRESH_TIMER: &str = "[Unit]
+Description=fraisier refresh timer for {name} ({environment})
+
+[Timer]
+# Exactly one OnCalendar=: systemd adds every non-empty assignment as
+# another trigger rather than replacing the last.
+OnCalendar={on_calendar}
+# No Persistent=: a refresh missed while the host was down waits for
+# the next one rather than stopping the services right after boot.
 
 [Install]
 WantedBy=timers.target

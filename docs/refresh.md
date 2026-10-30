@@ -1,9 +1,51 @@
 # Refreshing an environment from another one's backups
 
 `fraisier db refresh` replaces a non-production environment's database with
-the newest archive of another environment. It drops a database, so it only
-ever drops one that was marked for it, by a config that declares itself
-non-production.
+the newest archive of another environment. A staging environment that runs on
+last night's production data finds the bugs that only real data has, and the
+refresh checks the backups along the way: an archive that restores, migrates
+and runs is one you can rely on.
+
+It drops a database, so it only ever drops one that was marked for it, by a
+config that declares itself non-production. It copies another environment's
+data, so it never starts the service on that copy until a sanitize step has
+run and the outbound flag is provably set.
+
+```toml
+[deploy]
+name = "checkout"
+environment = "staging"
+production = false            # required: never inferred from a missing key
+
+[refresh]
+source_dir = "/var/backups/checkout"
+source_environment = "production"
+sanitize = "/etc/checkout/sanitize.sql"
+units = ["checkout-worker.service", "checkout-beat.timer"]
+schedule = "weekly Mon 05:00" # optional
+```
+
+A config with `[refresh]` that does not say `production = false` is invalid,
+and `production = true` with `[refresh]` is an error.
+
+## Why sanitize is mandatory
+
+A copy of production carries what production carries:
+
+- **personal data:** customers' names, emails, addresses and phone numbers;
+- **credentials:** mailbox passwords, API keys and tokens stored in tables;
+- **webhook URLs and API endpoints** that point at real partners;
+- **scheduled jobs** queued in the database, ready to send or charge.
+
+Started as is, a staging environment would mail real customers, poll real
+mailboxes and call real webhooks. So `[refresh].sanitize` is required on every
+refresh. It names a SQL file or an executable that rewrites or deletes all of
+that. Skipping it takes `sanitize = "none"` plus a `sanitize_reason`, which the
+plan and the receipt both show.
+
+The outbound flag (below) is defence in depth behind the sanitize step, not a
+replacement for it: it covers what the sanitize step missed, provided the
+application honours it.
 
 ## Marking a refresh target
 
@@ -170,3 +212,23 @@ Every run under the lock writes
 - for a failure, the step and the redacted reason.
 
 It holds no secrets.
+
+## Scheduling
+
+With `[refresh].schedule`, `fraisier scheduled install` writes
+`fraisier-<name>-<environment>-refresh.{service,timer}`. The service:
+
+- runs `fraisier db refresh --yes --skip-if-locked --failure-record %n`, as
+  root, with `--state-dir /var/lib/fraisier/state`. Give deploys on the host
+  the same `--state-dir` so they share the deploy lock;
+- loads the environment's `.env` and `.ops.env`, where the admin identity
+  lives;
+- names the alert unit in `OnFailure=`. A failed refresh notifies once,
+  through `[notify].command`, as `scheduled-refresh-failed`, with credentials
+  stripped from the reason. `fraisier validate` warns when a scheduled refresh
+  has no `[notify].command`.
+
+A refresh that finds a deploy holding the lock skips quietly; the next one
+runs. The timer has no `Persistent=`, so a refresh missed while the host was
+down waits for its next slot instead of stopping the services right after
+boot.

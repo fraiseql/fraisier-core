@@ -58,6 +58,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - **Receipt.** Each run writes `<state_dir>/refreshes/<fraise>-<env>.json`.
   - **Scaffold.** `fraisier scaffold` adds the `EnvironmentFile=` line to the
     app unit and a drop-in to each of `[refresh].units`.
+- **Scheduled refresh** (#136): `[refresh].schedule` gives
+  `fraisier scheduled install` a `…-refresh.{service,timer}` pair. The service
+  runs `db refresh --yes --skip-if-locked --failure-record %n` as root, with
+  `--state-dir /var/lib/fraisier/state` and the ops env file. A failure alerts
+  once as `scheduled-refresh-failed`. `db refresh --skip-if-locked` makes a
+  held deploy lock a quiet skip. `fraisier validate` warns when a scheduled
+  refresh has no `[notify].command`.
 
 ## [1.0.0-beta.13] - 2026-10-29
 

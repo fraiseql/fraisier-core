@@ -79,14 +79,14 @@ async fn pick_archive(
 pub(crate) async fn db_refresh(
     config_path: &Path,
     state_dir: &Path,
-    execute: bool,
+    run: Run,
 ) -> Result<CommandOutput> {
     let config = commands::load(config_path)?;
     let user = systemd_service(&config).is_ok_and(|(_, user)| user);
     db_refresh_with(
         config_path,
         state_dir,
-        execute,
+        run,
         &Machinery {
             server: &fraisier_db::restore::Postgres,
             units: &Systemctl::new(user),
@@ -94,9 +94,20 @@ pub(crate) async fn db_refresh(
             etc: Path::new("/etc"),
             operator_uid: current_uid(),
             now: SystemTime::now(),
+            drain: Duration::from_secs(10),
         },
     )
     .await
+}
+
+/// How a refresh was asked to run.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Run {
+    /// `--yes`: do it, rather than print the plan.
+    pub(crate) execute: bool,
+    /// `--skip-if-locked`: a held deploy lock is a quiet skip (exit 0), as a
+    /// timer wants, rather than a refusal.
+    pub(crate) skip_if_locked: bool,
 }
 
 /// What [`db_refresh`] drives, supplied by the caller.
@@ -110,6 +121,9 @@ pub(crate) struct Machinery<'a> {
     /// flag's directory alongside root.
     pub(crate) operator_uid: u32,
     pub(crate) now: SystemTime,
+    /// How long to wait, once the units are stopped, for their database
+    /// sessions to close before the pre-drop check counts what is left.
+    pub(crate) drain: Duration,
 }
 
 /// The sanitize step a refresh runs, as the config declares it.
@@ -138,7 +152,7 @@ struct Plan {
 pub(crate) async fn db_refresh_with(
     config_path: &Path,
     state_dir: &Path,
-    execute: bool,
+    run: Run,
     machinery: &Machinery<'_>,
 ) -> Result<CommandOutput> {
     let config = commands::load(config_path)?;
@@ -146,7 +160,7 @@ pub(crate) async fn db_refresh_with(
         Ok(plan) => plan,
         Err(refusal) => return Ok(refusal),
     };
-    if !execute {
+    if !run.execute {
         return Ok(show_plan(&plan));
     }
 
@@ -155,6 +169,16 @@ pub(crate) async fn db_refresh_with(
     let key = FraiseKey::new(&plan.fraise, &plan.environment);
     let guard = match store.acquire_lock(&key).await {
         Ok(guard) => guard,
+        Err(StateStoreError::Locked { .. }) if run.skip_if_locked => {
+            return Ok(CommandOutput {
+                exit_code: 0,
+                pretty: format!(
+                    "skipped: a deploy of {key} holds the deploy lock; the next scheduled \
+                     refresh will run\n"
+                ),
+                json: json!({ "ok": true, "skipped": true, "reason": "deploy lock held" }),
+            });
+        }
         Err(StateStoreError::Locked { .. }) => {
             return Ok(refuse(&format!(
                 "a deploy of {key} holds the deploy lock; refusing to refresh while it runs. \
@@ -453,6 +477,7 @@ async fn run_locked(
 ) -> std::result::Result<Done, Failure> {
     let units = machinery.units;
     let running = stop_all(units, &plan.units).await?;
+    drain_sessions(machinery, &plan.identity).await;
     let Refreshed {
         warnings, tviews, ..
     } = match refresh_in_place(
@@ -512,6 +537,23 @@ async fn run_locked(
             .into_iter()
             .collect(),
     })
+}
+
+/// Wait up to `machinery.drain` for the sessions on the target to close: a
+/// stopped unit's backends exit a moment after it. What is still connected
+/// afterwards is refused by the pre-drop check, by name.
+async fn drain_sessions(machinery: &Machinery<'_>, identity: &RestoreIdentity) {
+    let maintenance = identity.restorer("postgres");
+    let target = identity.app().database();
+    let deadline = Instant::now() + machinery.drain;
+    loop {
+        match machinery.server.connections(&maintenance, target).await {
+            Ok(sessions) if !sessions.is_empty() && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(250).min(machinery.drain)).await;
+            }
+            _ => return,
+        }
+    }
 }
 
 /// Stop `units` in order, returning those that were running. A unit that

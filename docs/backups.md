@@ -184,6 +184,9 @@ It records:
   without pg_tviews);
 - on failure, the failed step and the error, with any credentials redacted.
 
+A refresh restores the newest archive into a non-production environment for
+real, and keeps it: see [refresh.md](refresh.md).
+
 ## Scheduling and failure alerts
 
 `fraisier scheduled install` writes a timer and a oneshot service for each

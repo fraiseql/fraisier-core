@@ -331,6 +331,12 @@ been restored is not yet a backup.
 timers. Each failed run notifies once, through `[notify].command`, with
 credentials stripped from the reason. See [`docs/backups.md`](docs/backups.md).
 
+`fraisier db refresh` replaces a non-production environment's database with
+the newest archive of another environment. It only drops a database marked for
+it, and it runs a mandatory sanitize step. It starts the services with an
+outbound flag that it proves each process carries. See
+[`docs/refresh.md`](docs/refresh.md).
+
 ## Database readiness: PostgreSQL 18 and pg_tviews
 
 A deployable can declare what its database server must offer:

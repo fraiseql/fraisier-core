@@ -112,6 +112,11 @@ pub struct DeployConfig {
     /// against the newest archive in `[backup].dir`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drill: Option<DrillSection>,
+    /// The `[refresh]` section: how `fraisier db refresh` replaces this
+    /// environment's database with another environment's newest archive.
+    /// Absent, this database is never refreshed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<RefreshSection>,
     /// The `[metrics]` section: where each command writes its Prometheus
     /// textfile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,6 +162,12 @@ pub struct DeploySection {
     /// (requires `[blue_green]` + `[lb]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<String>,
+    /// Whether this environment is production. Optional, except that a config
+    /// with a `[refresh]` section must say `false`, and `fraisier db
+    /// mark-refresh-target` refuses unless it does: absent is never read as
+    /// "not production".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub production: Option<bool>,
 }
 
 /// The `[hosts]` section — the multi-host fleet inventory.
@@ -698,6 +709,114 @@ impl DrillSection {
     #[must_use]
     pub fn max_age_hours(&self) -> u32 {
         self.max_age_hours.unwrap_or(Self::DEFAULT_MAX_AGE_HOURS)
+    }
+}
+
+/// The `[refresh]` section: a refresh of this environment from another one.
+///
+/// `fraisier db refresh` replaces this environment's database with the newest
+/// archive another environment's backups wrote, migrates it forward, and runs
+/// the sanitize step before the service starts again. The target database must
+/// carry the marker `fraisier db mark-refresh-target` sets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshSection {
+    /// The directory holding the source environment's archives. Required, and
+    /// absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_dir: Option<PathBuf>,
+    /// The environment whose archives are restored
+    /// (`<fraise>-<source_environment>-*`). Required, and never this config's
+    /// own `[deploy].environment`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_environment: Option<String>,
+    /// The newest archive must be younger than this. Defaults to 48.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_hours: Option<u32>,
+    /// The refreshed, migrated database must hold at least this many tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_tables: Option<u64>,
+    /// The database server's data directory, when it is on this host. With it,
+    /// the refresh refuses unless the filesystem holding it has room for the
+    /// target database's current size plus 2 GB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<PathBuf>,
+    /// The project's sanitize step, run inside the refreshed database after the
+    /// migrations and before the service starts: an absolute path to a `.sql`
+    /// file or an executable. Required. A copy of another environment carries
+    /// its personal data and integration settings; `"none"` skips the step, and
+    /// then needs [`Self::sanitize_reason`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sanitize: Option<String>,
+    /// Why `sanitize = "none"` is safe here. Required with `"none"`, refused
+    /// otherwise, and recorded in the refresh receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sanitize_reason: Option<String>,
+    /// The environment variable set to `1` for the service's first start after
+    /// a refresh, so the application can keep its outbound integrations off
+    /// until they are re-enabled on purpose. Defaults to `FRAISIER_REFRESHED`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_flag: Option<String>,
+    /// The environment's other systemd units (`.service` or `.timer`): workers,
+    /// beat or cron units, anything that sends mail, calls webhooks or polls a
+    /// mailbox. The refresh stops them with the `[service]` unit, and each must
+    /// load the outbound flag too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub units: Vec<String>,
+    /// When `scheduled install` runs the refresh, in the `[schedule].calendar`
+    /// vocabulary. Absent, the refresh runs only when invoked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+}
+
+/// What a refresh's sanitize step is, as [`RefreshSection::sanitize`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sanitize<'a> {
+    /// Run this script or SQL file.
+    Script(&'a Path),
+    /// Skip the step (`sanitize = "none"`), for this reason.
+    Skipped {
+        /// The declared `sanitize_reason`.
+        reason: &'a str,
+    },
+}
+
+impl RefreshSection {
+    /// The age limit when `max_age_hours` is not declared.
+    pub const DEFAULT_MAX_AGE_HOURS: u32 = 48;
+
+    /// The flag variable when `outbound_flag` is not declared.
+    pub const DEFAULT_OUTBOUND_FLAG: &'static str = "FRAISIER_REFRESHED";
+
+    /// The value of `sanitize` that skips the step.
+    pub const SANITIZE_NONE: &'static str = "none";
+
+    /// The declared age limit, or [`Self::DEFAULT_MAX_AGE_HOURS`].
+    #[must_use]
+    pub fn max_age_hours(&self) -> u32 {
+        self.max_age_hours.unwrap_or(Self::DEFAULT_MAX_AGE_HOURS)
+    }
+
+    /// The declared flag variable, or [`Self::DEFAULT_OUTBOUND_FLAG`].
+    #[must_use]
+    pub fn outbound_flag(&self) -> &str {
+        self.outbound_flag
+            .as_deref()
+            .unwrap_or(Self::DEFAULT_OUTBOUND_FLAG)
+    }
+
+    /// The sanitize step, or `None` when it is undeclared, or skipped without
+    /// a reason.
+    #[must_use]
+    pub fn sanitize(&self) -> Option<Sanitize<'_>> {
+        match self.sanitize.as_deref()? {
+            Self::SANITIZE_NONE => self
+                .sanitize_reason
+                .as_deref()
+                .filter(|reason| !reason.trim().is_empty())
+                .map(|reason| Sanitize::Skipped { reason }),
+            path => Some(Sanitize::Script(Path::new(path))),
+        }
     }
 }
 

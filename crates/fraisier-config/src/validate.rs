@@ -137,6 +137,7 @@ impl DeployConfig {
         validate_database(self, &mut report);
         validate_backup(self, &mut report);
         validate_drill(self, &mut report);
+        validate_refresh(self, &mut report);
         validate_metrics(self, &mut report);
         validate_sync(self, &mut report);
         validate_blue_green(self, &mut report);
@@ -161,6 +162,7 @@ impl DeployConfig {
         validate_metrics(self, &mut report);
         validate_database(self, &mut report);
         validate_backup(self, &mut report);
+        validate_refresh(self, &mut report);
         report
     }
 
@@ -1071,6 +1073,155 @@ fn validate_drill(cfg: &DeployConfig, report: &mut ValidationReport) {
             );
         }
     }
+}
+
+fn validate_refresh(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(refresh) = cfg.refresh.as_ref() else {
+        return;
+    };
+    match cfg.deploy.as_ref().and_then(|deploy| deploy.production) {
+        Some(false) => {}
+        Some(true) => report.error(
+            "deploy.production",
+            "a production config cannot carry a [refresh] section: a refresh drops this \
+             environment's database",
+        ),
+        None => report.error(
+            "deploy.production",
+            "a config with a [refresh] section must declare [deploy] production = false: \
+             a refresh drops this environment's database, and an undeclared one is never \
+             taken to be non-production",
+        ),
+    }
+    match refresh.source_dir.as_deref() {
+        None => report.error(
+            "refresh.source_dir",
+            "a [refresh] needs source_dir: the directory holding the source environment's \
+             archives",
+        ),
+        Some(dir) if !dir.is_absolute() => report.error(
+            "refresh.source_dir",
+            format!(
+                "source_dir must be an absolute path, not '{}'",
+                dir.display()
+            ),
+        ),
+        Some(_) => {}
+    }
+    let own = cfg.deploy.as_ref().and_then(|d| d.environment.as_deref());
+    match refresh.source_environment.as_deref() {
+        None => report.error(
+            "refresh.source_environment",
+            "a [refresh] needs source_environment: the environment whose archives it restores",
+        ),
+        Some(source) if !is_unit_word(source) => report.error(
+            "refresh.source_environment",
+            format!("source_environment '{source}' is not a valid environment name"),
+        ),
+        Some(source) if Some(source) == own => report.error(
+            "refresh.source_environment",
+            format!(
+                "source_environment is this config's own environment ('{source}'); a refresh \
+                 replaces this environment's database with another environment's archive"
+            ),
+        ),
+        Some(_) => {}
+    }
+    validate_sanitize(refresh, report);
+    for (index, unit) in refresh.units.iter().enumerate() {
+        let at = format!("refresh.units[{index}]");
+        // systemd unit suffixes are case-sensitive: `.SERVICE` is no service.
+        let kind = unit.rsplit_once('.').map(|(_, kind)| kind);
+        if !is_unit_word(unit) || !matches!(kind, Some("service" | "timer")) {
+            report.error(
+                &at,
+                format!(
+                    "a refresh unit must be a .service or .timer name of letters, digits, \
+                     '_', '.' and '-', not {unit:?}"
+                ),
+            );
+        } else if refresh.units[..index].contains(unit) {
+            report.error(&at, format!("{unit} is listed twice"));
+        }
+    }
+    let flag = refresh.outbound_flag();
+    if !is_env_name(flag) {
+        report.error(
+            "refresh.outbound_flag",
+            format!(
+                "outbound_flag must be an environment variable name (A-Z, 0-9 and '_', not \
+                 starting with a digit), not {flag:?}"
+            ),
+        );
+    }
+    if let Some(spec) = refresh.schedule.as_deref() {
+        if let Err(message) = crate::calendar::to_on_calendar(spec) {
+            report.error("refresh.schedule", message);
+        }
+    }
+    if refresh.max_age_hours == Some(0) {
+        report.error("refresh.max_age_hours", "max_age_hours must be at least 1");
+    }
+    if refresh.min_tables == Some(0) {
+        report.error(
+            "refresh.min_tables",
+            "min_tables must be at least 1 (omit it for no table check)",
+        );
+    }
+    if let Some(dir) = refresh.data_dir.as_deref() {
+        if !dir.is_absolute() {
+            report.error(
+                "refresh.data_dir",
+                format!("data_dir must be an absolute path, not '{}'", dir.display()),
+            );
+        }
+    }
+}
+
+/// `[refresh].sanitize`: a step is required, and skipping it needs a reason.
+fn validate_sanitize(refresh: &crate::RefreshSection, report: &mut ValidationReport) {
+    let reason = is_set(refresh.sanitize_reason.as_ref());
+    match refresh.sanitize.as_deref() {
+        None => report.error(
+            "refresh.sanitize",
+            "a [refresh] needs sanitize: the script or SQL file that strips personal data \
+             and integration settings from the copy before the service starts. Set \
+             sanitize = \"none\" with a sanitize_reason to skip it",
+        ),
+        Some(crate::RefreshSection::SANITIZE_NONE) if !reason => report.error(
+            "refresh.sanitize_reason",
+            "sanitize = \"none\" needs a sanitize_reason: why this copy needs no cleanup \
+             (it is recorded in the refresh receipt)",
+        ),
+        Some(crate::RefreshSection::SANITIZE_NONE) => {}
+        Some(path) => {
+            if !Path::new(path).is_absolute() || !is_plain_dir(Path::new(path)) {
+                report.error(
+                    "refresh.sanitize",
+                    format!(
+                        "sanitize must be \"none\" or an absolute path of letters, digits, \
+                         '/', '.', '_' and '-' with no '..', not {path:?}"
+                    ),
+                );
+            }
+            if refresh.sanitize_reason.is_some() {
+                report.error(
+                    "refresh.sanitize_reason",
+                    "sanitize_reason applies only to sanitize = \"none\"; this config runs a \
+                     sanitize step",
+                );
+            }
+        }
+    }
+}
+
+/// Whether `name` is a portable environment variable name: `A-Z`, `0-9` and
+/// `_`, not starting with a digit.
+fn is_env_name(name: &str) -> bool {
+    name.bytes().next().is_some_and(|b| !b.is_ascii_digit())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
 fn validate_metrics(cfg: &DeployConfig, report: &mut ValidationReport) {

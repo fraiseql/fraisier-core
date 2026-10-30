@@ -86,6 +86,7 @@ impl SpecqlPreset {
                 name: name.clone(),
                 environment: self.environment.clone(),
                 strategy: None,
+                production: None,
             }),
             hosts: multi_host.then(|| self.host_defaults()),
             artifact: Some(ArtifactSection {
@@ -120,6 +121,7 @@ impl SpecqlPreset {
             database: None,
             backup: None,
             drill: None,
+            refresh: None,
             metrics: None,
             sync: None,
             blue_green: None,
@@ -204,6 +206,7 @@ impl Overlay for DeploySection {
             name: prefer(self.name, over.name),
             environment: prefer(self.environment, over.environment),
             strategy: prefer(self.strategy, over.strategy),
+            production: prefer(self.production, over.production),
         }
     }
 }
@@ -336,6 +339,8 @@ impl DeployConfig {
             // The preset never emits [backup]; an author-supplied one wins.
             backup: prefer(base.backup, self.backup),
             drill: prefer(base.drill, self.drill),
+            // The preset never emits [refresh]; an author-supplied one wins.
+            refresh: prefer(base.refresh, self.refresh),
             metrics: prefer(base.metrics, self.metrics),
             // The preset never emits [sync]; an author-supplied one wins.
             sync: prefer(base.sync, self.sync),

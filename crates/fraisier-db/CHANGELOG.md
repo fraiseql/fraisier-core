@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.14](https://github.com/fraiseql/fraisier-core/compare/fraisier-db-v1.0.0-beta.13...fraisier-db-v1.0.0-beta.14) - 2026-10-30
+
+### Added
+
+- *(db)* refresh sanitize step, outbound flag and its proof, --clear-flag
+- *(db)* fraisier db refresh — stop, drop the marked database, restore, migrate
+- *(db)* mark-refresh-target and the doctor refresh_target check
+
 ## [1.0.0-beta.13](https://github.com/fraiseql/fraisier-core/compare/fraisier-db-v1.0.0-beta.12...fraisier-db-v1.0.0-beta.13) - 2026-10-29
 
 ### Fixed

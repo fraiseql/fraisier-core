@@ -10,6 +10,10 @@ use serde_json::json;
 
 use crate::commands::{self, CommandOutput};
 
+mod run;
+
+pub(crate) use run::db_refresh;
+
 /// An exit-1 refusal carrying `message`, credentials stripped.
 fn refuse(message: &str) -> CommandOutput {
     let message = fraisier_saga::redact::credentials(message);

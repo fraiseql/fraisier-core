@@ -462,6 +462,11 @@ enum DbCommand {
     /// a `[refresh]` section.
     MarkRefreshTarget(DbMarkRefreshTargetArgs),
 
+    /// Replace this config's database with the newest archive of another
+    /// environment: stop the environment's units, drop the marked database,
+    /// restore, and migrate. Without `--yes`, only the plan is shown.
+    Refresh(DbRefreshArgs),
+
     /// pg_tviews maintenance.
     #[command(subcommand)]
     Tviews(DbTviewsCommand),
@@ -689,6 +694,21 @@ struct DbMarkRefreshTargetArgs {
     /// Path to the `fraisier.toml`.
     #[arg(long, default_value = "fraisier.toml")]
     config: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct DbRefreshArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Directory for the filesystem state store.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+
+    /// Execute the refresh (without this, only the plan is shown). Destructive.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1007,6 +1027,9 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         }
         Command::Db(DbCommand::MarkRefreshTarget(args)) => {
             refresh::db_mark_refresh_target(&args.config).await
+        }
+        Command::Db(DbCommand::Refresh(args)) => {
+            refresh::db_refresh(&args.config, &args.state_dir, args.yes).await
         }
         Command::Stack(StackCommand::Deploy(args)) => {
             stack::stack_deploy(

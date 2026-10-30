@@ -2195,7 +2195,7 @@ pub(crate) async fn db_migrate(config_path: &Path, state_dir: &Path) -> Result<C
 /// Record `revision` as the current revision in the state ledger for
 /// `fraise`/`environment`, preserving the active artifact a prior deploy recorded.
 /// Used by the migration-state changing db ops (`db migrate`, `db reset`).
-async fn record_ledger_revision(
+pub(crate) async fn record_ledger_revision(
     state_dir: &Path,
     fraise: &str,
     environment: &str,
@@ -2249,7 +2249,9 @@ pub(crate) fn resolve_pg_conn(config: &DeployConfig) -> Result<fraisier_db::PgCo
 /// # Errors
 /// The app DSN does not resolve, the admin env var is unset, or a DSN does not
 /// parse.
-fn restore_identity(config: &DeployConfig) -> Result<fraisier_db::restore::RestoreIdentity> {
+pub(crate) fn restore_identity(
+    config: &DeployConfig,
+) -> Result<fraisier_db::restore::RestoreIdentity> {
     fraisier_db::restore::RestoreIdentity::from_env(
         resolve_pg_conn(config)?,
         config
@@ -2935,7 +2937,7 @@ struct DrillArchive {
 
 /// How far ahead of the clock an archive's stamp may be before its age is
 /// treated as unknown, for a backup written on a host whose clock runs ahead.
-const DRILL_CLOCK_SKEW: std::time::Duration = std::time::Duration::from_mins(5);
+pub(crate) const DRILL_CLOCK_SKEW: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// The drill's steps up to and including [`fraisier_core::drill::run_restore_drill`],
 /// failing with the step's name and why. `found` records the newest archive once
@@ -3201,7 +3203,7 @@ fn render_restored(
 }
 
 /// `item 2, order 0`, or `nothing needed rebuilding`.
-fn describe_rebuilt(rows: &[fraisier_db::tviews::Rebuilt]) -> String {
+pub(crate) fn describe_rebuilt(rows: &[fraisier_db::tviews::Rebuilt]) -> String {
     if rows.is_empty() {
         return "nothing needed rebuilding".to_owned();
     }

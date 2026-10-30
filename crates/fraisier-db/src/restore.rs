@@ -305,12 +305,30 @@ async fn precheck(
     restorer: &PgConn,
     archive: &Path,
 ) -> Result<bool, RestoreError> {
-    let listing = server.list(archive).await.map_err(|error| {
+    let listing = list(server, archive).await?;
+    precheck_listing(server, identity, restorer, &listing).await
+}
+
+/// `archive`'s `pg_restore --list`, or the refusal saying it does not read back.
+pub(crate) async fn list(
+    server: &dyn RestoreServer,
+    archive: &Path,
+) -> Result<String, RestoreError> {
+    server.list(archive).await.map_err(|error| {
         RestoreError::Refused(format!(
             "pg_restore --list cannot read the archive: {error}"
         ))
-    })?;
-    if !tviews::archive_creates_pg_tviews(&listing) {
+    })
+}
+
+/// [`precheck`] from a listing already read.
+pub(crate) async fn precheck_listing(
+    server: &dyn RestoreServer,
+    identity: &RestoreIdentity,
+    restorer: &PgConn,
+    listing: &str,
+) -> Result<bool, RestoreError> {
+    if !tviews::archive_creates_pg_tviews(listing) {
         return Ok(false);
     }
     let who = server
@@ -327,13 +345,16 @@ async fn precheck(
             )));
         }
     }
-    tviews::restore_precheck(&listing, &who, None, identity.admin_env())
+    tviews::restore_precheck(listing, &who, None, identity.admin_env())
         .map_err(RestoreError::Refused)?;
     Ok(true)
 }
 
 /// Refill the empty TVIEWs on `conn`, then probe for any still empty.
-async fn rebuild(server: &dyn RestoreServer, conn: &PgConn) -> Result<TviewRebuild, String> {
+pub(crate) async fn rebuild(
+    server: &dyn RestoreServer,
+    conn: &PgConn,
+) -> Result<TviewRebuild, String> {
     let rebuilt = server.rebuild(conn, true).await?;
     let still_empty = server
         .still_empty(conn)

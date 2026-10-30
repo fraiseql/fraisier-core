@@ -1128,6 +1128,22 @@ fn validate_refresh(cfg: &DeployConfig, report: &mut ValidationReport) {
         Some(_) => {}
     }
     validate_sanitize(refresh, report);
+    for (index, unit) in refresh.units.iter().enumerate() {
+        let at = format!("refresh.units[{index}]");
+        // systemd unit suffixes are case-sensitive: `.SERVICE` is no service.
+        let kind = unit.rsplit_once('.').map(|(_, kind)| kind);
+        if !is_unit_word(unit) || !matches!(kind, Some("service" | "timer")) {
+            report.error(
+                &at,
+                format!(
+                    "a refresh unit must be a .service or .timer name of letters, digits, \
+                     '_', '.' and '-', not {unit:?}"
+                ),
+            );
+        } else if refresh.units[..index].contains(unit) {
+            report.error(&at, format!("{unit} is listed twice"));
+        }
+    }
     let flag = refresh.outbound_flag();
     if !is_env_name(flag) {
         report.error(

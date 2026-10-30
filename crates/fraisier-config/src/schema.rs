@@ -757,6 +757,12 @@ pub struct RefreshSection {
     /// until they are re-enabled on purpose. Defaults to `FRAISIER_REFRESHED`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_flag: Option<String>,
+    /// The environment's other systemd units (`.service` or `.timer`): workers,
+    /// beat or cron units, anything that sends mail, calls webhooks or polls a
+    /// mailbox. The refresh stops them with the `[service]` unit, and each must
+    /// load the outbound flag too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub units: Vec<String>,
     /// When `scheduled install` runs the refresh, in the `[schedule].calendar`
     /// vocabulary. Absent, the refresh runs only when invoked.
     #[serde(default, skip_serializing_if = "Option::is_none")]

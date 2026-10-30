@@ -28,6 +28,8 @@ fn now() -> SystemTime {
 struct Server {
     marker: Option<&'static str>,
     connections: Vec<String>,
+    /// How many `connections` calls still see the sessions; later ones see none.
+    draining: Mutex<Option<usize>>,
     restore_fails: bool,
     bytes: u64,
     tables: u64,
@@ -39,6 +41,7 @@ impl Default for Server {
         Self {
             marker: Some("checkout/staging"),
             connections: Vec::new(),
+            draining: Mutex::new(None),
             restore_fails: false,
             bytes: 0,
             tables: 3,
@@ -134,7 +137,15 @@ impl MarkerServer for Server {
 impl RefreshServer for Server {
     async fn connections(&self, _m: &PgConn, _db: &str) -> Result<Vec<String>, String> {
         self.record("connections".into());
-        Ok(self.connections.clone())
+        let mut draining = self.draining.lock().expect("draining");
+        match draining.as_mut() {
+            Some(0) => Ok(Vec::new()),
+            Some(left) => {
+                *left -= 1;
+                Ok(self.connections.clone())
+            }
+            None => Ok(self.connections.clone()),
+        }
     }
 
     async fn extensions_problem(
@@ -386,6 +397,7 @@ fn refresh_opts(
             etc: &dir.join("etc"),
             operator_uid: std::fs::metadata("/proc/self").expect("proc").uid(),
             now: now(),
+            drain: Duration::from_millis(50),
         },
     ))
     .expect("runs");
@@ -1025,4 +1037,20 @@ fn a_scheduled_run_skips_quietly_while_a_deploy_holds_the_lock() {
     assert!(units.of("stop").is_empty(), "{:?}", units.calls());
     assert!(!server.dropped());
     block_on(store.release_lock(guard)).expect("release");
+}
+
+#[test]
+fn sessions_that_close_after_the_stop_are_waited_for() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = config(dir.path(), Some(false), "true", SKIPPED);
+    archive(dir.path(), "20261026T021500Z");
+    let server = Server {
+        connections: vec!["app (psql, pid 4242)".to_owned()],
+        draining: Mutex::new(Some(2)),
+        ..Server::default()
+    };
+    let units = units(dir.path());
+    let out = refresh(dir.path(), &config, true, &server, &units);
+    assert_eq!(out.exit_code, 0, "{}", out.pretty);
+    assert!(server.dropped());
 }

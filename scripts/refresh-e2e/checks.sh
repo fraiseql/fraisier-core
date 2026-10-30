@@ -134,8 +134,9 @@ database_url_env = "CHECKOUT_DATABASE_URL"
 dir = "/var/backups/checkout"
 TOML
 
-  # The app: a web server. The worker: a session held open on the database,
-  # which a refresh that forgot it would trip over. The beat: a timer.
+  # The app: a web server. The worker: an idle session held open on the
+  # database, which a refresh that forgot it would trip over (an idle backend
+  # exits as soon as its client does). The beat: a timer.
   cat > /etc/systemd/system/checkout-staging.service <<UNIT
 [Service]
 User=checkout
@@ -150,7 +151,7 @@ UNIT
 [Service]
 User=checkout
 Group=checkout
-ExecStart=/usr/bin/psql -X -q -c "SELECT pg_sleep(86400)"
+ExecStart=/bin/sh -c 'sleep infinity | exec /usr/bin/psql -X -q'
 Restart=on-failure
 EnvironmentFile=-/etc/checkout/staging.env
 [Install]
@@ -254,7 +255,9 @@ before() {
   PGPASSWORD=$APP_PW psql -X -q -h 127.0.0.1 -U app -d checkout_staging -c "SET application_name = 'stray-console'; SELECT pg_sleep(120)" > /dev/null 2>&1 &
   stray=$!; sleep 2
   refresh --yes; rc=$?
-  kill "$stray" 2>/dev/null; wait "$stray" 2>/dev/null
+  # A backend in pg_sleep outlives its client, so end it on the server.
+  Q postgres "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'stray-console'" > /dev/null
+  wait "$stray" 2>/dev/null
   check "refused naming the session" test "$rc" = 1 -a -n "$(grep -l 'stray-console' "$W/out")"
   check "staging untouched" test "$(rows)" = staging-only
   check "units running again" all_running

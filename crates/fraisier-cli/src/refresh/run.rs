@@ -94,6 +94,7 @@ pub(crate) async fn db_refresh(
             etc: Path::new("/etc"),
             operator_uid: current_uid(),
             now: SystemTime::now(),
+            drain: Duration::from_secs(10),
         },
     )
     .await
@@ -120,6 +121,9 @@ pub(crate) struct Machinery<'a> {
     /// flag's directory alongside root.
     pub(crate) operator_uid: u32,
     pub(crate) now: SystemTime,
+    /// How long to wait, once the units are stopped, for their database
+    /// sessions to close before the pre-drop check counts what is left.
+    pub(crate) drain: Duration,
 }
 
 /// The sanitize step a refresh runs, as the config declares it.
@@ -473,6 +477,7 @@ async fn run_locked(
 ) -> std::result::Result<Done, Failure> {
     let units = machinery.units;
     let running = stop_all(units, &plan.units).await?;
+    drain_sessions(machinery, &plan.identity).await;
     let Refreshed {
         warnings, tviews, ..
     } = match refresh_in_place(
@@ -532,6 +537,23 @@ async fn run_locked(
             .into_iter()
             .collect(),
     })
+}
+
+/// Wait up to `machinery.drain` for the sessions on the target to close: a
+/// stopped unit's backends exit a moment after it. What is still connected
+/// afterwards is refused by the pre-drop check, by name.
+async fn drain_sessions(machinery: &Machinery<'_>, identity: &RestoreIdentity) {
+    let maintenance = identity.restorer("postgres");
+    let target = identity.app().database();
+    let deadline = Instant::now() + machinery.drain;
+    loop {
+        match machinery.server.connections(&maintenance, target).await {
+            Ok(sessions) if !sessions.is_empty() && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(250).min(machinery.drain)).await;
+            }
+            _ => return,
+        }
+    }
 }
 
 /// Stop `units` in order, returning those that were running. A unit that

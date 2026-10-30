@@ -12,7 +12,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   coming `fraisier db refresh`. `[refresh]` names the source environment and
   its archive directory, a required `sanitize` step (`"none"` needs a
   `sanitize_reason`), and the `outbound_flag` the service sees at its first
-  start after a refresh (default `FRAISIER_REFRESHED`). A config with
+  start after a refresh (default `FRAISIER_REFRESHED`), and the environment's
+  other `units` (workers, beat or cron units) a refresh stops with the
+  service. A config with
   `[refresh]` must declare `production = false`: an undeclared key is never
   taken to mean "not production", and `production = true` with `[refresh]` is
   an error. Configs without `[refresh]` need no change.

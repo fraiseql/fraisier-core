@@ -2470,3 +2470,44 @@ fn a_preset_keeps_the_declared_production_key_and_refresh_section() {
     assert_eq!(config.deploy.and_then(|d| d.production), Some(false));
     assert!(config.refresh.is_some());
 }
+
+#[test]
+fn refresh_units_name_the_other_units_of_the_environment() {
+    let config = refresh_config(&format!(
+        "{REFRESH_REQUIRED}units = [\"checkout-worker.service\", \"checkout-beat.timer\"]\n"
+    ));
+    assert!(
+        config.validate_db_ops().ok(),
+        "{}",
+        config.validate_db_ops()
+    );
+    assert_eq!(
+        config.refresh.map(|r| r.units),
+        Some(vec![
+            "checkout-worker.service".to_owned(),
+            "checkout-beat.timer".to_owned()
+        ])
+    );
+    assert!(refresh_config(REFRESH_REQUIRED)
+        .refresh
+        .is_some_and(|r| r.units.is_empty()));
+}
+
+#[test]
+fn a_refresh_unit_must_be_a_plain_service_or_timer_name() {
+    for bad in [
+        "worker",
+        "worker.socket",
+        "-x.service",
+        "a b.service",
+        "w%i.service",
+        "",
+    ] {
+        let report = refresh_report(&format!("{REFRESH_REQUIRED}units = [{bad:?}]\n"));
+        assert!(has_error(&report, "refresh.units[0]"), "{bad:?}: {report}");
+    }
+    let report = refresh_report(&format!(
+        "{REFRESH_REQUIRED}units = [\"w.service\", \"w.service\"]\n"
+    ));
+    assert!(has_error(&report, "refresh.units[1]"), "{report}");
+}

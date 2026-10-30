@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.14](https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.13...fraisier-v1.0.0-beta.14) - 2026-10-30
+
+### Added
+
+- *(scaffold)* scheduled refresh unit with alert, --skip-if-locked
+- *(db)* refresh sanitize step, outbound flag and its proof, --clear-flag
+- *(db)* fraisier db refresh — stop, drop the marked database, restore, migrate
+- *(db)* mark-refresh-target and the doctor refresh_target check
+
+### Fixed
+
+- *(refresh)* wait for stopped units' sessions to close before the pre-drop check
+
 ## [1.0.0-beta.13](https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.12...fraisier-v1.0.0-beta.13) - 2026-10-29
 
 ### Fixed

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.14](https://github.com/fraiseql/fraisier-core/compare/fraisier-config-v1.0.0-beta.13...fraisier-config-v1.0.0-beta.14) - 2026-10-30
+
+### Added
+
+- *(scaffold)* scheduled refresh unit with alert, --skip-if-locked
+- *(config)* [refresh].units, the environment's other units
+- *(config)* [refresh] section and explicit [deploy] production
+
 ## [1.0.0-beta.13](https://github.com/fraiseql/fraisier-core/compare/fraisier-config-v1.0.0-beta.12...fraisier-config-v1.0.0-beta.13) - 2026-10-29
 
 ### Fixed

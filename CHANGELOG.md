@@ -10,14 +10,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`[refresh]` and `[deploy] production` config keys** (#136), for the
   coming `fraisier db refresh`. `[refresh]` names the source environment and
-  its archive directory, a required `sanitize` step (`"none"` needs a
-  `sanitize_reason`), and the `outbound_flag` the service sees at its first
-  start after a refresh (default `FRAISIER_REFRESHED`), and the environment's
-  other `units` (workers, beat or cron units) a refresh stops with the
-  service. A config with
-  `[refresh]` must declare `production = false`: an undeclared key is never
-  taken to mean "not production", and `production = true` with `[refresh]` is
-  an error. Configs without `[refresh]` need no change.
+  its archive directory; a required `sanitize` step (`"none"` needs a
+  `sanitize_reason`); the `outbound_flag` the services see at their first
+  start after a refresh (default `FRAISIER_REFRESHED`); and the environment's
+  other `units` (workers, beat or cron units), which a refresh stops along
+  with the service. A config with `[refresh]` must declare
+  `production = false`: an undeclared key is never taken to mean "not
+  production", and `production = true` with `[refresh]` is an error. Configs
+  without `[refresh]` need no change.
 - **`fraisier db mark-refresh-target`** (#136) marks this config's database,
   once, as the one a refresh may replace (`fraisier.refresh_target =
   '<fraise>/<env>'`). It refuses, changing nothing, unless the config declares

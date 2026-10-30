@@ -18,6 +18,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `production = false`: an undeclared key is never taken to mean "not
   production", and `production = true` with `[refresh]` is an error. Configs
   without `[refresh]` need no change.
+- **`fraisier db mark-refresh-target`** (#136) marks this config's database,
+  once, as the one a refresh may replace (`fraisier.refresh_target =
+  '<fraise>/<env>'`). It refuses, changing nothing, unless the config declares
+  `[deploy] production = false` and has a `[refresh]` section; it refuses a
+  database marked for another config (naming the `RESET`) and, on PostgreSQL
+  15 and later, a role without `SET` on the parameter (naming the `GRANT`).
+  `fraisier doctor` gains a matching `refresh_target` check. See
+  `docs/refresh.md`.
 
 ## [1.0.0-beta.13] - 2026-10-29
 

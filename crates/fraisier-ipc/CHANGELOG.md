@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.13](https://github.com/fraiseql/fraisier-core/compare/fraisier-ipc-v1.0.0-beta.12...fraisier-ipc-v1.0.0-beta.13) - 2026-10-29
+
+### Other
+
+- updated the following local packages: fraisier-core
+
+## [1.0.0-beta.12](https://github.com/fraiseql/fraisier-core/compare/fraisier-ipc-v1.0.0-beta.11...fraisier-ipc-v1.0.0-beta.12) - 2026-10-27
+
+### Fixed
+
+- *(secrets)* keep the admin DSN out of the app and of every child process
+
+### Other
+
+- release v1.0.0-beta.11
+
 ## [1.0.0-beta.11](https://github.com/fraiseql/fraisier-core/compare/fraisier-ipc-v1.0.0-beta.10...fraisier-ipc-v1.0.0-beta.11) - 2026-09-26
 
 ### Other

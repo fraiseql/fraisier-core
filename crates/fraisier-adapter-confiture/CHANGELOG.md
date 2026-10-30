@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.13](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-confiture-v1.0.0-beta.12...fraisier-adapter-confiture-v1.0.0-beta.13) - 2026-10-29
+
+### Other
+
+- updated the following local packages: fraisier-core
+
+## [1.0.0-beta.12](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-confiture-v1.0.0-beta.11...fraisier-adapter-confiture-v1.0.0-beta.12) - 2026-10-27
+
+### Fixed
+
+- *(secrets)* keep the admin DSN out of the app and of every child process
+- *(confiture)* read the version off the `confiture version` line
+- *(lint)* pass clippy on Rust 1.99 (unblocks #65/#76 for #63)
+- *(test)* an ambient FRAISIER_* variable no longer fails seven tests
+
+### Other
+
+- Merge main into chore/strip-plan-labels
+- Merge feat/06c-restore-primitive (and main) into feat/56-deep-classification
+- Merge main into chore/confiture-1-36-exit-table
+- Merge main into chore/confiture-1-35-exit-table
+- Merge main into face/phase01-exit-table
+
 ## [1.0.0-beta.11](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-confiture-v1.0.0-beta.10...fraisier-adapter-confiture-v1.0.0-beta.11) - 2026-09-26
 
 ### Other

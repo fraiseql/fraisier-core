@@ -34,7 +34,7 @@ members = [
 exclude = ["examples/training-field"]
 
 [workspace.package]
-version = "1.0.0-beta.11"
+version = "1.0.0-beta.13"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/fraiseql/fraisier-core"
@@ -42,7 +42,7 @@ homepage = "https://fraiseql.dev"
 authors = ["Lionel Hamayon <evolution.digitale@gmail.com>"]
 keywords = ["deploy", "migration", "orchestration", "saga", "postgres"]
 categories = ["development-tools"]
-rust-version = "1.95"
+rust-version = "1.99"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -22,20 +22,24 @@
 //! ## The cost of seeing
 //!
 //! Reaching a change-set means spawning the migration adapter and reading the
-//! database, so a dry-run now does I/O where it did none (D8). Every way that
+//! database, so a dry-run now does I/O where it did none. Every way that
 //! can fail — no DSN, unreachable database, an adapter that does not lint —
 //! **degrades**: the plan still prints and still exits 0, carrying an explicit
 //! unavailability. `--dry-run --skip-preflight` restores the pure offline plan
 //! byte-for-byte.
 
+use std::fmt::Write as _;
+
 use fraisier_core::adapter_axes::{
-    AdapterCtx, AdapterDescription, ChangeSetUnavailable, MigrationAdapter, PreflightReport,
-    RiskTier, SchemaChange,
+    AdapterCtx, AdapterDescription, AdapterError, ChangeSetUnavailable, MigrationAdapter,
+    PreflightReport, RiskTier, SchemaChange,
 };
 use fraisier_core::policy::{
-    self, Baseline, Capabilities, Inspection, PolicyDecision, PolicyGate, PolicyReason,
+    self, judges_pending_only, Baseline, Capabilities, Inspection, PolicyDecision, PolicyGate,
+    PolicyReason, PENDING_SCOPE,
 };
 use fraisier_core::redact;
+use fraisier_core::restore_rehearsal::{self, BackupSource, RehearsalDb, DEEP_CLASSIFICATION};
 use serde::Serialize;
 
 /// The schema half of a `--dry-run` plan.
@@ -52,11 +56,60 @@ pub struct SchemaPreview {
     /// `None`. Never omitted from the serialized form.
     pub change_set_unavailable: Option<Unavailable>,
     /// What the gate would decide. `None` when nothing would decide anything: no
-    /// `[policy]` section and a strategy with no always-on baseline (D6).
+    /// `[policy]` section (the policy is opt-in) and a strategy with no always-on
+    /// baseline.
     pub policy: Option<PolicyPreview>,
     /// The adapter's window-safety verdict. `None` when the strategy never asks
     /// — only blue-green holds two versions against one database.
     pub window_safe: Option<WindowSafety>,
+    /// How the change-set was classified, for a restore-rehearsal deploy only:
+    /// against a fresh copy of the live data, or statically and why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification: Option<Classification>,
+    /// Which migrations the change-set covers, when a preflight ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Scope>,
+}
+
+/// Which migrations a preflight judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    /// Only those the database has not applied: what this deploy will apply.
+    Pending,
+    /// Every migration file, applied ones included, because the adapter does
+    /// not advertise [`PENDING_SCOPE`]. A change that already ran is judged
+    /// again.
+    All,
+}
+
+/// How a restore-rehearsal preview classified the pending changes.
+#[derive(Debug, Clone, Serialize)]
+pub struct Classification {
+    /// Deep or static.
+    pub kind: ClassificationKind,
+    /// One line for the operator.
+    pub detail: String,
+}
+
+/// Whether a classification read the live data's current schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassificationKind {
+    /// Against a throwaway restored from a fresh dump of the live database.
+    Deep,
+    /// From the migration files alone.
+    Static,
+}
+
+/// How far a restore-rehearsal dry run may go to classify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Depth {
+    /// From the migration files alone. Provisions nothing.
+    Static,
+    /// Against a throwaway restored from a fresh dump of the live database, as
+    /// the deploy classifies (`--dry-run --deep`).
+    Deep,
 }
 
 /// The change-set as a plan renders it: which adapter classified it, at which
@@ -81,7 +134,7 @@ pub struct ChangeSetPreview {
 ///
 /// [`code`](Self::code) is the stable machine name a pipeline branches on;
 /// [`detail`](Self::detail) is the line an operator reads. The pair is what
-/// keeps rule 3 honest — *unknown* is distinguishable from *empty* without
+/// keeps the plan honest — *unknown* is distinguishable from *empty* without
 /// parsing prose.
 #[derive(Debug, Clone, Serialize)]
 pub struct Unavailable {
@@ -96,7 +149,7 @@ impl Unavailable {
     ///
     /// The one state the human render stays silent about: telling an operator
     /// the plan cannot see the schema is telling them what they just asked for,
-    /// and rule 1 makes `--dry-run --skip-preflight` print today's plan
+    /// and `--dry-run --skip-preflight` must print the offline plan
     /// byte-for-byte. The machine form still says it.
     pub const SKIPPED: &'static str = "preflight_skipped";
     /// The config turned every preflight off (`[migration].preflight_mode`).
@@ -201,7 +254,7 @@ impl WindowSafety {
 ///
 /// Never fails. An adapter that cannot be inspected yields a plan with an
 /// explicit unavailability, because a dry-run that cannot reach the database
-/// still owes the operator the plan (rule 2, D8).
+/// still owes the operator the plan.
 pub async fn gather(
     migration: &dyn MigrationAdapter,
     ctx: &AdapterCtx,
@@ -209,36 +262,181 @@ pub async fn gather(
     approval_command: Option<&str>,
     baseline: Baseline,
 ) -> SchemaPreview {
-    let inspection = match policy::inspect(migration, ctx).await {
+    let inspected = policy::inspect(migration, ctx).await;
+    from_inspection(inspected, gate, approval_command, baseline)
+}
+
+/// Fold an inspection, or the error that stopped it, into the plan.
+fn from_inspection(
+    inspected: Result<Inspection, AdapterError>,
+    gate: &PolicyGate,
+    approval_command: Option<&str>,
+    baseline: Baseline,
+) -> SchemaPreview {
+    let inspection = match inspected {
         Ok(inspection) => inspection,
         // "The check could not run" is never "the check passed". The verdict is
         // computed as though nothing had been inspected, which is exactly what
         // the deploy itself would conclude.
         Err(error) => {
-            return assemble(
-                Err(Unavailable::new(
-                    Unavailable::PREFLIGHT_FAILED,
-                    redact::credentials(&format!(
-                        "the migration adapter could not be inspected: {error}"
-                    )),
-                )),
+            return failed(
+                &format!("the migration adapter could not be inspected: {error}"),
                 gate,
                 approval_command,
                 baseline,
-                Capabilities::default(),
-                None,
             )
         }
     };
     let change_set = classify(&inspection);
+    let scope = inspection
+        .report
+        .as_ref()
+        .and(inspection.adapter.as_ref())
+        .map(|described| {
+            if judges_pending_only(described) {
+                Scope::Pending
+            } else {
+                Scope::All
+            }
+        });
+    SchemaPreview {
+        scope,
+        ..assemble(
+            change_set,
+            gate,
+            approval_command,
+            baseline,
+            inspection.capabilities,
+            inspection.report.as_ref(),
+        )
+    }
+}
+
+/// The plan for an inspection that could not run, for the redacted `reason`.
+fn failed(
+    reason: &str,
+    gate: &PolicyGate,
+    approval_command: Option<&str>,
+    baseline: Baseline,
+) -> SchemaPreview {
     assemble(
-        change_set,
+        Err(Unavailable::new(
+            Unavailable::PREFLIGHT_FAILED,
+            redact::credentials(reason),
+        )),
         gate,
         approval_command,
         baseline,
-        inspection.capabilities,
-        inspection.report.as_ref(),
+        Capabilities::default(),
+        None,
     )
+}
+
+/// [`gather`], for a single-host restore-rehearsal deploy.
+///
+/// At [`Depth::Deep`] (`--dry-run --deep`), with a fresh dump and an adapter
+/// that advertises [`DEEP_CLASSIFICATION`], it provisions a throwaway exactly
+/// as the deploy's preflight does, classifies against it, and drops it.
+/// Otherwise the classification is static, and the plan says why. A plain dry
+/// run stays static so that it never dumps the live database. A throwaway that
+/// cannot be provisioned is an unavailable change-set, never a static one in
+/// its place: the deploy would stop at the same point.
+// Reason: `gather`'s three gate inputs plus the rehearsal's own (the throwaway
+// lifecycle, its backup source, the depth); a struct built once per call would
+// only rename them.
+#[allow(clippy::too_many_arguments)]
+pub async fn gather_rehearsed(
+    db: &dyn RehearsalDb,
+    backup: &BackupSource,
+    migration: &dyn MigrationAdapter,
+    ctx: &AdapterCtx,
+    gate: &PolicyGate,
+    approval_command: Option<&str>,
+    baseline: Baseline,
+    depth: Depth,
+) -> SchemaPreview {
+    let described = match migration.describe().await {
+        Ok(described) => described,
+        Err(error) => {
+            return failed(
+                &format!("the migration adapter could not be inspected: {error}"),
+                gate,
+                approval_command,
+                baseline,
+            )
+        }
+    };
+    let static_because = if *backup != BackupSource::FreshDump {
+        Some(
+            "classified statically: an archive-mode rehearsal classifies the migration files \
+             alone, because an archive behind live has a different pending set"
+                .to_owned(),
+        )
+    } else if !restore_rehearsal::classifies_deeply(&described) {
+        Some(format!(
+            "classified statically: {} {} does not advertise `{DEEP_CLASSIFICATION}`, so a \
+             change whose risk depends on the current schema, such as a column type change, \
+             stays unclassified",
+            described.name, described.version
+        ))
+    } else if depth == Depth::Static {
+        Some(
+            "classified statically: a dry run does not dump the live database. The deploy will \
+             classify against a fresh copy of it; add `--deep` to preview that classification"
+                .to_owned(),
+        )
+    } else {
+        None
+    };
+    if let Some(detail) = static_because {
+        let inspected = policy::inspect_described(migration, ctx, described).await;
+        return with_classification(
+            from_inspection(inspected, gate, approval_command, baseline),
+            ClassificationKind::Static,
+            detail,
+        );
+    }
+
+    let throwaway = match restore_rehearsal::provision(db, ctx, backup).await {
+        Ok(throwaway) => throwaway,
+        Err(error) => {
+            return failed(
+                &format!(
+                    "the throwaway database the deploy classifies against could not be \
+                     provisioned: {error}"
+                ),
+                gate,
+                approval_command,
+                baseline,
+            )
+        }
+    };
+    let against = restore_rehearsal::against_throwaway(ctx, &throwaway);
+    let inspected = policy::inspect_described(migration, &against, described).await;
+    let mut detail = "classified against a fresh copy of the live database, as the deploy will \
+                      classify it"
+        .to_owned();
+    if let Err(error) = db.teardown(&throwaway).await {
+        let _ = write!(
+            detail,
+            "; the throwaway database '{}' was not dropped and must be removed by hand: {error}",
+            throwaway.name
+        );
+    }
+    with_classification(
+        from_inspection(inspected, gate, approval_command, baseline),
+        ClassificationKind::Deep,
+        redact::credentials(&detail),
+    )
+}
+
+fn with_classification(
+    mut preview: SchemaPreview,
+    kind: ClassificationKind,
+    detail: String,
+) -> SchemaPreview {
+    preview.classification = Some(Classification { kind, detail });
+    preview
 }
 
 /// The plan for a run that inspected nothing — preflight is off, or the adapter
@@ -324,9 +522,9 @@ fn assemble(
         Ok(change_set) => (Some(change_set), None),
         Err(reason) => (None, Some(reason)),
     };
-    // With the tier gate switched off (D6) *and* no always-on baseline, nothing
-    // decides anything — which is not the same as deciding to allow, and must
-    // not render as a verdict the operator never configured.
+    // With the tier gate switched off (no `[policy]`) *and* no always-on baseline,
+    // nothing decides anything — which is not the same as deciding to allow, and
+    // must not render as a verdict the operator never configured.
     let decides = gate.policy().is_some() || baseline != Baseline::None;
     SchemaPreview {
         change_set,
@@ -343,6 +541,8 @@ fn assemble(
             // never ask — reported as `null`, distinct from "asked, no answer".
             _ => None,
         },
+        classification: None,
+        scope: None,
     }
 }
 
@@ -391,7 +591,7 @@ impl PolicyPreview {
 /// and a decision waiting on a human qualify, because neither one deploys
 /// unattended.
 ///
-/// A plan with no verdict at all (D6: no `[policy]`, no baseline) never blocks —
+/// A plan with no verdict at all (no `[policy]`, no baseline) never blocks —
 /// a pipeline must not start failing on a gate its config never opted in to.
 #[must_use]
 pub fn would_block(preview: &SchemaPreview) -> bool {
@@ -424,9 +624,9 @@ pub fn render(preview: &SchemaPreview) -> String {
     let mut lines: Vec<String> = Vec::new();
     match (&preview.change_set, &preview.change_set_unavailable) {
         (Some(change_set), _) => lines.extend(render_change_set(change_set)),
-        // The operator turned preflight off on this run, so telling them the
-        // plan cannot see the schema is telling them what they just asked for
-        // (rule 1). Every other cause is said out loud.
+        // The operator turned preflight off on this run, so telling them the plan
+        // cannot see the schema is telling them what they just asked for (the
+        // offline plan stays byte-for-byte). Every other cause is said out loud.
         (None, Some(reason)) if reason.code != Unavailable::SKIPPED => {
             lines.extend(wrap(&format!(
                 "schema change-set: UNAVAILABLE — {}. {UNKNOWN_NOT_ZERO}",
@@ -434,6 +634,18 @@ pub fn render(preview: &SchemaPreview) -> String {
             )));
         }
         (None, _) => {}
+    }
+    if let (Some(Scope::All), Some(change_set)) = (preview.scope, &preview.change_set) {
+        if !change_set.changes.is_empty() {
+            lines.extend(wrap(&format!(
+                "judged every migration file, applied ones included: {} {} does not advertise \
+                 `{PENDING_SCOPE}`, so a change that already ran is judged again",
+                change_set.adapter, change_set.adapter_version
+            )));
+        }
+    }
+    if let Some(classification) = &preview.classification {
+        lines.extend(wrap(&classification.detail));
     }
     if let Some(window) = preview.window_safe {
         if !lines.is_empty() {
@@ -597,7 +809,10 @@ fn wrap(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{gather, ChangeSetPreview, PolicyPreview, SchemaPreview, Unavailable, Verdict};
+    use super::{
+        gather, gather_rehearsed, not_inspected, render, ChangeSetPreview, ClassificationKind,
+        Depth, PolicyPreview, SchemaPreview, Unavailable, Verdict,
+    };
     use async_trait::async_trait;
     use fraisier_core::adapter_axes::{
         AdapterCtx, AdapterDescription, AdapterError, ChangeSet, MigrationAdapter,
@@ -606,6 +821,10 @@ mod tests {
     };
     use fraisier_core::policy::{
         ApprovalHook, ApprovalRequest, ApprovalVerdict, Baseline, Policy, PolicyGate, PolicyReason,
+    };
+    use fraisier_core::restore_rehearsal::{
+        BackupSource, RehearsalDb, RehearsalError, ThrowawayDb, AGAINST_DATABASE_URL_SECRET,
+        DEEP_CLASSIFICATION,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -618,6 +837,8 @@ mod tests {
         report: Result<PreflightReport, AdapterError>,
         describe_fails: Option<AdapterError>,
         trail: Mutex<Vec<&'static str>>,
+        /// The `AGAINST_DATABASE_URL` each `preflight` was handed.
+        against: Mutex<Vec<Option<String>>>,
     }
 
     impl FakeMigration {
@@ -630,6 +851,7 @@ mod tests {
                 report,
                 describe_fails: None,
                 trail: Mutex::new(Vec::new()),
+                against: Mutex::new(Vec::new()),
             }
         }
 
@@ -704,10 +926,247 @@ mod tests {
             unreachable!("a dry-run never verifies")
         }
 
-        async fn preflight(&self, _ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {
+        async fn preflight(&self, ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {
             self.record("preflight");
+            self.against
+                .lock()
+                .expect("against")
+                .push(ctx.secret(AGAINST_DATABASE_URL_SECRET).ok());
             self.report.clone()
         }
+    }
+
+    /// A throwaway lifecycle that records what it was asked to do.
+    struct FakeRehearsalDb {
+        trail: Mutex<Vec<&'static str>>,
+        fail_provision: bool,
+        fail_teardown: bool,
+    }
+
+    impl FakeRehearsalDb {
+        fn new() -> Self {
+            Self {
+                trail: Mutex::new(Vec::new()),
+                fail_provision: false,
+                fail_teardown: false,
+            }
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.trail.lock().expect("trail").clone()
+        }
+    }
+
+    #[async_trait]
+    impl RehearsalDb for FakeRehearsalDb {
+        async fn provision(
+            &self,
+            _live_dsn: &str,
+            _backup: &BackupSource,
+        ) -> Result<ThrowawayDb, RehearsalError> {
+            self.trail.lock().expect("trail").push("provision");
+            if self.fail_provision {
+                return Err(RehearsalError::Provision("pg_dump failed".to_owned()));
+            }
+            Ok(ThrowawayDb::new(
+                "postgres://u:pw@h/app_fraisier_rh_1",
+                "app_fraisier_rh_1",
+                "app",
+            ))
+        }
+
+        async fn teardown(&self, db: &ThrowawayDb) -> Result<(), String> {
+            self.trail.lock().expect("trail").push("teardown");
+            if self.fail_teardown {
+                return Err(format!("DROP DATABASE {} failed", db.name));
+            }
+            Ok(())
+        }
+    }
+
+    fn live_ctx() -> AdapterCtx {
+        ctx().with_resolved_secret("DATABASE_URL", "postgres://u:pw@h/app")
+    }
+
+    fn deep_adapter(changes: Vec<SchemaChange>) -> FakeMigration {
+        let mut migration = FakeMigration::classifying(changes).reporting("0.44.0");
+        migration.capabilities.push(DEEP_CLASSIFICATION.to_owned());
+        migration
+    }
+
+    fn narrowing() -> SchemaChange {
+        change("alter_column_type", "public.tb_order.note").with_tier(RiskTier::Irreversible)
+    }
+
+    /// A `--dry-run --deep` preview.
+    async fn rehearsed(
+        db: &FakeRehearsalDb,
+        backup: &BackupSource,
+        migration: &FakeMigration,
+    ) -> SchemaPreview {
+        rehearsed_at(db, backup, migration, Depth::Deep).await
+    }
+
+    async fn rehearsed_at(
+        db: &FakeRehearsalDb,
+        backup: &BackupSource,
+        migration: &FakeMigration,
+        depth: Depth,
+    ) -> SchemaPreview {
+        gather_rehearsed(
+            db,
+            backup,
+            migration,
+            &live_ctx(),
+            &PolicyGate::new(Policy::default()),
+            None,
+            Baseline::None,
+            depth,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_fresh_dump_rehearsal_previews_the_deep_classification() {
+        let db = FakeRehearsalDb::new();
+        let migration = deep_adapter(vec![narrowing()]);
+        let preview = rehearsed(&db, &BackupSource::FreshDump, &migration).await;
+        assert_eq!(db.calls(), ["provision", "teardown"]);
+        assert_eq!(
+            migration.against.lock().expect("against").clone(),
+            [Some("postgres://u:pw@h/app_fraisier_rh_1".to_owned())]
+        );
+        let classification = preview
+            .classification
+            .expect("a rehearsal says how it classified");
+        assert_eq!(classification.kind, ClassificationKind::Deep);
+        let policy = preview.policy.expect("a [policy] section decides");
+        assert_eq!(policy.decision, Verdict::Deny);
+        assert_eq!(policy.worst_tier, Some(RiskTier::Irreversible));
+    }
+
+    /// A plain `--dry-run` never dumps production. It classifies
+    /// statically and says so, naming the flag that would look deeper.
+    #[tokio::test]
+    async fn a_default_dry_run_does_not_dump_the_live_database() {
+        let db = FakeRehearsalDb::new();
+        let migration = deep_adapter(vec![narrowing()]);
+        let preview = rehearsed_at(&db, &BackupSource::FreshDump, &migration, Depth::Static).await;
+        assert!(
+            db.calls().is_empty(),
+            "nothing provisioned: {:?}",
+            db.calls()
+        );
+        assert_eq!(migration.against.lock().expect("against").clone(), [None]);
+        let classification = preview
+            .classification
+            .expect("a rehearsal says how it classified");
+        assert_eq!(classification.kind, ClassificationKind::Static);
+        assert!(
+            classification.detail.contains("--deep"),
+            "{}",
+            classification.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn an_archive_rehearsal_says_its_classification_is_static() {
+        let db = FakeRehearsalDb::new();
+        let migration = deep_adapter(vec![narrowing()]);
+        let preview = rehearsed(
+            &db,
+            &BackupSource::Archive("/backups/app.dump".into()),
+            &migration,
+        )
+        .await;
+        assert!(db.calls().is_empty(), "{:?}", db.calls());
+        assert_eq!(migration.against.lock().expect("against").clone(), [None]);
+        let classification = preview.classification.expect("classification");
+        assert_eq!(classification.kind, ClassificationKind::Static);
+        assert!(
+            classification.detail.contains("archive"),
+            "{}",
+            classification.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn below_the_floor_the_preview_says_static_not_deep() {
+        let db = FakeRehearsalDb::new();
+        let migration = FakeMigration::classifying(vec![narrowing()]).reporting("0.43.0");
+        let preview = rehearsed(&db, &BackupSource::FreshDump, &migration).await;
+        assert!(db.calls().is_empty(), "{:?}", db.calls());
+        let classification = preview.classification.expect("classification");
+        assert_eq!(classification.kind, ClassificationKind::Static);
+        assert!(
+            classification.detail.contains(DEEP_CLASSIFICATION),
+            "{}",
+            classification.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn a_throwaway_that_cannot_be_provisioned_is_not_previewed_statically() {
+        let db = FakeRehearsalDb {
+            fail_provision: true,
+            ..FakeRehearsalDb::new()
+        };
+        let migration = deep_adapter(vec![narrowing()]);
+        let preview = rehearsed(&db, &BackupSource::FreshDump, &migration).await;
+        assert_eq!(
+            migration.calls(),
+            ["describe"],
+            "no static preflight stands in"
+        );
+        assert_eq!(unavailable(&preview).code, Unavailable::PREFLIGHT_FAILED);
+        assert!(
+            unavailable(&preview).detail.contains("pg_dump failed"),
+            "{}",
+            unavailable(&preview).detail
+        );
+    }
+
+    #[tokio::test]
+    async fn a_throwaway_left_behind_by_the_preview_is_named() {
+        let db = FakeRehearsalDb {
+            fail_teardown: true,
+            ..FakeRehearsalDb::new()
+        };
+        let migration = deep_adapter(vec![narrowing()]);
+        let preview = rehearsed(&db, &BackupSource::FreshDump, &migration).await;
+        let classification = preview.classification.expect("classification");
+        assert!(
+            classification.detail.contains("app_fraisier_rh_1"),
+            "{}",
+            classification.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn the_render_says_how_the_change_set_was_classified() {
+        let db = FakeRehearsalDb::new();
+        let deep = rehearsed(
+            &db,
+            &BackupSource::FreshDump,
+            &deep_adapter(vec![narrowing()]),
+        )
+        .await;
+        assert!(
+            render(&deep).contains("classified against a fresh copy"),
+            "{}",
+            render(&deep)
+        );
+        let archive = rehearsed(
+            &db,
+            &BackupSource::Archive("/backups/app.dump".into()),
+            &deep_adapter(vec![narrowing()]),
+        )
+        .await;
+        assert!(
+            render(&archive).contains("classified statically"),
+            "{}",
+            render(&archive)
+        );
     }
 
     /// An approval hook that counts the times it was asked. A dry-run must never
@@ -1135,8 +1594,8 @@ mod tests {
 
     #[tokio::test]
     async fn no_policy_section_and_no_baseline_previews_no_verdict() {
-        // D6: an operator who has not opted in sees the change-set and nothing
-        // else — there is no decision to report.
+        // The policy is opt-in: an operator who has not opted in sees the
+        // change-set and nothing else — there is no decision to report.
         let adapter = FakeMigration::classifying(vec![
             change("drop_table", "public.tb_legacy").with_tier(RiskTier::Irreversible)
         ]);
@@ -1216,7 +1675,7 @@ mod tests {
 
     #[test]
     fn fail_on_block_exits_zero_when_nothing_decided() {
-        // D6: no `[policy]` section and no baseline means no verdict, and a
+        // No `[policy]` section and no baseline means no verdict, and a
         // pipeline must not start failing on a gate its config never opted in
         // to.
         assert!(!super::would_block(&SchemaPreview::default()));
@@ -1350,9 +1809,10 @@ mod tests {
 
     #[test]
     fn render_is_silent_when_preflight_was_skipped() {
-        // Rule 1's other half: the operator who turned preflight off is not told
-        // that preflight is off. This is what keeps `--dry-run --skip-preflight`
-        // byte-identical to the plan it printed before this phase.
+        // The other half of the offline promise: the operator who turned preflight
+        // off is not told that preflight is off. This is what keeps
+        // `--dry-run --skip-preflight` byte-identical to the plan it printed
+        // before the schema was inspected.
         let rendered = super::render(&SchemaPreview {
             change_set_unavailable: Some(Unavailable::new(
                 Unavailable::SKIPPED,
@@ -1437,7 +1897,7 @@ mod tests {
 
     #[tokio::test]
     async fn blue_green_previews_a_verdict_with_no_policy_section() {
-        // The D6 carve-out: the window-safety baseline is not opt-in, so
+        // The window-safety baseline is not opt-in, unlike the policy, so
         // blue-green always has something to report.
         // `window_safe` is advertised as well as returned: a verdict from an
         // adapter that never claimed the capability is refused for *that*
@@ -1527,7 +1987,7 @@ mod tests {
 
     #[test]
     fn an_empty_change_set_is_not_an_unavailable_one() {
-        // The presence distinction the type system carries in Phase 01, out on
+        // The presence distinction the type system carries, out on
         // the wire: "the adapter looked and found nothing" must not serialize
         // the same as "nobody looked".
         let looked = SchemaPreview {
@@ -1542,5 +2002,66 @@ mod tests {
         let json = serde_json::to_value(&looked).expect("serialize");
         assert_eq!(json["change_set"]["changes"], serde_json::json!([]));
         assert_eq!(json["change_set_unavailable"], serde_json::Value::Null);
+    }
+
+    fn added_column() -> SchemaChange {
+        change("add_column", "public.tb_order.placed_at").with_tier(RiskTier::Additive)
+    }
+
+    /// Below confiture 1.35.0 the change-set covers every migration file, so
+    /// the plan says it judged applied ones too rather than let an operator
+    /// read the list as this deploy's.
+    #[tokio::test]
+    async fn below_the_pending_scope_floor_the_plan_says_every_migration_was_judged() {
+        let migration = FakeMigration::classifying(vec![added_column()]).reporting("1.34.0");
+        let preview = gather(
+            &migration,
+            &ctx(),
+            &PolicyGate::new(Policy::default()),
+            None,
+            Baseline::None,
+        )
+        .await;
+
+        let json = serde_json::to_value(&preview).expect("serialize");
+        assert_eq!(json["scope"], "all", "{json}");
+        let rendered = render(&preview);
+        assert!(
+            rendered.contains("applied ones included"),
+            "the plan must say what was judged:\n{rendered}"
+        );
+    }
+
+    /// An adapter that judges only pending migrations says so in the machine
+    /// form, and the human plan stays as it was.
+    #[tokio::test]
+    async fn an_adapter_that_judges_pending_migrations_says_so() {
+        let mut migration = FakeMigration::classifying(vec![added_column()]).reporting("1.35.0");
+        migration.capabilities.push("pending_scope".to_owned());
+        let preview = gather(
+            &migration,
+            &ctx(),
+            &PolicyGate::new(Policy::default()),
+            None,
+            Baseline::None,
+        )
+        .await;
+
+        let json = serde_json::to_value(&preview).expect("serialize");
+        assert_eq!(json["scope"], "pending", "{json}");
+        assert!(!render(&preview).contains("applied ones included"));
+    }
+
+    /// A plan that inspected nothing judged nothing, so it states no scope.
+    #[test]
+    fn a_plan_that_inspected_nothing_states_no_scope() {
+        let preview = not_inspected(
+            Unavailable::new(Unavailable::SKIPPED, "skipped"),
+            &PolicyGate::default(),
+            None,
+            Baseline::None,
+        );
+        let json = serde_json::to_value(&preview).expect("serialize");
+        assert_eq!(json["scope"], serde_json::Value::Null, "{json}");
     }
 }

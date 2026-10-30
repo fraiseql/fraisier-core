@@ -36,11 +36,27 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 
-use crate::adapter_axes::{AdapterCtx, AdapterError, MigrationAdapter, Revision};
+use crate::adapter_axes::{
+    AdapterCtx, AdapterDescription, AdapterError, MigrationAdapter, Revision,
+};
 
 /// The logical secret name the migration DSN is exposed under (Decision 5); the
 /// migration adapter resolves it with `ctx.secret("DATABASE_URL")`.
 pub const DATABASE_URL_SECRET: &str = "DATABASE_URL";
+
+/// The logical secret naming the database a preflight classifies **against**.
+///
+/// It is the provisioned throwaway, seeded from the live database (deep
+/// classification). Resolved in-process only, for the one preflight that runs
+/// against the throwaway; an adapter that does not advertise
+/// [`DEEP_CLASSIFICATION`] never sees it.
+pub const AGAINST_DATABASE_URL_SECRET: &str = "AGAINST_DATABASE_URL";
+
+/// The capability of a preflight that can classify against a seeded copy.
+///
+/// Given [`AGAINST_DATABASE_URL_SECRET`], such an adapter tiers a change whose
+/// risk depends on the current schema, such as a column type change.
+pub const DEEP_CLASSIFICATION: &str = "deep_classification";
 
 /// Where the rehearsal's seed data comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,13 +71,33 @@ pub enum BackupSource {
 
 /// A provisioned throwaway database the rehearsal migrates against. Handed back to
 /// [`RehearsalDb::teardown`] for cleanup.
+///
+/// It records the live database it was copied from, so a teardown can refuse to
+/// drop a throwaway that turns out to be the live database itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ThrowawayDb {
     /// A DSN that resolves to the throwaway database (carries the password, like
     /// any DSN — kept in-process, never logged).
     pub dsn: String,
     /// The throwaway database name, for diagnostics and teardown.
     pub name: String,
+    /// The name of the live database the throwaway was copied from. A teardown
+    /// never drops a database by this name.
+    pub live: String,
+}
+
+impl ThrowawayDb {
+    /// A throwaway `name`, reached through `dsn`, copied from the live database
+    /// `live`.
+    #[must_use]
+    pub fn new(dsn: impl Into<String>, name: impl Into<String>, live: impl Into<String>) -> Self {
+        Self {
+            dsn: dsn.into(),
+            name: name.into(),
+            live: live.into(),
+        }
+    }
 }
 
 /// The outcome of a successful rehearsal.
@@ -89,6 +125,33 @@ pub enum RehearsalError {
     /// failure a real restore + migrate would hit, caught before touching live.
     #[error("restore-rehearsal migration failed on the throwaway database: {0}")]
     Migrate(#[source] AdapterError),
+}
+
+impl RehearsalError {
+    /// What the operator should do about this failure.
+    ///
+    /// Only [`Migrate`](Self::Migrate) means the pending migrations ran and
+    /// broke. The other variants fail before any migration runs, so their
+    /// advice points at the throwaway copy instead.
+    #[must_use]
+    pub const fn remedy(&self) -> &'static str {
+        match self {
+            Self::Migrate(_) => {
+                "The pending migrations did not apply cleanly on a fresh restore. Fix the \
+                 migrations"
+            }
+            Self::Provision(_) => {
+                "The pending migrations were not rehearsed: the throwaway copy could not be \
+                 created or seeded. If the database role may not create databases, grant it \
+                 CREATEDB or name a restore identity with `[database].admin_url_env`. Otherwise \
+                 fix the cause above"
+            }
+            Self::Secret(_) => {
+                "The pending migrations were not rehearsed: the live database DSN could not \
+                 be resolved. Check the `DATABASE_URL` secret"
+            }
+        }
+    }
 }
 
 /// Provision and tear down the throwaway database the rehearsal runs against.
@@ -138,26 +201,78 @@ pub async fn run_restore_rehearsal(
     ctx: &AdapterCtx,
     backup: &BackupSource,
 ) -> Result<RehearsalReport, RehearsalError> {
-    let live_dsn = ctx
-        .secret(DATABASE_URL_SECRET)
-        .map_err(RehearsalError::Secret)?;
-    let throwaway = db.provision(&live_dsn, backup).await?;
-
-    // Redirect the migration adapter at the throwaway DB (in-process only — the
-    // value never serializes and never logs). Pending resolves from *its* tracking.
-    let rehearsal_ctx = ctx
-        .clone()
-        .with_resolved_secret(DATABASE_URL_SECRET, throwaway.dsn.clone());
-    let migrate_result = migration.up(&rehearsal_ctx, None).await;
+    let throwaway = provision(db, ctx, backup).await?;
+    let migrate_result = rehearse_on(migration, ctx, &throwaway).await;
 
     // Always tear down, whatever the migration did.
     let teardown_result = db.teardown(&throwaway).await;
 
-    let outcome = migrate_result.map_err(RehearsalError::Migrate)?;
     Ok(RehearsalReport {
-        applied: outcome.applied,
+        applied: migrate_result?,
         teardown_warning: teardown_result.err(),
     })
+}
+
+/// Provision a throwaway copy of `ctx`'s live database, seeded from `backup`.
+///
+/// The caller owns the throwaway from here and must hand it to
+/// [`RehearsalDb::teardown`] on every path.
+///
+/// # Errors
+/// [`RehearsalError::Secret`] if the live DSN cannot be resolved, or the
+/// provisioning failure.
+pub async fn provision(
+    db: &dyn RehearsalDb,
+    ctx: &AdapterCtx,
+    backup: &BackupSource,
+) -> Result<ThrowawayDb, RehearsalError> {
+    let live_dsn = ctx
+        .secret(DATABASE_URL_SECRET)
+        .map_err(RehearsalError::Secret)?;
+    db.provision(&live_dsn, backup).await
+}
+
+/// `ctx` with its database redirected (in-process only; the value never
+/// serializes and never logs) at `throwaway`, so pending migrations resolve from
+/// the throwaway's own tracking table.
+#[must_use]
+pub fn on_throwaway(ctx: &AdapterCtx, throwaway: &ThrowawayDb) -> AdapterCtx {
+    ctx.clone()
+        .with_resolved_secret(DATABASE_URL_SECRET, throwaway.dsn.clone())
+}
+
+/// [`on_throwaway`], also naming `throwaway` as the database a preflight
+/// classifies against ([`AGAINST_DATABASE_URL_SECRET`]).
+#[must_use]
+pub fn against_throwaway(ctx: &AdapterCtx, throwaway: &ThrowawayDb) -> AdapterCtx {
+    on_throwaway(ctx, throwaway)
+        .with_resolved_secret(AGAINST_DATABASE_URL_SECRET, throwaway.dsn.clone())
+}
+
+/// Whether the adapter `described` can classify against a seeded copy.
+#[must_use]
+pub fn classifies_deeply(described: &AdapterDescription) -> bool {
+    described
+        .capabilities
+        .iter()
+        .any(|capability| capability == DEEP_CLASSIFICATION)
+}
+
+/// Rehearse the pending migrations on an already-provisioned `throwaway`,
+/// returning the migrations it applied. Does not tear it down.
+///
+/// # Errors
+/// [`RehearsalError::Migrate`] if the rehearsed `migrate up` fails.
+pub async fn rehearse_on(
+    migration: &dyn MigrationAdapter,
+    ctx: &AdapterCtx,
+    throwaway: &ThrowawayDb,
+) -> Result<Vec<Revision>, RehearsalError> {
+    migration
+        .up(&on_throwaway(ctx, throwaway), None)
+        .await
+        .map(|outcome| outcome.applied)
+        .map_err(RehearsalError::Migrate)
 }
 
 #[cfg(test)]
@@ -193,10 +308,11 @@ mod tests {
                 .lock()
                 .expect("calls")
                 .push(format!("provision:{live_dsn}:{backup:?}"));
-            Ok(ThrowawayDb {
-                dsn: THROWAWAY_DSN.to_owned(),
-                name: "app_fraisier_rehearsal".to_owned(),
-            })
+            Ok(ThrowawayDb::new(
+                THROWAWAY_DSN,
+                "app_fraisier_rehearsal",
+                "app",
+            ))
         }
 
         async fn teardown(&self, db: &ThrowawayDb) -> Result<(), String> {
@@ -346,5 +462,36 @@ mod tests {
             report.teardown_warning.is_some(),
             "a leaked throwaway DB must be surfaced as a warning"
         );
+    }
+
+    #[test]
+    fn only_a_failed_rehearsed_migration_blames_the_migrations() {
+        let migrate = RehearsalError::Migrate(AdapterError::new(
+            AdapterErrorKind::Execution,
+            "relation \"widgets\" does not exist",
+        ));
+        assert!(
+            migrate.remedy().contains("did not apply cleanly"),
+            "{}",
+            migrate.remedy()
+        );
+
+        let provision = RehearsalError::Provision("CREATE DATABASE failed".to_owned());
+        let secret = RehearsalError::Secret(AdapterError::new(
+            AdapterErrorKind::MissingSecret,
+            "DATABASE_URL is not declared",
+        ));
+        for unrehearsed in [provision, secret] {
+            let remedy = unrehearsed.remedy();
+            assert!(remedy.contains("were not rehearsed"), "{remedy}");
+            assert!(!remedy.contains("did not apply cleanly"), "{remedy}");
+        }
+    }
+
+    #[test]
+    fn a_provisioning_failure_names_the_admin_identity_escape() {
+        let remedy =
+            RehearsalError::Provision("permission denied to create database".to_owned()).remedy();
+        assert!(remedy.contains("[database].admin_url_env"), "{remedy}");
     }
 }

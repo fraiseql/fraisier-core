@@ -24,7 +24,9 @@ use fraisier_core::adapter_axes::{
     AdapterCtx, ArtifactAdapter, HealthAdapter, HostId, LbAdapter, MigrationAdapter, ServiceAdapter,
 };
 use fraisier_core::multi_host::{MultiHostPlan, RolloutStrategy};
+use fraisier_core::no_database::NoDatabase;
 use fraisier_core::policy::{ApprovalHook, PolicyGate};
+use fraisier_core::readiness::DatabaseReadiness;
 use fraisier_core::restore_rehearsal::{BackupSource, RehearsalDb};
 use fraisier_core::single_host::PreflightMode;
 use fraisier_ipc::{Launcher, SshLauncher};
@@ -33,6 +35,7 @@ use serde_json::Value;
 use crate::approval::ExecApproval;
 use crate::pg_rehearsal::PgRehearsalDb;
 use crate::preview::SchemaPreview;
+use fraisier_db::restore::Trigger;
 
 /// The logical secret name every migration adapter resolves the DSN under.
 const DATABASE_URL_LOGICAL: &str = "DATABASE_URL";
@@ -74,10 +77,11 @@ pub struct PlanSummary {
 
 /// Resolve the `[policy]` section into the gate a deploy runs at preflight.
 ///
-/// An absent section is the D6 opt-out and yields the default gate: no tier
-/// policy at all, and whatever always-on baseline the strategy itself applies.
-/// An `approval_command` becomes the one [`ApprovalHook`] implementation; without
-/// one, anything the policy sends for sign-off is refused rather than passed.
+/// An absent section is the opt-out (the policy is opt-in) and yields the default
+/// gate: no tier policy at all, and whatever always-on baseline the strategy itself
+/// applies. An `approval_command` becomes the one [`ApprovalHook`] implementation;
+/// without one, anything the policy sends for sign-off is refused rather than
+/// passed.
 fn build_policy_gate(config: &DeployConfig) -> PolicyGate {
     let Some(section) = config.policy.as_ref() else {
         return PolicyGate::default();
@@ -130,6 +134,9 @@ pub struct PreviewTarget {
     /// Whether any preflight runs at all (`[migration].preflight_mode`). When
     /// this is false the deploy inspects nothing, and neither does its preview.
     pub forward_compatible_lint: bool,
+    /// The restore rehearsal a single-host deploy of this config runs, if any,
+    /// so its preview can classify the same way.
+    pub restore_rehearsal: Option<RestoreRehearsalPlan>,
 }
 
 /// Build just what a `--dry-run` needs to inspect the pending schema change.
@@ -174,10 +181,13 @@ pub fn build_preview(
     ctx.env_secrets = env_secrets;
     ctx.settings = settings_map(config, app_version);
 
+    // A preview is an operator's dry run; the webhook never asks for one.
+    let (forward_compatible_lint, restore_rehearsal) = resolve_preflight(config, Trigger::Operator);
     Ok(PreviewTarget {
         migration,
         ctx,
-        forward_compatible_lint: resolve_preflight(config).0,
+        forward_compatible_lint,
+        restore_rehearsal,
     })
 }
 
@@ -200,6 +210,9 @@ pub struct ResolvedDeploy {
     /// the given [`RehearsalDb`]) seeded from [`BackupSource`] and rehearses the
     /// pending migrations there. Populated when `preflight_mode = "restore_rehearsal"`.
     pub restore_rehearsal: Option<RestoreRehearsalPlan>,
+    /// The `[database.requires]` probe, run first in preflight. `None` when the
+    /// section declares nothing.
+    pub database_readiness: Option<Arc<dyn DatabaseReadiness>>,
     /// The artifact adapter.
     pub artifact: Arc<dyn ArtifactAdapter>,
     /// The migration adapter (in-process or IPC).
@@ -239,9 +252,23 @@ fn add_token_provider_secrets(config: &DeployConfig, env_secrets: &mut BTreeMap<
     }
 }
 
+/// Whether the live forward-compat lint runs, by `[migration].preflight_mode`
+/// (or the legacy `forward_compatible_lint` it replaces). A path with no
+/// restore rehearsal, multi-host or migration-only, lints live under
+/// `restore_rehearsal`.
+fn live_lint(config: &DeployConfig) -> bool {
+    config
+        .migration
+        .as_ref()
+        .is_none_or(|m| m.effective_preflight_mode() != PreflightMode::Off)
+}
+
 /// Resolve the preflight knobs from `[migration]`: the live forward-compat lint
 /// toggle and the optional restore-rehearsal `(db, backup)` pair.
-fn resolve_preflight(config: &DeployConfig) -> (bool, Option<RestoreRehearsalPlan>) {
+fn resolve_preflight(
+    config: &DeployConfig,
+    trigger: Trigger,
+) -> (bool, Option<RestoreRehearsalPlan>) {
     let Some(migration) = config.migration.as_ref() else {
         return (true, None);
     };
@@ -253,7 +280,13 @@ fn resolve_preflight(config: &DeployConfig) -> (bool, Option<RestoreRehearsalPla
                 .preflight_backup_path
                 .clone()
                 .map_or(BackupSource::FreshDump, BackupSource::Archive);
-            let db: Arc<dyn RehearsalDb> = Arc::new(PgRehearsalDb);
+            let db: Arc<dyn RehearsalDb> = Arc::new(PgRehearsalDb {
+                admin_url_env: config
+                    .database
+                    .as_ref()
+                    .and_then(|d| d.admin_url_env.clone()),
+                trigger,
+            });
             (true, Some((db, backup)))
         }
     }
@@ -357,6 +390,12 @@ fn settings_map(config: &DeployConfig, app_version: Option<&str>) -> BTreeMap<St
                 settings.insert("token_provider".to_owned(), value);
             }
         }
+        if let Some(required) = &health.require_capabilities {
+            settings.insert(
+                "require_capabilities".to_owned(),
+                Value::from(required.clone()),
+            );
+        }
     }
     if let Some(lb) = &config.lb {
         put_path(&mut settings, "config_path", lb.config_path.as_deref());
@@ -454,6 +493,7 @@ fn put_path(map: &mut BTreeMap<String, Value>, key: &str, value: Option<&std::pa
 
 fn render_migration(config: &DeployConfig) -> String {
     match config.migration.as_ref().and_then(|m| m.adapter.as_deref()) {
+        Some(fraisier_core::no_database::ADAPTER_NAME) => "none (no database)".to_owned(),
         Some(name @ ("confiture" | "command")) => format!("{name} (in-process)"),
         Some(name) => format!("{name} (IPC: fraisier-adapter-{name})"),
         None => "<none>".to_owned(),
@@ -508,6 +548,20 @@ pub fn build(
     host_override: Option<&str>,
     app_version: Option<&str>,
 ) -> Result<ResolvedDeploy> {
+    build_for(config, host_override, app_version, Trigger::Operator)
+}
+
+/// [`build`] for a deploy started by `trigger`. A webhook-started deploy's
+/// restore rehearsal never resolves `[database].admin_url_env`.
+///
+/// # Errors
+/// As [`build`].
+pub fn build_for(
+    config: &DeployConfig,
+    host_override: Option<&str>,
+    app_version: Option<&str>,
+    trigger: Trigger,
+) -> Result<ResolvedDeploy> {
     let deploy = config.deploy.as_ref().context("missing [deploy] section")?;
     let fraise = deploy.name.clone().context("[deploy].name is required")?;
     let environment = deploy
@@ -535,7 +589,7 @@ pub fn build(
 
     // The forward-compat lint and (opt-in) restore-rehearsal are selected by
     // `[migration].preflight_mode` (default `live`, legacy flag honoured).
-    let (forward_compatible_lint, restore_rehearsal) = resolve_preflight(config);
+    let (forward_compatible_lint, restore_rehearsal) = resolve_preflight(config, trigger);
 
     let mut ctx = AdapterCtx::new(fraise.clone(), environment.clone());
     ctx.host = Some(host.clone());
@@ -555,6 +609,7 @@ pub fn build(
         forward_compatible_lint,
         policy: build_policy_gate(config),
         restore_rehearsal,
+        database_readiness: crate::pg_readiness::probe(config),
         artifact,
         migration,
         service,
@@ -576,6 +631,9 @@ pub struct ResolvedMultiHost {
     pub forward_compatible_lint: bool,
     /// The schema policy gate resolved from `[policy]` (default: no tier gate).
     pub policy: PolicyGate,
+    /// The `[database.requires]` probe, run first in preflight. `None` when the
+    /// section declares nothing.
+    pub database_readiness: Option<Arc<dyn DatabaseReadiness>>,
     /// The artifact adapter.
     pub artifact: Arc<dyn ArtifactAdapter>,
     /// The migration adapter (run once on the orchestrator).
@@ -633,11 +691,7 @@ pub fn build_multi_host(
     let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
     add_token_provider_secrets(config, &mut env_secrets);
 
-    let forward_compatible_lint = config
-        .migration
-        .as_ref()
-        .and_then(|m| m.forward_compatible_lint)
-        .unwrap_or(true);
+    let forward_compatible_lint = live_lint(config);
 
     // The host is set per-host by the multi-host composition; leave it None here.
     let mut ctx = AdapterCtx::new(fraise.clone(), environment.clone());
@@ -656,6 +710,7 @@ pub fn build_multi_host(
         ctx,
         forward_compatible_lint,
         policy: build_policy_gate(config),
+        database_readiness: crate::pg_readiness::probe(config),
         artifact,
         migration,
         service,
@@ -872,6 +927,24 @@ pub fn build_health_probe(config: &DeployConfig) -> Result<HealthProbePlan> {
     Ok(HealthProbePlan { health, ctx, hosts })
 }
 
+/// The context a request made as `config`'s deployable carries: its
+/// `[health]` headers and `token_provider`, with the provider's secret mapped
+/// to its environment variable (never resolved here).
+pub fn health_ctx(config: &DeployConfig) -> AdapterCtx {
+    let deploy = config.deploy.as_ref();
+    let mut ctx = AdapterCtx::new(
+        deploy
+            .and_then(|d| d.name.clone())
+            .unwrap_or_else(|| "<none>".to_owned()),
+        deploy
+            .and_then(|d| d.environment.clone())
+            .unwrap_or_else(|| "<none>".to_owned()),
+    );
+    ctx.settings = settings_map(config, None);
+    add_token_provider_secrets(config, &mut ctx.env_secrets);
+    ctx
+}
+
 /// A ready-to-run artifact probe: the adapter, a base context, and the hosts to
 /// query for their live active artifact (`deployment-status --per-host`).
 pub struct ArtifactProbePlan {
@@ -888,6 +961,18 @@ pub struct ArtifactProbePlan {
 /// # Errors
 /// Fails if `[artifact].source` is missing or unsupported in this build.
 pub fn build_artifact_probe(config: &DeployConfig) -> Result<ArtifactProbePlan> {
+    build_artifact_probe_at(config, None)
+}
+
+/// [`build_artifact_probe`], with the artifact settings at `app_version`: what
+/// staging that release needs.
+///
+/// # Errors
+/// Fails if `[artifact].source` is missing or unsupported in this build.
+pub fn build_artifact_probe_at(
+    config: &DeployConfig,
+    app_version: Option<&str>,
+) -> Result<ArtifactProbePlan> {
     let transport = build_transport(config);
     let launcher = build_launcher(config);
     let artifact = build_artifact(config, &transport, &launcher)?;
@@ -900,7 +985,7 @@ pub fn build_artifact_probe(config: &DeployConfig) -> Result<ArtifactProbePlan> 
         .unwrap_or_else(|| "<none>".to_owned());
     let mut ctx = AdapterCtx::new(fraise, environment);
     ctx.workdir = PathBuf::from(".");
-    ctx.settings = settings_map(config, None);
+    ctx.settings = settings_map(config, app_version);
     let hosts = config.host_inventory().map_or_else(
         || vec![(HostId::new("localhost"), None)],
         |inventory| {
@@ -1026,11 +1111,7 @@ pub fn build_migration_only(config: &DeployConfig) -> Result<ResolvedMigration> 
     let migration = build_migration(config, database_url_env.as_deref(), &mut env_secrets)?;
     add_token_provider_secrets(config, &mut env_secrets);
 
-    let forward_compatible_lint = config
-        .migration
-        .as_ref()
-        .and_then(|m| m.forward_compatible_lint)
-        .unwrap_or(true);
+    let forward_compatible_lint = live_lint(config);
 
     let mut ctx = AdapterCtx::new(fraise.clone(), environment.clone());
     ctx.workdir = PathBuf::from(".");
@@ -1061,6 +1142,7 @@ fn build_migration(
         .and_then(|m| m.adapter.as_deref())
         .context("[migration].adapter is required")?;
     match name {
+        fraisier_core::no_database::ADAPTER_NAME => Ok(Arc::new(NoDatabase)),
         "confiture" => {
             // In-process: map the logical secret to its source env var name.
             if let Some(source) = database_url_env {
@@ -1106,7 +1188,7 @@ fn build_migration(
 }
 
 // ---------------------------------------------------------------------------
-// Blue-green (phase-07) wiring
+// Blue-green wiring
 // ---------------------------------------------------------------------------
 
 use std::time::Duration;
@@ -1162,6 +1244,7 @@ impl AdapterFleet {
 
     async fn stop_unit(&self, unit: &str) -> Result<(), String> {
         let mut command = tokio::process::Command::new("systemctl");
+        fraisier_core::child_env::scrub(command.as_std_mut());
         if self.user {
             command.arg("--user");
         }
@@ -1383,15 +1466,19 @@ pub fn build_blue_green(
     Ok(ResolvedBlueGreen {
         fraise,
         environment,
-        deploy: BlueGreenDeploy::new(params, migration, traffic, fleet, budget),
+        deploy: match crate::pg_readiness::probe(config) {
+            Some(probe) => BlueGreenDeploy::new(params, migration, traffic, fleet, budget)
+                .database_readiness(probe),
+            None => BlueGreenDeploy::new(params, migration, traffic, fleet, budget),
+        },
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build, build_health, build_health_probe, build_multi_host, build_policy_gate, summarize,
-        summarize_multi_host,
+        build, build_for, build_health, build_health_probe, build_migration_only, build_multi_host,
+        build_policy_gate, summarize, summarize_multi_host,
     };
     use fraisier_config::DeployConfig;
     use fraisier_core::adapter_axes::RiskTier;
@@ -1400,7 +1487,7 @@ mod tests {
 
     #[test]
     fn an_absent_policy_section_builds_no_gate() {
-        // The D6 opt-out, at the wiring layer: nothing to configure means
+        // The policy opt-out, at the wiring layer: nothing to configure means
         // nothing to decide, and no approval hook to spawn.
         let config = DeployConfig::from_toml_str(&single_host_with_migration("")).expect("parses");
         let gate = build_policy_gate(&config);
@@ -1456,6 +1543,19 @@ mod tests {
     }
 
     #[test]
+    fn a_database_less_axis_builds_the_no_database_adapter() {
+        let toml = single_host_with_migration("").replace(
+            "adapter = \"confiture\"\ndatabase_url_env = \"APP_DATABASE_URL\"",
+            "adapter = \"none\"",
+        );
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+        let resolved = build(&config, None, None).expect("builds");
+        assert!(!resolved.migration.owns_database());
+        let summary = summarize(&config, None, None).expect("summarize");
+        assert_eq!(summary.migration, "none (no database)");
+    }
+
+    #[test]
     fn preflight_mode_restore_rehearsal_wires_a_rehearsal_db() {
         // Default backup source is a fresh dump.
         let config = DeployConfig::from_toml_str(&single_host_with_migration(
@@ -1488,6 +1588,34 @@ mod tests {
         }
     }
 
+    /// The rehearsal's provisioning error for `trigger`, on a config whose
+    /// `admin_url_env` names a variable that is never set.
+    async fn rehearsal_error(trigger: fraisier_db::restore::Trigger) -> String {
+        let toml = single_host_with_migration(
+            "preflight_mode = \"restore_rehearsal\"\n\
+             preflight_backup_path = \"/nonexistent/fraisier-rehearsal.dump\"\n",
+        ) + "\n[database]\nadmin_url_env = \"FRAISIER_ADMIN_NEVER_SET\"\n";
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+        let resolved = build_for(&config, None, None, trigger).expect("builds");
+        let (db, backup) = resolved.restore_rehearsal.expect("a rehearsal");
+        db.provision("postgres://app@127.0.0.1:1/app", &backup)
+            .await
+            .expect_err("nothing to restore")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_webhook_deploys_rehearsal_never_resolves_the_admin_identity() {
+        let error = rehearsal_error(fraisier_db::restore::Trigger::Webhook).await;
+        assert!(!error.contains("FRAISIER_ADMIN_NEVER_SET"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_operator_deploys_rehearsal_resolves_the_admin_identity() {
+        let error = rehearsal_error(fraisier_db::restore::Trigger::Operator).await;
+        assert!(error.contains("FRAISIER_ADMIN_NEVER_SET"), "{error}");
+    }
+
     #[test]
     fn preflight_mode_off_disables_both_preflights() {
         let config =
@@ -1496,6 +1624,26 @@ mod tests {
         let resolved = build(&config, None, None).expect("builds");
         assert!(!resolved.forward_compatible_lint);
         assert!(resolved.restore_rehearsal.is_none());
+    }
+
+    #[test]
+    fn preflight_mode_off_disables_the_multi_host_lint() {
+        let toml = MULTI_HOST_IPC.replace(
+            "[migration]\nadapter = \"command\"\n",
+            "[migration]\nadapter = \"command\"\npreflight_mode = \"off\"\n",
+        );
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+        let resolved = build_multi_host(&config, Some("1.2.3")).expect("builds multi-host");
+        assert!(!resolved.forward_compatible_lint);
+    }
+
+    #[test]
+    fn preflight_mode_off_disables_the_migration_only_lint() {
+        let config =
+            DeployConfig::from_toml_str(&single_host_with_migration("preflight_mode = \"off\"\n"))
+                .expect("parses");
+        let resolved = build_migration_only(&config).expect("builds");
+        assert!(!resolved.forward_compatible_lint);
     }
 
     /// A single-host config whose `[health]` block is command-driven, with the
@@ -1540,6 +1688,22 @@ mod tests {
         assert_eq!(
             plan.ctx.env_secrets.get("DATABASE_URL").map(String::as_str),
             Some("APP_DATABASE_URL"),
+        );
+    }
+
+    #[test]
+    fn http_health_plumbs_require_capabilities() {
+        let toml = "[deploy]\nname = \"app\"\nenvironment = \"prod\"\n\n\
+             [artifact]\nsource = \"local\"\npath = \"/builds/app\"\nactive_path = \"/srv/app/current\"\n\n\
+             [migration]\nadapter = \"confiture\"\ndatabase_url_env = \"APP_DATABASE_URL\"\n\n\
+             [service]\nadapter = \"systemd\"\nunit = \"app.service\"\n\n\
+             [health]\nadapter = \"http\"\nurl = \"http://127.0.0.1:8080/health\"\n\
+             require_capabilities = [\"observers\"]\n";
+        let config = DeployConfig::from_toml_str(toml).expect("parses");
+        let plan = build_health_probe(&config).expect("builds http health probe");
+        assert_eq!(
+            plan.ctx.settings.get("require_capabilities"),
+            Some(&serde_json::json!(["observers"])),
         );
     }
 

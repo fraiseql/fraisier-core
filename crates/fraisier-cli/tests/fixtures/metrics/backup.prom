@@ -1,0 +1,6 @@
+# HELP fraisier_backup_last_success_timestamp_seconds When the last successful backup started, in Unix seconds.
+# TYPE fraisier_backup_last_success_timestamp_seconds gauge
+fraisier_backup_last_success_timestamp_seconds{fraise="checkout",environment="production"} 1792984500
+# HELP fraisier_backup_last_size_bytes The size of the last successful backup's archive, in bytes.
+# TYPE fraisier_backup_last_size_bytes gauge
+fraisier_backup_last_size_bytes{fraise="checkout",environment="production"} 1048576

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.13](https://github.com/fraiseql/fraisier-core/compare/fraisier-core-v1.0.0-beta.12...fraisier-core-v1.0.0-beta.13) - 2026-10-29
+
+### Other
+
+- updated the following local packages: fraisier-saga
+
+## [1.0.0-beta.12](https://github.com/fraiseql/fraisier-core/compare/fraisier-core-v1.0.0-beta.11...fraisier-core-v1.0.0-beta.12) - 2026-10-27
+
+### Fixed
+
+- *(secrets)* keep the admin DSN out of the app and of every child process
+- *(rehearsal)* a rehearsal that never ran the migrations no longer blames them
+- *(saga)* a database-less deployable rolls back cleanly (adapter = "none")
+- *(lint)* pass clippy on Rust 1.99 (unblocks #65/#76 for #63)
+- *(test)* an ambient FRAISIER_* variable no longer fails seven tests
+
+### Other
+
+- Merge main into chore/strip-plan-labels
+- Merge main into fix/rehearsal-teardown-guard
+- Merge remote-tracking branch 'origin/main' into feat/56-deep-classification
+- Merge remote-tracking branch 'origin/main' into fix/rehearsal-refusal-wording
+- Merge main into feat/84-drill
+- Merge main into feat/83-pg-readiness
+- release v1.0.0-beta.11
+
 ## [1.0.0-beta.11](https://github.com/fraiseql/fraisier-core/compare/fraisier-core-v1.0.0-beta.10...fraisier-core-v1.0.0-beta.11) - 2026-09-26
 
 ### Other

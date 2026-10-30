@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Blue-green checkpoint — the phase-07 §7.5 GA gate, preflight half.
+# Blue-green checkpoint — the blue-green GA gate, preflight half.
 #
 # Drives the REAL `fraisier deploy` with `[deploy].strategy = "blue-green"` end-to-end through its
 # preflight gates, against **real confiture 0.22** and a **real Postgres**:

@@ -349,6 +349,102 @@ async fn command_health_regression_rolls_back_naming_the_detail() {
     );
 }
 
+/// A subgraph whose live SDL its router's candidate release does not hold.
+struct ServesNewSdl;
+
+#[async_trait::async_trait]
+impl crate::stack_sdl::SdlSource for ServesNewSdl {
+    async fn live_sdl(&self, _: &str, _: &[(String, String)]) -> Result<String, String> {
+        Ok("type Query { invoices: Int }\n".to_owned())
+    }
+    fn served_sdl(&self, path: &Path) -> Result<String, String> {
+        std::fs::read_to_string(path).map_err(|error| error.to_string())
+    }
+}
+
+/// The stack's SDL check sits in the subgraph's own health step, so a
+/// subgraph that is up but serves an SDL the router's candidate release does
+/// not hold rolls itself back through its saga, like any unhealthy release.
+#[tokio::test]
+async fn a_subgraph_the_candidate_router_release_does_not_hold_rolls_itself_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let staging = root.join("staging");
+    let active = root.join("current");
+    let log = root.join("calls.log");
+    let revfile = root.join("revision");
+    let store = FilesystemStateStore::new(root.join("state")).expect("store");
+    let sha = sha256_hex(ARTIFACT_BODY, root);
+    let addr = spawn_fixture(sha, Arc::new(AtomicU16::new(200)));
+    let systemctl = write_fake_systemctl(root, &log);
+
+    let outcome = run_deploy(
+        "v1",
+        deploy_ctx("v1", addr, &staging, &active),
+        Arc::new(HttpHealth::new()),
+        &log,
+        &revfile,
+        &systemctl,
+        store.clone(),
+    )
+    .await;
+    assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+
+    let candidate = root.join("router/releases/v7");
+    std::fs::create_dir_all(candidate.join("sdl")).expect("mkdir");
+    std::fs::write(
+        candidate.join("sdl/billing.graphql"),
+        "type Query { orders: Int }\n",
+    )
+    .expect("write");
+    let billing = fraisier_config::stack::Member {
+        name: "billing".to_owned(),
+        config_path: root.join("billing.toml"),
+        config: fraisier_config::DeployConfig {
+            federation: Some(fraisier_config::FederationSection {
+                graphql_url: Some("http://billing/graphql".to_owned()),
+            }),
+            ..fraisier_config::DeployConfig::default()
+        },
+        depends_on: Vec::new(),
+        sdl: Some(PathBuf::from("sdl/billing.graphql")),
+    };
+    let gate = crate::stack_sdl::SdlGate::new(&billing, &candidate, Arc::new(ServesNewSdl))
+        .expect("billing is checked");
+
+    let outcome = run_deploy(
+        "v2",
+        deploy_ctx("v2", addr, &staging, &active),
+        gate.guard(Arc::new(HttpHealth::new())),
+        &log,
+        &revfile,
+        &systemctl,
+        store,
+    )
+    .await;
+    let SagaOutcome::RolledBack {
+        failed_step,
+        reason,
+    } = &outcome
+    else {
+        panic!("expected a rollback, got {outcome:?}");
+    };
+    assert_eq!(failed_step, "health");
+    assert!(
+        reason.contains(&format!(
+            "the live SDL at http://billing/graphql is not {}",
+            candidate.join("sdl/billing.graphql").display()
+        )),
+        "{reason}"
+    );
+    assert_eq!(link_target_name(&active), "v1", "the subgraph rolled back");
+    assert_eq!(
+        std::fs::read_to_string(&revfile).expect("revfile").trim(),
+        "v1",
+        "and so did its migration"
+    );
+}
+
 /// Issue #62 end-to-end: a health command that fails the way a database client
 /// really fails prints the DSN it tried, and that text becomes the rollback
 /// reason. The reason itself stays faithful — the boundaries redact, not the ~25

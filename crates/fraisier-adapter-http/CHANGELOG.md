@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.13](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-http-v1.0.0-beta.12...fraisier-adapter-http-v1.0.0-beta.13) - 2026-10-29
+
+### Other
+
+- updated the following local packages: fraisier-core, fraisier-adapter-support
+
+## [1.0.0-beta.12](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-http-v1.0.0-beta.11...fraisier-adapter-http-v1.0.0-beta.12) - 2026-10-27
+
+### Added
+
+- *(stack)* [**breaking**] a subgraph's endpoint lives in its own config; its SDL query sends its [health] auth
+
+### Fixed
+
+- *(secrets)* keep the admin DSN out of the app and of every child process
+
+### Other
+
+- Merge main into feat/85-stack
+- *(stack)* rustfmt and a public rustdoc link for the SDL work
+
 ## [1.0.0-beta.11](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-http-v1.0.0-beta.10...fraisier-adapter-http-v1.0.0-beta.11) - 2026-09-26
 
 ### Other

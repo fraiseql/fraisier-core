@@ -458,6 +458,25 @@ mod kinds {
     pub const UNREADABLE_CHANGE_SET: &str = "unreadable_change_set";
 }
 
+/// The capability of a preflight whose change-set covers only the migrations
+/// the target database has not applied yet.
+///
+/// Without it, the change-set covers every migration file, applied ones
+/// included. A destructive migration that has already run is then judged again
+/// on every later deploy, so one approved `DROP COLUMN` refuses every deploy
+/// that follows it. The gate reads the change-set either way; this capability
+/// is what tells a plan which of the two it is looking at.
+pub const PENDING_SCOPE: &str = "pending_scope";
+
+/// Whether the adapter judges only the pending migrations ([`PENDING_SCOPE`]).
+#[must_use]
+pub fn judges_pending_only(described: &AdapterDescription) -> bool {
+    described
+        .capabilities
+        .iter()
+        .any(|capability| capability == PENDING_SCOPE)
+}
+
 /// What the adapter says it can do — the capability strings this gate reads.
 ///
 /// A struct rather than loose booleans because they are read by different
@@ -615,8 +634,8 @@ fn baseline_verdict(
 ///
 /// `baseline` selects the always-on rule for the deploy strategy and is applied
 /// **first**, with or without a `[policy]` section. `policy` is `None` when no
-/// section is configured, which leaves the tier gate switched off entirely (D6:
-/// configuring the section is the opt-in). `capabilities` is what the adapter
+/// section is configured, which leaves the tier gate switched off entirely
+/// (configuring the section is the opt-in). `capabilities` is what the adapter
 /// advertises; `report` is the preflight result, `None` when preflight did not
 /// run.
 ///
@@ -661,7 +680,7 @@ pub fn evaluate(
             reasons: Vec::new(),
         };
     }
-    // No `[policy]` section ⇒ no tier gate at all (D6). This is the switch that
+    // No `[policy]` section ⇒ no tier gate at all. This is the switch that
     // keeps every existing deploy behaving exactly as it does today.
     let Some(policy) = policy else {
         return PolicyDecision::Allow { changes: 0 };
@@ -756,6 +775,19 @@ pub async fn inspect(
     ctx: &AdapterCtx,
 ) -> Result<Inspection, AdapterError> {
     let described = migration.describe().await?;
+    inspect_described(migration, ctx, described).await
+}
+
+/// [`inspect`], for a caller that has already asked the adapter to describe
+/// itself (to decide which database to inspect against).
+///
+/// # Errors
+/// The adapter's own `preflight` [`AdapterError`], unchanged.
+pub async fn inspect_described(
+    migration: &dyn MigrationAdapter,
+    ctx: &AdapterCtx,
+    described: AdapterDescription,
+) -> Result<Inspection, AdapterError> {
     let capabilities = Capabilities::from_advertised(&described.capabilities);
     let report = if capabilities.preflight {
         Some(migration.preflight(ctx).await?)
@@ -778,8 +810,7 @@ pub const REFUSED: &str = "policy refused:";
 ///
 /// The default gate — no policy, no hook — is not an inert one: it still applies
 /// the [`Baseline`] its strategy passes, which is what keeps blue-green's
-/// window-safety rule on for the deploys that never configure `[policy]` (D6's
-/// carve-out).
+/// window-safety rule on for the deploys that never configure `[policy]`.
 #[derive(Clone, Default)]
 pub struct PolicyGate {
     policy: Option<Policy>,
@@ -1112,7 +1143,7 @@ mod tests {
 
     #[test]
     fn without_a_policy_section_the_tier_gate_does_not_run() {
-        // D6: configuring `[policy]` is the opt-in. With no section, an adapter
+        // Configuring `[policy]` is the opt-in. With no section, an adapter
         // that classifies nothing is exactly as deployable as it is today.
         assert_eq!(
             tier_gate(None, NO_TIERS, Some(&unclassified_report())),

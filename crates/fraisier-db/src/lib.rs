@@ -15,6 +15,13 @@
 //! **no** connection string on argv; only non-secret values (the database name a
 //! `pg_restore` needs as its target) ever appear as arguments.
 
+pub mod readiness;
+pub mod restore;
+pub mod tviews;
+
+pub mod archive;
+pub mod retention;
+
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -276,16 +283,31 @@ pub fn backup_command(conn: &PgConn, out: &Path) -> Command {
 /// With `clean`, existing objects are dropped first (`--clean --if-exists`). The
 /// target database name (not a secret) is the only connection value on argv;
 /// everything else comes from [`PgConn::pg_env`].
+///
+/// `pg_restore` needs `-d` to restore into a database at all (without it, it
+/// prints a script), and libpq reads a `-d` holding `=` or a URI scheme as a
+/// whole conninfo string. So the name goes in as a quoted `dbname='…'` pair:
+/// always a name, and the `PG*` variables still supply everything else.
 #[must_use]
 pub fn restore_command(conn: &PgConn, archive: &Path, clean: bool) -> Command {
     let mut command = Command::new("pg_restore");
     command.envs(conn.pg_env());
-    command.arg("-w").arg("-d").arg(conn.database());
+    command
+        .arg("-w")
+        .arg("-d")
+        .arg(conninfo_dbname(conn.database()));
     if clean {
         command.arg("--clean").arg("--if-exists");
     }
     command.arg(archive);
     command
+}
+
+/// `name` as a libpq conninfo `dbname` pair, single-quoted with `\` and `'`
+/// escaped.
+fn conninfo_dbname(name: &str) -> String {
+    let escaped = name.replace('\\', r"\\").replace('\'', r"\'");
+    format!("dbname='{escaped}'")
 }
 
 /// Build a non-interactive `psql` command that runs `sql` with
@@ -333,6 +355,28 @@ pub fn create_database_command(maintenance: &PgConn, new_db: &str) -> Result<Com
     Ok(psql_command(
         maintenance,
         &format!("CREATE DATABASE \"{new_db}\""),
+    ))
+}
+
+/// Build a `psql` command that runs `CREATE DATABASE "<new_db>" OWNER "<owner>"`.
+///
+/// A privileged identity creates the database on behalf of the app role, which
+/// then owns it. The owner is quoted as an identifier, embedded quotes doubled.
+///
+/// # Errors
+/// [`DbError::InvalidDatabaseName`] if `new_db` is not a safe identifier.
+pub fn create_database_owned_command(
+    maintenance: &PgConn,
+    new_db: &str,
+    owner: &str,
+) -> Result<Command, DbError> {
+    validate_db_name(new_db)?;
+    Ok(psql_command(
+        maintenance,
+        &format!(
+            "CREATE DATABASE \"{new_db}\" OWNER \"{}\"",
+            owner.replace('"', "\"\"")
+        ),
     ))
 }
 
@@ -392,7 +436,26 @@ pub async fn run(command: Command) -> Result<Outcome, DbError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_database_command, drop_database_command, DbError, PgConn};
+    use super::{
+        create_database_command, create_database_owned_command, drop_database_command, DbError,
+        PgConn,
+    };
+
+    #[test]
+    fn an_owned_database_quotes_its_owner() {
+        let maintenance = PgConn::parse("postgres:///postgres?host=/run").expect("dsn");
+        let command =
+            create_database_owned_command(&maintenance, "shop_rh", "app\"x").expect("valid");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.contains(&"CREATE DATABASE \"shop_rh\" OWNER \"app\"\"x\"".to_owned()),
+            "{args:?}"
+        );
+        assert!(create_database_owned_command(&maintenance, "bad;name", "app").is_err());
+    }
     use std::ffi::OsString;
 
     fn env_of(conn: &PgConn) -> std::collections::BTreeMap<String, String> {
@@ -604,7 +667,7 @@ mod tests {
         let args = args_of(&plain);
         assert!(args.contains(&"-d".to_owned()), "target db flag: {args:?}");
         assert!(
-            args.contains(&"shop".to_owned()),
+            args.contains(&"dbname='shop'".to_owned()),
             "target db name: {args:?}"
         );
         assert!(
@@ -624,6 +687,21 @@ mod tests {
             args.contains(&"--if-exists".to_owned()),
             "if-exists: {args:?}"
         );
+    }
+
+    #[test]
+    fn a_database_name_shaped_like_conninfo_stays_a_name() {
+        // pg_restore hands `-d` to libpq as a conninfo string when it holds an
+        // `=` or starts with a URI scheme, which would override PGHOST & co.
+        let conn = PgConn::parse("postgresql://alice@db.example.com/host%3Devil%20it%27s%5C")
+            .expect("parses");
+        let args = args_of(&restore_command(&conn, Path::new("/b.pgdump"), false));
+        let target = args
+            .iter()
+            .skip_while(|arg| *arg != "-d")
+            .nth(1)
+            .expect("a -d value");
+        assert_eq!(target, r"dbname='host=evil it\'s\\'");
     }
 
     #[test]

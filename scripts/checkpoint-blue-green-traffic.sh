@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Blue-green TRAFFIC checkpoint — the phase-07 §7.5 traffic-tier gates, end-to-end
+# Blue-green TRAFFIC checkpoint — the blue-green traffic-tier gates, end-to-end
 # against a **real nginx** routing real HTTP between a blue and a green fleet.
 #
 # Drives the real `fraisier deploy` with `[deploy].strategy = "blue-green"` through the full flow and

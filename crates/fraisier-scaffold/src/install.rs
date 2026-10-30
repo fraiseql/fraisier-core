@@ -335,7 +335,7 @@ upstream = "checkout_upstream"
 
     /// A scheduled `backup` config (the safe value; needs no unattended opt-in).
     fn scheduled_files() -> Vec<crate::GeneratedFile> {
-        let toml = format!("{CFG}\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
+        let toml = format!("{CFG}\n[backup]\ndir = \"/var/backups/checkout\"\n\n[schedule]\ncalendar = \"daily 03:00\"\ncommand = \"backup\"\n");
         crate::generate_scheduled(
             &fraisier_config::DeployConfig::from_toml_str(&toml).expect("parse"),
         )
@@ -349,17 +349,24 @@ upstream = "checkout_upstream"
         let files = scheduled_files();
 
         // Nothing installed yet.
-        assert!(list_installed(root.path()).expect("list").is_empty());
+        assert_eq!(
+            list_installed(root.path()).expect("list"),
+            Vec::<std::path::PathBuf>::new()
+        );
 
         install(&files, root.path()).expect("install");
         let listed = list_installed(root.path()).expect("list");
-        assert_eq!(listed.len(), 2, "timer + service listed: {listed:?}");
+        assert_eq!(
+            listed.len(),
+            3,
+            "timer + service + alert listed: {listed:?}"
+        );
         assert!(listed
             .iter()
             .any(|p| p.to_string_lossy().ends_with("scheduled.timer")));
 
         let removed = uninstall(&files, root.path()).expect("uninstall");
-        assert_eq!(removed.len(), 2, "both removed: {removed:?}");
+        assert_eq!(removed.len(), 3, "all three removed: {removed:?}");
         assert!(
             list_installed(root.path()).expect("list").is_empty(),
             "systemd dir clean after uninstall"
@@ -412,11 +419,12 @@ upstream = "checkout_upstream"
         std::fs::write(&timer, "[Timer]\nOnCalendar=hourly\n").unwrap();
 
         let removed = uninstall(&files, root.path()).expect("uninstall");
-        // Only the (still-marker-bearing) service is removed; the de-marked timer stays.
+        // Only the (still-marker-bearing) service and alert are removed; the
+        // de-marked timer stays.
         assert_eq!(
             removed.len(),
-            1,
-            "only the marker file removed: {removed:?}"
+            2,
+            "only the marker files removed: {removed:?}"
         );
         assert!(timer.exists(), "the de-marked file is left untouched");
     }

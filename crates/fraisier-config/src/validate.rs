@@ -8,6 +8,7 @@
 //! deploy time, not config-load time.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use fraisier_core::adapter_axes::{RiskTier, Severity};
 use fraisier_core::policy::{PolicyAction, UnclassifiedAction};
@@ -132,6 +133,11 @@ impl DeployConfig {
         validate_lb(self, &mut report);
         validate_webhook(self, &mut report);
         validate_schedule(self, &mut report);
+        validate_notify(self, &mut report);
+        validate_database(self, &mut report);
+        validate_backup(self, &mut report);
+        validate_drill(self, &mut report);
+        validate_metrics(self, &mut report);
         validate_sync(self, &mut report);
         validate_blue_green(self, &mut report);
         validate_checks(self, &mut report);
@@ -144,13 +150,32 @@ impl DeployConfig {
     /// The `db migrate|backup|restore|reset` commands act on the database alone,
     /// so they require `[deploy]` (for the state-ledger identity) and
     /// `[migration]` (the adapter + DSN source), but **not** the
-    /// artifact/service/health/lb axes a full deploy needs. This is the same pure,
-    /// no-I/O check restricted to those two sections.
+    /// artifact/service/health/lb axes a full deploy needs. `db backup` writes
+    /// into `[backup].dir`, so `[backup]` is checked too. This is the same pure,
+    /// no-I/O check restricted to those sections.
     #[must_use]
     pub fn validate_db_ops(&self) -> ValidationReport {
         let mut report = ValidationReport::default();
         validate_deploy(self, &mut report);
         validate_migration(self, &mut report);
+        validate_metrics(self, &mut report);
+        validate_database(self, &mut report);
+        validate_backup(self, &mut report);
+        report
+    }
+
+    /// Validate only the sections a backup-corpus operation needs.
+    ///
+    /// `backup prune` touches files alone, so it requires `[deploy]` (the
+    /// identity whose deploy lock it honours) and `[backup]`, but neither a DSN
+    /// nor the deploy axes.
+    #[must_use]
+    pub fn validate_backup_ops(&self) -> ValidationReport {
+        let mut report = ValidationReport::default();
+        validate_deploy(self, &mut report);
+        validate_backup(self, &mut report);
+        validate_drill(self, &mut report);
+        validate_metrics(self, &mut report);
         report
     }
 
@@ -203,7 +228,7 @@ fn validate_checks(cfg: &DeployConfig, report: &mut ValidationReport) {
 /// Validate the `[policy]` section: the tier lists name real tiers, no tier is
 /// claimed by both, and the approval hook matches what the policy asks for.
 ///
-/// An absent section is not an error — it is the D6 opt-out, and the tier gate
+/// An absent section is not an error — the policy is opt-in, and the tier gate
 /// simply does not run.
 fn validate_policy(cfg: &DeployConfig, report: &mut ValidationReport) {
     let Some(policy) = &cfg.policy else {
@@ -412,6 +437,22 @@ fn validate_migration(cfg: &DeployConfig, report: &mut ValidationReport) {
              (the name of the env var holding the database DSN)",
         );
     }
+    // `none` declares a deployable that owns no database; a DSN or settings
+    // beside it contradict that.
+    if adapter == Some("none") {
+        if is_set(migration.database_url_env.as_ref()) {
+            report.error(
+                "migration.database_url_env",
+                "adapter = \"none\" declares no database; remove database_url_env",
+            );
+        }
+        if !migration.settings.is_empty() {
+            report.error(
+                "migration.settings",
+                "adapter = \"none\" takes no settings; remove [migration.settings]",
+            );
+        }
+    }
     if migration.forward_compatible_lint == Some(true) && adapter == Some("command") {
         report.warn(
             "migration.forward_compatible_lint",
@@ -428,6 +469,16 @@ fn validate_migration(cfg: &DeployConfig, report: &mut ValidationReport) {
             "migration.preflight_mode",
             "preflight_mode = \"restore_rehearsal\" requires the confiture adapter \
              (it rehearses a real Postgres restore + migrate on a throwaway database)",
+        );
+    }
+    if migration.effective_preflight_mode() == PreflightMode::RestoreRehearsal
+        && cfg.hosts.is_some()
+    {
+        report.warn(
+            "migration.preflight_mode",
+            "preflight_mode = \"restore_rehearsal\" runs only on a single-host deploy; \
+             with [hosts], the multi-host rollout lints live instead (pass --host to \
+             rehearse against one host)",
         );
     }
 }
@@ -509,6 +560,9 @@ fn validate_health(cfg: &DeployConfig, report: &mut ValidationReport) {
             );
         }
     }
+    if let Some(required) = &health.require_capabilities {
+        validate_require_capabilities(health.adapter.as_deref(), required, report);
+    }
     if let Some(provider) = &health.token_provider {
         // A token provider only makes sense injecting a header into the http probe.
         if health.adapter.as_deref() != Some("http") {
@@ -525,6 +579,38 @@ fn validate_health(cfg: &DeployConfig, report: &mut ValidationReport) {
             provider.validate_against_headers(health.headers.keys().map(String::as_str))
         {
             report.error("health.token_provider.header", error.to_string());
+        }
+    }
+}
+
+fn validate_require_capabilities(
+    adapter: Option<&str>,
+    required: &[String],
+    report: &mut ValidationReport,
+) {
+    const PATH: &str = "health.require_capabilities";
+    if adapter != Some("http") {
+        report.error(
+            PATH,
+            "require_capabilities applies only to the http adapter (it reads the \
+             /health body)",
+        );
+    }
+    if required.is_empty() {
+        report.error(
+            PATH,
+            "require_capabilities is empty; list a capability or remove the key",
+        );
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for name in required {
+        if name.trim().is_empty() {
+            report.error(PATH, "require_capabilities contains a blank name");
+        } else if !seen.insert(name.as_str()) {
+            report.error(
+                PATH,
+                format!("require_capabilities lists '{name}' more than once"),
+            );
         }
     }
 }
@@ -698,14 +784,452 @@ fn validate_schedule(cfg: &DeployConfig, report: &mut ValidationReport) {
                      (it removes the operator-is-watching protection by construction)",
                 );
             }
-            if !is_set(schedule.notify.as_ref()) {
+            if !is_set(cfg.notify.as_ref().and_then(|n| n.command.as_ref())) {
                 report.error(
-                    "schedule.notify",
-                    "an unattended scheduled deploy requires a `notify` failure sink",
+                    "notify.command",
+                    "an unattended scheduled deploy requires a failure sink: \
+                     set [notify].command",
                 );
             }
         }
         Some(_) => {}
+    }
+    if schedule.notify.is_some() {
+        report.error(
+            "schedule.notify",
+            "[schedule].notify moved to `[notify].command`, the one sink every \
+             unattended run reports to",
+        );
+    }
+}
+
+fn validate_notify(cfg: &DeployConfig, report: &mut ValidationReport) {
+    if let Some(notify) = &cfg.notify {
+        if !is_set(notify.command.as_ref()) {
+            report.error(
+                "notify.command",
+                "the [notify] section requires command (run via `sh -c` on each failure)",
+            );
+        }
+        return;
+    }
+    // A scheduled deploy without a sink is an error (`validate_schedule`). The
+    // other timers still run unattended, but their alert unit can only write a
+    // failure to the journal, so say so.
+    let mut unattended = Vec::new();
+    if cfg
+        .schedule
+        .as_ref()
+        .is_some_and(|schedule| schedule.command.as_deref() == Some("backup"))
+    {
+        unattended.push("the scheduled backup");
+    }
+    if cfg
+        .backup
+        .as_ref()
+        .is_some_and(|backup| !backup.retain.is_empty())
+    {
+        unattended.push("the prune");
+    }
+    if cfg
+        .drill
+        .as_ref()
+        .is_some_and(|drill| drill.schedule.is_some())
+    {
+        unattended.push("the drill");
+    }
+    if !unattended.is_empty() {
+        report.warn(
+            "notify.command",
+            format!(
+                "{} run{} unattended with no [notify].command, so a failure only reaches the \
+                 journal; set [notify].command to be told",
+                unattended.join(", "),
+                if unattended.len() == 1 { "s" } else { "" }
+            ),
+        );
+    }
+}
+
+fn validate_database(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(database) = cfg.database.as_ref() else {
+        return; // optional
+    };
+    validate_admin_identity(cfg, report);
+    validate_tviews_gate(database, report);
+    let Some(requires) = database.requires.as_ref() else {
+        return;
+    };
+    if requires.postgres_major.is_none() && requires.pg_tviews != Some(true) {
+        report.error(
+            "database.requires",
+            "[database.requires] declares nothing: set postgres_major and/or pg_tviews = true",
+        );
+    }
+    if let Some(major) = requires.postgres_major.filter(|major| *major < 10) {
+        report.error(
+            "database.requires.postgres_major",
+            format!("postgres_major = {major} is not a PostgreSQL major version fraisier checks (10 or later)"),
+        );
+    }
+    let has_dsn = cfg
+        .migration
+        .as_ref()
+        .is_some_and(|m| is_set(m.database_url_env.as_ref()));
+    if !has_dsn {
+        report.error(
+            "migration.database_url_env",
+            "[database.requires] is checked against the database, so it needs \
+             [migration].database_url_env (the env var holding the DSN)",
+        );
+    }
+}
+
+fn validate_admin_identity(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(admin) = cfg
+        .database
+        .as_ref()
+        .and_then(|d| d.admin_url_env.as_deref())
+    else {
+        return;
+    };
+    if admin.trim().is_empty() {
+        report.error(
+            "database.admin_url_env",
+            "admin_url_env names the env var holding the restore identity's DSN; \
+             it cannot be blank",
+        );
+        return;
+    }
+    let migration = cfg
+        .migration
+        .as_ref()
+        .and_then(|m| m.database_url_env.as_deref());
+    if migration == Some(admin) {
+        report.error(
+            "database.admin_url_env",
+            format!(
+                "admin_url_env is the migration DSN's env var ({admin}); the restore \
+                 identity must be a separate, superuser role, never the app's"
+            ),
+        );
+    }
+}
+
+/// The values `[database.tviews].on_empty` takes. There is no "off": the gate is
+/// declared by `[database.requires].pg_tviews`, and only that switches it.
+const ON_EMPTY: &[&str] = &["fail", "warn"];
+
+fn validate_tviews_gate(database: &crate::DatabaseSection, report: &mut ValidationReport) {
+    let Some(tviews) = database.tviews.as_ref() else {
+        return;
+    };
+    let declared = database
+        .requires
+        .as_ref()
+        .is_some_and(|requires| requires.pg_tviews == Some(true));
+    if !declared {
+        report.error(
+            "database.tviews",
+            "[database.tviews] tunes the empty-TVIEW gate, which only \
+             [database.requires].pg_tviews = true declares",
+        );
+    }
+    if let Some(value) = tviews.on_empty.as_deref() {
+        if !ON_EMPTY.contains(&value) {
+            report.error(
+                "database.tviews.on_empty",
+                format!(
+                    "on_empty = '{value}' is not one of: fail, warn (the gate cannot be \
+                     switched off while pg_tviews is declared)"
+                ),
+            );
+        }
+    }
+}
+
+fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let dir = cfg.backup.as_ref().and_then(|backup| backup.dir.as_deref());
+    let scheduled = cfg
+        .schedule
+        .as_ref()
+        .is_some_and(|schedule| schedule.command.as_deref() == Some("backup"));
+    match dir {
+        Some(dir) if !dir.is_absolute() => report.error(
+            "backup.dir",
+            format!(
+                "backup.dir must be an absolute path, not '{}' (a scheduled unit runs \
+                 from /, so a relative one moves with the working directory)",
+                dir.display()
+            ),
+        ),
+        Some(dir) if !is_plain_dir(dir) => report.error(
+            "backup.dir",
+            format!(
+                "backup.dir must be a path of letters, digits, '/', '.', '_' and '-' with \
+                 no '..', not {:?}: it is written into the scheduled units",
+                dir.to_string_lossy()
+            ),
+        ),
+        None if cfg.backup.is_some() => report.error(
+            "backup.dir",
+            "the [backup] section requires dir: the directory archives are written to, \
+             and the one every [[backup.retain]].dir must be within",
+        ),
+        None if scheduled => report.error(
+            "backup.dir",
+            "a scheduled backup requires [backup].dir: without it every run writes the \
+             same file and fails from the second run on",
+        ),
+        _ => {}
+    }
+    let retain = cfg
+        .backup
+        .as_ref()
+        .map_or(&[][..], |backup| &backup.retain[..]);
+    let mut names: Vec<(String, usize)> = Vec::new();
+    for (index, entry) in retain.iter().enumerate() {
+        validate_retain_entry(entry, dir, &format!("backup.retain[{index}]"), report);
+        let Some(name) = entry.name() else {
+            report.error(
+                &format!("backup.retain[{index}].name"),
+                "a retain entry needs a name for its systemd units: set `name` (its dir \
+                 has no last component to take one from)",
+            );
+            continue;
+        };
+        if !is_unit_word(&name) {
+            report.error(
+                &format!("backup.retain[{index}].name"),
+                format!(
+                    "retain entry name '{name}' names its systemd units, so it may hold \
+                     only letters, digits, '_', '.' and '-', and not start with '-'"
+                ),
+            );
+        }
+        if let Some((_, first)) = names.iter().find(|(seen, _)| *seen == name) {
+            report.error(
+                &format!("backup.retain[{index}].name"),
+                format!(
+                    "retain entry name '{name}' is already used by backup.retain[{first}]; \
+                     set a distinct `name` on one of them"
+                ),
+            );
+        } else {
+            names.push((name, index));
+        }
+    }
+}
+
+/// Whether `word` is safe as part of a systemd unit name and as an
+/// `ExecStart=` argument: letters, digits, `_`, `.` and `-`, not starting with
+/// `-`.
+#[must_use]
+pub fn is_unit_word(word: &str) -> bool {
+    !word.is_empty()
+        && !word.starts_with('-')
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+fn validate_drill(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(drill) = cfg.drill.as_ref() else {
+        return;
+    };
+    if cfg
+        .backup
+        .as_ref()
+        .and_then(|backup| backup.dir.as_ref())
+        .is_none()
+    {
+        report.error(
+            "drill",
+            "a [drill] restores the newest archive in [backup].dir, so it requires \
+             [backup].dir",
+        );
+    }
+    if let Some(spec) = drill.schedule.as_deref() {
+        if let Err(message) = crate::calendar::to_on_calendar(spec) {
+            report.error("drill.schedule", message);
+        }
+    }
+    if drill.max_age_hours == Some(0) {
+        report.error("drill.max_age_hours", "max_age_hours must be at least 1");
+    }
+    if drill.min_tables == Some(0) {
+        report.error(
+            "drill.min_tables",
+            "min_tables must be at least 1 (omit it for no table check)",
+        );
+    }
+    if let Some(dir) = drill.data_dir.as_deref() {
+        if !dir.is_absolute() {
+            report.error(
+                "drill.data_dir",
+                format!("data_dir must be an absolute path, not '{}'", dir.display()),
+            );
+        }
+    }
+}
+
+fn validate_metrics(cfg: &DeployConfig, report: &mut ValidationReport) {
+    let Some(metrics) = cfg.metrics.as_ref() else {
+        return;
+    };
+    match metrics.textfile_dir.as_deref() {
+        None => report.error(
+            "metrics.textfile_dir",
+            "a [metrics] section needs textfile_dir: the directory node_exporter's textfile \
+             collector reads",
+        ),
+        Some(dir) if !dir.is_absolute() => report.error(
+            "metrics.textfile_dir",
+            format!(
+                "textfile_dir must be an absolute path, not '{}'",
+                dir.display()
+            ),
+        ),
+        Some(_) => {}
+    }
+}
+
+/// A character a value interpolated into a systemd unit or an argv may carry.
+///
+/// Whitespace, `%` (a unit specifier), `$`, `;`, quotes and newlines all change
+/// what a unit line means, so none is allowed.
+const fn is_plain(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
+}
+
+/// Whether `dir` is made of [`is_plain`] characters and has no `..` component.
+fn is_plain_dir(dir: &Path) -> bool {
+    dir.to_string_lossy().bytes().all(is_plain)
+        && !dir
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+}
+
+/// A retain entry's `dir`: absolute, plain, and `backup_dir` or below it.
+///
+/// `starts_with` compares whole components, so `/srv/backups2` is not below
+/// `/srv/backups`.
+fn validate_retain_dir(
+    dir: Option<&Path>,
+    backup_dir: Option<&Path>,
+    at: &str,
+    report: &mut ValidationReport,
+) {
+    match dir {
+        None => report.error(&format!("{at}.dir"), "a retain entry requires dir"),
+        Some(dir) => {
+            let text = dir.to_string_lossy();
+            if !dir.is_absolute() || !is_plain_dir(dir) {
+                report.error(
+                    &format!("{at}.dir"),
+                    format!(
+                        "dir must be an absolute path of letters, digits, '/', '.', '_' and \
+                         '-' with no '..', not {text:?}"
+                    ),
+                );
+            } else if let Some(backup_dir) = backup_dir.filter(|base| !dir.starts_with(base)) {
+                report.error(
+                    &format!("{at}.dir"),
+                    format!(
+                        "dir must be [backup].dir ({}) or a directory below it, not {text:?}: \
+                         a prune removes old files, so it may only reach the archives",
+                        backup_dir.display()
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// A retain entry's `match`: a file-name glob that can only select archives.
+fn validate_retain_match(pattern: &str, at: &str, report: &mut ValidationReport) {
+    let pattern_ok = !pattern.is_empty()
+        && pattern != "."
+        && pattern != ".."
+        && pattern
+            .bytes()
+            .all(|byte| is_plain(byte) && byte != b'/' || matches!(byte, b'*' | b'?'));
+    let suffix = crate::RetainEntry::DEFAULT_PATTERN.trim_start_matches('*');
+    if !pattern_ok {
+        report.error(
+            &format!("{at}.match"),
+            format!(
+                "match must be a file-name glob within dir (letters, digits, '.', '_', '-', \
+                 '*', '?'; no '/'), not {pattern:?}"
+            ),
+        );
+    } else if !pattern.ends_with(suffix) {
+        report.error(
+            &format!("{at}.match"),
+            format!(
+                "match must end in the archive suffix '{suffix}', not {pattern:?}: a prune \
+                 removes every old file the glob selects"
+            ),
+        );
+    }
+}
+
+/// Validate one `[[backup.retain]]` entry.
+///
+/// `backup prune --apply` removes every old file the entry selects, so the
+/// entry may select archives only: its `dir` must be `backup_dir` or below it,
+/// and its `match` must end in the archive suffix.
+fn validate_retain_entry(
+    entry: &crate::RetainEntry,
+    backup_dir: Option<&Path>,
+    at: &str,
+    report: &mut ValidationReport,
+) {
+    validate_retain_dir(entry.dir.as_deref(), backup_dir, at, report);
+    match entry.schedule.as_deref() {
+        None => report.error(
+            &format!("{at}.schedule"),
+            "a retain entry requires schedule (for example \"daily 05:30\")",
+        ),
+        Some(spec) => {
+            if let Err(message) = crate::calendar::to_on_calendar(spec) {
+                report.error(&format!("{at}.schedule"), message);
+            }
+        }
+    }
+    match entry.retention_days {
+        None => report.error(
+            &format!("{at}.retention_days"),
+            "a retain entry requires retention_days",
+        ),
+        Some(0) => report.error(
+            &format!("{at}.retention_days"),
+            "retention_days must be at least 1",
+        ),
+        Some(_) => {}
+    }
+    match entry.keep_last {
+        Some(0) => report.error(
+            &format!("{at}.keep_last"),
+            "keep_last must be at least 1: the newest archive is the restore point",
+        ),
+        Some(keep_last) if keep_last < entry.keep_minimum() => report.error(
+            &format!("{at}.keep_last"),
+            format!(
+                "keep_last = {keep_last} is below keep_minimum = {}: a corpus cannot hold at \
+                 least {} and at most {keep_last} archives",
+                entry.keep_minimum(),
+                entry.keep_minimum()
+            ),
+        ),
+        _ => {}
+    }
+    validate_retain_match(entry.pattern(), at, report);
+    if entry.min_free_gb == Some(0) {
+        report.error(
+            &format!("{at}.min_free_gb"),
+            "min_free_gb must be at least 1 (omit it for no threshold)",
+        );
     }
 }
 

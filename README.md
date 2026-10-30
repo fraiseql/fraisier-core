@@ -16,7 +16,7 @@ It ships three ways:
   workflows over the same engine),
 - an **adapter protocol** you can implement in any language over JSON-RPC.
 
-> **Status: pre-release (`1.0.0-beta.1`).** The engine and adapter contracts are
+> **Status: pre-release (the `1.0.0` betas).** The engine and adapter contracts are
 > frozen for v1.0 and exercised end-to-end against real infrastructure (real
 > Postgres + confiture, real systemd, real nginx, real multi-host over SSH).
 
@@ -70,6 +70,23 @@ fraisier init
 # 2. edit fraisier.toml, then deploy
 CHECKOUT_DATABASE_URL=postgres://… fraisier deploy --app-version 1.4.2
 ```
+
+### Prebuilt binaries
+
+Each `fraisier-v*` release carries a binary per target
+(`fraisier-<target>.tar.gz`: Linux `x86_64`/`aarch64` gnu with a glibc 2.28 floor,
+static `x86_64` musl, and macOS), a CycloneDX SBOM per target
+(`fraisier-<target>.cdx.json`), and a `SHA256SUMS` file covering all of them.
+Check a download against it before installing:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+That proves the files are the ones the release lists. It does not prove who
+published the release, because the checksums come from the same place as the
+binaries. [docs/security.md](docs/security.md#offline-install) covers installing
+on a host with no network access.
 
 A minimal `fraisier.toml`:
 
@@ -201,7 +218,13 @@ webhook-server    Run the signed-webhook deploy trigger (socket-activated/standa
 scheduled         Manage scheduled fraisier runs via systemd timers
 self-upgrade      Coordinated management of fraisier's own service
 sync              Share the deploy ledger across operators over git refs (experimental)
-backup / db       Database lifecycle: backup, migrate, restore, reset
+backup            Back up the database; `backup prune` applies retention,
+                  `backup drill` proves the newest archive restores
+db                Database lifecycle: migrate, restore, reset, `tviews rebuild`
+stack             Deploy or report a stack: subgraphs, router and databases
+notify            Send a failed scheduled run's record through [notify].command
+doctor            Diagnose the install: config, secrets, toolchain, database
+env-check         Report which env vars a subcommand would read, and which are unset
 providers         List the adapters available to this binary, per axis
 provider-test     Probe one provider (IPC handshake or built-in presence)
 check             Run the project's [[checks]] with cross-check parallelism (-j)
@@ -235,6 +258,14 @@ printed, and the full stdout+stderr is written to a `0o600` log under
 is named in the report, so nothing is lost. Small failures print whole. The
 `--json` report always carries the full output regardless.
 
+### Deploying FraiseQL
+
+fraisier is proven against FraiseQL **2.18.0**, pinned in
+[`tools/fraiseql-version`](tools/fraiseql-version). On 2.18, `/health` answers 200
+even when a configured capability failed to start. See
+[`docs/fraiseql.md`](docs/fraiseql.md) for the supported versions, the
+migrate-then-restart order, and what the health check does and does not prove.
+
 ### Perf-regression rollback gate
 
 The `command` health adapter turns the saga's post-deploy `health` step into an
@@ -243,7 +274,7 @@ arbitrary gate: it runs a configured shell command, passes iff the command exits
 FraiseQL's `fraiseql perf regression-scan --fail-on-regression --json` — a deploy
 that makes a database mutation slower rolls back automatically, naming the
 regressed operation (`perf regression: order/UPDATE p50 +42% (12ms→17ms)`) in the
-rollback reason and the `[schedule].notify` webhook. The DSN reaches the scan by
+rollback reason and the `[notify].command` webhook. The DSN reaches the scan by
 environment, never argv. See [`docs/perf-regression-gate.md`](docs/perf-regression-gate.md).
 
 ### Schema risk policy gate
@@ -268,7 +299,10 @@ hook that fails, times out, or cannot be spawned is a **refusal**. Blue-green's
 window-safety rule applies with or without the section.
 
 With the confiture adapter this needs **confiture ≥ 0.44.0** — the same floor as
-the `window_safe` verdict above, because both rest on the same classifier.
+the `window_safe` verdict above, because both rest on the same classifier — and
+**confiture ≥ 1.35.0** for the gate to judge only the migrations a deploy will
+apply. Below 1.35.0 it judges applied ones too, so one approved `DROP COLUMN`
+refuses every later deploy.
 Below it fraisier withholds the capability, so a `[policy]` section classifies
 nothing and refuses everything; `fraisier doctor` reports the installed version
 against the floor. One case survives the upgrade by design: an
@@ -283,11 +317,67 @@ that cannot see the schema says so (*"Risk is unknown, not zero"*) instead of
 printing as though it were clean. See
 [`docs/schema-risk-policy.md`](docs/schema-risk-policy.md).
 
+## Backups, retention and drills
+
+With `[backup].dir` set, `fraisier backup` writes a new timestamped archive on
+every run and renames it into place only after `pg_restore --list` reads it
+back. `[[backup.retain]]` policies decide what `fraisier backup prune` removes:
+a dry run unless `--apply`, and never below the policy's floor.
+`fraisier backup drill` restores the newest archive into a throwaway database,
+migrates it forward, checks it, and drops it, because an archive that has never
+been restored is not yet a backup.
+
+`fraisier scheduled install` turns backups, prunes and drills into systemd
+timers. Each failed run notifies once, through `[notify].command`, with
+credentials stripped from the reason. See [`docs/backups.md`](docs/backups.md).
+
+## Database readiness: PostgreSQL 18 and pg_tviews
+
+A deployable can declare what its database server must offer:
+
+```toml
+[database.requires]
+postgres_major = 18   # PostgreSQL 18.x or later
+pg_tviews = true      # preloaded, installed, and on read contract 2
+```
+
+Every deploy checks this first in preflight, before any mutation, and
+`fraisier doctor` reports it. With `pg_tviews = true`, a TVIEW that is empty
+while its backing view has rows refuses the deploy (`[database.tviews]
+on_empty`), and `fraisier db tviews rebuild` repopulates it. An optional
+`[database].admin_url_env` names a superuser identity. Once it is set, every
+operator-triggered restore runs as that identity (`db restore`, drills, and the
+restore rehearsal of a deploy you start yourself), and so does `db tviews
+rebuild`; migrations and health checks stay on the app role. A
+webhook-triggered deploy never reads it.
+fraisier never installs PostgreSQL or an extension;
+[`scripts/provision-pg18-tviews.sh`](scripts/provision-pg18-tviews.sh) gets a
+Debian host ready. See
+[`docs/database-requirements.md`](docs/database-requirements.md).
+
+## Stacks
+
+A stack is one environment's federated application: the subgraphs, the router
+in front of them, and their databases. A `stack.<env>.toml` references each
+member's own `fraisier.toml`. `fraisier stack deploy` deploys the members in
+dependency order and stops at the first failure; `fraisier stack status`
+reports them as one. With `[stack].router`, each subgraph's live SDL is checked
+against the router's candidate release before the router deploys. See
+[`docs/stacks.md`](docs/stacks.md).
+
 ## Observability
 
 Every saga step is both persisted (via the state store) and exported as an
 OpenTelemetry span, so a tracing backend reconstructs exactly what happened —
 including which step failed and which compensations ran.
+
+With `[metrics].textfile_dir` set, deploy, backup and backup drill each write a
+Prometheus textfile of gauges describing their last run, for node_exporter's
+textfile collector. See [`docs/metrics.md`](docs/metrics.md).
+
+A failed deploy, and a failed scheduled backup, prune or drill, runs
+`[notify].command` once, with a structured payload whose reason has its
+credentials stripped.
 
 ## Security model
 

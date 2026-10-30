@@ -12,14 +12,21 @@
 // a public API that a binary crate does not actually expose.
 #![allow(clippy::redundant_pub_crate)]
 
+mod alert;
 mod approval;
 mod commands;
 mod doctor;
 #[cfg(test)]
 mod e2e;
 mod factory;
+mod failure_record;
+mod metrics;
+mod pg_readiness;
 mod pg_rehearsal;
 mod preview;
+mod stack;
+mod stack_sdl;
+mod stack_status;
 #[cfg(test)]
 mod test_env;
 
@@ -90,12 +97,21 @@ enum Command {
     /// Share the deploy ledger across operators over git refs (experimental).
     Sync(SyncArgs),
 
-    /// Back up the database to a custom-format archive (`pg_dump -Fc`).
-    Backup(BackupArgs),
+    /// Back up the database to a custom-format archive (`pg_dump -Fc`), or prune
+    /// archives by their `[[backup.retain]]` policy (`backup prune`).
+    Backup(BackupCli),
 
     /// Database lifecycle operations (migrate / restore / reset).
     #[command(subcommand)]
     Db(DbCommand),
+
+    /// A stack: one environment's deployables, deployed in dependency order.
+    #[command(subcommand)]
+    Stack(StackCommand),
+
+    /// Report a failed scheduled backup, prune or drill through
+    /// `[notify].command`: the body of the `OnFailure=` alert unit.
+    Notify(NotifyArgs),
 
     /// List the adapters available to this binary, per axis (built-in + IPC).
     Providers,
@@ -315,6 +331,10 @@ struct InitArgs {
     force: bool,
 }
 
+// Reason: independent deploy flags (--dry-run / --skip-preflight /
+// --fail-on-block / --deep); clap reads them as switches, and `deploy` takes
+// the dry-run pair as one `Option<Depth>`.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Args)]
 struct DeployArgs {
     /// Path to the `fraisier.toml`.
@@ -349,6 +369,12 @@ struct DeployArgs {
     /// real deploy, which a policy block fails outright.
     #[arg(long)]
     fail_on_block: bool,
+
+    /// With `--dry-run` under a fresh-dump restore rehearsal, classify against a
+    /// throwaway restored from a fresh dump of the live database, as the deploy
+    /// will. Without it the dry run classifies statically and dumps nothing.
+    #[arg(long, requires = "dry_run")]
+    deep: bool,
 }
 
 #[derive(Debug, Args)]
@@ -429,6 +455,73 @@ enum DbCommand {
 
     /// Drop every user schema and re-apply migrations from scratch.
     Reset(DbResetArgs),
+
+    /// pg_tviews maintenance.
+    #[command(subcommand)]
+    Tviews(DbTviewsCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum StackCommand {
+    /// Deploy every member in dependency order, stopping at the first failure.
+    Deploy(StackDeployArgs),
+    /// Each member's health, version and last deploy, and each database's
+    /// readiness. Exits non-zero when anything is unhealthy.
+    Status(StackStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct StackStatusArgs {
+    /// Path to the stack file (`stack.<env>.toml`).
+    #[arg(long)]
+    stack: PathBuf,
+
+    /// The state store directory every member shares.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct StackDeployArgs {
+    /// Path to the stack file (`stack.<env>.toml`).
+    #[arg(long)]
+    stack: PathBuf,
+
+    /// The state store directory every member shares.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+
+    /// A member's version, as `<member>=<version>`. Repeatable; a member without
+    /// one deploys as `fraisier deploy` would without `--app-version`.
+    #[arg(long, value_name = "MEMBER=VERSION")]
+    app_version: Vec<String>,
+
+    /// Plan each member's deploy without executing it.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Skip each member's migration preflight.
+    #[arg(long)]
+    skip_preflight: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum DbTviewsCommand {
+    /// Refill TVIEWs from their backing views: the empty UNLOGGED ones a
+    /// restore, crash or failover reset, or with `--all` every TVIEW.
+    Rebuild(DbTviewsRebuildArgs),
+}
+
+#[derive(Debug, Args)]
+struct DbTviewsRebuildArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// Rebuild every TVIEW, not only the empty UNLOGGED ones (needed for a
+    /// LOGGED TVIEW or one emptied by hand).
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Debug, Args)]
@@ -474,18 +567,100 @@ struct BootstrapArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct BackupCli {
+    #[command(subcommand)]
+    command: Option<BackupCommand>,
+
+    #[command(flatten)]
+    backup: BackupArgs,
+}
+
+#[derive(Debug, Subcommand)]
+enum BackupCommand {
+    /// Remove archives by each `[[backup.retain]]` policy. A dry run unless
+    /// `--apply` is given.
+    Prune(BackupPruneArgs),
+    /// Restore the newest archive into a throwaway database, migrate it, check
+    /// it, and drop it.
+    Drill(BackupDrillArgs),
+}
+
+#[derive(Debug, Args)]
+struct BackupDrillArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// The state store directory; the drill's receipt goes in its `drills/`.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+
+    /// Run by a systemd unit: on failure, leave a redacted record for the
+    /// unit's `OnFailure=` alert, keyed by `$INVOCATION_ID`. The value is the
+    /// unit's name (`%n`).
+    #[arg(long, value_name = "UNIT")]
+    failure_record: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct BackupPruneArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// The state store directory, whose deploy lock a prune honours.
+    #[arg(long, default_value = ".fraisier/state")]
+    state_dir: PathBuf,
+
+    /// Prune only the retain entry with this name.
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Remove the archives the policy selects. Without it, only list them.
+    #[arg(long)]
+    apply: bool,
+
+    /// Run by a systemd unit: on failure, leave a redacted record for the
+    /// unit's `OnFailure=` alert, keyed by `$INVOCATION_ID`. The value is the
+    /// unit's name (`%n`).
+    #[arg(long, value_name = "UNIT")]
+    failure_record: Option<String>,
+}
+
+#[derive(Debug, Args)]
 struct BackupArgs {
     /// Path to the `fraisier.toml`.
     #[arg(long, default_value = "fraisier.toml")]
     config: PathBuf,
 
-    /// Where to write the archive (defaults to `<fraise>-<environment>.pgdump`).
+    /// Where to write the archive. Without it, a new timestamped archive goes into
+    /// `[backup].dir` when that is set, and `<fraise>-<environment>.pgdump`
+    /// otherwise.
     #[arg(long)]
     output: Option<PathBuf>,
 
-    /// Overwrite the output file if it already exists.
+    /// Overwrite the output file if it already exists. Archives in `[backup].dir`
+    /// are never overwritten.
     #[arg(long)]
     force: bool,
+
+    /// Run by a systemd unit: on failure, leave a redacted record for the
+    /// unit's `OnFailure=` alert, keyed by `$INVOCATION_ID`. The value is the
+    /// unit's name (`%n`).
+    #[arg(long, value_name = "UNIT")]
+    failure_record: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct NotifyArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
+
+    /// The failed unit (the alert unit's `%i`).
+    #[arg(long)]
+    unit: String,
 }
 
 #[derive(Debug, Args)]
@@ -719,7 +894,11 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
                 &args.state_dir,
                 args.host.as_deref(),
                 args.app_version.as_deref(),
-                args.dry_run,
+                args.dry_run.then_some(if args.deep {
+                    preview::Depth::Deep
+                } else {
+                    preview::Depth::Static
+                }),
                 args.skip_preflight,
                 args.fail_on_block,
             )
@@ -749,8 +928,57 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::WebhookServer(args) => {
             commands::webhook_server(&args.config, &args.state_dir, args.listen.as_deref()).await
         }
-        Command::Backup(args) => {
-            commands::db_backup(&args.config, args.output.as_deref(), args.force).await
+        Command::Backup(BackupCli {
+            command: Some(BackupCommand::Prune(args)),
+            ..
+        }) => {
+            let outcome = async {
+                let run = commands::backup_prune(
+                    &args.config,
+                    &args.state_dir,
+                    args.name.as_deref(),
+                    args.apply,
+                )
+                .await?;
+                for warning in &run.warnings {
+                    eprintln!("warning: {}", fraisier_saga::redact::credentials(warning));
+                }
+                Ok(run.output)
+            }
+            .await;
+            recorded(
+                outcome,
+                &args.config,
+                alert::ScheduledRun::Prune,
+                args.failure_record.as_deref(),
+            )
+        }
+        Command::Backup(BackupCli {
+            command: Some(BackupCommand::Drill(args)),
+            ..
+        }) => recorded(
+            commands::backup_drill(&args.config, &args.state_dir).await,
+            &args.config,
+            alert::ScheduledRun::Drill,
+            args.failure_record.as_deref(),
+        ),
+        Command::Backup(BackupCli {
+            command: None,
+            backup: args,
+        }) => recorded(
+            commands::db_backup(&args.config, args.output.as_deref(), args.force).await,
+            &args.config,
+            alert::ScheduledRun::Backup,
+            args.failure_record.as_deref(),
+        ),
+        Command::Notify(args) => {
+            alert::notify(
+                &args.config,
+                &args.unit,
+                std::env::var("MONITOR_INVOCATION_ID").ok().as_deref(),
+                &failure_record::dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref()),
+            )
+            .await
         }
         Command::Db(DbCommand::Migrate(args)) => {
             commands::db_migrate(&args.config, &args.state_dir).await
@@ -758,8 +986,32 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::Db(DbCommand::Restore(args)) => {
             commands::db_restore(&args.config, &args.input, args.yes).await
         }
+        Command::Db(DbCommand::Tviews(DbTviewsCommand::Rebuild(args))) => {
+            commands::db_tviews_rebuild(&args.config, args.all).await
+        }
         Command::Db(DbCommand::Reset(args)) => {
             commands::db_reset(&args.config, &args.state_dir, args.yes).await
+        }
+        Command::Stack(StackCommand::Deploy(args)) => {
+            stack::stack_deploy(
+                &args.stack,
+                &args.app_version,
+                &stack::Deployer {
+                    state_dir: args.state_dir.clone(),
+                    dry_run: args.dry_run,
+                    skip_preflight: args.skip_preflight,
+                },
+            )
+            .await
+        }
+        Command::Stack(StackCommand::Status(args)) => {
+            stack_status::stack_status(
+                &args.stack,
+                &stack_status::LiveProbe {
+                    state_dir: args.state_dir.clone(),
+                },
+            )
+            .await
         }
         Command::Providers => Ok(commands::providers()),
         Command::ProviderTest(args) => commands::provider_test(&args.name).await,
@@ -817,7 +1069,7 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         Command::ScaffoldInstall(args) => {
             commands::scaffold_install(&args.config, &args.root, args.prune, args.yes, args.dry_run)
         }
-        Command::Doctor(args) => Ok(doctor::doctor(&args.config, &args.checks)),
+        Command::Doctor(args) => Ok(doctor::doctor(&args.config, &args.checks).await),
         Command::EnvCheck(args) => Ok(doctor::env_check(&args.config, &args.subcommand)),
     }
 }
@@ -918,6 +1170,26 @@ fn render(output: CommandOutput, json: bool, verbose: u8) {
 /// Anyhow contexts wrap adapter errors (`"applying migrations"` over an
 /// `AdapterError`, say), so this line carries adapter text and is redacted for the
 /// same reason [`rendered`] is.
+/// Leave the failure record a `--failure-record` run asks for, then hand the
+/// outcome back unchanged: recording never alters what the run reports.
+fn recorded(
+    outcome: Result<CommandOutput>,
+    config: &std::path::Path,
+    run: alert::ScheduledRun,
+    unit: Option<&str>,
+) -> Result<CommandOutput> {
+    if let Some(unit) = unit {
+        let dir = failure_record::dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref());
+        let invocation_id = std::env::var("INVOCATION_ID").ok();
+        if let Err(warning) =
+            alert::record_failure(config, run, unit, &outcome, invocation_id.as_deref(), &dir)
+        {
+            eprintln!("warning: {warning}");
+        }
+    }
+    outcome
+}
+
 fn error_line(error: &anyhow::Error) -> String {
     format!("error: {}", commands::error_detail(error))
 }
@@ -1012,6 +1284,30 @@ mod cli_tests {
     }
 
     #[test]
+    fn backup_still_parses_alone_and_prune_is_its_subcommand() {
+        assert!(Cli::try_parse_from(["fraisier", "backup"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["fraisier", "backup", "--output", "x.pgdump", "--force"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["fraisier", "backup", "prune"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "fraisier",
+            "backup",
+            "prune",
+            "--apply",
+            "--name",
+            "nightly",
+            "--config",
+            "f.toml",
+            "--state-dir",
+            "/s"
+        ])
+        .is_ok());
+        // `--output` belongs to taking a backup, not to pruning.
+        assert!(Cli::try_parse_from(["fraisier", "backup", "prune", "--output", "x"]).is_err());
+    }
+
+    #[test]
     fn ship_no_bump_parses_without_a_level() {
         assert!(Cli::try_parse_from(["fraisier", "ship", "--no-bump"]).is_ok());
     }
@@ -1032,6 +1328,19 @@ mod cli_tests {
     fn deploy_accepts_fail_on_block_beside_dry_run() {
         assert!(
             Cli::try_parse_from(["fraisier", "deploy", "--dry-run", "--fail-on-block"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn deploy_accepts_deep_beside_dry_run() {
+        assert!(Cli::try_parse_from(["fraisier", "deploy", "--dry-run", "--deep"]).is_ok());
+    }
+
+    #[test]
+    fn deploy_refuses_deep_without_dry_run() {
+        assert!(
+            Cli::try_parse_from(["fraisier", "deploy", "--deep"]).is_err(),
+            "a real deploy always classifies the way its config says"
         );
     }
 

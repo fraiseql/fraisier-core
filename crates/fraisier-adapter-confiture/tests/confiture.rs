@@ -36,7 +36,7 @@ async fn describe_reports_version_and_capabilities() {
 
     assert_eq!(desc.name, "confiture");
     assert_eq!(desc.protocol_version, 1);
-    assert!(!desc.version.is_empty());
+    assert_ne!(desc.version, "");
     // The forward-compat lint capability must be advertised so the deploy layer
     // knows it can call preflight.
     assert!(
@@ -370,10 +370,12 @@ fn fake_confiture_program_reporting(version: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).expect("mkdir fake bin dir");
     std::fs::write(dir.join("version"), version).expect("write fake version");
     let script = dir.join("confiture");
-    // Answers `--version` from the file beside it, and otherwise copies
-    // ./payload.json to the path following `--output` and exits with
-    // ./exit_code — both read from the per-call working directory the adapter
-    // sets, which is how each test supplies its own scenario.
+    // Answers `--version` from the file beside it, and otherwise records its
+    // argv in ./argv, copies ./payload.json — or ./payload.<scope>.json when it
+    // was given `--scope <scope>` and that file exists — to the path following
+    // `--output`, and exits with ./exit_code. All of them live in the per-call
+    // working directory the adapter sets, which is how each test supplies its
+    // own scenario.
     std::fs::write(
         &script,
         "#!/bin/sh\n\
@@ -383,12 +385,17 @@ fn fake_confiture_program_reporting(version: &str) -> std::path::PathBuf {
          \x20       exit 0\n\
          \x20   fi\n\
          done\n\
+         printf '%s\\n' \"$@\" > argv\n\
          out=\"\"\n\
+         scope=\"\"\n\
          while [ $# -gt 0 ]; do\n\
          \x20   [ \"$1\" = \"--output\" ] && out=\"$2\"\n\
+         \x20   [ \"$1\" = \"--scope\" ] && scope=\"$2\"\n\
          \x20   shift\n\
          done\n\
-         [ -n \"$out\" ] && cat payload.json > \"$out\"\n\
+         payload=payload.json\n\
+         [ -n \"$scope\" ] && [ -f \"payload.$scope.json\" ] && payload=\"payload.$scope.json\"\n\
+         [ -n \"$out\" ] && cat \"$payload\" > \"$out\"\n\
          exit \"$(cat exit_code)\"\n",
     )
     .expect("write fake confiture");
@@ -444,6 +451,23 @@ impl FakeConfiture {
     fn without_payload(self) -> Self {
         std::fs::remove_file(self.dir.join("payload.json")).expect("drop the payload");
         self
+    }
+
+    /// The scenario that emits `payload` instead when it is given
+    /// `--scope <scope>`, as a confiture that knows the flag does.
+    fn with_scoped_payload(self, scope: &str, payload: &str) -> Self {
+        std::fs::write(self.dir.join(format!("payload.{scope}.json")), payload)
+            .expect("write scoped payload");
+        self
+    }
+
+    /// The arguments of the last non-`--version` call, one per element.
+    fn argv(&self) -> Vec<String> {
+        std::fs::read_to_string(self.dir.join("argv"))
+            .expect("the fake recorded its argv")
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     /// An adapter pointed at the shared fake. The scenario travels in the
@@ -1139,4 +1163,130 @@ async fn a_genuine_config_error_stays_an_invalid_config_error() {
         .expect_err("up must fail when Confiture has no usable DSN");
 
     assert_eq!(err.kind, AdapterErrorKind::InvalidConfig);
+}
+
+/// What confiture 1.35.0 emitted with no `--scope`: the applied `DROP COLUMN`
+/// is in the change-set. See `fixtures/scope/README.md`.
+#[cfg(unix)]
+const SCOPE_ALL: &str = include_str!("fixtures/scope/all-1.35.0.json");
+
+/// The same database under `--scope pending`: only the pending `ADD COLUMN`.
+#[cfg(unix)]
+const SCOPE_PENDING: &str = include_str!("fixtures/scope/pending-1.35.0.json");
+
+/// The release the scope captures came from, and the first that accepts
+/// `--scope`.
+#[cfg(unix)]
+const SCOPE_CAPTURED_FROM: &str = "1.35.0";
+
+/// The scenario that motivates judging only pending migrations: one applied,
+/// `irreversible` migration and one pending, `additive` one, under the default
+/// policy. The deploy applies only the additive one, so it is admitted.
+///
+/// Judging every migration instead would refuse every deploy after the first
+/// destructive one, for a change that has already happened.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_applied_irreversible_migration_does_not_gate_a_pending_additive_one() {
+    let fake = FakeConfiture::new("scope-pending", SCOPE_ALL, 0)
+        .with_scoped_payload("pending", SCOPE_PENDING);
+    let inspection = policy::inspect(
+        &FakeConfiture::adapter_reporting(SCOPE_CAPTURED_FROM),
+        &fake.ctx(),
+    )
+    .await
+    .expect("1.35.0 describes and preflights");
+
+    let decision = policy::evaluate(
+        Some(&policy::Policy::default()),
+        policy::Baseline::None,
+        inspection.capabilities,
+        inspection.report.as_ref(),
+    );
+
+    assert!(
+        matches!(decision, PolicyDecision::Allow { .. }),
+        "only the pending additive change is judged: {decision:?}"
+    );
+}
+
+/// The same scenario under blue-green's baseline: the applied `DROP COLUMN` no
+/// longer withholds the window-safety certificate from a pending `ADD COLUMN`.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_applied_drop_does_not_uncertify_the_blue_green_window() {
+    let fake = FakeConfiture::new("scope-pending-window", SCOPE_ALL, 0)
+        .with_scoped_payload("pending", SCOPE_PENDING);
+    let inspection = policy::inspect(
+        &FakeConfiture::adapter_reporting(SCOPE_CAPTURED_FROM),
+        &fake.ctx(),
+    )
+    .await
+    .expect("1.35.0 describes and preflights");
+
+    let decision = policy::evaluate(
+        None,
+        policy::Baseline::WindowSafety,
+        inspection.capabilities,
+        inspection.report.as_ref(),
+    );
+
+    assert!(
+        matches!(decision, PolicyDecision::Allow { .. }),
+        "the pending change is window-safe: {decision:?}"
+    );
+}
+
+/// Below the floor the flag is never passed, because 1.34.0 rejects it and
+/// writes no report. The gate then judges every migration, applied ones
+/// included, which refuses more than it should but never less.
+#[cfg(unix)]
+#[tokio::test]
+async fn below_the_scope_floor_every_migration_is_still_judged() {
+    let fake = FakeConfiture::new("scope-below-floor", SCOPE_ALL, 0)
+        .with_scoped_payload("pending", SCOPE_PENDING);
+    let inspection = policy::inspect(&FakeConfiture::adapter_reporting("1.34.0"), &fake.ctx())
+        .await
+        .expect("1.34.0 describes and preflights");
+
+    assert!(
+        !fake.argv().iter().any(|arg| arg == "--scope"),
+        "1.34.0 has no --scope: {:?}",
+        fake.argv()
+    );
+    let decision = policy::evaluate(
+        Some(&policy::Policy::default()),
+        policy::Baseline::None,
+        inspection.capabilities,
+        inspection.report.as_ref(),
+    );
+    assert!(
+        !matches!(decision, PolicyDecision::Allow { .. }),
+        "the applied DROP COLUMN is still judged: {decision:?}"
+    );
+}
+
+/// `pending_scope` is advertised from the first release that accepts `--scope`.
+#[cfg(unix)]
+#[tokio::test]
+async fn describe_advertises_pending_scope_from_the_release_that_accepts_it() {
+    for (version, scoped) in [
+        ("0.44.0", false),
+        ("1.19.0", false),
+        ("1.34.0", false),
+        ("1.35.0", true),
+        ("1.36.0", true),
+    ] {
+        let desc = FakeConfiture::adapter_reporting(version)
+            .describe()
+            .await
+            .expect("the fake answers --version");
+
+        assert_eq!(
+            desc.capabilities.iter().any(|cap| cap == "pending_scope"),
+            scoped,
+            "confiture {version} pending_scope: {:?}",
+            desc.capabilities
+        );
+    }
 }

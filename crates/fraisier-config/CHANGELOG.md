@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.13](https://github.com/fraiseql/fraisier-core/compare/fraisier-config-v1.0.0-beta.12...fraisier-config-v1.0.0-beta.13) - 2026-10-29
+
+### Fixed
+
+- *(config)* a retain entry's name is checked once, against one rule
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into HEAD
+- Merge remote-tracking branch 'origin/main' into HEAD
+
+## [1.0.0-beta.12](https://github.com/fraiseql/fraisier-core/compare/fraisier-config-v1.0.0-beta.11...fraisier-config-v1.0.0-beta.12) - 2026-10-27
+
+### Fixed
+
+- *(preflight)* honour preflight_mode on multi-host and db migrate
+- *(saga)* a database-less deployable rolls back cleanly (adapter = "none")
+- *(lint)* pass clippy on Rust 1.99 (unblocks #65/#76 for #63)
+
+### Other
+
+- Merge main into chore/strip-plan-labels
+- Merge main into fix/retain-prune-scope
+- Merge main into fix/preflight-mode-multi-host
+- Merge main into feat/85-stack
+- Merge main into feat/84-alerts
+- Merge main into feat/86-metrics
+- Merge main into feat/84-drill
+- Merge main into feat/84-retention
+- Merge main into feat/88-tviews-gate
+- *(config)* rustfmt the merged re-export list
+- Merge main into feat/83-pg-readiness
+- Merge main into feat/82-require-capabilities
+- Merge main into fix/no-database-migration
+- *(ci)* gate rustdoc, and fix the nine errors that had accumulated
+
 ## [1.0.0-beta.11](https://github.com/fraiseql/fraisier-core/compare/fraisier-config-v1.0.0-beta.10...fraisier-config-v1.0.0-beta.11) - 2026-09-26
 
 ### Other

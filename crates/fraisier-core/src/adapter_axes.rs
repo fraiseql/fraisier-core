@@ -1466,6 +1466,15 @@ pub trait MigrationAdapter: Send + Sync {
     async fn post_migrate(&self, _ctx: &AdapterCtx) -> Result<(), AdapterError> {
         Ok(())
     }
+
+    /// Whether a database stands behind this axis.
+    ///
+    /// Defaults to `true`. Only an axis that declares it has no database answers
+    /// `false`, and the saga then has nothing to compensate when a later step
+    /// fails. An adapter that merely reports no revision is not database-less.
+    fn owns_database(&self) -> bool {
+        true
+    }
 }
 
 /// **Artifact axis** — get code/binary onto a host and activate it.
@@ -2063,7 +2072,7 @@ mod tests {
         let looked: Option<ChangeSet> = Some(empty.clone());
         let nobody_looked: Option<ChangeSet> = None;
         assert_ne!(looked, nobody_looked);
-        assert!(empty.changes.is_empty());
+        assert_eq!(empty.changes, Vec::new());
         assert_eq!(empty.worst_tier(), None);
     }
 
@@ -2154,7 +2163,7 @@ mod tests {
         // `changes` absent means the producer classified and found nothing…
         let classified: ChangeSet =
             serde_json::from_str(r#"{"contract_version": 1}"#).expect("changes defaults to empty");
-        assert!(classified.changes.is_empty());
+        assert_eq!(classified.changes, Vec::new());
         // …while `contract_version` is what makes the envelope an envelope. An
         // unversioned payload is unreadable, not empty.
         serde_json::from_str::<ChangeSet>(r#"{"changes": []}"#)

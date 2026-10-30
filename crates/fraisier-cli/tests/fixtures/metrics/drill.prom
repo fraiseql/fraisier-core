@@ -1,0 +1,3 @@
+# HELP fraisier_drill_last_success_timestamp_seconds When the last successful restore drill started, in Unix seconds.
+# TYPE fraisier_drill_last_success_timestamp_seconds gauge
+fraisier_drill_last_success_timestamp_seconds{fraise="checkout",environment="production"} 1792984500

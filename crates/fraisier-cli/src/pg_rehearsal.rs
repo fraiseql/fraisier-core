@@ -1,27 +1,55 @@
-//! The real Postgres-backed [`RehearsalDb`] used by the restore-rehearsal
-//! preflight (`[migration].preflight_mode = "restore_rehearsal"`).
+//! The real Postgres-backed [`RehearsalDb`] and [`DrillDb`] behind the
+//! restore-rehearsal preflight (`[migration].preflight_mode =
+//! "restore_rehearsal"`) and `backup drill`.
 //!
-//! It composes `fraisier-db`'s generic-Postgres lifecycle commands: provision a
-//! freshly-named throwaway database on the live server, seed it from a full backup
-//! (`pg_restore` of an archive, or a fresh `pg_dump` of the live DB), and drop it
-//! afterwards. A **full** restore carries the migration-tracking rows with it, so
-//! the pending set the rehearsal resolves matches a real restore + migrate.
+//! Both are thin callers of [`fraisier_db::restore`], which owns the identity,
+//! the archive listing, the pg_tviews precheck and rebuild, and the teardown
+//! guard. A **full** restore carries the migration-tracking rows with it, so the
+//! pending set the rehearsal resolves matches a real restore + migrate.
 
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
 use async_trait::async_trait;
+use fraisier_core::drill::{DrillDb, RestoredCopy, TviewRebuilt};
 use fraisier_core::restore_rehearsal::{BackupSource, RehearsalDb, RehearsalError, ThrowawayDb};
-use fraisier_db::{
-    backup_command, create_database_command, drop_database_command, restore_command, run, PgConn,
-};
+use fraisier_db::restore::{self, Postgres, RestoreIdentity, Seed, Trigger};
+use fraisier_db::{run, PgConn};
 
-/// A throwaway-DB lifecycle backed by `pg_dump`/`pg_restore`/`psql` over the live
-/// server. Stateless — every operation is derived from the DSNs it is handed.
-pub(crate) struct PgRehearsalDb;
+/// A throwaway-DB lifecycle over the live server. Every operation is derived
+/// from the DSNs it is handed, plus the restore identity when
+/// `[database].admin_url_env` names one and `trigger` may use it.
+///
+/// With an admin identity, the throwaway is created (owned by the app role),
+/// restored into, and dropped as that identity: a pg_tviews archive restores
+/// only as a superuser. Migrations still run as the app role, through the
+/// returned DSN.
+pub(crate) struct PgRehearsalDb {
+    /// The env var holding the admin DSN, read when a throwaway is provisioned.
+    pub(crate) admin_url_env: Option<String>,
+    /// What started the run: a webhook-started one never resolves the admin.
+    pub(crate) trigger: Trigger,
+}
 
-fn provision_error(msg: impl Into<String>) -> RehearsalError {
-    RehearsalError::Provision(msg.into())
+impl PgRehearsalDb {
+    /// The identity a run reaching `app` restores as.
+    fn identity(&self, app: PgConn) -> Result<RestoreIdentity, String> {
+        RestoreIdentity::from_env(app, self.admin_url_env.as_deref(), self.trigger)
+    }
+
+    /// Restore `seed` into a throwaway off `live_dsn`, rebuilding its TVIEWs
+    /// when `rebuild`.
+    async fn fill(
+        &self,
+        live_dsn: &str,
+        seed: Seed<'_>,
+        rebuild: bool,
+    ) -> Result<restore::Throwaway, String> {
+        let live = PgConn::parse(live_dsn).map_err(|e| format!("invalid database DSN: {e}"))?;
+        let identity = self.identity(live)?;
+        restore::restore_throwaway(&Postgres, &identity, seed, rebuild)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[async_trait]
@@ -31,156 +59,160 @@ impl RehearsalDb for PgRehearsalDb {
         live_dsn: &str,
         backup: &BackupSource,
     ) -> Result<ThrowawayDb, RehearsalError> {
-        let live = PgConn::parse(live_dsn)
-            .map_err(|e| provision_error(format!("invalid database DSN: {e}")))?;
-        let name = throwaway_name(live.database());
-        let maintenance = live.with_database("postgres");
-
-        let create = create_database_command(&maintenance, &name)
-            .map_err(|e| provision_error(e.to_string()))?;
-        let created = run(create)
+        if *backup == BackupSource::FreshDump {
+            // The dump lands in the temp dir; refuse before creating anything
+            // when a copy would not fit.
+            let size = crate::commands::DrillServer::live_bytes(self, live_dsn)
+                .await
+                .map_err(|e| {
+                    RehearsalError::Provision(format!("could not size the live database: {e}"))
+                })?;
+            fraisier_db::restore::room_for_copy(size, &std::env::temp_dir())
+                .map_err(RehearsalError::Provision)?;
+        }
+        let seed = match backup {
+            BackupSource::Archive(path) => Seed::Archive(path),
+            BackupSource::FreshDump => Seed::FreshDump,
+        };
+        // The rehearsal proves the migrations, not the TVIEW contents: it does
+        // not rebuild, unlike a drill or `db restore`.
+        let copy = self
+            .fill(live_dsn, seed, false)
             .await
-            .map_err(|e| provision_error(e.to_string()))?;
-        if !created.succeeded() {
-            return Err(provision_error(format!(
-                "CREATE DATABASE failed: {}",
-                created.stderr.trim()
-            )));
-        }
-
-        let throwaway = live.with_database(name.clone());
-        if let Err(error) = seed(&live, &throwaway, backup).await {
-            // Best-effort cleanup of the half-provisioned database.
-            let _ = teardown_named(&throwaway, &name).await;
-            return Err(error);
-        }
-        Ok(ThrowawayDb {
-            dsn: throwaway.dsn(),
-            name,
-        })
+            .map_err(RehearsalError::Provision)?;
+        let live = self
+            .live_database(live_dsn)
+            .map_err(RehearsalError::Provision)?;
+        Ok(ThrowawayDb::new(copy.app.dsn(), copy.name, live))
     }
 
     async fn teardown(&self, db: &ThrowawayDb) -> Result<(), String> {
         let throwaway = PgConn::parse(&db.dsn).map_err(|e| e.to_string())?;
-        teardown_named(&throwaway, &db.name).await
+        let identity = self.identity(throwaway)?;
+        restore::drop_throwaway(&Postgres, &identity, &db.name, &db.live).await
     }
 }
 
-/// Seed `throwaway` from `backup`: restore an existing archive, or take a fresh
-/// dump of `live` and restore that.
-async fn seed(
-    live: &PgConn,
-    throwaway: &PgConn,
-    backup: &BackupSource,
-) -> Result<(), RehearsalError> {
-    match backup {
-        BackupSource::Archive(path) => restore_into(throwaway, path).await,
-        BackupSource::FreshDump => {
-            let tmp = temp_archive_path();
-            let dumped = run(backup_command(live, &tmp))
-                .await
-                .map_err(|e| provision_error(e.to_string()))?;
-            if !dumped.succeeded() {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(provision_error(format!(
-                    "pg_dump of the live DB failed: {}",
-                    dumped.stderr.trim()
-                )));
-            }
-            let result = restore_into(throwaway, &tmp).await;
-            let _ = std::fs::remove_file(&tmp);
-            result
-        }
-    }
-}
-
-/// Restore `archive` into the throwaway database (no `--clean`: the DB is empty).
-async fn restore_into(throwaway: &PgConn, archive: &Path) -> Result<(), RehearsalError> {
-    let restored = run(restore_command(throwaway, archive, false))
-        .await
-        .map_err(|e| provision_error(e.to_string()))?;
-    if !restored.succeeded() {
-        return Err(provision_error(format!(
-            "pg_restore into the throwaway DB failed: {}",
-            restored.stderr.trim()
-        )));
-    }
-    Ok(())
-}
-
-/// Drop the throwaway database `name`, connecting via a maintenance database.
-async fn teardown_named(throwaway: &PgConn, name: &str) -> Result<(), String> {
-    let maintenance = throwaway.with_database("postgres");
-    let drop = drop_database_command(&maintenance, name).map_err(|e| e.to_string())?;
-    let dropped = run(drop).await.map_err(|e| e.to_string())?;
-    if dropped.succeeded() {
-        Ok(())
+/// Run `sql` and return its single value.
+pub(crate) async fn scalar(conn: &PgConn, sql: &str) -> Result<String, String> {
+    let mut query = fraisier_db::psql_command(conn, sql);
+    query.arg("-tA");
+    let outcome = run(query).await.map_err(|e| e.to_string())?;
+    if outcome.succeeded() {
+        Ok(outcome.stdout.trim().to_owned())
     } else {
-        Err(format!(
-            "DROP DATABASE {name} failed: {}",
-            dropped.stderr.trim()
-        ))
+        Err(outcome.stderr.trim().to_owned())
     }
 }
 
-/// A unique, valid throwaway database name derived from `base` (≤ 63 chars,
-/// `[A-Za-z0-9_]`, leading letter). Process id + a high-resolution timestamp keep
-/// concurrent deploys from colliding.
-fn throwaway_name(base: &str) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let pid = std::process::id();
-    let cleaned: String = base
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .take(24)
-        .collect();
-    let head = if cleaned.starts_with(|c: char| c.is_ascii_alphabetic()) {
-        cleaned
-    } else {
-        format!("db{cleaned}")
-    };
-    format!("{head}_fraisier_rh_{pid}_{nanos:x}")
-        .chars()
-        .take(63)
-        .collect()
+#[async_trait]
+impl DrillDb for PgRehearsalDb {
+    async fn restore_copy(&self, live_dsn: &str, archive: &Path) -> Result<RestoredCopy, String> {
+        let copy = self.fill(live_dsn, Seed::Archive(archive), true).await?;
+        let live = self.live_database(live_dsn)?;
+        Ok(RestoredCopy {
+            db: ThrowawayDb::new(copy.app.dsn(), copy.name, live),
+            tviews_rebuilt: copy.tviews.map(|rebuild| {
+                rebuild
+                    .rebuilt
+                    .into_iter()
+                    .map(|r| TviewRebuilt {
+                        entity: r.entity,
+                        rows: r.rows,
+                    })
+                    .collect()
+            }),
+        })
+    }
+
+    fn live_database(&self, live_dsn: &str) -> Result<String, String> {
+        PgConn::parse(live_dsn)
+            .map(|live| live.database().to_owned())
+            .map_err(|e| format!("invalid database DSN: {e}"))
+    }
+
+    async fn table_count(&self, db: &ThrowawayDb) -> Result<u64, String> {
+        let throwaway = PgConn::parse(&db.dsn).map_err(|e| e.to_string())?;
+        let count = scalar(
+            &throwaway,
+            "SELECT count(*) FROM pg_catalog.pg_tables \
+             WHERE schemaname NOT IN ('pg_catalog', 'information_schema')",
+        )
+        .await?;
+        count
+            .parse()
+            .map_err(|_| format!("the table count was not a number: {count:?}"))
+    }
 }
 
-/// A temp file path for a fresh-dump archive (cleaned up by the caller).
-fn temp_archive_path() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let pid = std::process::id();
-    std::env::temp_dir().join(format!("fraisier-rehearsal-{pid}-{nanos:x}.dump"))
+#[async_trait]
+impl crate::commands::DrillServer for PgRehearsalDb {
+    async fn live_bytes(&self, live_dsn: &str) -> Result<u64, String> {
+        let live = PgConn::parse(live_dsn).map_err(|e| format!("invalid database DSN: {e}"))?;
+        let size = scalar(&live, "SELECT pg_database_size(current_database())").await?;
+        size.parse()
+            .map_err(|_| format!("the database size was not a number: {size:?}"))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{throwaway_name, PgRehearsalDb};
-    use fraisier_core::restore_rehearsal::{BackupSource, RehearsalDb};
+    use super::PgRehearsalDb;
+    use fraisier_core::drill::DrillDb;
+    use fraisier_core::restore_rehearsal::{BackupSource, RehearsalDb, ThrowawayDb};
+
+    const NO_ADMIN: PgRehearsalDb = PgRehearsalDb {
+        admin_url_env: None,
+        trigger: fraisier_db::restore::Trigger::Operator,
+    };
 
     #[test]
-    fn throwaway_name_is_a_valid_bounded_identifier() {
-        for base in [
-            "app",
-            "shop_db",
-            "9starts_with_digit",
-            "",
-            "weird-name.with.dots",
-        ] {
-            let name = throwaway_name(base);
-            assert!(name.len() <= 63, "name {name:?} exceeds 63 chars");
-            assert!(
-                name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'),
-                "name {name:?} must start with a letter or underscore"
-            );
-            assert!(
-                name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
-                "name {name:?} has an invalid character"
-            );
-        }
+    fn the_drill_and_the_primitive_agree_on_the_throwaway_marker() {
+        // The drill checks the name before migrating; the primitive before
+        // dropping. Both guards must recognise the same throwaways.
+        assert_eq!(
+            fraisier_core::drill::THROWAWAY_MARKER,
+            fraisier_db::restore::THROWAWAY_MARKER
+        );
+    }
+
+    #[test]
+    fn the_live_database_is_the_one_its_dsn_names() {
+        assert_eq!(
+            NO_ADMIN.live_database("postgres://app:pw@db.internal:5432/shop?sslmode=require"),
+            Ok("shop".to_owned())
+        );
+        assert!(NO_ADMIN.live_database("not a dsn").is_err());
+    }
+
+    #[tokio::test]
+    async fn teardown_refuses_a_name_without_the_throwaway_marker() {
+        // No server is reachable here: refusing must not need one.
+        let refused = NO_ADMIN
+            .teardown(&ThrowawayDb::new(
+                "postgres://app:pw@127.0.0.1:1/shop",
+                "shop",
+                "shop",
+            ))
+            .await
+            .expect_err("an unmarked name is never dropped");
+        assert!(refused.contains("_fraisier_rh_"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn teardown_refuses_the_live_database_even_with_the_marker() {
+        // No server is reachable here: refusing must not need one, so a drop
+        // that is attempted fails differently.
+        let name = "shop_fraisier_rh_1_a";
+        let refused = NO_ADMIN
+            .teardown(&ThrowawayDb::new(
+                format!("postgres://app:pw@127.0.0.1:1/{name}"),
+                name,
+                name,
+            ))
+            .await
+            .expect_err("the live database is never dropped");
+        assert!(refused.contains("it is the live database"), "{refused}");
     }
 
     /// End-to-end exercise of the real `pg_dump → CREATE DATABASE → pg_restore →
@@ -189,7 +221,7 @@ mod tests {
     /// and run with `cargo test -- --ignored`. (The migration-rehearsal logic over
     /// this lifecycle — including the Python-0.34 backup-behind-tracking scenario —
     /// is unit-tested in `fraisier_core::restore_rehearsal`; the full confiture
-    /// chain runs on the fixture host per the finalize-phase validation checklist.)
+    /// chain runs on the fixture host.)
     #[tokio::test]
     #[ignore = "requires a real Postgres reachable via FRAISIER_REHEARSAL_TEST_DSN"]
     async fn provisions_and_tears_down_a_throwaway_from_a_fresh_dump() {
@@ -197,7 +229,7 @@ mod tests {
             eprintln!("skipped: set FRAISIER_REHEARSAL_TEST_DSN to a postgres DSN");
             return;
         };
-        let db = PgRehearsalDb;
+        let db = NO_ADMIN;
         let throwaway = db
             .provision(&dsn, &BackupSource::FreshDump)
             .await

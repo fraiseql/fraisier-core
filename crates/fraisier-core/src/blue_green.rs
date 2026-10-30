@@ -34,6 +34,7 @@ use fraisier_saga::state_store::StateStore;
 use crate::adapter_axes::{AdapterCtx, MigrationAdapter, TrafficDirector, TrafficTarget};
 use crate::connection_budget::{self, BudgetVerdict, ConnectionBudget};
 use crate::policy::{self, Baseline, PolicyGate};
+use crate::readiness::{self, DatabaseReadiness};
 
 /// Operations on the blue/green fleets the flow drives.
 ///
@@ -75,6 +76,7 @@ pub trait FleetOps: Send + Sync {
 }
 
 /// The immutable per-run state shared by every step.
+#[derive(Clone)]
 struct BgShared {
     ctx: AdapterCtx,
     green: TrafficTarget,
@@ -92,6 +94,8 @@ struct BgShared {
     /// or without a `[policy]` section — blue-green's shared hold window is not
     /// something a config can switch off.
     policy: PolicyGate,
+    /// Optional database-readiness probe, run first in preflight.
+    database_readiness: Option<Arc<dyn DatabaseReadiness>>,
 }
 
 /// The mutable run state threaded to every step by the saga engine.
@@ -151,9 +155,12 @@ impl BgShared {
     /// configured, if doubling connections would exhaust the shared DB.
     ///
     /// One decision function answers both questions from one preflight report
-    /// (D3). The window rule is the [`Baseline::WindowSafety`] half and applies
-    /// unconditionally; the tier policy is the opt-in half.
+    /// rather than two gates. The window rule is the [`Baseline::WindowSafety`]
+    /// half and applies unconditionally; the tier policy is the opt-in half.
     async fn run_preflight(&self) -> Result<(), SagaError> {
+        if let Some(probe) = &self.database_readiness {
+            readiness::check(probe.as_ref(), &self.ctx).await?;
+        }
         let inspection = policy::inspect(&*self.migration, &self.ctx)
             .await
             .map_err(|e| {
@@ -370,8 +377,18 @@ impl BlueGreenDeploy {
                 fleet,
                 budget,
                 policy: params.policy,
+                database_readiness: None,
             }),
         }
+    }
+
+    /// Check the shared database against what the deployable declared it needs
+    /// (`[database.requires]`) as the first thing preflight does, before any
+    /// instance or traffic change. See [`crate::readiness`].
+    #[must_use]
+    pub fn database_readiness(mut self, probe: Arc<dyn DatabaseReadiness>) -> Self {
+        Arc::make_mut(&mut self.shared).database_readiness = Some(probe);
+        self
     }
 
     /// Run the blue-green flow over `store`. A clean rollback (e.g. a failed
@@ -657,6 +674,65 @@ mod tests {
         assert!(fleet.log().contains(&"reap_blue".to_owned()), "blue reaped");
     }
 
+    /// A readiness probe answering `reasons`.
+    struct FakeReadiness(Vec<String>);
+
+    #[async_trait]
+    impl crate::readiness::DatabaseReadiness for FakeReadiness {
+        async fn unready(&self, _live_dsn: &str) -> Result<Vec<String>, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn with_dsn() -> BlueGreenParams {
+        BlueGreenParams {
+            ctx: AdapterCtx::new("checkout", "production")
+                .with_resolved_secret("DATABASE_URL", "postgres://u:pw@h/app"),
+            ..params()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unready_database_fails_preflight_before_the_migration_is_asked() {
+        let traffic = FakeTraffic::blue();
+        let fleet = FakeFleet::new(true, true);
+        let migration = FakeMigration::window_safe();
+        let bg = BlueGreenDeploy::new(
+            with_dsn(),
+            Arc::clone(&migration) as Arc<dyn MigrationAdapter>,
+            Arc::clone(&traffic) as Arc<dyn TrafficDirector>,
+            Arc::clone(&fleet) as Arc<dyn FleetOps>,
+            None,
+        )
+        .database_readiness(Arc::new(FakeReadiness(vec![
+            "pg_tviews is not preloaded".to_owned()
+        ])));
+        let outcome = bg.run(MemoryStateStore::new()).await.expect("run");
+        let reason = refusal(&outcome, "preflight");
+        assert!(reason.contains("pg_tviews is not preloaded"), "{reason}");
+        assert!(
+            migration.calls.lock().unwrap().is_empty(),
+            "the migration was never asked"
+        );
+        assert!(traffic.swaps().is_empty(), "traffic never moved");
+    }
+
+    #[tokio::test]
+    async fn a_ready_database_lets_the_blue_green_commit() {
+        let traffic = FakeTraffic::blue();
+        let fleet = FakeFleet::new(true, true);
+        let bg = BlueGreenDeploy::new(
+            with_dsn(),
+            FakeMigration::window_safe(),
+            Arc::clone(&traffic) as Arc<dyn TrafficDirector>,
+            Arc::clone(&fleet) as Arc<dyn FleetOps>,
+            None,
+        )
+        .database_readiness(Arc::new(FakeReadiness(Vec::new())));
+        let outcome = bg.run(MemoryStateStore::new()).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "{outcome:?}");
+    }
+
     #[tokio::test]
     async fn the_pre_swap_health_gate_never_moves_traffic() {
         // Green is unhealthy from the start: the health gate fails BEFORE the swap.
@@ -781,7 +857,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The schema policy gate (#45, D3). Blue-green is the strategy whose
+    // The schema policy gate (#45). Blue-green is the strategy whose
     // window-safety rule the policy gate replaced: one decision function now
     // answers both "can N-1 and N share this database?" and "is this change
     // destructive enough to need a human?".
@@ -809,7 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_gate_refuses_for_either_cause_with_distinguishable_reasons() {
-        // The test that pins D3's resolved reading. `window_safe` is not a second
+        // The test that pins the one-gate design. `window_safe` is not a second
         // gate, it is an input to the one gate — and a refusal has to say which
         // rule fired, because the two have completely different fixes: one is
         // "rewrite the migration expand/contract", the other is "get sign-off".
@@ -846,7 +922,7 @@ mod tests {
 
     #[tokio::test]
     async fn blue_green_is_still_gated_with_no_policy_section() {
-        // The D6 carve-out at the saga level: the tier policy is opt-in, the
+        // The baseline carve-out at the saga level: the tier policy is opt-in, the
         // window-safety baseline is not. If this ever passes, replacing the
         // window-safety gate has silently deleted it for every existing user —
         // which is all of them, since nobody has a `[policy]` section today.

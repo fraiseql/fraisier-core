@@ -2203,3 +2203,270 @@ fn a_drill_with_no_schedule_needs_no_notify_sink() {
         .validate();
     assert!(!has_warning(&report, "notify.command"), "{report}");
 }
+
+const REFRESH_BASE: &str = r#"
+[deploy]
+name = "checkout"
+environment = "staging"
+production = false
+
+[migration]
+adapter = "command"
+database_url_env = "CHECKOUT_DATABASE_URL"
+"#;
+
+/// The keys every valid `[refresh]` needs.
+const REFRESH_REQUIRED: &str = "source_dir = \"/var/backups/checkout\"\n\
+                                source_environment = \"production\"\n\
+                                sanitize = \"/etc/checkout/sanitize.sql\"\n";
+
+fn refresh_config(section: &str) -> DeployConfig {
+    DeployConfig::from_toml_str(&format!("{REFRESH_BASE}\n[refresh]\n{section}")).expect("parses")
+}
+
+fn refresh_report(section: &str) -> fraisier_config::ValidationReport {
+    refresh_config(section).validate_db_ops()
+}
+
+#[test]
+fn deploy_production_is_absent_unless_declared() {
+    let config = DeployConfig::from_toml_str(SCHEDULE_BASE).expect("parses");
+    let deploy = config.deploy.as_ref().expect("[deploy]");
+    assert_eq!(deploy.production, None);
+    let written = toml::to_string(&config).expect("serializes");
+    assert!(!written.contains("production ="), "{written}");
+}
+
+#[test]
+fn deploy_production_keeps_its_declared_value() {
+    for (value, expected) in [("true", Some(true)), ("false", Some(false))] {
+        let toml = SCHEDULE_BASE.replace(
+            "environment = \"production\"",
+            &format!("environment = \"production\"\nproduction = {value}"),
+        );
+        let config = DeployConfig::from_toml_str(&toml).expect("parses");
+        assert_eq!(
+            config.deploy.and_then(|d| d.production),
+            expected,
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn a_config_without_refresh_needs_no_production_key() {
+    let config =
+        DeployConfig::from_toml_str(REFRESH_BASE.replace("production = false\n", "").as_str())
+            .expect("parses");
+    let report = config.validate_db_ops();
+    assert!(!has_error(&report, "deploy.production"), "{report}");
+}
+
+#[test]
+fn a_refresh_section_keeps_its_fields_and_defaults() {
+    let config = refresh_config(REFRESH_REQUIRED);
+    let refresh = config.refresh.expect("[refresh]");
+    assert_eq!(
+        refresh.source_dir.as_deref(),
+        Some(std::path::Path::new("/var/backups/checkout"))
+    );
+    assert_eq!(refresh.source_environment.as_deref(), Some("production"));
+    assert_eq!(refresh.max_age_hours(), 48);
+    assert_eq!(refresh.min_tables, None);
+    assert_eq!(refresh.schedule, None);
+    assert_eq!(refresh.outbound_flag(), "FRAISIER_REFRESHED");
+    assert_eq!(
+        refresh.sanitize(),
+        Some(fraisier_config::Sanitize::Script(std::path::Path::new(
+            "/etc/checkout/sanitize.sql"
+        )))
+    );
+}
+
+#[test]
+fn a_valid_refresh_section_validates_clean() {
+    let report = refresh_report(REFRESH_REQUIRED);
+    assert!(report.ok(), "{report}");
+    let report = refresh_config(REFRESH_REQUIRED).validate();
+    assert!(
+        !report.issues.iter().any(|i| i.path.starts_with("refresh")),
+        "{report}"
+    );
+}
+
+#[test]
+fn an_unknown_refresh_key_is_a_parse_error() {
+    let toml = format!("{REFRESH_BASE}\n[refresh]\n{REFRESH_REQUIRED}sanitise = \"none\"\n");
+    assert!(DeployConfig::from_toml_str(&toml).is_err());
+}
+
+#[test]
+fn a_refresh_target_must_declare_production_explicitly() {
+    // Absent never means "not production": the refusal names the key.
+    let toml = format!("{REFRESH_BASE}\n[refresh]\n{REFRESH_REQUIRED}")
+        .replace("production = false\n", "");
+    let config = DeployConfig::from_toml_str(&toml).expect("parses");
+    for report in [config.validate_db_ops(), config.validate()] {
+        let issue = report
+            .issues
+            .iter()
+            .find(|i| i.path == "deploy.production" && i.severity == Severity::Error)
+            .unwrap_or_else(|| panic!("no deploy.production error: {report}"));
+        assert!(
+            issue.message.contains("production = false"),
+            "{}",
+            issue.message
+        );
+    }
+}
+
+#[test]
+fn a_production_config_cannot_carry_a_refresh_section() {
+    let toml = format!("{REFRESH_BASE}\n[refresh]\n{REFRESH_REQUIRED}")
+        .replace("production = false", "production = true");
+    let report = DeployConfig::from_toml_str(&toml)
+        .expect("parses")
+        .validate_db_ops();
+    assert!(has_error(&report, "deploy.production"), "{report}");
+}
+
+#[test]
+fn a_refresh_needs_a_sanitize_step() {
+    let report = refresh_report(
+        "source_dir = \"/var/backups/checkout\"\nsource_environment = \"production\"\n",
+    );
+    assert!(has_error(&report, "refresh.sanitize"), "{report}");
+}
+
+#[test]
+fn skipping_sanitize_needs_a_stated_reason() {
+    let base = "source_dir = \"/var/backups/checkout\"\nsource_environment = \"production\"\n\
+                sanitize = \"none\"\n";
+    let report = refresh_report(base);
+    assert!(has_error(&report, "refresh.sanitize_reason"), "{report}");
+    let report = refresh_report(&format!("{base}sanitize_reason = \"  \"\n"));
+    assert!(has_error(&report, "refresh.sanitize_reason"), "{report}");
+
+    let config = refresh_config(&format!(
+        "{base}sanitize_reason = \"the source is synthetic data\"\n"
+    ));
+    assert!(
+        config.validate_db_ops().ok(),
+        "{}",
+        config.validate_db_ops()
+    );
+    assert_eq!(
+        config
+            .refresh
+            .as_ref()
+            .and_then(fraisier_config::RefreshSection::sanitize),
+        Some(fraisier_config::Sanitize::Skipped {
+            reason: "the source is synthetic data"
+        })
+    );
+}
+
+#[test]
+fn a_sanitize_reason_without_skipping_is_a_config_error() {
+    let report = refresh_report(&format!("{REFRESH_REQUIRED}sanitize_reason = \"why\"\n"));
+    assert!(has_error(&report, "refresh.sanitize_reason"), "{report}");
+}
+
+#[test]
+fn a_sanitize_script_must_be_an_absolute_plain_path() {
+    let base = "source_dir = \"/var/backups/checkout\"\nsource_environment = \"production\"\n";
+    for path in [
+        "sanitize.sql",
+        "/etc/checkout/../sanitize.sql",
+        "/etc/check out.sql",
+        "",
+    ] {
+        let report = refresh_report(&format!("{base}sanitize = {path:?}\n"));
+        assert!(has_error(&report, "refresh.sanitize"), "{path:?}: {report}");
+    }
+}
+
+#[test]
+fn the_outbound_flag_must_be_an_environment_variable_name() {
+    for bad in ["", "1FLAG", "flag", "MY-FLAG", "A B", "X\nY"] {
+        let report = refresh_report(&format!("{REFRESH_REQUIRED}outbound_flag = {bad:?}\n"));
+        assert!(
+            has_error(&report, "refresh.outbound_flag"),
+            "{bad:?}: {report}"
+        );
+    }
+    let config = refresh_config(&format!(
+        "{REFRESH_REQUIRED}outbound_flag = \"CHECKOUT_OUTBOUND_OFF\"\n"
+    ));
+    assert!(
+        config.validate_db_ops().ok(),
+        "{}",
+        config.validate_db_ops()
+    );
+    assert_eq!(
+        config
+            .refresh
+            .as_ref()
+            .map(fraisier_config::RefreshSection::outbound_flag),
+        Some("CHECKOUT_OUTBOUND_OFF")
+    );
+}
+
+#[test]
+fn a_refresh_needs_an_absolute_source_dir() {
+    let rest = "source_environment = \"production\"\nsanitize = \"/etc/checkout/sanitize.sql\"\n";
+    let report = refresh_report(rest);
+    assert!(has_error(&report, "refresh.source_dir"), "{report}");
+    let report = refresh_report(&format!("source_dir = \"backups\"\n{rest}"));
+    assert!(has_error(&report, "refresh.source_dir"), "{report}");
+}
+
+#[test]
+fn a_refresh_needs_a_source_environment() {
+    let report = refresh_report(
+        "source_dir = \"/var/backups/checkout\"\nsanitize = \"/etc/checkout/sanitize.sql\"\n",
+    );
+    assert!(has_error(&report, "refresh.source_environment"), "{report}");
+}
+
+#[test]
+fn a_refresh_from_its_own_environment_is_a_config_error() {
+    let report = refresh_report(&REFRESH_REQUIRED.replace(
+        "source_environment = \"production\"",
+        "source_environment = \"staging\"",
+    ));
+    assert!(has_error(&report, "refresh.source_environment"), "{report}");
+}
+
+#[test]
+fn refresh_bounds_and_schedule_are_checked() {
+    for (extra, path) in [
+        ("max_age_hours = 0\n", "refresh.max_age_hours"),
+        ("min_tables = 0\n", "refresh.min_tables"),
+        ("data_dir = \"pgdata\"\n", "refresh.data_dir"),
+        ("schedule = \"whenever\"\n", "refresh.schedule"),
+    ] {
+        let report = refresh_report(&format!("{REFRESH_REQUIRED}{extra}"));
+        assert!(has_error(&report, path), "{extra}: {report}");
+    }
+    let config = refresh_config(&format!(
+        "{REFRESH_REQUIRED}max_age_hours = 26\nmin_tables = 15\nschedule = \"daily 03:30\"\n"
+    ));
+    assert!(
+        config.validate_db_ops().ok(),
+        "{}",
+        config.validate_db_ops()
+    );
+    assert_eq!(config.refresh.map(|r| r.max_age_hours()), Some(26));
+}
+
+#[test]
+fn a_preset_keeps_the_declared_production_key_and_refresh_section() {
+    let toml = format!(
+        "[specql]\nname = \"checkout\"\nschema = \"./schema.toml\"\nenvironment = \"staging\"\n\
+         hosts = [\"web1.internal\"]\n\n[deploy]\nproduction = false\n\n[refresh]\n{REFRESH_REQUIRED}"
+    );
+    let config = DeployConfig::from_toml_str(&toml).expect("parses");
+    assert_eq!(config.deploy.and_then(|d| d.production), Some(false));
+    assert!(config.refresh.is_some());
+}

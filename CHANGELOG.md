@@ -6,6 +6,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`[refresh]` and `[deploy] production` config keys** (#136), for the
+  coming `fraisier db refresh`. `[refresh]` names the source environment and
+  its archive directory, a required `sanitize` step (`"none"` needs a
+  `sanitize_reason`), and the `outbound_flag` the service sees at its first
+  start after a refresh (default `FRAISIER_REFRESHED`). A config with
+  `[refresh]` must declare `production = false`: an undeclared key is never
+  taken to mean "not production", and `production = true` with `[refresh]` is
+  an error. Configs without `[refresh]` need no change.
+
 ## [1.0.0-beta.13] - 2026-10-29
 
 ### Added

@@ -306,7 +306,7 @@ pub fn restore_command(conn: &PgConn, archive: &Path, clean: bool) -> Command {
 
 /// `name` as a libpq conninfo `dbname` pair, single-quoted with `\` and `'`
 /// escaped.
-fn conninfo_dbname(name: &str) -> String {
+pub(crate) fn conninfo_dbname(name: &str) -> String {
     let escaped = name.replace('\\', r"\\").replace('\'', r"\'");
     format!("dbname='{escaped}'")
 }

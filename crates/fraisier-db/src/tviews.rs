@@ -88,7 +88,7 @@ pub struct Identity {
 }
 
 /// `"name"`, with embedded quotes doubled.
-fn ident(name: &str) -> String {
+pub(crate) fn ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 

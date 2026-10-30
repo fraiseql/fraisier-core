@@ -26,6 +26,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   15 and later, a role without `SET` on the parameter (naming the `GRANT`).
   `fraisier doctor` gains a matching `refresh_target` check. See
   `docs/refresh.md`.
+- **`fraisier db refresh`** (#136) replaces this config's database with the
+  newest archive of `[refresh].source_environment`. Without `--yes` it prints
+  the plan. With it, under the deploy lock, it stops the `[service]` unit and
+  every `[refresh].units` unit (timers first). It then refuses, starting them
+  again, unless the database carries this config's marker and no other
+  session is connected. Then it drops the database, re-creates it owned by
+  the app role, marks it again, restores the archive, and migrates as the app
+  role. With `[database].admin_url_env`, the admin creates the database and
+  its extensions and restores the archive's objects `--role=<app>`; it
+  restores the extensions' own rows separately. So a pg_tviews archive comes
+  back owned by the app role with its registry intact. The admin DSN never
+  reaches the migrations. Sanitizing and the outbound flag are not built yet,
+  so a refresh ends with the units stopped and says so.
 
 ## [1.0.0-beta.13] - 2026-10-29
 

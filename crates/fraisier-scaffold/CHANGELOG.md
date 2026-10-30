@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.15](https://github.com/fraiseql/fraisier-core/compare/fraisier-scaffold-v1.0.0-beta.13...fraisier-scaffold-v1.0.0-beta.15) - 2026-10-30
+
+### Added
+
+- *(scaffold)* scheduled refresh unit with alert, --skip-if-locked
+- *(db)* refresh sanitize step, outbound flag and its proof, --clear-flag
+
+### Other
+
+- release v1.0.0-beta.14
+
 ## [1.0.0-beta.14](https://github.com/fraiseql/fraisier-core/compare/fraisier-scaffold-v1.0.0-beta.13...fraisier-scaffold-v1.0.0-beta.14) - 2026-10-30
 
 ### Added

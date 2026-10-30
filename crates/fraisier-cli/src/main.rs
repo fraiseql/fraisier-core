@@ -24,6 +24,7 @@ mod metrics;
 mod pg_readiness;
 mod pg_rehearsal;
 mod preview;
+mod refresh;
 mod stack;
 mod stack_sdl;
 mod stack_status;
@@ -456,6 +457,11 @@ enum DbCommand {
     /// Drop every user schema and re-apply migrations from scratch.
     Reset(DbResetArgs),
 
+    /// Mark this config's database, once, as the one `db refresh` may replace.
+    /// Refused unless the config declares `[deploy] production = false` and has
+    /// a `[refresh]` section.
+    MarkRefreshTarget(DbMarkRefreshTargetArgs),
+
     /// pg_tviews maintenance.
     #[command(subcommand)]
     Tviews(DbTviewsCommand),
@@ -676,6 +682,13 @@ struct DbRestoreArgs {
     /// Execute the restore (without this, only the plan is shown). Destructive.
     #[arg(long)]
     yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct DbMarkRefreshTargetArgs {
+    /// Path to the `fraisier.toml`.
+    #[arg(long, default_value = "fraisier.toml")]
+    config: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -991,6 +1004,9 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
         }
         Command::Db(DbCommand::Reset(args)) => {
             commands::db_reset(&args.config, &args.state_dir, args.yes).await
+        }
+        Command::Db(DbCommand::MarkRefreshTarget(args)) => {
+            refresh::db_mark_refresh_target(&args.config).await
         }
         Command::Stack(StackCommand::Deploy(args)) => {
             stack::stack_deploy(

@@ -364,6 +364,69 @@ fn check_throwaways(config: &DeployConfig, list: ListThrowaways<'_>) -> Option<C
     }
 }
 
+/// Whether this config's database carries the refresh marker `db refresh`
+/// needs, and its role could set it again. Only a config with `[refresh]`
+/// reaches the database for this.
+async fn check_refresh_target(
+    config: &DeployConfig,
+    server: &dyn fraisier_db::refresh::MarkerServer,
+) -> Option<Check> {
+    config.refresh.as_ref()?;
+    let fail = |detail: String| {
+        Some(Check {
+            name: "refresh_target",
+            status: Status::Fail,
+            detail: fraisier_saga::redact::credentials(&detail),
+        })
+    };
+    if let Some(problem) = crate::refresh::production_problem(config) {
+        return fail(format!("`db refresh` will refuse it: {problem}"));
+    }
+    let Some(source) = config
+        .migration
+        .as_ref()
+        .and_then(|m| m.database_url_env.as_deref())
+    else {
+        return fail("cannot read the marker: [migration].database_url_env is not set".to_owned());
+    };
+    let Some(dsn) = std::env::var(source).ok().filter(|dsn| !dsn.is_empty()) else {
+        return fail(format!("cannot read the marker: ${source} is not set"));
+    };
+    let conn = match PgConn::parse(&dsn) {
+        Ok(conn) => conn,
+        Err(error) => return fail(format!("cannot read the marker: invalid DSN: {error}")),
+    };
+    let expected = crate::refresh::expected_marker(config);
+    let marker = match server.marker(&conn).await {
+        Ok(marker) => marker,
+        Err(error) => return fail(format!("cannot read the marker: {error}")),
+    };
+    match server.marker_privilege(&conn).await {
+        Err(error) => return fail(format!("cannot check the marker privilege: {error}")),
+        Ok(Some(problem)) => {
+            return fail(format!(
+                "`db refresh` will refuse to drop the database: {problem}"
+            ))
+        }
+        Ok(None) => {}
+    }
+    match marker {
+        Some(found) if found == expected => Some(Check {
+            name: "refresh_target",
+            status: Status::Pass,
+            detail: format!("the database is the refresh target of {found}"),
+        }),
+        Some(found) => fail(format!(
+            "the database is marked as the refresh target of '{found}', not '{expected}': \
+             `db refresh` will refuse it"
+        )),
+        None => fail(format!(
+            "the database carries no refresh marker, so `db refresh` will refuse it; mark it \
+             once with `fraisier db mark-refresh-target` ({expected})"
+        )),
+    }
+}
+
 /// The databases carrying the throwaway marker on the server `dsn` names.
 fn list_throwaways(dsn: &str) -> Result<Vec<String>, String> {
     let conn = fraisier_db::PgConn::parse(dsn).map_err(|e| format!("invalid database DSN: {e}"))?;
@@ -441,6 +504,7 @@ pub(crate) async fn doctor(config_path: &Path, only: &[String]) -> CommandOutput
                 checks.push(check);
             }
             checks.extend(check_throwaways(&config, &list_throwaways));
+            checks.extend(check_refresh_target(&config, &fraisier_db::restore::Postgres).await);
         }
     }
 
@@ -554,8 +618,8 @@ pub(crate) fn env_check(config_path: &Path, subcommand: &str) -> CommandOutput {
 #[cfg(test)]
 mod tests {
     use super::{
-        below_floor, check_throwaways, doctor, env_check, judge_admin, parse_version,
-        referenced_secrets, Identity, Status, CONFITURE_FLOOR,
+        below_floor, check_refresh_target, check_throwaways, doctor, env_check, judge_admin,
+        parse_version, referenced_secrets, Identity, Status, CONFITURE_FLOOR,
     };
     use fraisier_config::DeployConfig;
     use std::io::Write as _;
@@ -606,6 +670,135 @@ url = "http://127.0.0.1/health"
     }
 
     const DRILL: &str = "[backup]\ndir = \"/var/backups/app\"\n[drill]\n";
+
+    const REFRESH: &str = "[refresh]\nsource_dir = \"/var/backups/app\"\n\
+                           source_environment = \"staging\"\n\
+                           sanitize = \"/etc/app/sanitize.sql\"\n";
+
+    /// A marker server answering from fixed values, counting its queries.
+    #[derive(Default)]
+    struct Markers {
+        marker: Option<String>,
+        privilege: Option<String>,
+        error: Option<String>,
+        queries: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl fraisier_db::refresh::MarkerServer for Markers {
+        async fn marker(&self, _: &fraisier_db::PgConn) -> Result<Option<String>, String> {
+            self.queries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.error
+                .clone()
+                .map_or_else(|| Ok(self.marker.clone()), Err)
+        }
+
+        async fn marker_privilege(
+            &self,
+            _: &fraisier_db::PgConn,
+        ) -> Result<Option<String>, String> {
+            self.queries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.privilege.clone())
+        }
+
+        async fn set_marker(&self, _: &fraisier_db::PgConn, _: &str) -> Result<(), String> {
+            panic!("doctor never sets the marker")
+        }
+    }
+
+    impl Markers {
+        fn marked(marker: &str) -> Self {
+            Self {
+                marker: Some(marker.to_owned()),
+                ..Self::default()
+            }
+        }
+
+        fn queried(&self) -> usize {
+            self.queries.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// `throwaway_config` as a refresh target (`production = false`).
+    fn refresh_target(extra: &str) -> DeployConfig {
+        DeployConfig::from_toml_str(&format!(
+            "[deploy]\nname = \"app\"\nenvironment = \"prod\"\nproduction = false\n\
+             [migration]\nadapter = \"command\"\ndatabase_url_env = \"FRAISIER_DOCTOR_DSN\"\n\
+             {extra}"
+        ))
+        .expect("config")
+    }
+
+    fn judge(config: &DeployConfig, server: &Markers) -> Option<super::Check> {
+        with_dsn(Some("postgres://app:s3cret@db/shop"), || {
+            crate::test_env::block_on(check_refresh_target(config, server))
+        })
+    }
+
+    #[test]
+    fn a_config_without_refresh_never_reads_the_marker() {
+        let server = Markers::default();
+        assert!(judge(&throwaway_config(""), &server).is_none());
+        assert_eq!(server.queried(), 0);
+    }
+
+    #[test]
+    fn a_marked_refresh_target_passes() {
+        let check = judge(&refresh_target(REFRESH), &Markers::marked("app/prod")).expect("check");
+        assert_eq!(check.status, Status::Pass, "{}", check.detail);
+        assert_eq!(check.name, "refresh_target");
+    }
+
+    #[test]
+    fn an_unmarked_or_other_refresh_target_fails() {
+        let check = judge(&refresh_target(REFRESH), &Markers::default()).expect("check");
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.detail.contains("mark-refresh-target"),
+            "{}",
+            check.detail
+        );
+        let check = judge(&refresh_target(REFRESH), &Markers::marked("app/qa")).expect("check");
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.contains("app/qa"), "{}", check.detail);
+    }
+
+    #[test]
+    fn a_marked_target_the_role_could_not_mark_again_fails_with_the_grant() {
+        let server = Markers {
+            privilege: Some("GRANT SET ON PARAMETER fraisier.refresh_target TO \"app\"".into()),
+            ..Markers::marked("app/prod")
+        };
+        let check = judge(&refresh_target(REFRESH), &server).expect("check");
+        assert_eq!(check.status, Status::Fail, "{}", check.detail);
+        assert!(check.detail.contains("GRANT SET"), "{}", check.detail);
+    }
+
+    #[test]
+    fn a_refresh_config_without_production_false_fails_before_any_query() {
+        let server = Markers::marked("app/prod");
+        let check = judge(&throwaway_config(REFRESH), &server).expect("check");
+        assert_eq!(check.status, Status::Fail, "{}", check.detail);
+        assert!(
+            check.detail.contains("production = false"),
+            "{}",
+            check.detail
+        );
+        assert_eq!(server.queried(), 0);
+    }
+
+    #[test]
+    fn an_unreadable_marker_fails_without_its_password() {
+        let server = Markers {
+            error: Some("connection to postgres://app:s3cret@db/shop refused".into()),
+            ..Markers::default()
+        };
+        let check = judge(&refresh_target(REFRESH), &server).expect("check");
+        assert_eq!(check.status, Status::Fail);
+        assert!(!check.detail.contains("s3cret"), "{}", check.detail);
+    }
 
     #[test]
     fn a_config_that_creates_no_throwaways_never_reaches_the_database() {

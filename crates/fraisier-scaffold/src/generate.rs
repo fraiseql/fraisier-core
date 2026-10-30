@@ -49,7 +49,13 @@ pub fn generate(config: &DeployConfig) -> Result<Vec<GeneratedFile>, ScaffoldErr
             .replace("{name}", &r.name)
             .replace("{environment}", &r.environment)
             .replace("{exec_start}", &r.exec_start)
-            .replace("{env_file}", &r.env_file),
+            .replace("{env_file}", &r.env_file)
+            .replace(
+                "{refreshed}",
+                &r.refreshed_file.as_ref().map_or_else(String::new, |file| {
+                    REFRESHED_ENV.replace("{refreshed_file}", file)
+                }),
+            ),
     );
     let socket = with_header(
         &SYSTEMD_SOCKET
@@ -75,7 +81,7 @@ pub fn generate(config: &DeployConfig) -> Result<Vec<GeneratedFile>, ScaffoldErr
             .replace("{environment}", &r.environment),
     );
 
-    Ok(vec![
+    let mut files = vec![
         GeneratedFile {
             rel_path: PathBuf::from(format!("systemd/{}", r.unit)),
             install_dest: Some(PathBuf::from(format!("/etc/systemd/system/{}", r.unit))),
@@ -101,7 +107,35 @@ pub fn generate(config: &DeployConfig) -> Result<Vec<GeneratedFile>, ScaffoldErr
             install_dest: None,
             contents: env,
         },
-    ])
+    ];
+    if let Some(file) = &r.refreshed_file {
+        files.extend(refreshed_drop_ins(config, file));
+    }
+    Ok(files)
+}
+
+/// A drop-in loading the outbound flag `file` for each of `[refresh].units`;
+/// a timer's goes to the service of the same name, which it starts.
+fn refreshed_drop_ins(config: &DeployConfig, file: &str) -> Vec<GeneratedFile> {
+    let units = config
+        .refresh
+        .as_ref()
+        .map(|refresh| refresh.units.as_slice())
+        .unwrap_or_default();
+    units
+        .iter()
+        .map(|unit| {
+            unit.strip_suffix(".timer")
+                .map_or_else(|| unit.clone(), |base| format!("{base}.service"))
+        })
+        .map(|service| GeneratedFile {
+            rel_path: PathBuf::from(format!("systemd/{service}.d/fraisier-refreshed.conf")),
+            install_dest: Some(PathBuf::from(format!(
+                "/etc/systemd/system/{service}.d/fraisier-refreshed.conf"
+            ))),
+            contents: with_header(&REFRESHED_DROP_IN.replace("{refreshed_file}", file)),
+        })
+        .collect()
 }
 
 /// Render the systemd units that run fraisier on a calendar schedule.
@@ -393,6 +427,8 @@ struct Resolved {
     socket: String,
     exec_start: String,
     env_file: String,
+    /// The outbound flag file, for a config with `[refresh]`.
+    refreshed_file: Option<String>,
     upstream: String,
     nginx_dest: PathBuf,
     db_env: String,
@@ -455,6 +491,10 @@ impl Resolved {
         Ok(Self {
             exec_start: format!("{active_path}/{name}"),
             env_file: format!("/etc/{name}/{environment}.env"),
+            refreshed_file: config
+                .refresh
+                .is_some()
+                .then(|| format!("/etc/{name}/{environment}.refreshed.env")),
             server_block: host_addresses(config)
                 .iter()
                 .map(|address| format!("    server {address};"))
@@ -499,9 +539,21 @@ Type=simple
 ExecStart={exec_start}
 Restart=on-failure
 EnvironmentFile=-{env_file}
-
+{refreshed}
 [Install]
 WantedBy=multi-user.target
+";
+
+/// The app unit's line loading the outbound flag a refresh sets, after the
+/// shared environment file so it wins.
+const REFRESHED_ENV: &str = "# Set by `fraisier db refresh` until `--clear-flag`: keeps outbound
+# integrations off on a copy of another environment's data.
+EnvironmentFile=-{refreshed_file}
+";
+
+/// A drop-in giving one of `[refresh].units` the outbound flag.
+const REFRESHED_DROP_IN: &str = "[Service]
+EnvironmentFile=-{refreshed_file}
 ";
 
 const SYSTEMD_SOCKET: &str = "[Unit]
@@ -781,6 +833,72 @@ upstream = "checkout_upstream"
         let ci = find(&files, "deploy.yml");
         // The `${{ secrets.* }}` expressions must survive verbatim.
         assert!(ci.contents.contains("${{ secrets."), "{ci:?}");
+    }
+
+    const REFRESHED: &str = r#"
+[deploy]
+name = "checkout"
+environment = "staging"
+production = false
+
+[service]
+adapter = "systemd"
+unit = "checkout.service"
+
+[refresh]
+source_dir = "/var/backups/checkout"
+source_environment = "production"
+sanitize = "/etc/checkout/sanitize.sql"
+units = ["checkout-worker.service", "checkout-beat.timer"]
+"#;
+
+    #[test]
+    fn a_refresh_target_s_app_unit_loads_the_outbound_flag_after_its_env() {
+        let cfg = DeployConfig::from_toml_str(REFRESHED).expect("parse");
+        let files = generate(&cfg).expect("generate");
+        let service = find(&files, "systemd/checkout.service");
+        let shared = service
+            .contents
+            .find("EnvironmentFile=-/etc/checkout/staging.env\n")
+            .expect("the shared env file");
+        let flag = service
+            .contents
+            .find("EnvironmentFile=-/etc/checkout/staging.refreshed.env\n")
+            .expect("the flag file");
+        assert!(shared < flag, "{}", service.contents);
+    }
+
+    #[test]
+    fn every_refresh_unit_gets_a_drop_in_loading_the_flag() {
+        let cfg = DeployConfig::from_toml_str(REFRESHED).expect("parse");
+        let files = generate(&cfg).expect("generate");
+        for unit in ["checkout-worker.service", "checkout-beat.service"] {
+            let drop_in = find(&files, &format!("systemd/{unit}.d/fraisier-refreshed.conf"));
+            assert_eq!(
+                drop_in.install_dest.as_deref(),
+                Some(std::path::Path::new(&format!(
+                    "/etc/systemd/system/{unit}.d/fraisier-refreshed.conf"
+                )))
+            );
+            assert!(
+                drop_in
+                    .contents
+                    .contains("[Service]\nEnvironmentFile=-/etc/checkout/staging.refreshed.env\n"),
+                "{}",
+                drop_in.contents
+            );
+            assert!(drop_in.contents.contains(MARKER));
+        }
+    }
+
+    #[test]
+    fn a_config_without_refresh_gets_no_flag_line() {
+        let cfg = DeployConfig::from_toml_str(MULTI).expect("parse");
+        let files = generate(&cfg).expect("generate");
+        assert_eq!(files.len(), 5);
+        assert!(!find(&files, "checkout.service")
+            .contents
+            .contains("refreshed"));
     }
 
     #[test]

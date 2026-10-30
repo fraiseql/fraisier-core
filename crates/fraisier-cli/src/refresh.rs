@@ -10,9 +10,11 @@ use serde_json::json;
 
 use crate::commands::{self, CommandOutput};
 
+mod flag;
 mod run;
+mod units;
 
-pub(crate) use run::db_refresh;
+pub(crate) use run::{db_refresh, db_refresh_clear_flag};
 
 /// An exit-1 refusal carrying `message`, credentials stripped.
 fn refuse(message: &str) -> CommandOutput {

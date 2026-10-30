@@ -88,7 +88,85 @@ the admin DSN never reaches them.
 `--no-acl` drops the archive's grants. A grant to a role other than the app
 role must be made again after a refresh; the sanitize step is the place for it.
 
-### Not yet
+## Sanitize, the outbound flag, and the restart
 
-Sanitizing and the outbound flag are not built yet. Until they are, a refresh
-ends with every unit stopped and says so.
+After the migrations and the table count, the refresh:
+
+1. **Runs the sanitize step** inside the refreshed database, as the app role.
+   Its environment is `PATH` plus the app's `PG*` variables (`PGHOST`,
+   `PGUSER`, `PGPASSWORD`, `PGDATABASE`, ...), nothing else: no DSN on argv,
+   never the admin identity.
+   - A `.sql` file is read once and hashed, and those same bytes are piped to
+     `psql -X -1 -v ON_ERROR_STOP=1`: one transaction, nothing committed when
+     a statement fails.
+   - Anything else runs as an executable with no arguments.
+   - The step must not be group- or world-writable, and must be owned by root
+     or by the user running the refresh; otherwise the refresh refuses before
+     anything stops.
+   - `sanitize = "none"` skips it; the plan and the receipt carry the
+     `sanitize_reason`.
+   - A failed step leaves every unit stopped.
+2. **Writes the outbound flag** to `/etc/<name>/<environment>.refreshed.env`:
+   `<outbound_flag>=1` (default `FRAISIER_REFRESHED=1`), mode 0640, owned by
+   the user running the refresh with the `[service]` unit's group. The app can
+   read it but neither change it nor delete it: the refresh refuses a
+   directory that is group- or world-writable or owned by anyone but root or
+   the operator.
+3. **Starts the units that were running**, the `[service]` unit first.
+4. **Proves the flag** for each started service: its `MainPID`'s
+   `/proc/<pid>/environ` must hold `<outbound_flag>=1`. If one has no main
+   process, lacks the flag, or its environment cannot be read, the refresh
+   stops every unit again and fails. An unreadable environment is never taken
+   as a pass.
+
+Your application reads the variable and keeps its outbound integrations (mail,
+webhooks, payment calls, mailbox polling) off while it is `1`.
+
+### Every unit loads the flag
+
+Before anything stops, the refresh asks systemd
+(`systemctl show -p EnvironmentFiles`) whether each unit loads the flag file.
+For a timer it asks the units the timer starts. A unit that does not load it
+is refused by name. `fraisier scaffold` generates the line for the app unit:
+
+```ini
+EnvironmentFile=-/etc/checkout/staging.refreshed.env
+```
+
+It also generates a drop-in for each of `[refresh].units`
+(`/etc/systemd/system/<unit>.d/fraisier-refreshed.conf`; a timer's goes to
+the service of the same name). Install them with `fraisier scaffold-install`,
+then `systemctl daemon-reload`.
+
+### Run it as root
+
+Only root, or the process's own user, may read `/proc/<pid>/environ`, and
+the flag file is owned by whoever writes it. Run `fraisier db refresh` as
+root, for example `sudo fraisier db refresh --config ... --yes`. Run as
+anyone else, the proof cannot read the app's environment and the refresh
+fails.
+
+### Clearing the flag
+
+```sh
+sudo fraisier db refresh --config /etc/fraisier/checkout-staging.toml --clear-flag
+```
+
+This removes the file and records who (`$SUDO_USER`, else `$USER`, and the
+uid) and when, on stderr and in the receipt's `flag_cleared`. It never
+restarts a unit: the next start loads the environment without the flag.
+
+### The receipt
+
+Every run under the lock writes
+`<state_dir>/refreshes/<fraise>-<environment>.json`. It holds:
+
+- the archive's path, stamp, size and mtime;
+- the sanitize step (path, kind and SHA-256, or `none` with the reason) and
+  its outcome;
+- the migrations applied and the table count;
+- the flag's variable and file, and the pid that proved it for each unit;
+- the start time and duration;
+- for a failure, the step and the redacted reason.
+
+It holds no secrets.

@@ -79,14 +79,14 @@ async fn pick_archive(
 pub(crate) async fn db_refresh(
     config_path: &Path,
     state_dir: &Path,
-    execute: bool,
+    run: Run,
 ) -> Result<CommandOutput> {
     let config = commands::load(config_path)?;
     let user = systemd_service(&config).is_ok_and(|(_, user)| user);
     db_refresh_with(
         config_path,
         state_dir,
-        execute,
+        run,
         &Machinery {
             server: &fraisier_db::restore::Postgres,
             units: &Systemctl::new(user),
@@ -97,6 +97,16 @@ pub(crate) async fn db_refresh(
         },
     )
     .await
+}
+
+/// How a refresh was asked to run.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Run {
+    /// `--yes`: do it, rather than print the plan.
+    pub(crate) execute: bool,
+    /// `--skip-if-locked`: a held deploy lock is a quiet skip (exit 0), as a
+    /// timer wants, rather than a refusal.
+    pub(crate) skip_if_locked: bool,
 }
 
 /// What [`db_refresh`] drives, supplied by the caller.
@@ -138,7 +148,7 @@ struct Plan {
 pub(crate) async fn db_refresh_with(
     config_path: &Path,
     state_dir: &Path,
-    execute: bool,
+    run: Run,
     machinery: &Machinery<'_>,
 ) -> Result<CommandOutput> {
     let config = commands::load(config_path)?;
@@ -146,7 +156,7 @@ pub(crate) async fn db_refresh_with(
         Ok(plan) => plan,
         Err(refusal) => return Ok(refusal),
     };
-    if !execute {
+    if !run.execute {
         return Ok(show_plan(&plan));
     }
 
@@ -155,6 +165,16 @@ pub(crate) async fn db_refresh_with(
     let key = FraiseKey::new(&plan.fraise, &plan.environment);
     let guard = match store.acquire_lock(&key).await {
         Ok(guard) => guard,
+        Err(StateStoreError::Locked { .. }) if run.skip_if_locked => {
+            return Ok(CommandOutput {
+                exit_code: 0,
+                pretty: format!(
+                    "skipped: a deploy of {key} holds the deploy lock; the next scheduled \
+                     refresh will run\n"
+                ),
+                json: json!({ "ok": true, "skipped": true, "reason": "deploy lock held" }),
+            });
+        }
         Err(StateStoreError::Locked { .. }) => {
             return Ok(refuse(&format!(
                 "a deploy of {key} holds the deploy lock; refusing to refresh while it runs. \

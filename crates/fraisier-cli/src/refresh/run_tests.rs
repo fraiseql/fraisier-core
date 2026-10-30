@@ -9,7 +9,7 @@ use fraisier_db::restore::RestoreServer;
 use fraisier_db::tviews::{Identity, Rebuilt};
 use fraisier_db::PgConn;
 
-use super::{clear_flag_with, db_refresh_with, Machinery};
+use super::{clear_flag_with, db_refresh_with, Machinery, Run};
 use crate::commands::CommandOutput;
 use crate::refresh::units::Units;
 use crate::test_env::{block_on, env_guard};
@@ -356,6 +356,16 @@ fn refresh(
     server: &Server,
     units: &FakeUnits,
 ) -> CommandOutput {
+    refresh_opts(dir, config, (execute, false), server, units)
+}
+
+fn refresh_opts(
+    dir: &Path,
+    config: &Path,
+    (execute, skip_if_locked): (bool, bool),
+    server: &Server,
+    units: &FakeUnits,
+) -> CommandOutput {
     let _guard = env_guard();
     std::env::set_var(
         DSN_ENV,
@@ -365,7 +375,10 @@ fn refresh(
     let out = block_on(db_refresh_with(
         config,
         &dir.join("state"),
-        execute,
+        Run {
+            execute,
+            skip_if_locked,
+        },
         &Machinery {
             server,
             units,
@@ -989,6 +1002,25 @@ fn a_held_deploy_lock_is_refused_before_any_unit_stops() {
     let (server, units) = (Server::default(), units(dir.path()));
     let out = refresh(dir.path(), &config, true, &server, &units);
     assert_eq!(out.exit_code, 1, "{}", out.pretty);
+    assert!(out.pretty.contains("deploy lock"), "{}", out.pretty);
+    assert!(units.of("stop").is_empty(), "{:?}", units.calls());
+    assert!(!server.dropped());
+    block_on(store.release_lock(guard)).expect("release");
+}
+
+#[test]
+fn a_scheduled_run_skips_quietly_while_a_deploy_holds_the_lock() {
+    use fraisier_saga::state_store::{FilesystemStateStore, FraiseKey, StateStore as _};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = config(dir.path(), Some(false), "true", SKIPPED);
+    archive(dir.path(), "20261026T021500Z");
+    let store = FilesystemStateStore::new(dir.path().join("state")).expect("store");
+    let guard = block_on(store.acquire_lock(&FraiseKey::new("checkout", "staging"))).expect("lock");
+    let (server, units) = (Server::default(), units(dir.path()));
+    let out = refresh_opts(dir.path(), &config, (true, true), &server, &units);
+    assert_eq!(out.exit_code, 0, "{}", out.pretty);
+    assert_eq!(out.json["skipped"], true);
     assert!(out.pretty.contains("deploy lock"), "{}", out.pretty);
     assert!(units.of("stop").is_empty(), "{:?}", units.calls());
     assert!(!server.dropped());

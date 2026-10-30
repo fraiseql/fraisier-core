@@ -2511,3 +2511,18 @@ fn a_refresh_unit_must_be_a_plain_service_or_timer_name() {
     ));
     assert!(has_error(&report, "refresh.units[1]"), "{report}");
 }
+
+#[test]
+fn a_scheduled_refresh_without_a_notify_command_warns() {
+    let report = refresh_config(&format!(
+        "{REFRESH_REQUIRED}schedule = \"weekly Mon 05:00\"\n"
+    ))
+    .validate();
+    assert!(has_warning(&report, "notify.command"), "{report}");
+    assert!(report.to_string().contains("the refresh"), "{report}");
+    let unscheduled = refresh_config(REFRESH_REQUIRED).validate();
+    assert!(
+        !has_warning(&unscheduled, "notify.command"),
+        "{unscheduled}"
+    );
+}

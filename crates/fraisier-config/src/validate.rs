@@ -840,6 +840,13 @@ fn validate_notify(cfg: &DeployConfig, report: &mut ValidationReport) {
     {
         unattended.push("the drill");
     }
+    if cfg
+        .refresh
+        .as_ref()
+        .is_some_and(|refresh| refresh.schedule.is_some())
+    {
+        unattended.push("the refresh");
+    }
     if !unattended.is_empty() {
         report.warn(
             "notify.command",

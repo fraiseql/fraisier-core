@@ -714,6 +714,17 @@ struct DbRefreshArgs {
     /// pick the change up at their next start.
     #[arg(long)]
     clear_flag: bool,
+
+    /// When a deploy holds the deploy lock, skip quietly (exit 0) instead of
+    /// refusing: what a timer wants.
+    #[arg(long)]
+    skip_if_locked: bool,
+
+    /// Run by a systemd unit: on failure, leave a redacted record for the
+    /// unit's `OnFailure=` alert, keyed by `$INVOCATION_ID`. The value is the
+    /// unit's name (`%n`).
+    #[arg(long, value_name = "UNIT")]
+    failure_record: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1037,7 +1048,20 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
             if args.clear_flag {
                 refresh::db_refresh_clear_flag(&args.config, &args.state_dir)
             } else {
-                refresh::db_refresh(&args.config, &args.state_dir, args.yes).await
+                recorded(
+                    refresh::db_refresh(
+                        &args.config,
+                        &args.state_dir,
+                        refresh::Run {
+                            execute: args.yes,
+                            skip_if_locked: args.skip_if_locked,
+                        },
+                    )
+                    .await,
+                    &args.config,
+                    alert::ScheduledRun::Refresh,
+                    args.failure_record.as_deref(),
+                )
             }
         }
         Command::Stack(StackCommand::Deploy(args)) => {

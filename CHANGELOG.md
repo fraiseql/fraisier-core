@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-beta.14] - 2026-10-30
+
 ### Added
 
 - **`[refresh]` and `[deploy] production` config keys** (#136), for the
@@ -1315,7 +1317,8 @@ migration-safe rollback across one host or a fleet.
 - **GitHub Actions CI** that runs `cargo xtask ci`.
 
 [c197]: https://github.com/fraiseql/confiture/issues/197
-[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.13...HEAD
+[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.14...HEAD
+[1.0.0-beta.14]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.13...fraisier-v1.0.0-beta.14
 [1.0.0-beta.13]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.12...fraisier-v1.0.0-beta.13
 [1.0.0-beta.12]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.11...fraisier-v1.0.0-beta.12
 [1.0.0-beta.11]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.10...fraisier-v1.0.0-beta.11

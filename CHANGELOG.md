@@ -37,8 +37,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   its extensions and restores the archive's objects `--role=<app>`; it
   restores the extensions' own rows separately. So a pg_tviews archive comes
   back owned by the app role with its registry intact. The admin DSN never
-  reaches the migrations. Sanitizing and the outbound flag are not built yet,
-  so a refresh ends with the units stopped and says so.
+  reaches the migrations.
+- **The refresh's sanitize step and outbound flag** (#136):
+  - **Sanitize.** After the migrations, the refresh runs `[refresh].sanitize`
+    inside the new database as the app role. The step's environment holds
+    `PATH` and the app's `PG*` variables only. A `.sql` file's bytes are
+    hashed and those same bytes are piped to `psql -1 -v ON_ERROR_STOP=1`.
+    A step that is group- or world-writable, or owned by anyone other than
+    root or the operator, is refused before anything stops.
+  - **The flag.** The refresh writes `/etc/<name>/<env>.refreshed.env`
+    (`<outbound_flag>=1`, mode 0640, owned by root with the unit's group). It
+    starts only the units that were running.
+  - **The two checks.** Before anything stops, it refuses unless every unit
+    loads that file. After the start, it proves each service's main process
+    carries the flag through `/proc/<pid>/environ`. A process without the
+    flag, or one whose environment cannot be read, stops every unit and fails
+    the refresh.
+  - **`fraisier db refresh --clear-flag`** removes the file and records who
+    and when. It never restarts a unit.
+  - **Receipt.** Each run writes `<state_dir>/refreshes/<fraise>-<env>.json`.
+  - **Scaffold.** `fraisier scaffold` adds the `EnvironmentFile=` line to the
+    app unit and a drop-in to each of `[refresh].units`.
 
 ## [1.0.0-beta.13] - 2026-10-29
 

@@ -707,8 +707,13 @@ struct DbRefreshArgs {
     state_dir: PathBuf,
 
     /// Execute the refresh (without this, only the plan is shown). Destructive.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "clear_flag")]
     yes: bool,
+
+    /// Remove the outbound flag a refresh set, recording who and when. Units
+    /// pick the change up at their next start.
+    #[arg(long)]
+    clear_flag: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1029,7 +1034,11 @@ async fn dispatch(cli: &Cli) -> Result<CommandOutput> {
             refresh::db_mark_refresh_target(&args.config).await
         }
         Command::Db(DbCommand::Refresh(args)) => {
-            refresh::db_refresh(&args.config, &args.state_dir, args.yes).await
+            if args.clear_flag {
+                refresh::db_refresh_clear_flag(&args.config, &args.state_dir)
+            } else {
+                refresh::db_refresh(&args.config, &args.state_dir, args.yes).await
+            }
         }
         Command::Stack(StackCommand::Deploy(args)) => {
             stack::stack_deploy(

@@ -18,6 +18,7 @@
 pub mod readiness;
 pub mod refresh;
 pub mod restore;
+pub mod sanitize;
 pub mod tviews;
 
 pub mod archive;

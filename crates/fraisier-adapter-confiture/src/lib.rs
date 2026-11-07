@@ -118,8 +118,8 @@ use std::sync::OnceLock;
 use async_trait::async_trait;
 use fraisier_core::adapter_axes::{
     AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, ChangeSet, MigrationAdapter,
-    MigrationOutcome, PreflightIssue, PreflightReport, Revision, SchemaChange, Severity,
-    VerifyCheck, VerifyReport,
+    MigrationOutcome, PreflightIssue, PreflightReport, Reversibility, Revision, SchemaChange,
+    Severity, VerifyCheck, VerifyReport, REVERSIBILITY,
 };
 use fraisier_core::policy::PENDING_SCOPE;
 use fraisier_core::restore_rehearsal::{AGAINST_DATABASE_URL_SECRET, DEEP_CLASSIFICATION};
@@ -237,6 +237,25 @@ const DEEP_CLASSIFICATION_MIN_CONFITURE: (u32, u32, u32) = (0, 44, 0);
 /// migration is pending. The captures are in `tests/fixtures/scope/`.
 const PENDING_SCOPE_MIN_CONFITURE: (u32, u32, u32) = (1, 35, 0);
 
+/// The first confiture whose `migrate preflight` names a `.py` migration whose
+/// `down()` does nothing (`PFLIGHT_DOWN_EMPTY`), and whose `migrate down-to`
+/// refuses to run one.
+///
+/// **Observed, not read off a changelog**, which said 1.41.0. On a `.py`
+/// migration with `def down(): pass`, 1.39.0 reports nothing, and its `migrate
+/// down-to` exits 0, deletes the ledger row and leaves the migration's table in
+/// place. 1.40.0 reports `PFLIGHT_DOWN_EMPTY` naming it, and its `down-to`
+/// refuses with `ROLLBACK_600`, exit 8. The captures are in
+/// `tests/fixtures/reversibility/`.
+const REVERSIBILITY_MIN_CONFITURE: (u32, u32, u32) = (1, 40, 0);
+
+/// The preflight codes that name a migration `migrate down` cannot undo
+/// because it has no down that does anything: none written, or a `.py`
+/// `down()` that does nothing. confiture's broader `reversible` verdict also
+/// counts migrations whose down runs but cannot bring data back; those are the
+/// policy gate's to judge, by tier.
+const NO_USABLE_DOWN: [&str; 2] = ["PFLIGHT_MISSING_DOWN", "PFLIGHT_DOWN_EMPTY"];
+
 /// Every version-gated capability this adapter has, with the confiture release
 /// it starts trusting for it. `None` means the capability is withheld from every
 /// version.
@@ -256,6 +275,7 @@ pub const CAPABILITY_FLOORS: &[CapabilityFloor] = &[
     (RISK_TIER_CAPABILITY, RISK_TIER_MIN_CONFITURE),
     (DEEP_CLASSIFICATION, Some(DEEP_CLASSIFICATION_MIN_CONFITURE)),
     (PENDING_SCOPE, Some(PENDING_SCOPE_MIN_CONFITURE)),
+    (REVERSIBILITY, Some(REVERSIBILITY_MIN_CONFITURE)),
 ];
 
 /// One row of [`CAPABILITY_FLOORS`]: the capability's advertised name, and the
@@ -1057,7 +1077,49 @@ fn capabilities_for(version: &str) -> Vec<String> {
     if version_at_or_above(version, PENDING_SCOPE_MIN_CONFITURE) {
         capabilities.push(PENDING_SCOPE.to_owned());
     }
+    if version_at_or_above(version, REVERSIBILITY_MIN_CONFITURE) {
+        capabilities.push(REVERSIBILITY.to_owned());
+    }
     capabilities
+}
+
+/// Whether `migrate down` can undo the pending migrations of the preflight
+/// report `json`, produced by the confiture at `version`.
+///
+/// From [`REVERSIBILITY_MIN_CONFITURE`], every migration a [`NO_USABLE_DOWN`]
+/// issue names. Below it an empty `down()` is invisible, so the check could not
+/// run unless the report judged no migration at all.
+fn reversibility_of(json: &Value, version: &str) -> Reversibility {
+    if !version_at_or_above(version, REVERSIBILITY_MIN_CONFITURE) {
+        let checked = json
+            .pointer("/summary/migrations_checked")
+            .and_then(Value::as_u64);
+        if checked != Some(0) {
+            let (major, minor, patch) = REVERSIBILITY_MIN_CONFITURE;
+            return Reversibility::Unchecked {
+                reason: format!(
+                    "confiture {version} is older than {major}.{minor}.{patch}, the first \
+                     release that reports a .py migration whose down() does nothing"
+                ),
+            };
+        }
+    }
+    let mut irreversible: Vec<String> = Vec::new();
+    for issue in json
+        .get("issues")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let code = issue.get("code").and_then(Value::as_str);
+        let migration = issue.get("migration").and_then(Value::as_str);
+        if let (Some(code), Some(migration)) = (code, migration) {
+            if NO_USABLE_DOWN.contains(&code) && !irreversible.iter().any(|m| m == migration) {
+                irreversible.push(migration.to_owned());
+            }
+        }
+    }
+    Reversibility::Checked { irreversible }
 }
 
 /// The `--scope` arguments for a preflight by the confiture at `version`.
@@ -1231,12 +1293,9 @@ impl MigrationAdapter for ConfitureMigration {
     }
 
     async fn preflight(&self, ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {
+        let version = self.installed_version().await?;
         let output = self
-            .run(
-                "preflight",
-                ctx,
-                &preflight_scope(&self.installed_version().await?),
-            )
+            .run("preflight", ctx, &preflight_scope(&version))
             .await?;
         // Same envelope rule as `verify`. An envelope would at least parse to
         // `ok = false` here (it carries a top-level `"ok"`), so this is not the
@@ -1246,7 +1305,9 @@ impl MigrationAdapter for ConfitureMigration {
             .json
             .as_ref()
             .filter(|json| !is_error_envelope(json))
-            .map(parse_preflight_report);
+            .map(|json| {
+                parse_preflight_report(json).with_reversibility(reversibility_of(json, &version))
+            });
         if let Some(report) = report {
             return Ok(report);
         }
@@ -1266,8 +1327,9 @@ mod tests {
         args_contain, capabilities_for, classify, error_code_of, is_error_envelope,
         parse_change_set, parse_current_revision, parse_down_to_outcome, parse_preflight_report,
         parse_up_outcome, parse_verify_report, parse_version, plan, reports_uninitialised,
-        subcommand_takes_migrations_dir, supports_risk_tier, version_at_or_above, version_triple,
-        ConfitureMigration, NotAReport, CONFITURE_DSN_ENV, RISK_TIER_MIN_CONFITURE,
+        reversibility_of, subcommand_takes_migrations_dir, supports_risk_tier, version_at_or_above,
+        version_triple, ConfitureMigration, NotAReport, Reversibility, CAPABILITY_FLOORS,
+        CONFITURE_DSN_ENV, REVERSIBILITY, RISK_TIER_MIN_CONFITURE,
     };
     use fraisier_core::adapter_axes::{
         AdapterCtx, AdapterErrorKind, ChangeSetUnavailable, PreflightReport, Revision, RiskTier,
@@ -2279,6 +2341,95 @@ mod tests {
                 "{version}"
             );
         }
+    }
+
+    /// A `tests/fixtures/reversibility/` capture.
+    fn reversibility_capture(name: &str) -> Value {
+        let bytes = match name {
+            "down-empty-1.36.0" => {
+                include_str!("../tests/fixtures/reversibility/down-empty-1.36.0.json")
+            }
+            "down-empty-1.39.0" => {
+                include_str!("../tests/fixtures/reversibility/down-empty-1.39.0.json")
+            }
+            "down-empty-1.40.0" => {
+                include_str!("../tests/fixtures/reversibility/down-empty-1.40.0.json")
+            }
+            "down-empty-1.45.0" => {
+                include_str!("../tests/fixtures/reversibility/down-empty-1.45.0.json")
+            }
+            "missing-down-1.45.0" => {
+                include_str!("../tests/fixtures/reversibility/missing-down-1.45.0.json")
+            }
+            other => panic!("no reversibility capture named {other}"),
+        };
+        serde_json::from_str(bytes).expect("a capture is JSON")
+    }
+
+    fn checked(irreversible: &[&str]) -> Reversibility {
+        Reversibility::Checked {
+            irreversible: irreversible.iter().map(|m| (*m).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn from_the_floor_an_empty_down_is_named() {
+        for version in ["1.40.0", "1.45.0"] {
+            let json = reversibility_capture(&format!("down-empty-{version}"));
+            assert_eq!(
+                reversibility_of(&json, version),
+                checked(&["20261107000002"]),
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_down_is_named_too() {
+        assert_eq!(
+            reversibility_of(&reversibility_capture("missing-down-1.45.0"), "1.45.0"),
+            checked(&["20261107000003"])
+        );
+    }
+
+    #[test]
+    fn migrations_that_all_have_a_down_are_checked_and_clean() {
+        let json: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/verdicts/1.45.0.json"))
+                .expect("json");
+        assert_eq!(reversibility_of(&json, "1.45.0"), checked(&[]));
+    }
+
+    #[test]
+    fn below_the_floor_the_check_could_not_run_and_says_why() {
+        for version in ["1.36.0", "1.39.0"] {
+            let json = reversibility_capture(&format!("down-empty-{version}"));
+            let Reversibility::Unchecked { reason } = reversibility_of(&json, version) else {
+                panic!("{version} cannot see an empty down()");
+            };
+            assert!(reason.contains(version), "{reason}");
+            assert!(reason.contains("1.40.0"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn below_the_floor_with_nothing_pending_there_is_nothing_to_undo() {
+        let json = serde_json::json!({
+            "ok": true,
+            "issues": [],
+            "summary": { "migrations_checked": 0 },
+            "scope": "pending"
+        });
+        assert_eq!(reversibility_of(&json, "1.36.0"), checked(&[]));
+    }
+
+    #[test]
+    fn the_reversibility_capability_starts_at_the_floor() {
+        assert!(!capabilities_for("1.39.0").contains(&REVERSIBILITY.to_owned()));
+        assert!(capabilities_for("1.40.0").contains(&REVERSIBILITY.to_owned()));
+        assert!(CAPABILITY_FLOORS
+            .iter()
+            .any(|(name, floor)| *name == REVERSIBILITY && *floor == Some((1, 40, 0))));
     }
 
     /// The worst tier per migration of a `tests/fixtures/verdicts/` capture.

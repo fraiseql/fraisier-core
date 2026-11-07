@@ -10,9 +10,10 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use fraisier_config::{DeployConfig, Severity, ValidationReport};
-use fraisier_core::adapter_axes::HealthAdapter;
+use fraisier_core::adapter_axes::{HealthAdapter, PreflightReport, Reversibility};
 use fraisier_core::multi_host::MultiHostDeploy;
 use fraisier_core::policy::Baseline;
+use fraisier_core::preflight_verdict;
 use fraisier_core::redact;
 use fraisier_core::single_host::{DeployRecord, SingleHostDeploy};
 use fraisier_saga::saga::SagaOutcome;
@@ -1898,6 +1899,7 @@ async fn run_single_host(
     )
     .context(resolved.ctx)
     .forward_compatible_lint(resolved.forward_compatible_lint && !skip_preflight)
+    .allow_irreversible(resolved.allow_irreversible)
     .policy(resolved.policy)
     .artifact(resolved.artifact)
     .migration(resolved.migration)
@@ -1969,6 +1971,7 @@ async fn run_multi_host(
     )
     .context(resolved.ctx)
     .forward_compatible_lint(resolved.forward_compatible_lint)
+    .allow_irreversible(resolved.allow_irreversible)
     .policy(resolved.policy)
     .artifact(resolved.artifact)
     .migration(resolved.migration)
@@ -2109,8 +2112,6 @@ pub(crate) fn refuse_invalid_db_config(config: &DeployConfig, verb: &str) -> Opt
 /// all pending migrations (`up(None)`), and records the resulting revision in the
 /// state ledger so `status`/`list` stay accurate.
 pub(crate) async fn db_migrate(config_path: &Path, state_dir: &Path) -> Result<CommandOutput> {
-    use fraisier_core::adapter_axes::Severity;
-
     let config = load(config_path)?;
     if let Some(refusal) = refuse_invalid_db_config(&config, "migrate") {
         return Ok(refusal);
@@ -2121,7 +2122,8 @@ pub(crate) async fn db_migrate(config_path: &Path, state_dir: &Path) -> Result<C
 
     // Forward-compat preflight, gated exactly as the deploy flow gates it: skip
     // entirely on opt-out, describe to learn capabilities, only call preflight if
-    // advertised, and block on Error-severity findings.
+    // advertised, and block on Error-severity findings and on a pending migration
+    // no down can undo.
     if resolved.forward_compatible_lint {
         let described = adapter
             .describe()
@@ -2132,26 +2134,8 @@ pub(crate) async fn db_migrate(config_path: &Path, state_dir: &Path) -> Result<C
                 .preflight(&resolved.ctx)
                 .await
                 .context("running the forward-compatibility preflight")?;
-            let blocking: Vec<_> = report
-                .issues
-                .iter()
-                .filter(|issue| issue.severity == Severity::Error)
-                .collect();
-            if !blocking.is_empty() {
-                let mut pretty = String::new();
-                for issue in &blocking {
-                    let _ = writeln!(pretty, "  [error] {}: {}", issue.code, issue.message);
-                }
-                let _ = writeln!(
-                    pretty,
-                    "refusing to migrate: {} blocking forward-compatibility issue(s)",
-                    blocking.len()
-                );
-                return Ok(CommandOutput {
-                    exit_code: 1,
-                    pretty,
-                    json: json!({ "ok": false, "preflight_blocking": blocking.len() }),
-                });
+            if let Some(refusal) = migrate_preflight_refusal(&report, resolved.allow_irreversible) {
+                return Ok(refusal);
             }
         }
     }
@@ -2189,6 +2173,47 @@ pub(crate) async fn db_migrate(config_path: &Path, state_dir: &Path) -> Result<C
             "count": applied.len(),
             "to": to,
         }),
+    })
+}
+
+/// Why `db migrate` refuses this preflight report, rendered, or `None` when it
+/// may apply the pending migrations. The lint goes first, as on a deploy.
+fn migrate_preflight_refusal(
+    report: &PreflightReport,
+    allow_irreversible: bool,
+) -> Option<CommandOutput> {
+    let groups = preflight_verdict::blocking(report);
+    if !groups.is_empty() {
+        let mut pretty = String::new();
+        for group in &groups {
+            let _ = writeln!(pretty, "  [error] {}", group.line());
+        }
+        let _ = writeln!(
+            pretty,
+            "refusing to migrate: {}",
+            preflight_verdict::counts(&groups)
+        );
+        let issues: usize = groups.iter().map(|group| group.issues.len()).sum();
+        return Some(CommandOutput {
+            exit_code: 1,
+            pretty,
+            json: json!({
+                "ok": false,
+                "preflight_blocking": groups.len(),
+                "preflight_issues": issues,
+            }),
+        });
+    }
+    let reason = preflight_verdict::reversibility_refusal(Some(report), allow_irreversible)?;
+    let mut json = json!({ "ok": false, "reason": reason });
+    match &report.reversibility {
+        Some(Reversibility::Checked { irreversible }) => json["irreversible"] = json!(irreversible),
+        _ => json["reversibility"] = json!("unchecked"),
+    }
+    Some(CommandOutput {
+        exit_code: 1,
+        pretty: format!("refusing to migrate: {reason}\n"),
+        json,
     })
 }
 
@@ -4044,13 +4069,14 @@ async fn notify_deploy_failure(
 mod tests {
     use super::{
         apply_exit, bootstrap, check, classify_source, db_backup, db_migrate, db_reset, db_restore,
-        deploy, discover_adapters, health, init, list, notify_deploy_failure, provider_test,
-        providers, render_check_report, render_failed_output, rollback, scaffold, scaffold_install,
-        scheduled_install, scheduled_list, scheduled_uninstall, ship, slugify, status, sync,
-        validate_config, version_bump, version_show, webhook_server, write_check_log, Depth,
-        ShipArgs,
+        deploy, discover_adapters, health, init, list, migrate_preflight_refusal,
+        notify_deploy_failure, provider_test, providers, render_check_report, render_failed_output,
+        rollback, scaffold, scaffold_install, scheduled_install, scheduled_list,
+        scheduled_uninstall, ship, slugify, status, sync, validate_config, version_bump,
+        version_show, webhook_server, write_check_log, Depth, ShipArgs,
     };
     use fraisier_config::DeployConfig;
+    use fraisier_core::adapter_axes::{PreflightIssue, PreflightReport, Reversibility, Severity};
     use fraisier_core::single_host::DeployRecord;
     use fraisier_saga::events::SagaState;
     use fraisier_saga::saga::SagaOutcome;
@@ -5464,6 +5490,77 @@ current_revision = "true"
             .await
             .expect("snapshot");
         assert!(snap.is_some(), "db migrate records a ledger entry");
+    }
+
+    fn issue(code: &str, migration: Option<&str>) -> PreflightIssue {
+        PreflightIssue {
+            severity: Severity::Error,
+            code: code.to_owned(),
+            message: format!("{code} happened"),
+            migration: migration.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn db_migrate_counts_blocking_findings_per_migration() {
+        let report = PreflightReport::new(false).with_issues(vec![
+            issue("PFLIGHT_MISSING_DOWN", Some("003")),
+            issue("PFLIGHT_REPLAY_FAILED", Some("003")),
+            issue("PFLIGHT_CONFIG", None),
+        ]);
+        let out = migrate_preflight_refusal(&report, true).expect("refused");
+        assert_eq!(out.exit_code, 1);
+        assert_eq!(out.json["preflight_blocking"], serde_json::json!(2));
+        assert_eq!(out.json["preflight_issues"], serde_json::json!(3));
+        assert!(
+            out.pretty
+                .contains("  [error] 003: PFLIGHT_MISSING_DOWN: PFLIGHT_MISSING_DOWN happened"),
+            "{}",
+            out.pretty
+        );
+        assert!(
+            out.pretty.contains("1 pending migration(s) would fail"),
+            "{}",
+            out.pretty
+        );
+    }
+
+    #[test]
+    fn db_migrate_refuses_an_irreversible_migration_unless_allowed() {
+        let report = PreflightReport::new(true).with_reversibility(Reversibility::Checked {
+            irreversible: vec!["005_add_index".to_owned()],
+        });
+        let out = migrate_preflight_refusal(&report, false).expect("refused");
+        assert_eq!(out.exit_code, 1);
+        assert_eq!(
+            out.json["irreversible"],
+            serde_json::json!(["005_add_index"])
+        );
+        assert!(
+            out.pretty.contains("[migration].allow_irreversible = true"),
+            "{}",
+            out.pretty
+        );
+        assert!(migrate_preflight_refusal(&report, true).is_none());
+    }
+
+    #[test]
+    fn db_migrate_refuses_when_the_adapter_could_not_tell() {
+        let report = PreflightReport::new(true).with_reversibility(Reversibility::Unchecked {
+            reason: "confiture 1.36.0 is older than 1.40.0".to_owned(),
+        });
+        let out = migrate_preflight_refusal(&report, false).expect("refused");
+        assert!(
+            out.pretty.contains("1.36.0 is older than 1.40.0"),
+            "{}",
+            out.pretty
+        );
+        assert_eq!(out.json["reversibility"], serde_json::json!("unchecked"));
+    }
+
+    #[test]
+    fn db_migrate_passes_a_clean_report() {
+        assert!(migrate_preflight_refusal(&PreflightReport::new(true), false).is_none());
     }
 
     #[tokio::test]

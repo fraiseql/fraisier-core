@@ -57,14 +57,22 @@ fn describe(issue: &PreflightIssue) -> String {
     format!("{}: {}", issue.code, issue.message)
 }
 
-/// Why the forward-compatibility lint refuses this report, or `None` when no
-/// finding blocks it.
-#[must_use]
-pub fn lint_refusal(report: &PreflightReport) -> Option<String> {
-    let groups = blocking(report);
-    if groups.is_empty() {
-        return None;
+impl BlockingMigration {
+    /// The migration, then each finding: `003: CODE: message; CODE: message`.
+    #[must_use]
+    pub fn line(&self) -> String {
+        let issues = self.issues.join("; ");
+        self.migration.as_ref().map_or_else(
+            || issues.clone(),
+            |migration| format!("{migration}: {issues}"),
+        )
     }
+}
+
+/// How many migrations fail and how many findings name none, for a headline:
+/// `2 pending migration(s) would fail, 1 other blocking issue(s)`.
+#[must_use]
+pub fn counts(groups: &[BlockingMigration]) -> String {
     let migrations = groups.iter().filter(|g| g.migration.is_some()).count();
     let others = groups.len() - migrations;
     let mut counts = Vec::new();
@@ -74,19 +82,21 @@ pub fn lint_refusal(report: &PreflightReport) -> Option<String> {
     if others > 0 {
         counts.push(format!("{others} other blocking issue(s)"));
     }
-    let detail: Vec<String> = groups
-        .iter()
-        .map(|group| {
-            let issues = group.issues.join("; ");
-            group.migration.as_ref().map_or_else(
-                || issues.clone(),
-                |migration| format!("{migration}: {issues}"),
-            )
-        })
-        .collect();
+    counts.join(", ")
+}
+
+/// Why the forward-compatibility lint refuses this report, or `None` when no
+/// finding blocks it.
+#[must_use]
+pub fn lint_refusal(report: &PreflightReport) -> Option<String> {
+    let groups = blocking(report);
+    if groups.is_empty() {
+        return None;
+    }
+    let detail: Vec<String> = groups.iter().map(BlockingMigration::line).collect();
     Some(format!(
         "forward-compatibility preflight: {} — {}",
-        counts.join(", "),
+        counts(&groups),
         detail.join(" | ")
     ))
 }

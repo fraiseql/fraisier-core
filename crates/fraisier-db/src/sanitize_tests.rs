@@ -28,19 +28,26 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Run `step`, waiting out `ETXTBSY`: a test thread that forks while this one
-/// still holds the freshly written script open for writing keeps it busy until
-/// that child execs.
+/// Run `step`, waiting out `ETXTBSY` (see [`retry_busy`]).
 fn run_step(step: &Path, operator_uid: u32) -> Result<super::Sanitized, String> {
+    retry_busy(|| block_on(run(step, &conn(), operator_uid)))
+}
+
+/// Run `attempt` again while its exec fails with `ETXTBSY`: a test thread that
+/// forks while another still holds a freshly written script open for writing
+/// keeps it busy until that child execs.
+fn retry_busy(
+    attempt: impl Fn() -> Result<super::Sanitized, String>,
+) -> Result<super::Sanitized, String> {
     for _ in 0..50 {
-        match block_on(run(step, &conn(), operator_uid)) {
+        match attempt() {
             Err(error) if error.contains("Text file busy") => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             other => return other,
         }
     }
-    panic!("{} stayed busy", step.display());
+    panic!("the step stayed busy");
 }
 
 #[test]
@@ -157,7 +164,8 @@ fn a_sql_step_pipes_the_bytes_it_hashed_to_psql_in_one_transaction() {
         "UPDATE tb_user SET email = 'x';\n",
         0o600,
     );
-    let ran = block_on(super::run_with(&bin.join("psql"), &step, &conn(), me())).expect("ran");
+    let psql = bin.join("psql");
+    let ran = retry_busy(|| block_on(super::run_with(&psql, &step, &conn(), me()))).expect("ran");
     assert_eq!(ran.kind, "sql");
     let args = std::fs::read_to_string(seen.with_extension("args")).expect("args");
     assert!(args.contains("ON_ERROR_STOP=1"), "{args}");

@@ -91,13 +91,17 @@ impl RestoreIdentity {
     /// one is configured. A webhook-started operation never reads it.
     ///
     /// # Errors
-    /// The configured env var is unset, or its DSN does not parse. A configured
-    /// identity is never silently replaced by the app role.
+    /// The configured env var is unset, its DSN does not parse, or either DSN
+    /// names a host list (see [`PgConn::is_multi_host`]). A configured identity
+    /// is never silently replaced by the app role.
     pub fn from_env(
         app: PgConn,
         admin_env: Option<&str>,
         trigger: Trigger,
     ) -> Result<Self, String> {
+        if app.is_multi_host() {
+            return Err(format!("the app DSN {MULTI_HOST}"));
+        }
         let Some(env) = admin_env else {
             return Ok(Self::new(app, None, trigger));
         };
@@ -112,6 +116,9 @@ impl RestoreIdentity {
             .map_err(|_| format!("the configured admin_url_env '{env}' is not set"))?;
         let conn =
             PgConn::parse(&dsn).map_err(|error| format!("invalid admin DSN in {env}: {error}"))?;
+        if conn.is_multi_host() {
+            return Err(format!("the admin DSN in {env} {MULTI_HOST}"));
+        }
         Ok(Self::new(
             app,
             Some(Admin {
@@ -151,6 +158,10 @@ impl RestoreIdentity {
             .or(self.withheld.as_deref())
     }
 }
+
+/// Why a restore-class operation refuses a libpq host list.
+const MULTI_HOST: &str = "names more than one host, address or port; a restore, refresh or \
+     drill must know which server it replaces, so name one";
 
 /// The database operations a restore needs. [`Postgres`] runs them for real.
 #[async_trait]

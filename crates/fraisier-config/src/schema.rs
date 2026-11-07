@@ -458,6 +458,15 @@ pub struct ServiceSection {
     /// system manager. Ignored by the other service adapters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<bool>,
+    /// The account the app runs as: `User=` in the unit `fraisier scaffold`
+    /// renders, which it requires for a system-manager unit. Never `root` or
+    /// `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as: Option<String>,
+    /// The app's group: `Group=` in the scaffolded unit. Defaults to the
+    /// account's primary group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as_group: Option<String>,
 }
 
 /// The `[health]` section.

@@ -279,6 +279,8 @@ impl Overlay for ServiceSection {
             compose_service: prefer(self.compose_service, over.compose_service),
             compose_file: prefer(self.compose_file, over.compose_file),
             user: prefer(self.user, over.user),
+            run_as: prefer(self.run_as, over.run_as),
+            run_as_group: prefer(self.run_as_group, over.run_as_group),
         }
     }
 }

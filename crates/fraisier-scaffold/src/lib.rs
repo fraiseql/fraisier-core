@@ -101,6 +101,9 @@ migrations_path = "./migrations"
 # Service manager: "systemd", "rc", or "docker-compose".
 adapter = "systemd"
 unit = "myapp.service"
+# The account the app runs as (`User=` in the unit `fraisier scaffold` writes).
+# Required to scaffold; never root.
+run_as = "myapp"
 
 [health]
 # Post-restart health probe; the deploy commits only once this passes.
@@ -126,6 +129,21 @@ mod tests {
             report.warnings().count(),
             0,
             "a good starter config should carry no caveats:\n{report}"
+        );
+    }
+
+    #[test]
+    fn the_starter_config_scaffolds_an_app_unit_that_is_not_root() {
+        let cfg = DeployConfig::from_toml_str(super::starter_config()).expect("parses");
+        let files = crate::generate(&cfg).expect("the starter config scaffolds");
+        let unit = files
+            .iter()
+            .find(|f| f.rel_path.ends_with("myapp.service"))
+            .expect("an app unit");
+        assert!(
+            unit.contents.contains("\nUser=myapp\n"),
+            "{}",
+            unit.contents
         );
     }
 }

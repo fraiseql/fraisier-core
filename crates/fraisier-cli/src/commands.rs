@@ -4092,6 +4092,7 @@ database_url_env = "CHECKOUT_DATABASE_URL"
 [service]
 adapter = "systemd"
 unit = "checkout.service"
+run_as = "checkout"
 
 [health]
 adapter = "http"

@@ -81,7 +81,7 @@ pub use schema::{
     ScaffoldSection, ScheduleSection, ServiceSection, SshSection, DEFAULT_APPROVAL_TIMEOUT_SECS,
     UNCLASSIFIED_ACTIONS,
 };
-pub use validate::{is_unit_word, ValidationIssue, ValidationReport};
+pub use validate::{is_superuser, is_unit_word, ValidationIssue, ValidationReport};
 
 // Re-exported so callers can match on issue severity without depending on
 // `fraisier-core` directly.

@@ -514,12 +514,50 @@ fn validate_service(cfg: &DeployConfig, report: &mut ValidationReport) {
              (the service within the Compose project)",
         );
     }
+    validate_run_as(service, report);
     if service.user == Some(true) && service.adapter.as_deref() != Some("systemd") {
         report.warn(
             "service.user",
             "user = true only applies to the systemd adapter (systemctl --user); \
              it is ignored by this adapter",
         );
+    }
+}
+
+/// `[service].run_as` / `run_as_group`: the account the scaffolded unit's
+/// `User=` / `Group=` name. The values are never echoed: a bad one may hold a
+/// line break.
+fn validate_run_as(service: &crate::ServiceSection, report: &mut ValidationReport) {
+    if let Some(run_as) = service.run_as.as_deref() {
+        if is_superuser(run_as) {
+            report.error(
+                "service.run_as",
+                "run_as must not be root (or uid 0): name the account the app runs as",
+            );
+        } else if !is_unit_word(run_as) {
+            report.error(
+                "service.run_as",
+                "run_as must be one account name or uid (letters, digits, `_`, `.` and `-`)",
+            );
+        }
+        if service.user == Some(true) {
+            report.error(
+                "service.run_as",
+                "run_as does not apply with user = true: a user-manager unit runs as its \
+                 user, and User= is invalid there",
+            );
+        }
+    }
+    if let Some(group) = service.run_as_group.as_deref() {
+        if !is_unit_word(group) {
+            report.error(
+                "service.run_as_group",
+                "run_as_group must be one group name or gid (letters, digits, `_`, `.` and `-`)",
+            );
+        }
+        if service.run_as.is_none() {
+            report.error("service.run_as_group", "run_as_group needs run_as");
+        }
     }
 }
 
@@ -1028,6 +1066,12 @@ fn validate_backup(cfg: &DeployConfig, report: &mut ValidationReport) {
             names.push((name, index));
         }
     }
+}
+
+/// Whether `account` names the superuser: `root`, or uid 0 in any spelling.
+#[must_use]
+pub fn is_superuser(account: &str) -> bool {
+    account == "root" || (!account.is_empty() && account.bytes().all(|b| b == b'0'))
 }
 
 /// Whether `word` is safe as part of a systemd unit name and as an

@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use fraisier_config::{DeployConfig, RetainEntry};
+use fraisier_config::{is_superuser, is_unit_word, DeployConfig, RetainEntry, ServiceSection};
 
 use crate::ScaffoldError;
 
@@ -88,6 +88,7 @@ fn serving_files(r: &Resolved) -> Vec<GeneratedFile> {
         &SYSTEMD_SERVICE
             .replace("{name}", &r.name)
             .replace("{environment}", &r.environment)
+            .replace("{run_as}", &r.run_as)
             .replace("{exec_start}", &r.exec_start)
             .replace("{env_file}", &r.env_file)
             .replace(
@@ -483,6 +484,8 @@ struct Resolved {
     server_block: String,
     /// The nginx site's gzip/brotli directives, possibly empty.
     compression: String,
+    /// The app unit's `User=`/`Group=` lines, empty for a user-manager unit.
+    run_as: String,
 }
 
 impl Resolved {
@@ -540,6 +543,7 @@ impl Resolved {
 
         Ok(Self {
             compression: compression(config),
+            run_as: run_as_lines(config.service.as_ref())?,
             exec_start: format!("{active_path}/{name}"),
             env_file: format!("/etc/{name}/{environment}.env"),
             refreshed_file: config
@@ -575,6 +579,51 @@ fn host_addresses(config: &DeployConfig) -> Vec<String> {
     }
 }
 
+/// The app unit's `User=` (and `Group=`) lines. A system-manager unit must name
+/// its account, and never root: without `User=` systemd runs it as root. A
+/// user-manager unit (`user = true`) runs as its user and takes neither.
+fn run_as_lines(service: Option<&ServiceSection>) -> Result<String, ScaffoldError> {
+    let Some(service) = service else {
+        return Ok(String::new());
+    };
+    let invalid = |field, message: &str| ScaffoldError::InvalidField {
+        section: "service",
+        field,
+        message: message.to_owned(),
+    };
+    if service.user == Some(true) {
+        return if service.run_as.is_some() {
+            Err(invalid(
+                "run_as",
+                "does not apply with user = true (User= is invalid in a user-manager unit)",
+            ))
+        } else {
+            Ok(String::new())
+        };
+    }
+    let run_as = service
+        .run_as
+        .as_deref()
+        .ok_or(ScaffoldError::MissingField {
+            section: "service",
+            field: "run_as",
+        })?;
+    if is_superuser(run_as) {
+        return Err(invalid("run_as", "must not be root (or uid 0)"));
+    }
+    if !is_unit_word(run_as) {
+        return Err(invalid("run_as", "must be one account name or uid"));
+    }
+    let group = match service.run_as_group.as_deref() {
+        Some(group) if !is_unit_word(group) => {
+            return Err(invalid("run_as_group", "must be one group name or gid"));
+        }
+        Some(group) => format!("Group={group}\n"),
+        None => String::new(),
+    };
+    Ok(format!("User={run_as}\n{group}"))
+}
+
 /// The compression directives for the nginx site: gzip unless
 /// `[scaffold.nginx].gzip = false`, brotli only with `brotli = true`. Both cover
 /// JSON only; nginx's own defaults already cover `text/html`.
@@ -605,7 +654,7 @@ Description={name} ({environment})
 After=network.target
 
 [Service]
-Type=simple
+{run_as}Type=simple
 # Edit ExecStart to your binary; {active_path} is the symlink fraisier swaps.
 ExecStart={exec_start}
 Restart=on-failure
@@ -857,6 +906,7 @@ database_url_env = "CHECKOUT_DATABASE_URL"
 [service]
 adapter = "systemd"
 unit = "checkout.service"
+run_as = "checkout"
 
 [health]
 adapter = "http"
@@ -1013,6 +1063,7 @@ production = false
 [service]
 adapter = "systemd"
 unit = "checkout.service"
+run_as = "checkout"
 
 [refresh]
 source_dir = "/var/backups/checkout"
@@ -1083,6 +1134,53 @@ units = ["checkout-worker.service", "checkout-beat.timer"]
             .map(|f| f.rel_path.display().to_string())
             .collect();
         assert_eq!(paths, vec![".github/workflows/deploy.yml", ".env.example"]);
+    }
+
+    fn app_unit(service: &str) -> Result<String, crate::ScaffoldError> {
+        let cfg = DeployConfig::from_toml_str(&format!(
+            "[deploy]\nname = \"app\"\nenvironment = \"production\"\n\n\
+             [service]\nadapter = \"systemd\"\nunit = \"app.service\"\n{service}"
+        ))
+        .expect("parse");
+        let files = generate(&cfg)?;
+        Ok(find(&files, "systemd/app.service").contents.clone())
+    }
+
+    #[test]
+    fn the_app_unit_runs_as_the_configured_account() {
+        let unit = app_unit("run_as = \"app\"\nrun_as_group = \"web\"\n").expect("generate");
+        assert!(unit.contains("[Service]\nUser=app\nGroup=web\n"), "{unit}");
+        let unit = app_unit("run_as = \"app\"\n").expect("generate");
+        assert!(
+            unit.contains("[Service]\nUser=app\nType=simple\n"),
+            "{unit}"
+        );
+    }
+
+    #[test]
+    fn an_app_unit_without_run_as_is_refused_naming_the_key() {
+        let error = app_unit("").expect_err("refused");
+        assert!(error.to_string().contains("[service].run_as"), "{error}");
+    }
+
+    #[test]
+    fn root_and_a_line_break_are_refused_as_run_as() {
+        for value in ["root", "0", "000", "app\\nExecStartPre=/bin/sh", "a b"] {
+            let error = app_unit(&format!("run_as = \"{value}\"\n")).expect_err(value);
+            assert!(error.to_string().contains("[service].run_as"), "{error}");
+        }
+        let error =
+            app_unit("run_as = \"app\"\nrun_as_group = \"web\\nUser=root\"\n").expect_err("group");
+        assert!(
+            error.to_string().contains("[service].run_as_group"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_user_manager_unit_needs_no_run_as_and_gets_no_user_line() {
+        let unit = app_unit("user = true\n").expect("generate");
+        assert!(!unit.contains("User="), "{unit}");
     }
 
     #[test]

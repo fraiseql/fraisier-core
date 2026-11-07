@@ -329,7 +329,8 @@ fn every_scheduled_unit_loads_the_ops_env_file_after_the_shared_one() {
 fn the_app_unit_never_loads_the_ops_env_file() {
     // An admin DSN set for the drill must not reach the application.
     let config = DeployConfig::from_toml_str(&format!(
-        "{BASE}\n[service]\nadapter = \"systemd\"\nunit = \"checkout.service\"\n"
+        "{BASE}\n[service]\nadapter = \"systemd\"\nunit = \"checkout.service\"\n\
+         run_as = \"checkout\"\n"
     ))
     .expect("parses");
     let files = generate(&config).expect("generates");

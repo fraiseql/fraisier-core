@@ -3277,6 +3277,22 @@ pub(crate) async fn db_tviews_rebuild(config_path: &Path, all: bool) -> Result<C
     }
 }
 
+/// The migration adapter a destructive database operation will re-apply
+/// migrations with, built and asked to describe itself before anything is
+/// destroyed, so a tool that cannot run refuses the operation instead of
+/// leaving an emptied database behind.
+pub(crate) async fn ready_migration(
+    config: &DeployConfig,
+) -> std::result::Result<factory::ResolvedMigration, String> {
+    let resolved = factory::build_migration_only(config).map_err(|error| format!("{error:#}"))?;
+    resolved
+        .migration
+        .describe()
+        .await
+        .map_err(|error| format!("the migration adapter cannot run: {error}"))?;
+    Ok(resolved)
+}
+
 /// `db reset`: drop every user schema and re-apply migrations from scratch.
 ///
 /// Destructive: it wipes the database, so it only runs with `execute` (the
@@ -3319,6 +3335,17 @@ pub(crate) async fn db_reset(
         });
     }
 
+    let resolved = match ready_migration(&config).await {
+        Ok(resolved) => resolved,
+        Err(problem) => {
+            return Ok(CommandOutput {
+                exit_code: 1,
+                pretty: format!("refusing to reset: {problem}. Nothing was changed\n"),
+                json: json!({ "ok": false, "stage": "adapter", "error": problem }),
+            })
+        }
+    };
+
     // 1. Drop every user schema (generic Postgres).
     let dropped = fraisier_db::run(fraisier_db::psql_command(&conn, fraisier_db::RESET_SQL))
         .await
@@ -3332,7 +3359,6 @@ pub(crate) async fn db_reset(
     }
 
     // 2. Re-apply migrations through the configured adapter.
-    let resolved = factory::build_migration_only(&config)?;
     let adapter = resolved.migration.as_ref();
     let outcome = adapter
         .up(&resolved.ctx, None)
@@ -5528,6 +5554,37 @@ current_revision = "true"
             "the plan must spell out the destruction: {}",
             out.pretty
         );
+    }
+
+    #[test]
+    fn db_reset_refuses_a_migration_tool_it_cannot_run_before_dropping_anything() {
+        let _guard = crate::test_env::env_guard();
+        let var = "FRAISIER_DBOPS_RESET_NO_TOOL";
+        // Nothing listens on port 1: a reset that reached psql would fail at
+        // the drop stage, so the stage says which check ran first.
+        std::env::set_var(var, "postgres://app@127.0.0.1:1/shop");
+        std::env::set_var("FRAISIER_CONFITURE_BIN", "/nonexistent/confiture");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(
+            dir.path(),
+            "fraisier.toml",
+            &format!(
+                "[deploy]\nname = \"demo\"\nenvironment = \"test\"\n\n\
+                 [migration]\nadapter = \"confiture\"\ndatabase_url_env = \"{var}\"\n"
+            ),
+        );
+        let out = block_on(db_reset(&config, &dir.path().join("state"), true)).expect("ran");
+        std::env::remove_var(var);
+        std::env::remove_var("FRAISIER_CONFITURE_BIN");
+
+        assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
+        assert_eq!(
+            out.json["stage"],
+            serde_json::json!("adapter"),
+            "{}",
+            out.json
+        );
+        assert!(out.pretty.contains("Nothing was changed"), "{}", out.pretty);
     }
 
     #[test]

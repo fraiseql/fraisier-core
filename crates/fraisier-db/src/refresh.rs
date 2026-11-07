@@ -549,7 +549,7 @@ pub async fn refresh_in_place(
         if !rebuilt.still_empty.is_empty() {
             return Err(failed(format!(
                 "after the post-restore TVIEW rebuild, these TVIEWs are still empty over a \
-                 populated view: {}",
+                 populated view, or could not be read: {}",
                 rebuilt.still_empty.join(", ")
             )));
         }

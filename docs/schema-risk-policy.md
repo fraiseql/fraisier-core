@@ -143,6 +143,9 @@ combination rather than leaving you to discover it at the gate.
 | blue-green | opt-in via `[policy]` | **always on** |
 | `fraisier rollback` | not gated | — |
 
+Every forward path also refuses a migration no `down` can undo; see
+*Migrations no down can undo* below.
+
 Blue-green additionally refuses any migration confiture cannot certify as
 forward-compatible for a two-version window, with or without a `[policy]`
 section — N-1 and N share one database for the hold window, and that rule is not
@@ -153,6 +156,44 @@ same block as before this gate existed; only the message is new.
 report describes the pending *forward* changes — judging one by the other would
 rule on a change-set the run will not apply, and would put an approver between
 an operator and an emergency rollback.
+
+## Migrations no down can undo
+
+Every forward migrate — the three deploy strategies and `fraisier db migrate` —
+also refuses a pending migration that has no `down` able to undo it: one with no
+`.down.sql`, or a `.py` migration whose `down()` does nothing. Rolling back past
+such a migration rewinds confiture's ledger and leaves the schema it created,
+so the next `up` fails or, worse, succeeds on a schema the ledger misdescribes.
+
+The refusal names each such migration:
+
+```
+refusing to migrate: pending migration(s) 20261107000002 have no down that undoes
+them, so a rollback past them would rewind the ledger and leave the schema; write
+a down, or set [migration].allow_irreversible = true to apply them anyway
+```
+
+To apply them anyway — a migration that genuinely cannot be undone, such as a
+data backfill — say so in the config:
+
+```toml
+[migration]
+allow_irreversible = true
+```
+
+| Adapter | What happens |
+|---|---|
+| confiture ≥ 1.40.0 | checked; refused unless allowed |
+| confiture < 1.40.0, with pending migrations | **refused** unless allowed: it cannot report an empty `down()`, so fraisier cannot tell. Upgrade confiture, or set the key |
+| `command`, IPC adapters | not checked: they report no reversibility |
+
+Only a missing or empty `down` counts. confiture's broader `reversible` verdict
+(which also covers a `.py` down it could not run, and destructive changes) is
+not what this gate reads; the tier policy above judges destructive changes.
+
+`fraisier rollback` is not held behind this check, for the reason it is not
+gated by the tier policy. `--skip-preflight` and `preflight_mode = "off"` skip
+it along with the lint: nothing asked the adapter.
 
 ## The approval hook
 

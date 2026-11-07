@@ -6,6 +6,49 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`[migration].allow_irreversible`** (default `false`). See the ⚠️ entry
+  under Changed: without it, a forward migrate now refuses a pending
+  migration no `down` can undo.
+- **The confiture adapter reports reversibility** (capability
+  `reversibility`, from confiture 1.40.0): the pending migrations with no
+  `.down.sql`, or a `.py` `down()` that does nothing
+  (`PFLIGHT_MISSING_DOWN`, `PFLIGHT_DOWN_EMPTY`). `PreflightReport` gains an
+  optional `reversibility` field; an adapter that does not report it is
+  unaffected.
+
+### Changed
+
+- ⚠️ **A pending migration no `down` can undo now stops a deploy and `db
+  migrate`**, before anything changes, unless `[migration].allow_irreversible
+  = true`. Rolling back past such a migration rewinds confiture's ledger and
+  leaves its schema; confiture before 1.40.0 did exactly that for a `.py`
+  migration whose `down()` is `pass`. The refusal names each migration. With
+  a confiture older than 1.40.0 and pending migrations, the deploy is refused
+  too, because nothing can tell: upgrade confiture, or set the key. The
+  `command` and IPC adapters report no reversibility and are not affected;
+  `fraisier rollback` is never held behind it.
+- ⚠️ **The pinned confiture moves from 1.36.0 to 1.45.0**
+  (`tools/confiture-requirements.txt`). The exit-code table adds `DIFFER_411`
+  (exit 0), `VALID_010` (exit 5) and `CONFIG_016` (exit 5); no new class.
+  Two policy-gate verdicts loosen with it, so a `[policy]` that refused them
+  may now admit them:
+  - a view `DROP VIEW …; CREATE VIEW …` is `reversible`, not `destructive`;
+  - a same-name `CHECK` swap written as two statements is `lock_risky`, not
+    `destructive`.
+- **Preflight findings are counted per migration.** Two blocking findings on
+  one migration read as one failing migration, each listed with its codes.
+  `db migrate --json`: `preflight_blocking` now counts migrations (and
+  findings that name none); the new `preflight_issues` counts findings.
+
+### Known issues
+
+- confiture 1.42.0 through 1.45.0 crash (`INTERNAL_ERROR`, "list index out of
+  range") classifying a one-statement constraint swap such as `ALTER TABLE t
+  DROP CONSTRAINT c, ADD CONSTRAINT c CHECK (x > 0);`. The preflight fails, so
+  the deploy stops. Write it as two statements.
+
 ## [1.0.0-beta.14] - 2026-10-30
 
 ### Added

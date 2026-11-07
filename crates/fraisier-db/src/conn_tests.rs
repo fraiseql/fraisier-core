@@ -268,3 +268,34 @@ fn debug_never_shows_the_password() {
     let shown = format!("{conn:?}");
     assert!(!shown.contains("s3cret"), "{shown}");
 }
+
+// ---- resolve: the ambient TLS/GSS policy ------------------------------------
+
+fn ambient_sslmode(name: &str) -> Option<std::ffi::OsString> {
+    (name == "PGSSLMODE").then(|| "verify-full".into())
+}
+
+#[test]
+fn resolve_refuses_an_ambient_tls_policy_the_url_does_not_pin() {
+    let error = PgConn::resolve_with("postgresql://u:s3cret@db.internal/app", &ambient_sslmode)
+        .expect_err("refused");
+    let message = error.to_string();
+    assert!(message.contains("PGSSLMODE"), "{message}");
+    assert!(message.contains("?sslmode="), "{message}");
+    assert!(!message.contains("verify-full"), "{message}");
+    assert!(!message.contains("s3cret"), "{message}");
+}
+
+#[test]
+fn resolve_accepts_what_parse_accepts_when_nothing_is_ambient() {
+    let dsn = "postgresql://u@db.internal/app";
+    assert_eq!(
+        PgConn::resolve_with(dsn, &|_| None).expect("resolves"),
+        PgConn::parse(dsn).expect("parses")
+    );
+}
+
+#[test]
+fn parse_stays_pure() {
+    assert!(PgConn::parse("postgresql://u@db.internal/app").is_ok());
+}

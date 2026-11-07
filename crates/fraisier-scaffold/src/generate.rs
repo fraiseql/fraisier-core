@@ -36,14 +36,54 @@ pub struct GeneratedFile {
 
 /// Render the full set of deploy infrastructure files for `config`.
 ///
-/// Produces the systemd service + socket units, an nginx site config, a GitHub
-/// Actions deploy workflow, and a `.env.example`.
+/// A config with a `[service]` gets the systemd service + socket units and an
+/// nginx site; every config gets a GitHub Actions deploy workflow and a
+/// `.env.example`. A config that serves nothing (no `[service]`, such as one
+/// that only migrates a database) gets no unit and no site.
 ///
 /// # Errors
 /// [`ScaffoldError::MissingField`] if `[deploy].name` / `[deploy].environment`
 /// (the fields every template keys on) are absent.
 pub fn generate(config: &DeployConfig) -> Result<Vec<GeneratedFile>, ScaffoldError> {
     let r = Resolved::from_config(config)?;
+    let ci = with_header(
+        &CI_WORKFLOW
+            .replace("{name}", &r.name)
+            .replace("{environment}", &r.environment),
+    );
+    let env = with_header(
+        &ENV_EXAMPLE
+            .replace("{db_env}", &r.db_env)
+            .replace("{env_file}", &r.env_file)
+            .replace("{name}", &r.name)
+            .replace("{environment}", &r.environment),
+    );
+
+    let mut files = if config.service.is_some() {
+        serving_files(&r)
+    } else {
+        Vec::new()
+    };
+    files.extend([
+        GeneratedFile {
+            rel_path: PathBuf::from(".github/workflows/deploy.yml"),
+            install_dest: None,
+            contents: ci,
+        },
+        GeneratedFile {
+            rel_path: PathBuf::from(".env.example"),
+            install_dest: None,
+            contents: env,
+        },
+    ]);
+    if let Some(file) = &r.refreshed_file {
+        files.extend(refreshed_drop_ins(config, file));
+    }
+    Ok(files)
+}
+
+/// The app's systemd service and socket units and its nginx site.
+fn serving_files(r: &Resolved) -> Vec<GeneratedFile> {
     let service = with_header(
         &SYSTEMD_SERVICE
             .replace("{name}", &r.name)
@@ -68,20 +108,7 @@ pub fn generate(config: &DeployConfig) -> Result<Vec<GeneratedFile>, ScaffoldErr
             .replace("{upstream}", &r.upstream)
             .replace("{name}", &r.name),
     );
-    let ci = with_header(
-        &CI_WORKFLOW
-            .replace("{name}", &r.name)
-            .replace("{environment}", &r.environment),
-    );
-    let env = with_header(
-        &ENV_EXAMPLE
-            .replace("{db_env}", &r.db_env)
-            .replace("{env_file}", &r.env_file)
-            .replace("{name}", &r.name)
-            .replace("{environment}", &r.environment),
-    );
-
-    let mut files = vec![
+    vec![
         GeneratedFile {
             rel_path: PathBuf::from(format!("systemd/{}", r.unit)),
             install_dest: Some(PathBuf::from(format!("/etc/systemd/system/{}", r.unit))),
@@ -94,24 +121,10 @@ pub fn generate(config: &DeployConfig) -> Result<Vec<GeneratedFile>, ScaffoldErr
         },
         GeneratedFile {
             rel_path: PathBuf::from(format!("nginx/{}.conf", r.name)),
-            install_dest: Some(r.nginx_dest),
+            install_dest: Some(r.nginx_dest.clone()),
             contents: nginx,
         },
-        GeneratedFile {
-            rel_path: PathBuf::from(".github/workflows/deploy.yml"),
-            install_dest: None,
-            contents: ci,
-        },
-        GeneratedFile {
-            rel_path: PathBuf::from(".env.example"),
-            install_dest: None,
-            contents: env,
-        },
-    ];
-    if let Some(file) = &r.refreshed_file {
-        files.extend(refreshed_drop_ins(config, file));
-    }
-    Ok(files)
+    ]
 }
 
 /// A drop-in loading the outbound flag `file` for each of `[refresh].units`;
@@ -963,6 +976,21 @@ units = ["checkout-worker.service", "checkout-beat.timer"]
         assert!(!find(&files, "checkout.service")
             .contents
             .contains("refreshed"));
+    }
+
+    #[test]
+    fn a_config_that_serves_nothing_gets_no_app_unit_socket_or_site() {
+        let cfg = DeployConfig::from_toml_str(
+            "[deploy]\nname = \"jobs\"\nenvironment = \"production\"\n\n\
+             [migration]\nadapter = \"confiture\"\ndatabase_url_env = \"JOBS_DSN\"\n",
+        )
+        .expect("parse");
+        let files = generate(&cfg).expect("generate");
+        let paths: Vec<String> = files
+            .iter()
+            .map(|f| f.rel_path.display().to_string())
+            .collect();
+        assert_eq!(paths, vec![".github/workflows/deploy.yml", ".env.example"]);
     }
 
     #[test]

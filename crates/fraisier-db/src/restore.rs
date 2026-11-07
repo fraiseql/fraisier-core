@@ -143,6 +143,11 @@ impl RestoreIdentity {
             .with_database(database)
     }
 
+    /// The resolved admin identity, if one restores.
+    pub(crate) const fn admin(&self) -> Option<&Admin> {
+        self.admin.as_ref()
+    }
+
     /// The env var the pg_tviews refusal points at.
     fn admin_env(&self) -> Option<&str> {
         self.admin

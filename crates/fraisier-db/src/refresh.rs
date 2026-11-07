@@ -99,6 +99,69 @@ pub fn marker_privilege_problem(stdout: &str) -> Result<Option<String>, String> 
     )))
 }
 
+/// The SQL that asks whether `current_user` may create a database for `owner`.
+///
+/// It prints one JSON object: `user`, `superuser`, `createdb`, `owner_ok` and
+/// `owner`. PostgreSQL 16 asks for `SET` on the owner; older releases for
+/// membership.
+#[must_use]
+pub fn create_privilege_sql(owner: Option<&str>) -> String {
+    let (owner_ok, owner_value) = owner.map_or_else(
+        || ("true".to_owned(), "NULL".to_owned()),
+        |owner| {
+            let owner = literal(owner);
+            (
+                format!(
+                    "r.rolsuper OR CASE WHEN current_setting('server_version_num')::int >= 160000 \
+                     THEN pg_has_role(current_user, {owner}, 'SET') \
+                     ELSE pg_has_role(current_user, {owner}, 'MEMBER') END"
+                ),
+                owner,
+            )
+        },
+    );
+    format!(
+        "SELECT json_build_object('user', r.rolname, 'superuser', r.rolsuper, \
+         'createdb', r.rolcreatedb, 'owner_ok', {owner_ok}, 'owner', {owner_value}) \
+         FROM pg_catalog.pg_roles r WHERE r.rolname = current_user"
+    )
+}
+
+/// Why [`create_privilege_sql`]'s reply rules out creating the target again,
+/// with the statement that fixes it, or `None`.
+///
+/// # Errors
+/// The reply is not the JSON object the query prints.
+pub fn create_privilege_problem(stdout: &str) -> Result<Option<String>, String> {
+    let reply: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|error| format!("the create privilege query did not print its JSON: {error}"))?;
+    let flag = |key: &str| {
+        reply[key]
+            .as_bool()
+            .ok_or_else(|| format!("the create privilege query printed no {key}"))
+    };
+    let (superuser, createdb, owner_ok) =
+        (flag("superuser")?, flag("createdb")?, flag("owner_ok")?);
+    let quoted = |key: &str| reply[key].as_str().unwrap_or("<role>").replace('"', "\"\"");
+    let user = quoted("user");
+    if !superuser && !createdb {
+        return Ok(Some(format!(
+            "the role \"{user}\" may not create databases, so the target could not be \
+             created again after the drop. A superuser runs: ALTER ROLE \"{user}\" CREATEDB \
+             (or set [database].admin_url_env to a role that may)"
+        )));
+    }
+    if !owner_ok {
+        let owner = quoted("owner");
+        return Ok(Some(format!(
+            "the role \"{user}\" may create databases but not make \"{owner}\" their owner, \
+             so the target could not be created again for the app. A superuser runs: \
+             GRANT \"{owner}\" TO \"{user}\""
+        )));
+    }
+    Ok(None)
+}
+
 /// The extensions `listing` (a `pg_restore --list` table of contents) creates.
 #[must_use]
 pub fn archive_extensions(listing: &str) -> Vec<String> {
@@ -227,6 +290,38 @@ pub fn connections_sql(db: &str) -> Result<String, DbError> {
     ))
 }
 
+/// Why the target, once dropped, could not be created again where the app
+/// connects: an admin on another cluster than the app's (the refresh would
+/// replace a database the app never reads), or a creating role that may not
+/// create it, or not for `owner`.
+async fn can_create_again(
+    server: &dyn RefreshServer,
+    identity: &RestoreIdentity,
+    maintenance: &PgConn,
+    owner: Option<&str>,
+) -> Result<(), String> {
+    if let Some(admin) = identity.admin() {
+        let read = |error: String| format!("could not read the cluster's identity: {error}");
+        let app = server.identity(identity.app()).await.map_err(read)?;
+        let admin_side = server.identity(maintenance).await.map_err(read)?;
+        if app.system_identifier != admin_side.system_identifier {
+            return Err(format!(
+                "{} reaches another PostgreSQL cluster than the app's DSN \
+                 (system identifier {} against {}); point both at the same server",
+                admin.env, admin_side.system_identifier, app.system_identifier
+            ));
+        }
+    }
+    match server.create_problem(maintenance, owner).await {
+        Ok(None) => Ok(()),
+        Ok(Some(problem)) => Err(problem),
+        Err(error) => Err(format!(
+            "could not check that {} can be created again: {error}",
+            identity.app().database()
+        )),
+    }
+}
+
 /// The database operations a refresh needs beyond a restore's and the
 /// marker's. [`crate::restore::Postgres`] runs them for real.
 #[async_trait]
@@ -246,6 +341,17 @@ pub trait RefreshServer: RestoreServer + MarkerServer {
         &self,
         conn: &PgConn,
         extensions: &[String],
+    ) -> Result<Option<String>, String>;
+
+    /// Why `maintenance`'s role could not create the target again (and, with
+    /// `owner`, make that role its owner), or `None`.
+    ///
+    /// # Errors
+    /// The query failed.
+    async fn create_problem(
+        &self,
+        maintenance: &PgConn,
+        owner: Option<&str>,
     ) -> Result<Option<String>, String>;
 
     /// `conn`'s database's size in bytes (`pg_database_size`).
@@ -377,17 +483,15 @@ pub async fn refresh_in_place(
                 .to_owned(),
         ));
     }
+    let app_role = server
+        .current_user(identity.app())
+        .await
+        .map_err(|error| refused(format!("could not read the app role: {error}")))?;
     // The role the restored objects are owned by, when the admin restores.
-    let owner = if identity.uses_admin() {
-        Some(
-            server
-                .current_user(identity.app())
-                .await
-                .map_err(|error| refused(format!("could not read the app role: {error}")))?,
-        )
-    } else {
-        None
-    };
+    let owner = identity.uses_admin().then(|| app_role.clone());
+    can_create_again(server, identity, &maintenance, owner.as_deref())
+        .await
+        .map_err(refused)?;
     match server.marker_privilege(&restorer).await {
         Ok(None) => {}
         Ok(Some(problem)) => return Err(refused(problem)),
@@ -402,7 +506,16 @@ pub async fn refresh_in_place(
         .await
         .map_err(refused)?;
 
-    let failed = RestoreError::Failed;
+    // From the drop on, the target is gone until the restore finishes, and a
+    // re-run refuses until it exists and is marked again: say how.
+    let failed = |reason: String| {
+        RestoreError::Failed(format!(
+            "{reason}. {target} may no longer exist; to recover, create it again \
+             (`createdb -O {app_role} {target}`, as a role that may create databases), \
+             mark it (`fraisier db mark-refresh-target --config <this config>`), then run \
+             the refresh again"
+        ))
+    };
     server
         .drop(&maintenance, &target)
         .await
@@ -734,6 +847,16 @@ impl RefreshServer for crate::restore::Postgres {
         extensions_problem(&out)
     }
 
+    async fn create_problem(
+        &self,
+        maintenance: &PgConn,
+        owner: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let reply =
+            tviews::query(Path::new("psql"), maintenance, &create_privilege_sql(owner)).await?;
+        create_privilege_problem(&reply)
+    }
+
     async fn database_bytes(&self, conn: &PgConn) -> Result<u64, String> {
         scalar(conn, "SELECT pg_database_size(current_database())").await
     }
@@ -837,9 +960,10 @@ mod in_place_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        archive_extensions, connections_sql, extensions_problem, extensions_sql,
-        marker_privilege_problem, marker_privilege_sql, marker_sql, marker_value, parse_marker,
-        restore_list_command, set_marker_sql, split_listing, without_extensions, MARKER_SETTING,
+        archive_extensions, connections_sql, create_privilege_problem, create_privilege_sql,
+        extensions_problem, extensions_sql, marker_privilege_problem, marker_privilege_sql,
+        marker_sql, marker_value, parse_marker, restore_list_command, set_marker_sql,
+        split_listing, without_extensions, MARKER_SETTING,
     };
 
     const LISTING: &str = ";\n; Archive created at 2026-10-30\n;\n\
@@ -1059,6 +1183,57 @@ mod tests {
         assert!(
             sql.contains("has_parameter_privilege('fraisier.refresh_target', 'SET')"),
             "{sql}"
+        );
+    }
+
+    #[test]
+    fn the_create_privilege_query_names_the_owner_it_would_set() {
+        let sql = create_privilege_sql(Some("app's"));
+        assert!(sql.contains("rolcreatedb"), "{sql}");
+        assert!(
+            sql.contains("pg_has_role(current_user, 'app''s', 'SET')"),
+            "{sql}"
+        );
+        assert!(sql.contains("160000"), "{sql}");
+        assert!(!create_privilege_sql(None).contains("pg_has_role"));
+    }
+
+    #[test]
+    fn a_role_without_createdb_is_told_the_alter_role() {
+        let problem = create_privilege_problem(
+            r#"{"user": "app", "superuser": false, "createdb": false, "owner_ok": true}"#,
+        )
+        .expect("json")
+        .expect("a problem");
+        assert!(problem.contains("ALTER ROLE \"app\" CREATEDB"), "{problem}");
+    }
+
+    #[test]
+    fn a_role_that_cannot_give_the_database_away_is_told_the_grant() {
+        let problem = create_privilege_problem(
+            r#"{"user": "admin", "superuser": false, "createdb": true, "owner_ok": false, "owner": "app"}"#,
+        )
+        .expect("json")
+        .expect("a problem");
+        assert!(problem.contains("GRANT \"app\" TO \"admin\""), "{problem}");
+    }
+
+    #[test]
+    fn a_superuser_or_a_createdb_role_may_create_the_target_again() {
+        for reply in [
+            r#"{"user": "postgres", "superuser": true, "createdb": false, "owner_ok": true}"#,
+            r#"{"user": "app", "superuser": false, "createdb": true, "owner_ok": true}"#,
+        ] {
+            assert_eq!(
+                create_privilege_problem(reply).expect("json"),
+                None,
+                "{reply}"
+            );
+        }
+        assert!(create_privilege_problem("nope").is_err());
+        assert!(
+            create_privilege_problem("{}").is_err(),
+            "a reply without the flags is an error"
         );
     }
 

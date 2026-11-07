@@ -48,6 +48,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   connects without them. Put them in the URL, or keep the password in a
   `PGPASSFILE` (still read). Check the webhook unit's `Environment=` as well
   as your shell.
+- ⚠️ **Only the URL decides where `psql`, `pg_dump`, `pg_restore` and
+  `confiture` connect.** They now start without *any* libpq variable but
+  `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, `PGSSLCRL`, `PGSSLCRLDIR`,
+  `PGPASSFILE`, `PGREQUIREAUTH`, `PGCONNECT_TIMEOUT` and `PGAPPNAME`. An
+  ambient TLS or GSS policy (`PGSSLMODE`, `PGGSSENCMODE`, `PGCHANNELBINDING`,
+  …) that a TCP URL does not pin is **refused** before anything runs, naming
+  the keyword to add (`?sslmode=verify-full`), rather than dropped to libpq's
+  `prefer`. Unix-socket URLs are exempt. Locally launched IPC adapters keep
+  their TLS policy variables, since fraisier never reads their URL.
+
+  **Upgrading:** move a TLS policy you export into the URL. `fraisier doctor`
+  reports the refusal; run it under the webhook and scheduled units'
+  environment too (`systemctl show -p Environment <unit>`), where a
+  `PGSSLMODE` fires only in the runs those units start.
 - `PgConn`'s `Debug` no longer prints the password; it prints the redacted URL.
   `RestoreIdentity` and `Admin` derive `Debug` over it.
 

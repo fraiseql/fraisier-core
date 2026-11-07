@@ -28,6 +28,21 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
+/// Run `step`, waiting out `ETXTBSY`: a test thread that forks while this one
+/// still holds the freshly written script open for writing keeps it busy until
+/// that child execs.
+fn run_step(step: &Path, operator_uid: u32) -> Result<super::Sanitized, String> {
+    for _ in 0..50 {
+        match block_on(run(step, &conn(), operator_uid)) {
+            Err(error) if error.contains("Text file busy") => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
+    panic!("{} stayed busy", step.display());
+}
+
 #[test]
 fn an_executable_sees_only_path_and_the_app_pg_variables() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -39,7 +54,7 @@ fn an_executable_sees_only_path_and_the_app_pg_variables() {
         0o700,
     );
     std::env::set_var("FRAISIER_SANITIZE_TEST_SECRET", "r00tpw");
-    let ran = block_on(run(&step, &conn(), me())).expect("ran");
+    let ran = run_step(&step, me()).expect("ran");
     std::env::remove_var("FRAISIER_SANITIZE_TEST_SECRET");
     assert_eq!(ran.kind, "executable");
     let env = std::fs::read_to_string(&seen).expect("env dumped");
@@ -69,7 +84,7 @@ fn the_step_gets_no_arguments() {
         &format!("#!/bin/sh\necho \"$#\" > {}\n", seen.display()),
         0o700,
     );
-    block_on(run(&step, &conn(), me())).expect("ran");
+    run_step(&step, me()).expect("ran");
     assert_eq!(std::fs::read_to_string(&seen).expect("args").trim(), "0");
 }
 
@@ -77,7 +92,7 @@ fn the_step_gets_no_arguments() {
 fn the_executable_is_hashed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let step = script(dir.path(), "sanitize.sh", "#!/bin/sh\nexit 0\n", 0o700);
-    let ran = block_on(run(&step, &conn(), me())).expect("ran");
+    let ran = run_step(&step, me()).expect("ran");
     assert_eq!(ran.sha256, super::sha256_hex(b"#!/bin/sh\nexit 0\n"));
     assert_eq!(ran.sha256.len(), 64);
 }
@@ -91,7 +106,7 @@ fn a_failing_executable_fails_the_step_with_its_stderr() {
         "#!/bin/sh\necho 'could not scrub users' >&2\nexit 4\n",
         0o700,
     );
-    let error = block_on(run(&step, &conn(), me())).expect_err("fails");
+    let error = run_step(&step, me()).expect_err("fails");
     assert!(error.contains("could not scrub users"), "{error}");
 }
 
@@ -106,7 +121,7 @@ fn a_group_or_world_writable_step_is_refused_before_it_runs() {
             &format!("#!/bin/sh\ntouch {}\n", ran.display()),
             mode,
         );
-        let error = block_on(run(&step, &conn(), me())).expect_err("refused");
+        let error = run_step(&step, me()).expect_err("refused");
         assert!(error.contains("writable"), "{error}");
         assert!(!ran.exists());
     }
@@ -116,7 +131,7 @@ fn a_group_or_world_writable_step_is_refused_before_it_runs() {
 fn a_step_owned_by_someone_else_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let step = script(dir.path(), "sanitize.sh", "#!/bin/sh\nexit 0\n", 0o700);
-    let error = block_on(run(&step, &conn(), me() + 1)).expect_err("refused");
+    let error = run_step(&step, me() + 1).expect_err("refused");
     assert!(error.contains("owned by"), "{error}");
 }
 

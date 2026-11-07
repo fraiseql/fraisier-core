@@ -106,6 +106,7 @@ fn serving_files(r: &Resolved) -> Vec<GeneratedFile> {
         &NGINX_SITE
             .replace("{server_block}", &r.server_block)
             .replace("{upstream}", &r.upstream)
+            .replace("{compression}", &r.compression)
             .replace("{name}", &r.name),
     );
     vec![
@@ -480,6 +481,8 @@ struct Resolved {
     nginx_dest: PathBuf,
     db_env: String,
     server_block: String,
+    /// The nginx site's gzip/brotli directives, possibly empty.
+    compression: String,
 }
 
 impl Resolved {
@@ -536,6 +539,7 @@ impl Resolved {
             );
 
         Ok(Self {
+            compression: compression(config),
             exec_start: format!("{active_path}/{name}"),
             env_file: format!("/etc/{name}/{environment}.env"),
             refreshed_file: config
@@ -569,6 +573,26 @@ fn host_addresses(config: &DeployConfig) -> Vec<String> {
             .collect(),
         _ => vec!["127.0.0.1:8080".to_owned()],
     }
+}
+
+/// The compression directives for the nginx site: gzip unless
+/// `[scaffold.nginx].gzip = false`, brotli only with `brotli = true`. Both cover
+/// JSON only; nginx's own defaults already cover `text/html`.
+fn compression(config: &DeployConfig) -> String {
+    let nginx = config.scaffold.as_ref().and_then(|s| s.nginx.as_ref());
+    let gzip = nginx.and_then(|n| n.gzip) != Some(false);
+    let brotli = nginx.and_then(|n| n.brotli) == Some(true);
+    let mut directives = String::new();
+    if gzip || brotli {
+        directives.push('\n');
+    }
+    if gzip {
+        directives.push_str(GZIP);
+    }
+    if brotli {
+        directives.push_str(BROTLI);
+    }
+    directives
 }
 
 /// Prepend the fraisier-generated marker comment to a rendered body.
@@ -754,13 +778,30 @@ const NGINX_SITE: &str = "upstream {upstream} {
 server {
     listen 80;
     server_name {name}.example.com;
-
+{compression}
     location / {
         proxy_pass http://{upstream};
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 }
+";
+
+/// gzip for JSON responses, including proxied ones (`gzip_proxied any`), which
+/// nginx's default `gzip_proxied off` would leave uncompressed.
+const GZIP: &str = "    gzip on;
+    gzip_proxied any;
+    gzip_types application/json application/graphql-response+json;
+    gzip_min_length 1024;
+    gzip_comp_level 5;
+    gzip_vary on;
+";
+
+/// brotli for JSON responses. Needs nginx's brotli filter module.
+const BROTLI: &str = "    brotli on;
+    brotli_types application/json application/graphql-response+json;
+    brotli_min_length 1024;
+    brotli_comp_level 5;
 ";
 
 const CI_WORKFLOW: &str = "name: deploy {name}
@@ -893,6 +934,57 @@ upstream = "checkout_upstream"
             nginx.install_dest.as_deref(),
             Some(std::path::Path::new("/etc/nginx/sites-available/checkout"))
         );
+    }
+
+    fn site(extra: &str) -> String {
+        let cfg = DeployConfig::from_toml_str(&format!("{MULTI}{extra}")).expect("parse");
+        let files = generate(&cfg).expect("generate");
+        find(&files, "nginx").contents.clone()
+    }
+
+    const JSON_TYPES: &str = "application/json application/graphql-response+json;";
+
+    #[test]
+    fn the_site_gzips_json_by_default() {
+        let site = site("");
+        for line in [
+            "    gzip on;\n",
+            "    gzip_proxied any;\n",
+            "    gzip_min_length 1024;\n",
+            "    gzip_comp_level 5;\n",
+            "    gzip_vary on;\n",
+        ] {
+            assert!(site.contains(line), "{line:?} in:\n{site}");
+        }
+        assert!(
+            site.contains(&format!("    gzip_types {JSON_TYPES}\n")),
+            "{site}"
+        );
+        assert!(!site.contains("brotli"), "{site}");
+    }
+
+    #[test]
+    fn brotli_is_opt_in() {
+        let site = site("\n[scaffold.nginx]\nbrotli = true\n");
+        for line in [
+            "    brotli on;\n",
+            "    brotli_min_length 1024;\n",
+            "    brotli_comp_level 5;\n",
+        ] {
+            assert!(site.contains(line), "{line:?} in:\n{site}");
+        }
+        assert!(
+            site.contains(&format!("    brotli_types {JSON_TYPES}\n")),
+            "{site}"
+        );
+        assert!(site.contains("    gzip on;\n"), "{site}");
+    }
+
+    #[test]
+    fn gzip_can_be_switched_off() {
+        let site = site("\n[scaffold.nginx]\ngzip = false\n");
+        assert!(!site.contains("gzip"), "{site}");
+        assert!(!site.contains("brotli"), "{site}");
     }
 
     #[test]

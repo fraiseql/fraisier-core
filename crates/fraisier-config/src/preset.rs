@@ -130,6 +130,7 @@ impl SpecqlPreset {
             // The preset states no policy: the tier gate stays opt-in, so a
             // preset must not switch it on behind the author's back.
             policy: None,
+            scaffold: None,
             specql: None,
         }
     }
@@ -355,6 +356,8 @@ impl DeployConfig {
             },
             // The preset never emits [policy]; an author-supplied one wins.
             policy: prefer(base.policy, self.policy),
+            // The preset never emits [scaffold]; an author-supplied one wins.
+            scaffold: prefer(base.scaffold, self.scaffold),
             specql: None,
         }
     }

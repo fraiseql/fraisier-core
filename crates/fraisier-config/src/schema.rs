@@ -140,6 +140,10 @@ pub struct DeployConfig {
     /// opt-in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicySection>,
+    /// The `[scaffold]` section: what `fraisier scaffold` renders beyond the
+    /// defaults. Absent renders the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaffold: Option<ScaffoldSection>,
     /// The `[specql]` preset. Present only in the *unexpanded* form; both
     /// [`from_toml_str`](DeployConfig::from_toml_str) and
     /// [`load`](DeployConfig::load) consume it and leave this `None`.
@@ -404,6 +408,30 @@ impl MigrationSection {
             _ => PreflightMode::Live,
         }
     }
+}
+
+/// The `[scaffold]` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScaffoldSection {
+    /// `[scaffold.nginx]`: the generated nginx site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nginx: Option<ScaffoldNginxSection>,
+}
+
+/// The `[scaffold.nginx]` section: compression in the generated nginx site.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScaffoldNginxSection {
+    /// gzip JSON responses (`application/json`,
+    /// `application/graphql-response+json`). Default `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gzip: Option<bool>,
+    /// Also brotli them. Default `false`: it needs nginx's brotli module
+    /// (Debian: `libnginx-mod-http-brotli-filter`), without which `nginx -t`
+    /// fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brotli: Option<bool>,
 }
 
 /// The `[service]` section.

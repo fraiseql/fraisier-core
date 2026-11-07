@@ -6,6 +6,36 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A database URL now reaches what it reaches under libpq** (#105).
+  `PgConn::parse` read only `?sslmode=` from the query and dropped every other
+  parameter, so `?host=/run/postgresql`, `?password=`, `?port=`, `?user=` and
+  `?dbname=` were ignored: the URI part or the compiled-in default applied
+  instead. Every libpq 18 keyword with an environment variable is now read,
+  and a query value overrides the URI part, as in libpq. A socket-directory
+  host (`postgres://u@%2Frun%2Fpostgresql/db`) now also renders back into a
+  URL that parses, and `with_database` replaces a `?dbname=` rather than
+  keeping it beside the new name.
+
+### Changed
+
+- ⚠️ **A DSN fraisier cannot hand on whole is refused** where it used to be
+  silently trimmed: a keyword with no `PG*` variable (`keepalives`,
+  `sslpassword`, …), an unknown keyword, `?service=`, a `key=value` string,
+  and an unencoded `@` in the user name or password. The error names the key,
+  never the value. Run `fraisier doctor` before upgrading: `validate` only
+  sees the variable's name. See `docs/security.md`.
+- ⚠️ **A restore, `db refresh` and a drill refuse a multi-host DSN** (app or
+  admin), before anything runs.
+- `fraisier_db::DbError` is now `#[non_exhaustive]` and gains
+  `UnsupportedKeyword`. `PgConn` gains `is_multi_host`.
+
+### Security
+
+- `PgConn`'s `Debug` no longer prints the password; it prints the redacted URL.
+  `RestoreIdentity` and `Admin` derive `Debug` over it.
+
 ## [1.0.0-beta.14] - 2026-10-30
 
 ### Added

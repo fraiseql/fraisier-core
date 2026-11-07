@@ -6,6 +6,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **Nothing secret on an `ssh` command line.** The ssh transport refuses an
+  environment for a remote command instead of rendering it as `K=value` on
+  the command line, where any user on either host could read it. No built-in
+  adapter passes one. An embedder that called `Transport::run` over ssh with
+  a non-empty `envs` now gets an `InvalidConfig` error naming the keys.
+- **A `pull` artifact URL with credentials is refused.** `release_url` and
+  `checksum_url` go to `curl` on a command line, so `fraisier validate` (and
+  every command that validates) refuses `user:password@` in either. A token
+  in the URL's query is not detected; see `docs/security.md`.
+
 ## [1.0.0-beta.14] - 2026-10-30
 
 ### Added

@@ -630,8 +630,7 @@ pub fn restore_list_command(
     role: Option<&str>,
     data_only: bool,
 ) -> std::process::Command {
-    let mut command = std::process::Command::new("pg_restore");
-    command.envs(conn.pg_env());
+    let mut command = crate::connected("pg_restore", conn);
     command
         .arg("-w")
         .arg("-d")

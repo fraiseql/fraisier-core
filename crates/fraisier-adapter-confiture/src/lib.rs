@@ -342,8 +342,7 @@ impl ConfitureMigration {
         let output_path = temp_output_path(subcommand);
         let plan = plan(subcommand, ctx, extra, &output_path)?;
 
-        let mut command = tokio::process::Command::new(&self.program);
-        fraisier_core::child_env::scrub(command.as_std_mut());
+        let mut command = self.base_command();
         command
             .args(&plan.args)
             .env(CONFITURE_DSN_ENV, &plan.database_url)
@@ -370,6 +369,15 @@ impl ConfitureMigration {
             stderr,
             json,
         })
+    }
+
+    /// The `confiture` command before any argument: no withheld variable, and
+    /// no ambient libpq variable to fill what the injected DSN leaves unset.
+    fn base_command(&self) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.program);
+        fraisier_core::child_env::scrub(command.as_std_mut());
+        fraisier_db::libpq::scrub_ambient(command.as_std_mut());
+        command
     }
 
     /// Error for a failure to even spawn the `confiture` binary.
@@ -1123,8 +1131,7 @@ fn version_triple(version: &str) -> Option<(u32, u32, u32)> {
 #[async_trait]
 impl MigrationAdapter for ConfitureMigration {
     async fn describe(&self) -> Result<AdapterDescription, AdapterError> {
-        let mut command = tokio::process::Command::new(&self.program);
-        fraisier_core::child_env::scrub(command.as_std_mut());
+        let mut command = self.base_command();
         let output = command
             .arg("--version")
             .output()
@@ -2148,6 +2155,27 @@ mod tests {
         );
         // The env DSN names the same throwaway, so pending resolves from its ledger.
         assert_eq!(plan.database_url, THROWAWAY_DSN);
+    }
+
+    #[test]
+    fn confiture_inherits_no_ambient_variable_that_would_fill_the_dsns_gaps() {
+        let command = ConfitureMigration::with_program("confiture").base_command();
+        let removed: Vec<String> = command
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for name in [
+            "PGHOST",
+            "PGPORT",
+            "PGUSER",
+            "PGPASSWORD",
+            "PGOPTIONS",
+            "PGSERVICE",
+        ] {
+            assert!(removed.iter().any(|key| key == name), "{name}: {removed:?}");
+        }
     }
 
     #[test]

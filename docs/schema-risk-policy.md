@@ -56,7 +56,8 @@ included. One `DROP COLUMN` that was approved and applied long ago is then
 judged again on every later deploy, and refuses each of them. The plan says so
 (`judged every migration file, applied ones included`) and its JSON carries
 `scope = "all"`; with a new enough confiture it carries `scope = "pending"`.
-`fraisier doctor` warns about any confiture below 1.35.0 for this reason.
+`fraisier doctor` warns about any confiture below 1.35.0 for this reason (and
+below 1.40.0 for the reason in *Migrations no down can undo*).
 
 ### Absence is never safety
 

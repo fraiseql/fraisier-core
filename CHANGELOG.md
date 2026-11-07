@@ -37,6 +37,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - a view `DROP VIEW …; CREATE VIEW …` is `reversible`, not `destructive`;
   - a same-name `CHECK` swap written as two statements is `lock_risky`, not
     `destructive`.
+- **`fraisier doctor` warns below confiture 1.40.0** (was 1.35.0), naming
+  the `reversibility` capability it withholds there.
 - **Preflight findings are counted per migration.** Two blocking findings on
   one migration read as one failing migration, each listed with its codes.
   `db migrate --json`: `preflight_blocking` now counts migrations (and

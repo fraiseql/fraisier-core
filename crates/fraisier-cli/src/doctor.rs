@@ -197,7 +197,7 @@ fn judge_admin(admin: Result<Identity, String>, app: Result<Identity, String>) -
 async fn identity_of(source: Option<&str>) -> Result<Identity, String> {
     let source = source.ok_or("[migration].database_url_env is not set")?;
     let dsn = std::env::var(source).map_err(|_| format!("${source} is not set"))?;
-    let conn = PgConn::parse(&dsn).map_err(|error| error.to_string())?;
+    let conn = PgConn::resolve(&dsn).map_err(|error| error.to_string())?;
     let stdout = tviews::query(Path::new("psql"), &conn, tviews::IDENTITY_SQL).await?;
     tviews::parse_identity(&stdout)
 }
@@ -392,7 +392,7 @@ async fn check_refresh_target(
     let Some(dsn) = std::env::var(source).ok().filter(|dsn| !dsn.is_empty()) else {
         return fail(format!("cannot read the marker: ${source} is not set"));
     };
-    let conn = match PgConn::parse(&dsn) {
+    let conn = match PgConn::resolve(&dsn) {
         Ok(conn) => conn,
         Err(error) => return fail(format!("cannot read the marker: invalid DSN: {error}")),
     };
@@ -429,7 +429,8 @@ async fn check_refresh_target(
 
 /// The databases carrying the throwaway marker on the server `dsn` names.
 fn list_throwaways(dsn: &str) -> Result<Vec<String>, String> {
-    let conn = fraisier_db::PgConn::parse(dsn).map_err(|e| format!("invalid database DSN: {e}"))?;
+    let conn =
+        fraisier_db::PgConn::resolve(dsn).map_err(|e| format!("invalid database DSN: {e}"))?;
     // `_` is a LIKE wildcard, so the marker's underscores are escaped.
     let pattern = fraisier_core::drill::THROWAWAY_MARKER.replace('_', "\\_");
     let mut query = fraisier_db::psql_command(

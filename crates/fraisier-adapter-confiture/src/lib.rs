@@ -408,6 +408,7 @@ fn plan(
     let database_url = ctx
         .secret(DATABASE_URL_LOGICAL)
         .map_err(|err| err.with_adapter(ADAPTER_NAME))?;
+    resolved(&database_url, "the migration DSN")?;
 
     let mut args: Vec<OsString> = vec![OsString::from("migrate"), OsString::from(subcommand)];
     args.extend_from_slice(extra);
@@ -429,6 +430,7 @@ fn plan(
     let mut env = Vec::new();
     if subcommand == "preflight" {
         if let Ok(target) = ctx.secret(AGAINST_DATABASE_URL_SECRET) {
+            resolved(&target, "the deep-classification target")?;
             let (url, password) = split_password(&target)?;
             args.push(OsString::from("--against"));
             args.push(OsString::from(url));
@@ -443,6 +445,19 @@ fn plan(
         database_url,
         env,
     })
+}
+
+/// Refuse a DSN fraisier could not hand to a database child as it reads:
+/// confiture gets the text unchanged, but every child loses the ambient libpq
+/// variables, so a DSN [`fraisier_db::PgConn::resolve`] refuses would reach
+/// another place under confiture than under fraisier's own tools.
+fn resolved(dsn: &str, what: &str) -> Result<(), AdapterError> {
+    fraisier_db::PgConn::resolve(dsn)
+        .map(drop)
+        .map_err(|error| {
+            AdapterError::new(AdapterErrorKind::InvalidConfig, format!("{what}: {error}"))
+                .with_adapter(ADAPTER_NAME)
+        })
 }
 
 /// Split a `postgres://` URL into the URL without its password and the
@@ -2134,6 +2149,24 @@ mod tests {
             .position(|arg| arg == OsStr::new(flag))
             .and_then(|at| args.get(at + 1))
             .map(OsString::as_os_str)
+    }
+
+    #[test]
+    fn a_dsn_keyword_fraisier_cannot_pass_on_is_refused_before_confiture_runs() {
+        let ctx = ctx_with_secret("UNSET")
+            .with_resolved_secret(DATABASE_URL_SECRET, "postgres://app@db/shop?keepalives=1");
+        let error = plan("up", &ctx, &[], &PathBuf::from("/tmp/r.json")).expect_err("refused");
+        assert_eq!(error.kind, AdapterErrorKind::InvalidConfig, "{error:?}");
+        assert!(error.message.contains("keepalives"), "{}", error.message);
+    }
+
+    #[test]
+    fn confiture_loses_the_ambient_tls_policy_as_well() {
+        let command = ConfitureMigration::with_program("confiture").base_command();
+        assert!(command
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == "PGSSLMODE" && value.is_none()));
     }
 
     #[test]

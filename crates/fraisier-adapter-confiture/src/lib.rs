@@ -2281,6 +2281,41 @@ mod tests {
         }
     }
 
+    /// The worst tier per migration of a `tests/fixtures/verdicts/` capture.
+    fn verdict_tiers(json: &str, migration: &str) -> Vec<Option<RiskTier>> {
+        let json: Value = serde_json::from_str(json).expect("a capture is JSON");
+        parse_change_set(&json)
+            .expect("classified")
+            .changes
+            .into_iter()
+            .filter(|change| change.migration.as_deref() == Some(migration))
+            .map(|change| change.tier)
+            .collect()
+    }
+
+    #[test]
+    fn the_pin_move_loosens_a_view_recreate_and_a_check_swap() {
+        let old = include_str!("../tests/fixtures/verdicts/1.36.0.json");
+        let new = include_str!("../tests/fixtures/verdicts/1.45.0.json");
+        let (view, check) = ("20261107000006", "20261107000008");
+        assert_eq!(
+            verdict_tiers(old, view),
+            [Some(RiskTier::Destructive), Some(RiskTier::Additive)]
+        );
+        assert_eq!(
+            verdict_tiers(new, view),
+            [Some(RiskTier::Reversible), Some(RiskTier::Additive)]
+        );
+        assert_eq!(
+            verdict_tiers(old, check),
+            [Some(RiskTier::Destructive), Some(RiskTier::LockRisky)]
+        );
+        assert_eq!(
+            verdict_tiers(new, check),
+            [Some(RiskTier::LockRisky), Some(RiskTier::LockRisky)]
+        );
+    }
+
     #[test]
     fn below_the_floor_type_changes_stay_untiered_even_against_a_copy() {
         assert_eq!(

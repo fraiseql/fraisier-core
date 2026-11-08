@@ -452,6 +452,26 @@ fn an_undeclared_production_key_is_refused_before_anything_runs() {
 }
 
 #[test]
+fn a_multi_host_admin_dsn_is_refused_before_any_unit_stops() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = config(dir.path(), Some(false), "true", SKIPPED);
+    let multi = "FRAISIER_REFRESH_RUN_ADMIN_MULTI_HOST";
+    let toml = std::fs::read_to_string(&path)
+        .expect("read")
+        .replace(ADMIN_ENV, multi);
+    std::fs::write(&path, toml).expect("write");
+    archive(dir.path(), "20261026T021500Z");
+    std::env::set_var(multi, "postgres://postgres:r00tpw@db1,db2/postgres");
+    let (server, units) = (Server::default(), units(dir.path()));
+    let out = refresh(dir.path(), &path, true, &server, &units);
+    std::env::remove_var(multi);
+    assert_eq!(out.exit_code, 1, "{}", out.pretty);
+    assert!(out.pretty.contains("more than one host"), "{}", out.pretty);
+    assert!(!server.dropped(), "{:?}", server.calls());
+    assert!(units.calls().is_empty(), "{:?}", units.calls());
+}
+
+#[test]
 fn a_config_whose_service_is_not_systemd_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = config(dir.path(), Some(false), "true", SKIPPED);

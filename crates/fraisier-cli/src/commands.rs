@@ -5538,6 +5538,21 @@ current_revision = "true"
     }
 
     #[test]
+    fn db_reset_refuses_a_dsn_keyword_it_cannot_pass_on_before_dropping_anything() {
+        let _guard = crate::test_env::env_guard();
+        let var = "FRAISIER_DBOPS_RESET_KEYWORD";
+        std::env::set_var(var, "postgres://app@dbhost/shop?keepalives=1");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), "fraisier.toml", &db_ops_config(var));
+        let out = block_on(db_reset(&config, &dir.path().join("state"), true)).expect("runs");
+        std::env::remove_var(var);
+
+        assert_eq!(out.exit_code, 1, "pretty: {}", out.pretty);
+        assert!(out.pretty.contains("keepalives"), "{}", out.pretty);
+        assert_ne!(out.json["stage"], serde_json::json!("drop"), "{}", out.json);
+    }
+
+    #[test]
     fn db_reset_plan_is_destructive_and_does_not_execute() {
         let _guard = crate::test_env::env_guard();
         let var = "FRAISIER_DBOPS_RESET_PLAN";

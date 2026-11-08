@@ -195,6 +195,32 @@ fn a_webhook_never_reads_the_admin_env_var() {
 }
 
 #[test]
+fn a_multi_host_app_dsn_is_refused_before_anything_runs() {
+    for dsn in [
+        "postgres://app@h1,h2/shop",
+        "postgres://app@h/shop?host=a,b",
+        "postgres://app@h/shop?hostaddr=192.0.2.1,192.0.2.2",
+        "postgres://app@h/shop?port=1,2",
+    ] {
+        let app = PgConn::parse(dsn).expect("a multi-host URL parses");
+        let refused = RestoreIdentity::from_env(app, None, Trigger::Operator)
+            .expect_err("a restore must know which server it replaces");
+        assert!(refused.contains("more than one host"), "{refused}");
+    }
+}
+
+#[test]
+fn a_multi_host_admin_dsn_is_refused_naming_its_variable() {
+    let env = "FRAISIER_RESTORE_TEST_ADMIN_MULTI_HOST";
+    std::env::set_var(env, "postgres://postgres@h1,h2/postgres");
+    let refused = RestoreIdentity::from_env(app(), Some(env), Trigger::Operator)
+        .expect_err("a multi-host admin DSN");
+    std::env::remove_var(env);
+    assert!(refused.contains(env), "{refused}");
+    assert!(refused.contains("more than one host"), "{refused}");
+}
+
+#[test]
 fn no_admin_configured_needs_no_env_var() {
     let identity = RestoreIdentity::from_env(app(), None, Trigger::Operator).expect("app role");
     assert!(!identity.uses_admin());

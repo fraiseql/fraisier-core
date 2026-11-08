@@ -23,9 +23,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   connects without them. Put them in the URL, or keep the password in a
   `PGPASSFILE` (still read). Check the webhook unit's `Environment=` as well
   as your shell.
+- `PgConn`'s `Debug` no longer prints the password; it prints the redacted URL.
+  `RestoreIdentity` and `Admin` derive `Debug` over it.
 
 ### Fixed
 
+- **A database URL now reaches what it reaches under libpq** (#105).
+  `PgConn::parse` read only `?sslmode=` from the query and dropped every other
+  parameter, so `?host=/run/postgresql`, `?password=`, `?port=`, `?user=` and
+  `?dbname=` were ignored: the URI part or the compiled-in default applied
+  instead. Every libpq 18 keyword with an environment variable is now read,
+  and a query value overrides the URI part, as in libpq. A socket-directory
+  host (`postgres://u@%2Frun%2Fpostgresql/db`) now also renders back into a
+  URL that parses, and `with_database` replaces a `?dbname=` rather than
+  keeping it beside the new name.
 - **`fraisier db refresh` no longer drops a database it cannot create again.**
   It dropped the target, then ran `CREATE DATABASE`; a role that owned the
   target but lacked `CREATEDB`, or an admin that could not make the app role
@@ -48,6 +59,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- ⚠️ **A DSN fraisier cannot hand on whole is refused** where it used to be
+  silently trimmed: a keyword with no `PG*` variable (`keepalives`,
+  `sslpassword`, …), an unknown keyword, `?service=`, a `key=value` string,
+  and an unencoded `@` in the user name or password. The error names the key,
+  never the value. Run `fraisier doctor` before upgrading: `validate` only
+  sees the variable's name. See `docs/security.md`.
+- ⚠️ **A restore, `db refresh` and a drill refuse a multi-host DSN** (app or
+  admin), before anything runs.
+- `fraisier_db::DbError` is now `#[non_exhaustive]` and gains
+  `UnsupportedKeyword`. `PgConn` gains `is_multi_host`.
 - `fraisier_db::refresh::RefreshServer` gains a required method,
   `create_problem`, which a custom implementation must provide.
 

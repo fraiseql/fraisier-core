@@ -48,6 +48,38 @@ so keep secrets out of the stderr of anything fraisier runs. `AdapterError.stder
 also keeps its raw text on purpose: it is a structured field nothing renders today,
 and the output edge covers it if something ever does.
 
+## A database URL means what it means to libpq
+
+fraisier hands a connection to `psql`, `pg_dump` and `pg_restore` as `PG*`
+environment variables, never on argv. So it reads the URL first, with libpq's
+rules: every query parameter is a connection keyword and **overrides** the URI
+part (`postgresql:///app?host=/run/postgresql` names a socket directory), and
+components are percent-decoded with a `+` kept literal. Then each keyword goes
+out as the variable libpq 18 reads it from.
+
+A DSN that cannot be passed on that way is refused, naming the key and never its
+value:
+
+- a keyword libpq takes only from a connection string (`keepalives*`,
+  `tcp_user_timeout`, `fallback_application_name`, `sslpassword`, `replication`,
+  `scram_*`, `oauth_*`, `sslkeylogfile`), or an unknown one;
+- `service`, since a service-file entry can supply another host, role or
+  password than the DSN shows;
+- a `key=value` connection string;
+- an unencoded `@` in the user name or password. libpq splits at the first `@`
+  and a URL parser at the last, so one DSN would name two hosts. Encode it as
+  `%40`.
+
+A restore, `db refresh` and a drill also refuse a host list (`h1,h2`,
+`?host=a,b`, `?hostaddr=…,…`, `?port=1,2`), app or admin DSN: they must know
+which server they replace. Other commands accept one, as libpq does.
+
+**With a libpq older than 18** (Debian 12 ships 15), a newer keyword such as
+`sslcertmode`, `sslnegotiation` or `min_protocol_version` is accepted here, but
+that libpq ignores its variable, so the setting does not take effect. Run
+fraisier's database tools from PostgreSQL 18's client packages when a DSN relies
+on one.
+
 ## A database child connects only where its URL says
 
 libpq reads a `PG*` variable for every connection parameter a URL leaves unset.

@@ -24,37 +24,16 @@ pub mod tviews;
 pub mod archive;
 pub mod libpq;
 pub mod retention;
+mod uri;
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fmt::Write as _;
 use std::path::Path;
 use std::process::Command;
 
-use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
-use url::Url;
-
-/// The URL characters that must be percent-encoded inside a DSN's userinfo
-/// (username / password) so a rendered DSN round-trips back through [`PgConn::parse`].
-const USERINFO: &AsciiSet = &CONTROLS
-    .add(b' ')
-    .add(b'"')
-    .add(b'#')
-    .add(b'<')
-    .add(b'>')
-    .add(b'?')
-    .add(b'`')
-    .add(b'{')
-    .add(b'}')
-    .add(b'/')
-    .add(b':')
-    .add(b'@')
-    .add(b'\\')
-    .add(b'[')
-    .add(b']')
-    .add(b'%');
-
 /// An error from parsing a DSN or running a database operation.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DbError {
     /// The DSN could not be parsed as a URL.
     #[error("could not parse the database DSN: {0}")]
@@ -65,6 +44,15 @@ pub enum DbError {
         "database lifecycle ops require a postgres:// DSN, but the configured one uses '{0}://'"
     )]
     UnsupportedScheme(String),
+    /// A query parameter of the DSN that fraisier cannot hand to its tools. The
+    /// key is named; its value never is.
+    #[error("the database DSN's `{key}` parameter {reason}")]
+    UnsupportedKeyword {
+        /// The query parameter's key.
+        key: String,
+        /// Why it cannot be passed on.
+        reason: &'static str,
+    },
     /// The DSN has no database name, which these ops require.
     #[error("the database DSN does not name a database (expected postgres://…/<dbname>)")]
     MissingDatabase,
@@ -87,74 +75,61 @@ pub enum DbError {
 
 /// PostgreSQL connection parameters resolved from a DSN.
 ///
-/// Construct one with [`PgConn::parse`]. The fields map onto libpq's `PG*`
-/// environment variables via [`PgConn::pg_env`]; the password is never rendered
-/// onto a command line (see [`PgConn::redacted`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Construct one with [`PgConn::parse`], which reads the URL as libpq does. The
+/// parameters map onto libpq's `PG*` environment variables via
+/// [`PgConn::pg_env`]; the password is never rendered onto a command line, nor
+/// by `Debug` (see [`PgConn::redacted`]).
+#[derive(Clone, PartialEq, Eq)]
 pub struct PgConn {
-    host: Option<String>,
-    port: Option<u16>,
-    user: Option<String>,
-    password: Option<String>,
-    database: String,
-    sslmode: Option<String>,
+    /// libpq keyword → value; only keywords with an environment variable, and
+    /// always `dbname`.
+    params: BTreeMap<&'static str, String>,
 }
 
-/// Percent-decode a DSN component (username / password / path) into a plain
-/// string, lossily for any non-UTF-8 bytes.
-fn decode(component: &str) -> String {
-    percent_decode_str(component)
-        .decode_utf8_lossy()
-        .into_owned()
+impl std::fmt::Debug for PgConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PgConn").field(&self.redacted()).finish()
+    }
 }
 
 impl PgConn {
-    /// Parse a PostgreSQL DSN (e.g. `postgresql://user:pass@host:5432/db?sslmode=require`).
+    /// Parse a PostgreSQL URL (e.g.
+    /// `postgresql://user:pass@host:5432/db?sslmode=require`) as libpq reads it.
     ///
-    /// The username, password, and database name are percent-decoded so a
-    /// password containing reserved characters (`@`, `/`, …) round-trips intact.
+    /// Every query parameter is a libpq connection keyword and overrides the
+    /// matching URI part (`?host=/run/postgresql` names a socket directory).
+    /// Components are percent-decoded, with a `+` kept literal. A host list
+    /// (`h1,h2`) is kept as libpq joins it; see [`Self::is_multi_host`].
     ///
     /// # Errors
-    /// - [`DbError::Parse`] if the string is not a valid URL.
+    /// - [`DbError::Parse`] if the string is not a `postgres://` URL (a key=value
+    ///   connection string included), holds an invalid percent-escape or an
+    ///   unencoded `@` in its user name or password, or a port that is not a
+    ///   number.
     /// - [`DbError::UnsupportedScheme`] if the scheme is not `postgres`/`postgresql`.
+    /// - [`DbError::UnsupportedKeyword`] for a query parameter fraisier cannot
+    ///   pass on: an unknown keyword, one with no `PG*` variable
+    ///   (`keepalives`, `sslpassword`, …), `service`, or one without a value.
     /// - [`DbError::MissingDatabase`] if no database name is present.
     pub fn parse(dsn: &str) -> Result<Self, DbError> {
-        let url = Url::parse(dsn).map_err(|error| DbError::Parse(error.to_string()))?;
-        let scheme = url.scheme();
-        if scheme != "postgres" && scheme != "postgresql" {
-            return Err(DbError::UnsupportedScheme(scheme.to_owned()));
-        }
+        uri::parse(dsn).map(|params| Self { params })
+    }
 
-        let host = url.host_str().filter(|h| !h.is_empty()).map(decode);
-        let port = url.port();
-        let user = {
-            let raw = url.username();
-            (!raw.is_empty()).then(|| decode(raw))
-        };
-        let password = url.password().map(decode);
-        let database = decode(url.path().trim_start_matches('/'));
-        if database.is_empty() {
-            return Err(DbError::MissingDatabase);
-        }
-        let sslmode = url
-            .query_pairs()
-            .find(|(key, _)| key == "sslmode")
-            .map(|(_, value)| value.into_owned());
-
-        Ok(Self {
-            host,
-            port,
-            user,
-            password,
-            database,
-            sslmode,
+    /// Whether the connection names more than one host, address or port: a
+    /// libpq host list, which may reach a different server on each connection.
+    #[must_use]
+    pub fn is_multi_host(&self) -> bool {
+        ["host", "hostaddr", "port"].iter().any(|key| {
+            self.params
+                .get(key)
+                .is_some_and(|value| value.contains(','))
         })
     }
 
     /// The target database name.
     #[must_use]
     pub fn database(&self) -> &str {
-        &self.database
+        &self.params["dbname"]
     }
 
     /// The libpq `PG*` environment variables for this connection — every value
@@ -162,37 +137,25 @@ impl PgConn {
     /// environment so no secret appears on its argv.
     #[must_use]
     pub fn pg_env(&self) -> Vec<(OsString, OsString)> {
-        let mut env: Vec<(OsString, OsString)> = Vec::new();
-        let mut put =
-            |key: &str, value: String| env.push((OsString::from(key), OsString::from(value)));
-        if let Some(host) = &self.host {
-            put("PGHOST", host.clone());
-        }
-        if let Some(port) = self.port {
-            put("PGPORT", port.to_string());
-        }
-        if let Some(user) = &self.user {
-            put("PGUSER", user.clone());
-        }
-        if let Some(password) = &self.password {
-            put("PGPASSWORD", password.clone());
-        }
-        put("PGDATABASE", self.database.clone());
-        if let Some(sslmode) = &self.sslmode {
-            put("PGSSLMODE", sslmode.clone());
-        }
-        env
+        self.params
+            .iter()
+            .map(|(keyword, value)| {
+                (
+                    OsString::from(uri::variable(keyword)),
+                    OsString::from(value),
+                )
+            })
+            .collect()
     }
 
     /// A clone of this connection pointing at a different database on the same
-    /// server (same host/port/user/password/sslmode). Used to reach a maintenance
-    /// database (`postgres`) and to address a throwaway rehearsal database.
+    /// server (every other parameter kept). Used to reach a maintenance database
+    /// (`postgres`) and to address a throwaway rehearsal database.
     #[must_use]
     pub fn with_database(&self, database: impl Into<String>) -> Self {
-        Self {
-            database: database.into(),
-            ..self.clone()
-        }
+        let mut params = self.params.clone();
+        params.insert("dbname", database.into());
+        Self { params }
     }
 
     /// The full DSN **including the password**, percent-encoded so it round-trips
@@ -200,49 +163,13 @@ impl PgConn {
     /// log it or place it on argv. For display use [`Self::redacted`].
     #[must_use]
     pub fn dsn(&self) -> String {
-        let mut out = String::from("postgres://");
-        if let Some(user) = &self.user {
-            out.push_str(&utf8_percent_encode(user, USERINFO).to_string());
-            if let Some(password) = &self.password {
-                out.push(':');
-                out.push_str(&utf8_percent_encode(password, USERINFO).to_string());
-            }
-            out.push('@');
-        }
-        if let Some(host) = &self.host {
-            out.push_str(host);
-        }
-        if let Some(port) = self.port {
-            let _ = write!(out, ":{port}");
-        }
-        out.push('/');
-        out.push_str(&self.database);
-        if let Some(sslmode) = &self.sslmode {
-            let _ = write!(out, "?sslmode={sslmode}");
-        }
-        out
+        uri::render(&self.params, true)
     }
 
     /// A password-free rendering of the connection, safe to print in plans/logs.
     #[must_use]
     pub fn redacted(&self) -> String {
-        let mut out = String::from("postgres://");
-        if let Some(user) = &self.user {
-            out.push_str(user);
-            out.push('@');
-        }
-        if let Some(host) = &self.host {
-            out.push_str(host);
-        }
-        if let Some(port) = self.port {
-            let _ = write!(out, ":{port}");
-        }
-        out.push('/');
-        out.push_str(&self.database);
-        if let Some(sslmode) = &self.sslmode {
-            let _ = write!(out, "?sslmode={sslmode}");
-        }
-        out
+        uri::render(&self.params, false)
     }
 }
 
@@ -444,6 +371,9 @@ pub async fn run(command: Command) -> Result<Outcome, DbError> {
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
 }
+
+#[cfg(test)]
+mod conn_tests;
 
 #[cfg(test)]
 mod tests {

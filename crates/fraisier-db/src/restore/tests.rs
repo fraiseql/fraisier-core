@@ -571,3 +571,29 @@ fn throwaway_name_is_a_valid_bounded_identifier() {
         );
     }
 }
+
+#[test]
+fn a_tview_the_probe_could_not_read_is_reported_with_its_grant() {
+    let tview = |name: &str| crate::tviews::Tview {
+        schema: "public".to_owned(),
+        name: name.to_owned(),
+        view_schema: "tviews".to_owned(),
+        view_name: format!("public__{name}"),
+        readable: true,
+    };
+    let found = crate::tviews::Emptiness {
+        empty: vec![tview("tv_item")],
+        unreadable: vec![(
+            tview("tv_order"),
+            "GRANT SELECT ON public.tv_order TO app".to_owned(),
+        )],
+    };
+    assert_eq!(
+        super::unfilled(&found),
+        vec![
+            "public.tv_item".to_owned(),
+            "public.tv_order (could not be read: GRANT SELECT ON public.tv_order TO app)"
+                .to_owned(),
+        ]
+    );
+}

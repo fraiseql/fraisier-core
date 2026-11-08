@@ -511,6 +511,7 @@ version = "1.0.0-beta.14"
 dependencies = [
  "async-trait",
  "fraisier-core",
+ "fraisier-db",
  "serde_json",
  "tokio",
  "tracing",
@@ -714,6 +715,7 @@ version = "1.0.0-beta.14"
 dependencies = [
  "async-trait",
  "fraisier-core",
+ "fraisier-db",
  "serde",
  "serde_json",
  "tempfile",

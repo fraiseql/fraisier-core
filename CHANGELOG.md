@@ -6,6 +6,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **An ambient `PG*` variable no longer fills what a database URL leaves
+  unset.** Every `psql`, `pg_dump` and `pg_restore` fraisier runs, `confiture`,
+  and every locally launched IPC adapter now start without `PGHOST`,
+  `PGHOSTADDR`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGOPTIONS`,
+  `PGSERVICE`, `PGSERVICEFILE`, `PGSYSCONFDIR`, `PGTZ`, `PGDATESTYLE`,
+  `PGGEQO`, `PGTARGETSESSIONATTRS`, `PGLOADBALANCEHOSTS`, `PGCLIENTENCODING`
+  and `PGREQUIREPEER`. Before, an exported `PGPORT` or `PGOPTIONS` sent them to
+  another server or into another session than the config named. See
+  `docs/security.md`.
+
+  **Upgrading:** a host whose database URL omits the password, the port or the
+  user and relied on an exported `PGPASSWORD`, `PGPORT` or `PGUSER` now
+  connects without them. Put them in the URL, or keep the password in a
+  `PGPASSFILE` (still read). Check the webhook unit's `Environment=` as well
+  as your shell.
+- `PgConn`'s `Debug` no longer prints the password; it prints the redacted URL.
+  `RestoreIdentity` and `Admin` derive `Debug` over it.
+
 ### Fixed
 
 - **A database URL now reaches what it reaches under libpq** (#105).
@@ -17,6 +37,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   host (`postgres://u@%2Frun%2Fpostgresql/db`) now also renders back into a
   URL that parses, and `with_database` replaces a `?dbname=` rather than
   keeping it beside the new name.
+- **`fraisier db refresh` no longer drops a database it cannot create again.**
+  It dropped the target, then ran `CREATE DATABASE`; a role that owned the
+  target but lacked `CREATEDB`, or an admin that could not make the app role
+  the owner (`SET` on the role, PostgreSQL 16+), left no database and the
+  units stopped. The refresh now checks both before the drop and refuses,
+  naming the `ALTER ROLE … CREATEDB` or `GRANT <app> TO <admin>` that fixes
+  it. With `[database].admin_url_env`, it also refuses an admin DSN that
+  reaches another cluster than the app's. A failure after the drop now names
+  the recovery (`createdb -O <app> <db>`, `fraisier db mark-refresh-target`,
+  run again).
+- **`fraisier db reset` and `fraisier db refresh` check the migration tool
+  before destroying anything.** A reset used to drop every schema and only
+  then find that the migration adapter could not run (a missing `confiture`),
+  leaving an empty database; a refresh found out after the drop and restore.
+  Both now refuse first, with nothing changed.
+- **A restore no longer reports TVIEWs as filled when it could not read
+  them.** The probe after the post-restore rebuild (restore, refresh, the
+  restore drill) skipped a TVIEW its role could not read. It now fails the
+  check, naming the TVIEW and the `GRANT SELECT` that lets the role read it.
 
 ### Changed
 
@@ -30,11 +69,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   admin), before anything runs.
 - `fraisier_db::DbError` is now `#[non_exhaustive]` and gains
   `UnsupportedKeyword`. `PgConn` gains `is_multi_host`.
-
-### Security
-
-- `PgConn`'s `Debug` no longer prints the password; it prints the redacted URL.
-  `RestoreIdentity` and `Admin` derive `Debug` over it.
+- `fraisier_db::refresh::RefreshServer` gains a required method,
+  `create_problem`, which a custom implementation must provide.
 
 ## [1.0.0-beta.14] - 2026-10-30
 

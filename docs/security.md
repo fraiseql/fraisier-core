@@ -80,6 +80,32 @@ that libpq ignores its variable, so the setting does not take effect. Run
 fraisier's database tools from PostgreSQL 18's client packages when a DSN relies
 on one.
 
+## A database child connects only where its URL says
+
+libpq reads a `PG*` variable for every connection parameter a URL leaves unset.
+fraisier's own environment (an operator's shell, a unit's `Environment=`) can
+hold a `PGPORT`, `PGUSER` or `PGOPTIONS` meant for something else, and a child
+that inherited it would reach another server, as another role, or with another
+`search_path`, than the config names.
+
+So every database child is started without the variables that pick a server, a
+role, a database or a session setting: `PGHOST`, `PGHOSTADDR`, `PGPORT`,
+`PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGOPTIONS`, `PGSERVICE`,
+`PGSERVICEFILE`, `PGSYSCONFDIR`, `PGTZ`, `PGDATESTYLE`, `PGGEQO`,
+`PGTARGETSESSIONATTRS`, `PGLOADBALANCEHOSTS`, `PGCLIENTENCODING` and
+`PGREQUIREPEER`. Then the URL's own values are set. The children are `psql`,
+`pg_dump` and `pg_restore` for every `db` command, a refresh and a backup;
+`confiture`; and every locally launched IPC adapter, since the launcher cannot
+tell which adapters connect to PostgreSQL. A variable an IPC adapter is
+configured with is set after the removal and still reaches it.
+
+`PGPASSFILE` and the TLS and GSS variables (`PGSSLMODE`, `PGSSLROOTCERT`, …) are
+kept: they authenticate or tighten a connection the URL already chose.
+
+**What this does not cover.** The `command` migration adapter's script is the
+operator's own code and gets fraisier's environment as it is, with
+`$DATABASE_URL` added; it decides what it reads.
+
 ## Privileged operations: `systemctl` shell-out, not socket helpers
 
 Python fraisier shipped root-privileged Unix-socket helpers with `SO_PEERCRED`

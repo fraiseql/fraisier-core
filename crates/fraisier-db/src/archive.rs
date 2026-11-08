@@ -282,8 +282,7 @@ pub async fn write_archive(
         source,
     })?;
 
-    let mut dump = Command::new(&tools.pg_dump);
-    dump.envs(conn.pg_env());
+    let mut dump = crate::connected(&tools.pg_dump, conn);
     dump.arg("-Fc").arg("-w").arg("-f").arg(partial.path());
     let outcome = crate::run(dump).await?;
     if !outcome.succeeded() {

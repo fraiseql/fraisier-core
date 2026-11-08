@@ -22,6 +22,7 @@ pub mod sanitize;
 pub mod tviews;
 
 pub mod archive;
+pub mod libpq;
 pub mod retention;
 mod uri;
 
@@ -201,8 +202,7 @@ CREATE SCHEMA IF NOT EXISTS public;";
 /// `-w` makes it non-interactive (never prompt for a password).
 #[must_use]
 pub fn backup_command(conn: &PgConn, out: &Path) -> Command {
-    let mut command = Command::new("pg_dump");
-    command.envs(conn.pg_env());
+    let mut command = connected("pg_dump", conn);
     command.arg("-Fc").arg("-w").arg("-f").arg(out);
     command
 }
@@ -219,8 +219,7 @@ pub fn backup_command(conn: &PgConn, out: &Path) -> Command {
 /// always a name, and the `PG*` variables still supply everything else.
 #[must_use]
 pub fn restore_command(conn: &PgConn, archive: &Path, clean: bool) -> Command {
-    let mut command = Command::new("pg_restore");
-    command.envs(conn.pg_env());
+    let mut command = connected("pg_restore", conn);
     command
         .arg("-w")
         .arg("-d")
@@ -244,8 +243,7 @@ pub(crate) fn conninfo_dbname(name: &str) -> String {
 /// skips `~/.psqlrc` (`-X`) for reproducibility.
 #[must_use]
 pub fn psql_command(conn: &PgConn, sql: &str) -> Command {
-    let mut command = Command::new("psql");
-    command.envs(conn.pg_env());
+    let mut command = connected("psql", conn);
     command
         .arg("-w")
         .arg("-X")
@@ -253,6 +251,17 @@ pub fn psql_command(conn: &PgConn, sql: &str) -> Command {
         .arg("ON_ERROR_STOP=1")
         .arg("-c")
         .arg(sql);
+    command
+}
+
+/// A command running `program` against `conn`: the connection comes from
+/// [`PgConn::pg_env`] alone, with no ambient [`libpq::AMBIENT_GAP_FILLERS`]
+/// variable left to fill what the URL leaves unset.
+#[must_use]
+pub fn connected(program: impl AsRef<std::ffi::OsStr>, conn: &PgConn) -> Command {
+    let mut command = Command::new(program);
+    libpq::scrub_ambient(&mut command);
+    command.envs(conn.pg_env());
     command
 }
 
@@ -567,6 +576,86 @@ mod tests {
             Some(password),
             "the password must travel as PGPASSWORD in the environment",
         );
+    }
+
+    /// The libpq variables that pick a server, a role, a database or a session
+    /// setting: an ambient one must never fill what the URL leaves unset.
+    const GAP_FILLERS: [&str; 17] = [
+        "PGHOST",
+        "PGHOSTADDR",
+        "PGPORT",
+        "PGUSER",
+        "PGPASSWORD",
+        "PGDATABASE",
+        "PGOPTIONS",
+        "PGSERVICE",
+        "PGSERVICEFILE",
+        "PGSYSCONFDIR",
+        "PGTZ",
+        "PGDATESTYLE",
+        "PGGEQO",
+        "PGTARGETSESSIONATTRS",
+        "PGLOADBALANCEHOSTS",
+        "PGCLIENTENCODING",
+        "PGREQUIREPEER",
+    ];
+
+    /// Every gap-filler is either removed from `command` or set from the URL.
+    fn assert_no_gap_filler_inherited(command: &Command) {
+        let program = command.get_program().to_string_lossy();
+        let named: BTreeMap<String, Option<String>> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        for name in GAP_FILLERS {
+            assert!(
+                named.contains_key(name),
+                "{program} would inherit an ambient {name}: {named:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_builder_keeps_ambient_libpq_variables_from_filling_the_urls_gaps() {
+        let conn = PgConn::parse("postgresql://alice@db.example.com/shop").expect("parses");
+        let archive = Path::new("/backups/shop.pgdump");
+        let commands = [
+            psql_command(&conn, "SELECT 1"),
+            backup_command(&conn, archive),
+            restore_command(&conn, archive, true),
+            crate::readiness::query_command(Path::new("psql"), &conn, "SELECT 1"),
+            crate::refresh::restore_list_command(&conn, archive, Path::new("/tmp/l"), None, false),
+            crate::connected("/opt/pg/bin/pg_dump", &conn),
+        ];
+        for command in &commands {
+            assert_no_gap_filler_inherited(command);
+        }
+    }
+
+    #[test]
+    fn the_url_still_wins_over_the_removal() {
+        let command = psql_command(&conn_with_secret(), "SELECT 1");
+        let env = envs_of(&command);
+        assert_eq!(env["PGPORT"], "6432");
+        assert_eq!(env["PGPASSWORD"], "s3cret");
+        assert_eq!(env["PGHOST"], "db.example.com");
+    }
+
+    #[test]
+    fn tls_variables_are_left_for_the_policy_check() {
+        let conn = PgConn::parse("postgresql://alice@db.example.com/shop").expect("parses");
+        let command = psql_command(&conn, "SELECT 1");
+        for name in ["PGSSLMODE", "PGSSLROOTCERT", "PGPASSFILE"] {
+            assert!(
+                !command.get_envs().any(|(key, _)| key == name),
+                "{name} is not this check's to touch"
+            );
+        }
     }
 
     fn conn_with_secret() -> PgConn {

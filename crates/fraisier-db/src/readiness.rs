@@ -240,8 +240,7 @@ pub fn contract_sql(schema: &str) -> String {
 /// A `psql` that runs `sql` and prints only the bare result (`-tA`).
 #[must_use]
 pub fn query_command(psql: &Path, conn: &PgConn, sql: &str) -> Command {
-    let mut command = Command::new(psql);
-    command.envs(conn.pg_env());
+    let mut command = crate::connected(psql, conn);
     command
         .arg("-w")
         .arg("-X")

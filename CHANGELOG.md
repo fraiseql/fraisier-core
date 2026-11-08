@@ -37,6 +37,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reports the refusal; run it under the webhook and scheduled units'
   environment too (`systemctl show -p Environment <unit>`), where a
   `PGSSLMODE` fires only in the runs those units start.
+- **Nothing secret on an `ssh` command line.** The ssh transport refuses an
+  environment for a remote command instead of rendering it as `K=value` on
+  the command line, where any user on either host could read it. No built-in
+  adapter passes one. An embedder that called `Transport::run` over ssh with
+  a non-empty `envs` now gets an `InvalidConfig` error naming the keys.
+- **A `pull` artifact URL with credentials is refused.** `release_url` and
+  `checksum_url` go to `curl` on a command line, so `fraisier validate` (and
+  every command that validates) refuses `user:password@` in either. A token
+  in the URL's query is not detected; see `docs/security.md`.
 - `PgConn`'s `Debug` no longer prints the password; it prints the redacted URL.
   `RestoreIdentity` and `Admin` derive `Debug` over it.
 

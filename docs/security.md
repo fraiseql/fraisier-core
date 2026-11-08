@@ -124,6 +124,27 @@ reaches it.
 operator's own code and gets fraisier's environment as it is, with
 `$DATABASE_URL` added; it decides what it reads.
 
+## Nothing secret on a command line
+
+A process's command line is readable by every user on its host (`ps`,
+`/proc/<pid>/cmdline`). Under `[hosts]`, a command for a remote host is the
+argument of a local `ssh`, and the remote shell runs it again, so it is
+readable on both machines.
+
+- **The ssh transport passes no environment.** `Transport::Ssh` refuses a
+  non-empty `envs` list rather than render it as `K=value` on the remote
+  command line; the error names the keys, never the values. Database
+  migrations, the one axis that needs a secret, run once on the orchestrator
+  and never over ssh.
+- **A pull URL carries no credentials.** The `pull` artifact source hands
+  `release_url` and `checksum_url` to `curl` on the host's command line, so
+  validation refuses a `user:password@` in either, without echoing the URL.
+
+**What this does not cover.** A token in a pull URL's *query*
+(`?token=…`) still reaches `curl`'s command line; fraisier cannot tell a
+token from any other parameter. Use a credential-free URL instead: a
+pre-signed path that expires, or a public release.
+
 ## Privileged operations: `systemctl` shell-out, not socket helpers
 
 Python fraisier shipped root-privileged Unix-socket helpers with `SO_PEERCRED`

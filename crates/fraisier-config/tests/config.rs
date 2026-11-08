@@ -2526,3 +2526,58 @@ fn a_scheduled_refresh_without_a_notify_command_warns() {
         "{unscheduled}"
     );
 }
+
+fn pull_config(release_url: &str, checksum_url: &str) -> DeployConfig {
+    DeployConfig::from_toml_str(&format!(
+        r#"
+[deploy]
+name = "checkout"
+environment = "staging"
+
+[artifact]
+source = "pull"
+release_url = "{release_url}"
+checksum_url = "{checksum_url}"
+
+[migration]
+adapter = "command"
+
+[service]
+adapter = "systemd"
+unit = "checkout.service"
+
+[health]
+adapter = "http"
+url = "http://127.0.0.1:8080/health"
+"#
+    ))
+    .expect("parses")
+}
+
+#[test]
+fn a_pull_url_carrying_credentials_is_refused_without_echoing_them() {
+    let report = pull_config(
+        "https://deploy:t0ken@example.com/app-{version}.tar.gz",
+        "https://u@example.com/app.sha256",
+    )
+    .validate();
+    for path in ["artifact.release_url", "artifact.checksum_url"] {
+        let issue = report
+            .errors()
+            .find(|i| i.path == path)
+            .unwrap_or_else(|| panic!("an error at {path}: {report:?}"));
+        assert!(issue.message.contains("credentials"), "{}", issue.message);
+        assert!(!issue.message.contains("t0ken"), "{}", issue.message);
+        assert!(!issue.message.contains("example.com"), "{}", issue.message);
+    }
+}
+
+#[test]
+fn an_at_sign_after_the_host_is_not_userinfo() {
+    let report = pull_config(
+        "https://example.com/releases/@scope/app.tar.gz",
+        "https://example.com/app.sha256?by=a@b",
+    )
+    .validate();
+    assert!(report.ok(), "{report:?}");
+}

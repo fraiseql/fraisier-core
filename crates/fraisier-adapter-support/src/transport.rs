@@ -23,9 +23,9 @@
 //! Migrations (the only axis that needs the database secret) run **once on the
 //! orchestrator**, never per host, so they stay [`Transport::Local`] and the DSN
 //! never reaches a remote `argv`. The per-host axes routed over SSH (service /
-//! load-balancer) carry no secrets. Any `envs` passed to an SSH command become
-//! `K=value` assignments on the remote command line, so callers must not send
-//! secret values through it.
+//! load-balancer) carry no secrets. [`Transport::Ssh`] refuses an `envs` list
+//! outright: a value could only travel on the `ssh` command line and the remote
+//! shell's, where any user on either host can read it.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -71,7 +71,7 @@ impl Transport {
     ///
     /// # Errors
     /// [`AdapterError`] if the (local) process cannot be spawned, or — for SSH —
-    /// if the context names no target host address. As with `run_command`, a
+    /// if the context names no target host address or `envs` is not empty. As with `run_command`, a
     /// process that runs and exits non-zero returns `Ok(Captured)`.
     // Reason: the signature deliberately mirrors `run_command` (its six args plus
     // the `AdapterCtx` the SSH target is read from) so adapters swap one call for
@@ -90,11 +90,12 @@ impl Transport {
         match self {
             Self::Local => run_command(program, args, envs, cwd, adapter, operation).await,
             Self::Ssh(ssh) => {
+                refuse_envs(envs, operation)?;
                 let destination = ssh.destination(ctx, operation)?;
-                let remote = remote_command(program, args, envs, cwd);
+                let remote = remote_command(program, args, cwd);
                 let ssh_args = ssh.ssh_argv(&destination, &remote);
-                // `envs`/`cwd` are baked into the remote command, so the local
-                // `ssh` process gets neither.
+                // `cwd` is baked into the remote command, so the local `ssh`
+                // process gets none.
                 run_command(&ssh.program, &ssh_args, &[], None, adapter, operation).await
             }
         }
@@ -223,26 +224,39 @@ impl SshTransport {
     }
 }
 
-/// Render `program args` (with optional `cwd` and `envs`) as a single shell
-/// command for the remote login shell: `cd <dir> && K=v … <program> <args…>`,
-/// each token quoted so spaces and metacharacters survive.
-fn remote_command(
-    program: &OsStr,
-    args: &[OsString],
-    envs: &[(OsString, OsString)],
-    cwd: Option<&Path>,
-) -> String {
+/// Refuse an environment for a remote command. It could only travel on the
+/// command line — the local `ssh` argv and the remote shell's — where any user
+/// on either host can read it. The error names the keys, never the values.
+fn refuse_envs(envs: &[(OsString, OsString)], operation: &str) -> Result<(), AdapterError> {
+    if envs.is_empty() {
+        return Ok(());
+    }
+    let keys: Vec<String> = envs
+        .iter()
+        .map(|(key, _)| key.to_string_lossy().into_owned())
+        .collect();
+    Err(error(
+        AdapterErrorKind::InvalidConfig,
+        TRANSPORT_ADAPTER,
+        operation,
+        format!(
+            "the ssh transport does not pass an environment to a remote command (it would \
+             sit on the ssh command line); refusing {}",
+            keys.join(", ")
+        ),
+        None,
+    ))
+}
+
+/// Render `program args` (with optional `cwd`) as a single shell command for the
+/// remote login shell: `cd <dir> && <program> <args…>`, each token quoted so
+/// spaces and metacharacters survive.
+fn remote_command(program: &OsStr, args: &[OsString], cwd: Option<&Path>) -> String {
     let mut command = String::new();
     if let Some(dir) = cwd {
         command.push_str("cd ");
         command.push_str(&shell_quote(&dir.to_string_lossy()));
         command.push_str(" && ");
-    }
-    for (key, value) in envs {
-        command.push_str(&key.to_string_lossy());
-        command.push('=');
-        command.push_str(&shell_quote(&value.to_string_lossy()));
-        command.push(' ');
     }
     command.push_str(&shell_quote(&program.to_string_lossy()));
     for arg in args {
@@ -291,25 +305,20 @@ mod tests {
     }
 
     #[test]
-    fn remote_command_renders_cwd_env_and_quoted_args() {
+    fn remote_command_renders_cwd_and_quoted_args() {
         let cmd = remote_command(
             OsString::from("systemctl").as_os_str(),
             &args(&["restart", "fraiseql.service"]),
-            &[],
             None,
         );
         assert_eq!(cmd, "systemctl restart fraiseql.service");
 
-        let with_ctx = remote_command(
+        let with_cwd = remote_command(
             OsString::from("app").as_os_str(),
             &args(&["--flag", "two words"]),
-            &[(OsString::from("KEY"), OsString::from("a value"))],
             Some(Path::new("/srv/app")),
         );
-        assert_eq!(
-            with_ctx,
-            "cd /srv/app && KEY='a value' app --flag 'two words'"
-        );
+        assert_eq!(with_cwd, "cd /srv/app && app --flag 'two words'");
     }
 
     #[test]
@@ -412,6 +421,31 @@ mod tests {
             "remote command passed as one arg: {lines:?}"
         );
         assert!(lines.contains(&"BatchMode=yes"));
+    }
+
+    #[tokio::test]
+    async fn ssh_refuses_an_environment_naming_the_keys_never_the_values() {
+        let (_dir, fake) = fake_ssh();
+        let transport = Transport::ssh(SshTransport::new().with_program(fake));
+        let mut ctx = AdapterCtx::new("app", "prod");
+        ctx.settings
+            .insert("address".to_owned(), json!("web1.internal"));
+
+        let error = transport
+            .run(
+                &ctx,
+                OsString::from("app").as_os_str(),
+                &[],
+                &[(OsString::from("API_TOKEN"), OsString::from("s3cret"))],
+                None,
+                "test",
+                "run",
+            )
+            .await
+            .expect_err("an environment never goes over ssh");
+        let shown = error.to_string();
+        assert!(shown.contains("API_TOKEN"), "{shown}");
+        assert!(!shown.contains("s3cret"), "{shown}");
     }
 
     #[tokio::test]

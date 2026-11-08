@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.15](https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.14...fraisier-v1.0.0-beta.15) - 2026-11-08
+
+### Fixed
+
+- *(db)* a restore, refresh or drill refuses a multi-host DSN
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into test/docs-toml-blocks-parse
+- Merge remote-tracking branch 'origin/main' into feat/scaffold-serving-gzip-run-as
+- Merge remote-tracking branch 'origin/main' into feat/confiture-1.45-reversibility
+- Merge remote-tracking branch 'origin/main' into fix/libpq-allowlist-tls-policy
+- Merge remote-tracking branch 'origin/main' into fix/pgconn-reads-urls-as-libpq
+
 ## [1.0.0-beta.14](https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.13...fraisier-v1.0.0-beta.14) - 2026-10-30
 
 ### Added

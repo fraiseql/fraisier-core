@@ -130,6 +130,7 @@ impl SpecqlPreset {
             // The preset states no policy: the tier gate stays opt-in, so a
             // preset must not switch it on behind the author's back.
             policy: None,
+            scaffold: None,
             specql: None,
         }
     }
@@ -264,6 +265,7 @@ impl Overlay for MigrationSection {
             ),
             preflight_mode: prefer(self.preflight_mode, over.preflight_mode),
             preflight_backup_path: prefer(self.preflight_backup_path, over.preflight_backup_path),
+            allow_irreversible: prefer(self.allow_irreversible, over.allow_irreversible),
             settings,
         }
     }
@@ -278,6 +280,8 @@ impl Overlay for ServiceSection {
             compose_service: prefer(self.compose_service, over.compose_service),
             compose_file: prefer(self.compose_file, over.compose_file),
             user: prefer(self.user, over.user),
+            run_as: prefer(self.run_as, over.run_as),
+            run_as_group: prefer(self.run_as_group, over.run_as_group),
         }
     }
 }
@@ -355,6 +359,8 @@ impl DeployConfig {
             },
             // The preset never emits [policy]; an author-supplied one wins.
             policy: prefer(base.policy, self.policy),
+            // The preset never emits [scaffold]; an author-supplied one wins.
+            scaffold: prefer(base.scaffold, self.scaffold),
             specql: None,
         }
     }

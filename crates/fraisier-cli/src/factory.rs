@@ -204,6 +204,9 @@ pub struct ResolvedDeploy {
     /// Whether to run the migration adapter's forward-compatibility `preflight`
     /// lint (`[migration].forward_compatible_lint`, default `true`).
     pub forward_compatible_lint: bool,
+    /// Whether to apply pending migrations no `down` can undo
+    /// (`[migration].allow_irreversible`).
+    pub allow_irreversible: bool,
     /// The schema policy gate resolved from `[policy]` (default: no tier gate).
     pub policy: PolicyGate,
     /// When set, the restore-rehearsal preflight provisions a throwaway DB (via
@@ -250,6 +253,15 @@ fn add_token_provider_secrets(config: &DeployConfig, env_secrets: &mut BTreeMap<
         }
         Some(TokenProvider::Exec(_)) | None => {}
     }
+}
+
+/// Whether `[migration].allow_irreversible = true` lets a forward migrate apply
+/// pending migrations no `down` can undo.
+pub(crate) fn allow_irreversible(config: &DeployConfig) -> bool {
+    config
+        .migration
+        .as_ref()
+        .is_some_and(fraisier_config::MigrationSection::allows_irreversible)
 }
 
 /// Whether the live forward-compat lint runs, by `[migration].preflight_mode`
@@ -607,6 +619,7 @@ pub fn build_for(
         host,
         ctx,
         forward_compatible_lint,
+        allow_irreversible: allow_irreversible(config),
         policy: build_policy_gate(config),
         restore_rehearsal,
         database_readiness: crate::pg_readiness::probe(config),
@@ -629,6 +642,9 @@ pub struct ResolvedMultiHost {
     pub ctx: AdapterCtx,
     /// Whether to run the forward-compatibility preflight lint.
     pub forward_compatible_lint: bool,
+    /// Whether to apply pending migrations no `down` can undo
+    /// (`[migration].allow_irreversible`).
+    pub allow_irreversible: bool,
     /// The schema policy gate resolved from `[policy]` (default: no tier gate).
     pub policy: PolicyGate,
     /// The `[database.requires]` probe, run first in preflight. `None` when the
@@ -709,6 +725,7 @@ pub fn build_multi_host(
         plan,
         ctx,
         forward_compatible_lint,
+        allow_irreversible: allow_irreversible(config),
         policy: build_policy_gate(config),
         database_readiness: crate::pg_readiness::probe(config),
         artifact,
@@ -1087,6 +1104,9 @@ pub struct ResolvedMigration {
     pub ctx: AdapterCtx,
     /// Whether to run the adapter's forward-compatibility `preflight` lint.
     pub forward_compatible_lint: bool,
+    /// Whether to apply pending migrations no `down` can undo
+    /// (`[migration].allow_irreversible`).
+    pub allow_irreversible: bool,
 }
 
 /// Build just the migration adapter + context from a config, for a database-only
@@ -1128,6 +1148,7 @@ pub fn build_migration_only(config: &DeployConfig) -> Result<ResolvedMigration> 
         migration,
         ctx,
         forward_compatible_lint,
+        allow_irreversible: allow_irreversible(config),
     })
 }
 
@@ -1337,7 +1358,7 @@ impl ConnectionBudget for PgConnectionBudget {
     async fn probe(&self, _ctx: &AdapterCtx) -> Result<BudgetSnapshot, String> {
         let dsn =
             std::env::var(&self.dsn_env).map_err(|_| format!("{} is not set", self.dsn_env))?;
-        let conn = fraisier_db::PgConn::parse(&dsn).map_err(|e| e.to_string())?;
+        let conn = fraisier_db::PgConn::resolve(&dsn).map_err(|e| e.to_string())?;
         let max_connections = Self::query_u32(&conn, "SHOW max_connections").await?;
         let current = Self::query_u32(&conn, "SELECT count(*) FROM pg_stat_activity").await?;
         Ok(BudgetSnapshot {
@@ -1466,10 +1487,13 @@ pub fn build_blue_green(
     Ok(ResolvedBlueGreen {
         fraise,
         environment,
-        deploy: match crate::pg_readiness::probe(config) {
-            Some(probe) => BlueGreenDeploy::new(params, migration, traffic, fleet, budget)
-                .database_readiness(probe),
-            None => BlueGreenDeploy::new(params, migration, traffic, fleet, budget),
+        deploy: {
+            let deploy = BlueGreenDeploy::new(params, migration, traffic, fleet, budget)
+                .allow_irreversible(allow_irreversible(config));
+            match crate::pg_readiness::probe(config) {
+                Some(probe) => deploy.database_readiness(probe),
+                None => deploy,
+            }
         },
     })
 }
@@ -1553,6 +1577,27 @@ mod tests {
         assert!(!resolved.migration.owns_database());
         let summary = summarize(&config, None, None).expect("summarize");
         assert_eq!(summary.migration, "none (no database)");
+    }
+
+    #[test]
+    fn allow_irreversible_reaches_the_deploy_and_db_migrate() {
+        let on =
+            DeployConfig::from_toml_str(&single_host_with_migration("allow_irreversible = true\n"))
+                .expect("parses");
+        assert!(build(&on, None, None).expect("builds").allow_irreversible);
+        assert!(
+            build_migration_only(&on)
+                .expect("builds")
+                .allow_irreversible
+        );
+
+        let off = DeployConfig::from_toml_str(&single_host_with_migration("")).expect("parses");
+        assert!(!build(&off, None, None).expect("builds").allow_irreversible);
+        assert!(
+            !build_migration_only(&off)
+                .expect("builds")
+                .allow_irreversible
+        );
     }
 
     #[test]

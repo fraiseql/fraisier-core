@@ -2526,3 +2526,127 @@ fn a_scheduled_refresh_without_a_notify_command_warns() {
         "{unscheduled}"
     );
 }
+
+fn service_config(service: &str) -> DeployConfig {
+    DeployConfig::from_toml_str(&format!(
+        r#"
+[deploy]
+name = "checkout"
+environment = "staging"
+
+[artifact]
+source = "release"
+release_url = "https://example.com/app.tar.gz"
+checksum_url = "https://example.com/app.tar.gz.sha256"
+
+[migration]
+adapter = "command"
+
+[service]
+adapter = "systemd"
+unit = "checkout.service"
+{service}
+
+[health]
+adapter = "http"
+url = "http://127.0.0.1:8080/health"
+"#
+    ))
+    .expect("parses")
+}
+
+fn service_error(service: &str, path: &str) -> String {
+    let report = service_config(service).validate();
+    let message = report
+        .errors()
+        .find(|i| i.path == path)
+        .unwrap_or_else(|| panic!("an error at {path}: {report:?}"))
+        .message
+        .clone();
+    message
+}
+
+#[test]
+fn run_as_root_is_refused() {
+    for value in ["root", "0"] {
+        let message = service_error(&format!("run_as = \"{value}\""), "service.run_as");
+        assert!(message.contains("root"), "{message}");
+    }
+}
+
+#[test]
+fn run_as_must_be_one_word() {
+    service_error("run_as = \"app\\nUser=root\"", "service.run_as");
+    service_error(
+        "run_as = \"app\"\nrun_as_group = \"a b\"",
+        "service.run_as_group",
+    );
+}
+
+#[test]
+fn run_as_is_refused_for_a_user_manager_unit() {
+    let message = service_error("run_as = \"app\"\nuser = true", "service.run_as");
+    assert!(message.contains("user = true"), "{message}");
+}
+
+#[test]
+fn run_as_an_ordinary_account_validates() {
+    let report = service_config("run_as = \"checkout\"\nrun_as_group = \"www-data\"").validate();
+    assert!(report.ok(), "{report:?}");
+}
+
+fn pull_config(release_url: &str, checksum_url: &str) -> DeployConfig {
+    DeployConfig::from_toml_str(&format!(
+        r#"
+[deploy]
+name = "checkout"
+environment = "staging"
+
+[artifact]
+source = "pull"
+release_url = "{release_url}"
+checksum_url = "{checksum_url}"
+
+[migration]
+adapter = "command"
+
+[service]
+adapter = "systemd"
+unit = "checkout.service"
+run_as = "checkout"
+
+[health]
+adapter = "http"
+url = "http://127.0.0.1:8080/health"
+"#
+    ))
+    .expect("parses")
+}
+
+#[test]
+fn a_pull_url_carrying_credentials_is_refused_without_echoing_them() {
+    let report = pull_config(
+        "https://deploy:t0ken@example.com/app-{version}.tar.gz",
+        "https://u@example.com/app.sha256",
+    )
+    .validate();
+    for path in ["artifact.release_url", "artifact.checksum_url"] {
+        let issue = report
+            .errors()
+            .find(|i| i.path == path)
+            .unwrap_or_else(|| panic!("an error at {path}: {report:?}"));
+        assert!(issue.message.contains("credentials"), "{}", issue.message);
+        assert!(!issue.message.contains("t0ken"), "{}", issue.message);
+        assert!(!issue.message.contains("example.com"), "{}", issue.message);
+    }
+}
+
+#[test]
+fn an_at_sign_after_the_host_is_not_userinfo() {
+    let report = pull_config(
+        "https://example.com/releases/@scope/app.tar.gz",
+        "https://example.com/app.sha256?by=a@b",
+    )
+    .validate();
+    assert!(report.ok(), "{report:?}");
+}

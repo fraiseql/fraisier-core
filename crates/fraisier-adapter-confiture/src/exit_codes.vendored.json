@@ -19,6 +19,7 @@
         "DIFFER_404",
         "DIFFER_405",
         "DIFFER_408",
+        "DIFFER_411",
         "MIGR_101",
         "SCHEMA_206",
         "SEED_002",
@@ -84,6 +85,7 @@
         "CONFIG_013",
         "CONFIG_014",
         "CONFIG_015",
+        "CONFIG_016",
         "DIFFER_400",
         "DIFFER_401",
         "DIFFER_403",
@@ -104,6 +106,7 @@
         "VALID_007",
         "VALID_008",
         "VALID_009",
+        "VALID_010",
         "VERIFY_001"
       ]
     },

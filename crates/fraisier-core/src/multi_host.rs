@@ -64,11 +64,12 @@ use fraisier_saga::state_store::{FraiseKey, StateStore, StateStoreError};
 use serde_json::Value;
 
 use crate::policy::{self, Baseline, Inspection, PolicyGate};
+use crate::preflight_verdict;
 use crate::readiness::{self, DatabaseReadiness};
 
 use crate::adapter_axes::{
     AdapterCtx, AdapterError, ArtifactAdapter, HealthAdapter, HostId, LbAdapter, LbMembership,
-    MigrationAdapter, Revision, ServiceAdapter, Severity, StagedArtifact,
+    MigrationAdapter, Revision, ServiceAdapter, StagedArtifact,
 };
 
 /// One host in a multi-host deploy's inventory.
@@ -273,6 +274,8 @@ pub struct MultiHostDeploy {
     ctx: AdapterCtx,
     target: Option<Revision>,
     forward_compatible_lint: bool,
+    /// Apply pending migrations no `down` can undo (`[migration].allow_irreversible`).
+    allow_irreversible: bool,
     /// The schema policy gate. Default (no `[policy]` section) leaves the tier
     /// gate switched off — multi-host rolls one version at a time against the
     /// database, so it has no always-on baseline rule either.
@@ -384,6 +387,7 @@ pub struct MultiHostDeployBuilder {
     ctx: Option<AdapterCtx>,
     target: Option<Revision>,
     forward_compatible_lint: bool,
+    allow_irreversible: bool,
     policy: PolicyGate,
     database_readiness: Option<Arc<dyn DatabaseReadiness>>,
     artifact: Option<Arc<dyn ArtifactAdapter>>,
@@ -404,6 +408,7 @@ impl MultiHostDeployBuilder {
             // Default on: the forward-compat preflight runs whenever the adapter
             // advertises it, unless the operator opts out (PRD G11 / Decision 4).
             forward_compatible_lint: true,
+            allow_irreversible: false,
             policy: PolicyGate::default(),
             database_readiness: None,
             artifact: None,
@@ -435,6 +440,15 @@ impl MultiHostDeployBuilder {
     #[must_use]
     pub const fn forward_compatible_lint(mut self, enabled: bool) -> Self {
         self.forward_compatible_lint = enabled;
+        self
+    }
+
+    /// Apply pending migrations the adapter says no `down` can undo
+    /// (`[migration].allow_irreversible`, default `false`). Off, preflight
+    /// refuses them, and refuses when the adapter could not tell.
+    #[must_use]
+    pub const fn allow_irreversible(mut self, allow: bool) -> Self {
+        self.allow_irreversible = allow;
         self
     }
 
@@ -525,6 +539,7 @@ impl MultiHostDeployBuilder {
             ctx,
             target: self.target,
             forward_compatible_lint: self.forward_compatible_lint,
+            allow_irreversible: self.allow_irreversible,
             policy: self.policy,
             database_readiness: self.database_readiness,
         })
@@ -540,6 +555,7 @@ struct RolloutShared {
     inventory: Vec<HostEntry>,
     target: Option<Revision>,
     forward_compatible_lint: bool,
+    allow_irreversible: bool,
     policy: PolicyGate,
     database_readiness: Option<Arc<dyn DatabaseReadiness>>,
     artifact: Arc<dyn ArtifactAdapter>,
@@ -649,6 +665,7 @@ impl RolloutShared {
             inventory: deploy.plan.inventory().hosts().to_vec(),
             target: deploy.target.clone(),
             forward_compatible_lint: deploy.forward_compatible_lint,
+            allow_irreversible: deploy.allow_irreversible,
             policy: deploy.policy.clone(),
             database_readiness: deploy.database_readiness.clone(),
             artifact: Arc::clone(&deploy.artifact),
@@ -746,24 +763,31 @@ impl RolloutShared {
         let Some(report) = inspection.report.as_ref() else {
             return Ok(());
         };
-        let blocking = report
-            .issues
-            .iter()
-            .filter(|issue| issue.severity == Severity::Error)
-            .count();
-        if blocking > 0 {
-            return Err(SagaError::StepFailed {
+        preflight_verdict::lint_refusal(report).map_or(Ok(()), |message| {
+            Err(SagaError::StepFailed {
                 step: "preflight".to_owned(),
-                message: format!(
-                    "forward-compatibility preflight found {blocking} blocking issue(s)"
-                ),
-            });
-        }
-        Ok(())
+                message,
+            })
+        })
     }
 
-    /// Preflight: the schema policy gate, the shared forward-compat lint, then a
-    /// reachability probe of **every** host in parallel. Reports all unreachable
+    /// Refuse pending migrations no `down` can undo, unless the operator allowed
+    /// them.
+    fn run_reversibility_gate(&self, inspection: &Inspection) -> Result<(), SagaError> {
+        preflight_verdict::reversibility_refusal(
+            inspection.report.as_ref(),
+            self.allow_irreversible,
+        )
+        .map_or(Ok(()), |message| {
+            Err(SagaError::StepFailed {
+                step: "preflight".to_owned(),
+                message,
+            })
+        })
+    }
+
+    /// Preflight: the schema policy gate, the shared forward-compat lint, the
+    /// reversibility gate, then a reachability probe of **every** host in parallel. Reports all unreachable
     /// hosts at once.
     ///
     /// The gate runs first, for the same reason it does on single-host: a deploy
@@ -776,6 +800,7 @@ impl RolloutShared {
         let inspection = self.inspect().await?;
         self.run_policy_gate(&inspection).await?;
         Self::run_forward_compat_lint(&inspection)?;
+        self.run_reversibility_gate(&inspection)?;
 
         let probes = self.inventory.iter().map(|entry| {
             let ctx = self.host_ctx(entry);
@@ -1186,9 +1211,9 @@ mod tests {
     use crate::adapter_axes::{
         AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, ArtifactAdapter,
         ArtifactRef, ChangeSet, HealthAdapter, HealthStatus, HostId, LbAdapter, LbMembership,
-        LbState, MigrationAdapter, MigrationOutcome, PreflightIssue, PreflightReport, Revision,
-        RiskTier, SchemaChange, ServiceAdapter, ServiceStatus, Severity, StagedArtifact,
-        VerifyCheck, VerifyReport,
+        LbState, MigrationAdapter, MigrationOutcome, PreflightIssue, PreflightReport,
+        Reversibility, Revision, RiskTier, SchemaChange, ServiceAdapter, ServiceStatus, Severity,
+        StagedArtifact, VerifyCheck, VerifyReport,
     };
     use crate::policy::{testing::FixedApproval, Policy, PolicyGate, REFUSED};
     use async_trait::async_trait;
@@ -1258,6 +1283,8 @@ mod tests {
         /// The classified change-set the preflight report carries. `Some` also
         /// makes the adapter advertise `risk_tier`.
         change_set: Option<ChangeSet>,
+        /// The reversibility verdict the preflight report carries.
+        reversibility: Option<Reversibility>,
     }
 
     impl Faults {
@@ -1417,6 +1444,7 @@ mod tests {
             if let Some(changes) = self.faults.change_set.clone() {
                 report = report.with_change_set(changes);
             }
+            report.reversibility.clone_from(&self.faults.reversibility);
             Ok(report)
         }
     }
@@ -1817,6 +1845,72 @@ mod tests {
             trail,
             vec!["describe", "preflight"],
             "no host probed: {trail:?}"
+        );
+    }
+
+    fn irreversible_faults() -> Arc<Faults> {
+        Arc::new(Faults {
+            reversibility: Some(Reversibility::Checked {
+                irreversible: vec!["003_add_index".to_owned()],
+            }),
+            ..Faults::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn an_irreversible_pending_migration_fails_before_any_host_is_probed() {
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let plan = deploy(&trail, &irreversible_faults(), RolloutStrategy::AllAtOnce);
+
+        let outcome = plan.run(store).await.expect("run");
+        let SagaOutcome::RolledBack {
+            failed_step,
+            reason,
+            ..
+        } = &outcome
+        else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert_eq!(failed_step, "preflight");
+        assert!(reason.contains("003_add_index"), "{reason}");
+        assert!(
+            reason.contains("[migration].allow_irreversible = true"),
+            "{reason}"
+        );
+        assert_eq!(drain_trail(&trail), vec!["describe", "preflight"]);
+    }
+
+    #[tokio::test]
+    async fn allow_irreversible_rolls_it_out() {
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let plan = MultiHostDeploy {
+            allow_irreversible: true,
+            ..deploy(&trail, &irreversible_faults(), RolloutStrategy::AllAtOnce)
+        };
+        let outcome = plan.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn the_lint_counts_a_migration_once_and_names_it() {
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let faults = Arc::new(Faults {
+            preflight_blocking: true,
+            ..Faults::default()
+        });
+        let outcome = deploy(&trail, &faults, RolloutStrategy::AllAtOnce)
+            .run(store)
+            .await
+            .expect("run");
+        let SagaOutcome::RolledBack { reason, .. } = &outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert!(
+            reason.contains("1 pending migration(s) would fail — 003: non_reversible"),
+            "{reason}"
         );
     }
 

@@ -24,6 +24,33 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `PGPASSFILE` (still read). Check the webhook unit's `Environment=` as well
   as your shell.
 
+### Fixed
+
+- **`fraisier db refresh` no longer drops a database it cannot create again.**
+  It dropped the target, then ran `CREATE DATABASE`; a role that owned the
+  target but lacked `CREATEDB`, or an admin that could not make the app role
+  the owner (`SET` on the role, PostgreSQL 16+), left no database and the
+  units stopped. The refresh now checks both before the drop and refuses,
+  naming the `ALTER ROLE … CREATEDB` or `GRANT <app> TO <admin>` that fixes
+  it. With `[database].admin_url_env`, it also refuses an admin DSN that
+  reaches another cluster than the app's. A failure after the drop now names
+  the recovery (`createdb -O <app> <db>`, `fraisier db mark-refresh-target`,
+  run again).
+- **`fraisier db reset` and `fraisier db refresh` check the migration tool
+  before destroying anything.** A reset used to drop every schema and only
+  then find that the migration adapter could not run (a missing `confiture`),
+  leaving an empty database; a refresh found out after the drop and restore.
+  Both now refuse first, with nothing changed.
+- **A restore no longer reports TVIEWs as filled when it could not read
+  them.** The probe after the post-restore rebuild (restore, refresh, the
+  restore drill) skipped a TVIEW its role could not read. It now fails the
+  check, naming the TVIEW and the `GRANT SELECT` that lets the role read it.
+
+### Changed
+
+- `fraisier_db::refresh::RefreshServer` gains a required method,
+  `create_problem`, which a custom implementation must provide.
+
 ## [1.0.0-beta.14] - 2026-10-30
 
 ### Added

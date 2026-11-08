@@ -10,6 +10,9 @@ use crate::PgConn;
 
 const MARKER: &str = "checkout/staging";
 
+/// The `system_identifier` of the cluster the app role reaches.
+const APP_CLUSTER: &str = "7700958424225614334";
+
 /// A plain archive: one table and its rows.
 const PLAIN: &str = "220; 1259 16400 TABLE public tb_item app_prod\n\
                      221; 0 16400 TABLE DATA public tb_item app_prod\n";
@@ -46,6 +49,9 @@ struct Fake {
     extensions_problem: Option<&'static str>,
     first_pass_fails: bool,
     still_empty: Vec<String>,
+    create_problem: Option<&'static str>,
+    create_fails: bool,
+    admin_cluster: &'static str,
     calls: Mutex<Vec<String>>,
 }
 
@@ -59,6 +65,9 @@ impl Fake {
             extensions_problem: None,
             first_pass_fails: false,
             still_empty: Vec::new(),
+            create_problem: None,
+            create_fails: false,
+            admin_cluster: APP_CLUSTER,
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -116,7 +125,12 @@ impl RestoreServer for Fake {
             user: user(conn),
             superuser: user(conn) == "postgres",
             recovery: false,
-            system_identifier: "7700958424225614334".to_owned(),
+            system_identifier: if user(conn) == "postgres" {
+                self.admin_cluster
+            } else {
+                APP_CLUSTER
+            }
+            .to_owned(),
         })
     }
 
@@ -139,6 +153,9 @@ impl RestoreServer for Fake {
             &format!("create {name} owner {}", owner.unwrap_or("-")),
             maintenance,
         );
+        if self.create_fails {
+            return Err("ERROR:  permission denied to create database".to_owned());
+        }
         Ok(())
     }
 
@@ -205,6 +222,18 @@ impl RefreshServer for Fake {
             conn,
         );
         Ok(self.extensions_problem.map(str::to_owned))
+    }
+
+    async fn create_problem(
+        &self,
+        maintenance: &PgConn,
+        owner: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        self.record(
+            &format!("may_create owner {}", owner.unwrap_or("-")),
+            maintenance,
+        );
+        Ok(self.create_problem.map(str::to_owned))
     }
 
     async fn database_bytes(&self, conn: &PgConn) -> Result<u64, String> {
@@ -433,6 +462,63 @@ async fn a_tview_still_empty_after_the_rebuild_fails_the_refresh() {
     };
     match refresh(&fake, true).await {
         Err(RestoreError::Failed(reason)) => assert!(reason.contains("public.tv_item"), "{reason}"),
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_role_that_could_not_create_the_target_again_is_refused_before_the_drop() {
+    let fake = Fake {
+        create_problem: Some("role \"app\" may not create databases: ALTER ROLE \"app\" CREATEDB"),
+        ..Fake::new(PLAIN)
+    };
+    let reason = refused(refresh(&fake, false).await);
+    assert!(reason.contains("ALTER ROLE"), "{reason}");
+    assert!(!fake.changed(), "{:?}", fake.calls());
+}
+
+#[tokio::test]
+async fn the_create_privilege_is_asked_of_the_role_that_creates_for_the_owner() {
+    let fake = Fake::new(TVIEWS);
+    refresh(&fake, true).await.expect("refreshed");
+    assert!(
+        fake.calls()[..fake.at("drop")]
+            .contains(&"may_create owner app:postgres@postgres".to_owned()),
+        "{:?}",
+        fake.calls()
+    );
+}
+
+#[tokio::test]
+async fn an_admin_on_another_cluster_than_the_app_is_refused_before_the_drop() {
+    let fake = Fake {
+        admin_cluster: "7700958424225699999",
+        ..Fake::new(TVIEWS)
+    };
+    let reason = refused(refresh(&fake, true).await);
+    assert!(reason.contains("CHECKOUT_ADMIN_URL"), "{reason}");
+    assert!(reason.contains("another PostgreSQL cluster"), "{reason}");
+    assert!(!reason.contains("s3cret"), "{reason}");
+    assert!(!fake.changed(), "{:?}", fake.calls());
+}
+
+#[tokio::test]
+async fn a_failure_after_the_drop_names_the_recovery() {
+    let fake = Fake {
+        create_fails: true,
+        ..Fake::new(PLAIN)
+    };
+    match refresh(&fake, false).await {
+        Err(RestoreError::Failed(reason)) => {
+            assert!(
+                reason.contains("createdb -O app checkout_staging"),
+                "{reason}"
+            );
+            assert!(
+                reason.contains("fraisier db mark-refresh-target"),
+                "{reason}"
+            );
+        }
         other => panic!("expected a failure, got {other:?}"),
     }
 }

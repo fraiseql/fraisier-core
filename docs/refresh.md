@@ -102,6 +102,7 @@ nothing changed, when:
   `max_age_hours` (48 by default), or it is stamped in the future;
 - `[refresh].data_dir` is set and its filesystem lacks room for the database's
   current size plus 2 GB;
+- the migration adapter cannot run (for example, `confiture` is not installed);
 - a deploy holds the deploy lock.
 
 It then stops the environment's units: the `[refresh].units` timers first, so
@@ -111,11 +112,20 @@ outside: workers, beat or cron units, mail pollers. Before dropping, it reads
 the marker and the database's sessions again. Another config's marker, or
 any other session still connected (named in the refusal), stops the refresh;
 the units that were running start again.
+It refuses the same way when the role that creates the database again could
+not: it needs `CREATEDB` (or superuser), and with `admin_url_env`, the right to
+make the app role the owner (`SET` on the role on PostgreSQL 16 and later,
+membership before). The refusal names the `ALTER ROLE … CREATEDB` or
+`GRANT <app> TO <admin>` that fixes it. With `admin_url_env`, it also refuses
+an admin DSN that reaches another cluster than the app's.
 
 Then it drops the database, re-creates it owned by the app role, marks it
 again, and restores the archive. It runs the migrations forward as the app
 role, then checks that at least `min_tables` tables came back. A failure from
-the drop on leaves the units stopped.
+the drop on leaves the units stopped, and names the recovery: create the
+database again owned by the app role (`createdb -O <app> <db>`), mark it with
+`fraisier db mark-refresh-target`, and run the refresh again. Until it is
+marked, a new refresh refuses.
 
 ### Who does what
 

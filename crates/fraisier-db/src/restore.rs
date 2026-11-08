@@ -150,6 +150,11 @@ impl RestoreIdentity {
             .with_database(database)
     }
 
+    /// The resolved admin identity, if one restores.
+    pub(crate) const fn admin(&self) -> Option<&Admin> {
+        self.admin.as_ref()
+    }
+
     /// The env var the pg_tviews refusal points at.
     fn admin_env(&self) -> Option<&str> {
         self.admin
@@ -221,7 +226,8 @@ pub trait RestoreServer: Send + Sync {
     /// The rebuild was refused or failed.
     async fn rebuild(&self, conn: &PgConn, only_empty: bool) -> Result<Vec<Rebuilt>, String>;
 
-    /// The TVIEWs still empty over a populated view, as `schema.name`.
+    /// The TVIEWs still empty over a populated view, as `schema.name`, and
+    /// those the probe could not read, each with the GRANT that lets it.
     ///
     /// # Errors
     /// The probe failed.
@@ -233,7 +239,7 @@ pub trait RestoreServer: Send + Sync {
 pub struct TviewRebuild {
     /// What the rebuild filled.
     pub rebuilt: Vec<Rebuilt>,
-    /// What is still empty over a populated view afterwards.
+    /// What is still empty over a populated view afterwards, or unreadable.
     pub still_empty: Vec<String>,
 }
 
@@ -455,7 +461,7 @@ async fn fill_throwaway(
         } else {
             Err(format!(
                 "after the post-restore TVIEW rebuild, these TVIEWs are still empty over a \
-                 populated view: {}",
+                 populated view, or could not be read: {}",
                 rebuilt.still_empty.join(", ")
             ))
         }
@@ -652,9 +658,23 @@ impl RestoreServer for Postgres {
         let Some(schema) = tviews::usable_schema(psql, conn).await? else {
             return Ok(Vec::new());
         };
-        let found = tviews::find_empty(psql, conn, &schema).await?;
-        Ok(found.empty.iter().map(tviews::Tview::qualified).collect())
+        Ok(unfilled(&tviews::find_empty(psql, conn, &schema).await?))
     }
+}
+
+/// The TVIEWs a post-restore probe could not show to be filled: each empty
+/// one, and each it could not read, with the GRANT that lets it.
+fn unfilled(found: &tviews::Emptiness) -> Vec<String> {
+    found
+        .empty
+        .iter()
+        .map(tviews::Tview::qualified)
+        .chain(
+            found.unreadable.iter().map(|(tview, grant)| {
+                format!("{} (could not be read: {grant})", tview.qualified())
+            }),
+        )
+        .collect()
 }
 
 /// A unique, valid throwaway database name derived from `base` (≤ 63 chars,

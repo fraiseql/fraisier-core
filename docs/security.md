@@ -162,6 +162,29 @@ mistakes, not adversaries; `/etc/systemd/system` being root-only-write is the re
 trust boundary. D-Bus / privileged socket helpers (and a `--via-socket` path that
 drops the operator-sudo requirement) are deferred to v1.1+.
 
+## What `fraisier scaffold` renders
+
+- **The app unit never runs as root.** Without `User=`, systemd runs a
+  system unit as root, so `fraisier scaffold` requires `[service].run_as`
+  (and takes an optional `run_as_group`) for the app unit and renders
+  `User=`/`Group=`. `root`, uid `0` in any spelling, and anything but one
+  account word are refused: a line break in the value would add directives
+  to the unit. A user-manager unit (`[service].user = true`) runs as its own
+  user and takes no `run_as`.
+- **A config that serves nothing gets no unit and no site.** Without a
+  `[service]`, `scaffold` renders no app unit, socket or nginx site.
+- **The nginx site gzips JSON.** It compresses `application/json` and
+  `application/graphql-response+json` by default (`[scaffold.nginx].gzip =
+  false` turns it off; `brotli = true` adds brotli, which needs nginx's
+  brotli module). Compression enables
+  [BREACH](https://www.breachattack.com/): over TLS, an attacker who can make
+  the browser send requests and can watch the compressed response sizes
+  can recover a secret in a response that also reflects their input, such as
+  a CSRF token next to an echoed query parameter. A JSON API that
+  authenticates with a header (not a cookie) and puts no secret in a
+  response body is not exposed. Otherwise, mask such secrets per response,
+  or set `gzip = false` for that site.
+
 ## `fraises.yaml` runtime compatibility — withdrawn
 
 The Python `fraises.yaml` format (with the `!envvar` YAML tag) is **not** parsed

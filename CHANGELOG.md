@@ -60,6 +60,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`PFLIGHT_MISSING_DOWN`, `PFLIGHT_DOWN_EMPTY`). `PreflightReport` gains an
   optional `reversibility` field; an adapter that does not report it is
   unaffected.
+- **The scaffolded nginx site gzips JSON** (#145):
+  `application/json` and `application/graphql-response+json`,
+  `gzip_proxied any`, `gzip_min_length 1024`, `gzip_comp_level 5`,
+  `gzip_vary on`. `[scaffold.nginx].brotli = true` adds the same for
+  brotli, which needs nginx's brotli module (Debian:
+  `libnginx-mod-http-brotli-filter`); without it `nginx -t` fails.
+  `[scaffold.nginx].gzip = false` turns gzip off. See the BREACH note in
+  `docs/security.md`.
+- **`[service].run_as` and `run_as_group`**: the account the scaffolded app
+  unit runs as (`User=`, `Group=`).
 
 ### Changed
 
@@ -98,6 +108,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one migration read as one failing migration, each listed with its codes.
   `db migrate --json`: `preflight_blocking` now counts migrations (and
   findings that name none); the new `preflight_issues` counts findings.
+- ⚠️ **`fraisier scaffold` requires `[service].run_as`** for the app unit,
+  which until now had no `User=` and so ran as root. A config with a
+  `[service]` and no `run_as` is refused, naming the key; set it to the
+  account the app runs as. `root` and uid `0` are refused, and so is
+  `run_as` together with `[service].user = true` (a user-manager unit runs
+  as its own user). Configs written by `fraisier init` now set it.
+- **`fraisier scaffold` renders no app unit, socket or nginx site for a
+  config without `[service]`**, and says so. On such a host,
+  `scaffold-install --prune` now removes those three files if an earlier
+  scaffold installed them (they carry the fraisier marker).
 
 ### Fixed
 

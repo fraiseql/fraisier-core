@@ -646,9 +646,14 @@ fn check_report_json(run: &fraisier_check::CheckRunReport) -> Value {
 pub(crate) fn scaffold(config_path: &Path, out_dir: &Path, dry_run: bool) -> Result<CommandOutput> {
     let config = load(config_path)?;
     let files = fraisier_scaffold::generate(&config)?;
+    let notice = if config.service.is_none() {
+        "no [service]: no app unit, socket or nginx site\n"
+    } else {
+        ""
+    };
 
     if dry_run {
-        let mut pretty = format!("scaffold plan (into {}):\n", out_dir.display());
+        let mut pretty = format!("{notice}scaffold plan (into {}):\n", out_dir.display());
         for file in &files {
             let _ = writeln!(pretty, "  {}", out_dir.join(&file.rel_path).display());
         }
@@ -665,7 +670,7 @@ pub(crate) fn scaffold(config_path: &Path, out_dir: &Path, dry_run: bool) -> Res
 
     let written = fraisier_scaffold::write_tree(&files, out_dir)?;
     let mut pretty = format!(
-        "wrote {} files into {}:\n",
+        "{notice}wrote {} files into {}:\n",
         written.len(),
         out_dir.display()
     );
@@ -4139,6 +4144,7 @@ database_url_env = "CHECKOUT_DATABASE_URL"
 [service]
 adapter = "systemd"
 unit = "checkout.service"
+run_as = "checkout"
 
 [health]
 adapter = "http"
@@ -4739,6 +4745,24 @@ url = "http://127.0.0.1:8080/health"
         let done = scaffold(&config, &out, false).expect("scaffold");
         assert_eq!(done.exit_code, 0);
         assert!(out.join("systemd/checkout.service").exists());
+    }
+
+    #[test]
+    fn scaffold_says_in_one_line_that_a_config_without_a_service_gets_no_unit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(
+            dir.path(),
+            "fraisier.toml",
+            "[deploy]\nname = \"jobs\"\nenvironment = \"production\"\n",
+        );
+        let plan = scaffold(&config, &dir.path().join("deploy"), true).expect("dry run");
+        assert_eq!(plan.json["files"].as_array().expect("files").len(), 2);
+        assert!(
+            plan.pretty
+                .contains("no [service]: no app unit, socket or nginx site"),
+            "{}",
+            plan.pretty
+        );
     }
 
     #[test]

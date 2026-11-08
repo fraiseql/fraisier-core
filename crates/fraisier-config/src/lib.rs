@@ -77,10 +77,11 @@ pub use schema::{
     ArtifactSection, BackupSection, BlueGreenSection, CheckSection, DatabaseRequires,
     DatabaseSection, DatabaseTviews, DeployConfig, DeploySection, DrillSection, FederationSection,
     HealthSection, HostSpec, HostsSection, LbSection, MetricsSection, MigrationSection,
-    NotifySection, PolicySection, RefreshSection, RetainEntry, Sanitize, ScheduleSection,
-    ServiceSection, SshSection, DEFAULT_APPROVAL_TIMEOUT_SECS, UNCLASSIFIED_ACTIONS,
+    NotifySection, PolicySection, RefreshSection, RetainEntry, Sanitize, ScaffoldNginxSection,
+    ScaffoldSection, ScheduleSection, ServiceSection, SshSection, DEFAULT_APPROVAL_TIMEOUT_SECS,
+    UNCLASSIFIED_ACTIONS,
 };
-pub use validate::{is_unit_word, ValidationIssue, ValidationReport};
+pub use validate::{is_superuser, is_unit_word, ValidationIssue, ValidationReport};
 
 // Re-exported so callers can match on issue severity without depending on
 // `fraisier-core` directly.

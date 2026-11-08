@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use fraisier_config::{DeployConfig, RetainEntry};
+use fraisier_config::{is_superuser, is_unit_word, DeployConfig, RetainEntry, ServiceSection};
 
 use crate::ScaffoldError;
 
@@ -36,18 +36,59 @@ pub struct GeneratedFile {
 
 /// Render the full set of deploy infrastructure files for `config`.
 ///
-/// Produces the systemd service + socket units, an nginx site config, a GitHub
-/// Actions deploy workflow, and a `.env.example`.
+/// A config with a `[service]` gets the systemd service + socket units and an
+/// nginx site; every config gets a GitHub Actions deploy workflow and a
+/// `.env.example`. A config that serves nothing (no `[service]`, such as one
+/// that only migrates a database) gets no unit and no site.
 ///
 /// # Errors
 /// [`ScaffoldError::MissingField`] if `[deploy].name` / `[deploy].environment`
 /// (the fields every template keys on) are absent.
 pub fn generate(config: &DeployConfig) -> Result<Vec<GeneratedFile>, ScaffoldError> {
     let r = Resolved::from_config(config)?;
+    let ci = with_header(
+        &CI_WORKFLOW
+            .replace("{name}", &r.name)
+            .replace("{environment}", &r.environment),
+    );
+    let env = with_header(
+        &ENV_EXAMPLE
+            .replace("{db_env}", &r.db_env)
+            .replace("{env_file}", &r.env_file)
+            .replace("{name}", &r.name)
+            .replace("{environment}", &r.environment),
+    );
+
+    let mut files = if config.service.is_some() {
+        serving_files(&r)
+    } else {
+        Vec::new()
+    };
+    files.extend([
+        GeneratedFile {
+            rel_path: PathBuf::from(".github/workflows/deploy.yml"),
+            install_dest: None,
+            contents: ci,
+        },
+        GeneratedFile {
+            rel_path: PathBuf::from(".env.example"),
+            install_dest: None,
+            contents: env,
+        },
+    ]);
+    if let Some(file) = &r.refreshed_file {
+        files.extend(refreshed_drop_ins(config, file));
+    }
+    Ok(files)
+}
+
+/// The app's systemd service and socket units and its nginx site.
+fn serving_files(r: &Resolved) -> Vec<GeneratedFile> {
     let service = with_header(
         &SYSTEMD_SERVICE
             .replace("{name}", &r.name)
             .replace("{environment}", &r.environment)
+            .replace("{run_as}", &r.run_as)
             .replace("{exec_start}", &r.exec_start)
             .replace("{env_file}", &r.env_file)
             .replace(
@@ -66,22 +107,10 @@ pub fn generate(config: &DeployConfig) -> Result<Vec<GeneratedFile>, ScaffoldErr
         &NGINX_SITE
             .replace("{server_block}", &r.server_block)
             .replace("{upstream}", &r.upstream)
+            .replace("{compression}", &r.compression)
             .replace("{name}", &r.name),
     );
-    let ci = with_header(
-        &CI_WORKFLOW
-            .replace("{name}", &r.name)
-            .replace("{environment}", &r.environment),
-    );
-    let env = with_header(
-        &ENV_EXAMPLE
-            .replace("{db_env}", &r.db_env)
-            .replace("{env_file}", &r.env_file)
-            .replace("{name}", &r.name)
-            .replace("{environment}", &r.environment),
-    );
-
-    let mut files = vec![
+    vec![
         GeneratedFile {
             rel_path: PathBuf::from(format!("systemd/{}", r.unit)),
             install_dest: Some(PathBuf::from(format!("/etc/systemd/system/{}", r.unit))),
@@ -94,24 +123,10 @@ pub fn generate(config: &DeployConfig) -> Result<Vec<GeneratedFile>, ScaffoldErr
         },
         GeneratedFile {
             rel_path: PathBuf::from(format!("nginx/{}.conf", r.name)),
-            install_dest: Some(r.nginx_dest),
+            install_dest: Some(r.nginx_dest.clone()),
             contents: nginx,
         },
-        GeneratedFile {
-            rel_path: PathBuf::from(".github/workflows/deploy.yml"),
-            install_dest: None,
-            contents: ci,
-        },
-        GeneratedFile {
-            rel_path: PathBuf::from(".env.example"),
-            install_dest: None,
-            contents: env,
-        },
-    ];
-    if let Some(file) = &r.refreshed_file {
-        files.extend(refreshed_drop_ins(config, file));
-    }
-    Ok(files)
+    ]
 }
 
 /// A drop-in loading the outbound flag `file` for each of `[refresh].units`;
@@ -467,6 +482,10 @@ struct Resolved {
     nginx_dest: PathBuf,
     db_env: String,
     server_block: String,
+    /// The nginx site's gzip/brotli directives, possibly empty.
+    compression: String,
+    /// The app unit's `User=`/`Group=` lines, empty for a user-manager unit.
+    run_as: String,
 }
 
 impl Resolved {
@@ -523,6 +542,8 @@ impl Resolved {
             );
 
         Ok(Self {
+            compression: compression(config),
+            run_as: run_as_lines(config.service.as_ref())?,
             exec_start: format!("{active_path}/{name}"),
             env_file: format!("/etc/{name}/{environment}.env"),
             refreshed_file: config
@@ -558,6 +579,71 @@ fn host_addresses(config: &DeployConfig) -> Vec<String> {
     }
 }
 
+/// The app unit's `User=` (and `Group=`) lines. A system-manager unit must name
+/// its account, and never root: without `User=` systemd runs it as root. A
+/// user-manager unit (`user = true`) runs as its user and takes neither.
+fn run_as_lines(service: Option<&ServiceSection>) -> Result<String, ScaffoldError> {
+    let Some(service) = service else {
+        return Ok(String::new());
+    };
+    let invalid = |field, message: &str| ScaffoldError::InvalidField {
+        section: "service",
+        field,
+        message: message.to_owned(),
+    };
+    if service.user == Some(true) {
+        return if service.run_as.is_some() {
+            Err(invalid(
+                "run_as",
+                "does not apply with user = true (User= is invalid in a user-manager unit)",
+            ))
+        } else {
+            Ok(String::new())
+        };
+    }
+    let run_as = service
+        .run_as
+        .as_deref()
+        .ok_or(ScaffoldError::MissingField {
+            section: "service",
+            field: "run_as",
+        })?;
+    if is_superuser(run_as) {
+        return Err(invalid("run_as", "must not be root (or uid 0)"));
+    }
+    if !is_unit_word(run_as) {
+        return Err(invalid("run_as", "must be one account name or uid"));
+    }
+    let group = match service.run_as_group.as_deref() {
+        Some(group) if !is_unit_word(group) => {
+            return Err(invalid("run_as_group", "must be one group name or gid"));
+        }
+        Some(group) => format!("Group={group}\n"),
+        None => String::new(),
+    };
+    Ok(format!("User={run_as}\n{group}"))
+}
+
+/// The compression directives for the nginx site: gzip unless
+/// `[scaffold.nginx].gzip = false`, brotli only with `brotli = true`. Both cover
+/// JSON only; nginx's own defaults already cover `text/html`.
+fn compression(config: &DeployConfig) -> String {
+    let nginx = config.scaffold.as_ref().and_then(|s| s.nginx.as_ref());
+    let gzip = nginx.and_then(|n| n.gzip) != Some(false);
+    let brotli = nginx.and_then(|n| n.brotli) == Some(true);
+    let mut directives = String::new();
+    if gzip || brotli {
+        directives.push('\n');
+    }
+    if gzip {
+        directives.push_str(GZIP);
+    }
+    if brotli {
+        directives.push_str(BROTLI);
+    }
+    directives
+}
+
 /// Prepend the fraisier-generated marker comment to a rendered body.
 fn with_header(body: &str) -> String {
     format!("# {MARKER}\n{body}")
@@ -568,7 +654,7 @@ Description={name} ({environment})
 After=network.target
 
 [Service]
-Type=simple
+{run_as}Type=simple
 # Edit ExecStart to your binary; {active_path} is the symlink fraisier swaps.
 ExecStart={exec_start}
 Restart=on-failure
@@ -741,13 +827,30 @@ const NGINX_SITE: &str = "upstream {upstream} {
 server {
     listen 80;
     server_name {name}.example.com;
-
+{compression}
     location / {
         proxy_pass http://{upstream};
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 }
+";
+
+/// gzip for JSON responses, including proxied ones (`gzip_proxied any`), which
+/// nginx's default `gzip_proxied off` would leave uncompressed.
+const GZIP: &str = "    gzip on;
+    gzip_proxied any;
+    gzip_types application/json application/graphql-response+json;
+    gzip_min_length 1024;
+    gzip_comp_level 5;
+    gzip_vary on;
+";
+
+/// brotli for JSON responses. Needs nginx's brotli filter module.
+const BROTLI: &str = "    brotli on;
+    brotli_types application/json application/graphql-response+json;
+    brotli_min_length 1024;
+    brotli_comp_level 5;
 ";
 
 const CI_WORKFLOW: &str = "name: deploy {name}
@@ -803,6 +906,7 @@ database_url_env = "CHECKOUT_DATABASE_URL"
 [service]
 adapter = "systemd"
 unit = "checkout.service"
+run_as = "checkout"
 
 [health]
 adapter = "http"
@@ -882,6 +986,57 @@ upstream = "checkout_upstream"
         );
     }
 
+    fn site(extra: &str) -> String {
+        let cfg = DeployConfig::from_toml_str(&format!("{MULTI}{extra}")).expect("parse");
+        let files = generate(&cfg).expect("generate");
+        find(&files, "nginx").contents.clone()
+    }
+
+    const JSON_TYPES: &str = "application/json application/graphql-response+json;";
+
+    #[test]
+    fn the_site_gzips_json_by_default() {
+        let site = site("");
+        for line in [
+            "    gzip on;\n",
+            "    gzip_proxied any;\n",
+            "    gzip_min_length 1024;\n",
+            "    gzip_comp_level 5;\n",
+            "    gzip_vary on;\n",
+        ] {
+            assert!(site.contains(line), "{line:?} in:\n{site}");
+        }
+        assert!(
+            site.contains(&format!("    gzip_types {JSON_TYPES}\n")),
+            "{site}"
+        );
+        assert!(!site.contains("brotli"), "{site}");
+    }
+
+    #[test]
+    fn brotli_is_opt_in() {
+        let site = site("\n[scaffold.nginx]\nbrotli = true\n");
+        for line in [
+            "    brotli on;\n",
+            "    brotli_min_length 1024;\n",
+            "    brotli_comp_level 5;\n",
+        ] {
+            assert!(site.contains(line), "{line:?} in:\n{site}");
+        }
+        assert!(
+            site.contains(&format!("    brotli_types {JSON_TYPES}\n")),
+            "{site}"
+        );
+        assert!(site.contains("    gzip on;\n"), "{site}");
+    }
+
+    #[test]
+    fn gzip_can_be_switched_off() {
+        let site = site("\n[scaffold.nginx]\ngzip = false\n");
+        assert!(!site.contains("gzip"), "{site}");
+        assert!(!site.contains("brotli"), "{site}");
+    }
+
     #[test]
     fn repo_files_have_no_install_dest() {
         let cfg = DeployConfig::from_toml_str(MULTI).expect("parse");
@@ -908,6 +1063,7 @@ production = false
 [service]
 adapter = "systemd"
 unit = "checkout.service"
+run_as = "checkout"
 
 [refresh]
 source_dir = "/var/backups/checkout"
@@ -963,6 +1119,68 @@ units = ["checkout-worker.service", "checkout-beat.timer"]
         assert!(!find(&files, "checkout.service")
             .contents
             .contains("refreshed"));
+    }
+
+    #[test]
+    fn a_config_that_serves_nothing_gets_no_app_unit_socket_or_site() {
+        let cfg = DeployConfig::from_toml_str(
+            "[deploy]\nname = \"jobs\"\nenvironment = \"production\"\n\n\
+             [migration]\nadapter = \"confiture\"\ndatabase_url_env = \"JOBS_DSN\"\n",
+        )
+        .expect("parse");
+        let files = generate(&cfg).expect("generate");
+        let paths: Vec<String> = files
+            .iter()
+            .map(|f| f.rel_path.display().to_string())
+            .collect();
+        assert_eq!(paths, vec![".github/workflows/deploy.yml", ".env.example"]);
+    }
+
+    fn app_unit(service: &str) -> Result<String, crate::ScaffoldError> {
+        let cfg = DeployConfig::from_toml_str(&format!(
+            "[deploy]\nname = \"app\"\nenvironment = \"production\"\n\n\
+             [service]\nadapter = \"systemd\"\nunit = \"app.service\"\n{service}"
+        ))
+        .expect("parse");
+        let files = generate(&cfg)?;
+        Ok(find(&files, "systemd/app.service").contents.clone())
+    }
+
+    #[test]
+    fn the_app_unit_runs_as_the_configured_account() {
+        let unit = app_unit("run_as = \"app\"\nrun_as_group = \"web\"\n").expect("generate");
+        assert!(unit.contains("[Service]\nUser=app\nGroup=web\n"), "{unit}");
+        let unit = app_unit("run_as = \"app\"\n").expect("generate");
+        assert!(
+            unit.contains("[Service]\nUser=app\nType=simple\n"),
+            "{unit}"
+        );
+    }
+
+    #[test]
+    fn an_app_unit_without_run_as_is_refused_naming_the_key() {
+        let error = app_unit("").expect_err("refused");
+        assert!(error.to_string().contains("[service].run_as"), "{error}");
+    }
+
+    #[test]
+    fn root_and_a_line_break_are_refused_as_run_as() {
+        for value in ["root", "0", "000", "app\\nExecStartPre=/bin/sh", "a b"] {
+            let error = app_unit(&format!("run_as = \"{value}\"\n")).expect_err(value);
+            assert!(error.to_string().contains("[service].run_as"), "{error}");
+        }
+        let error =
+            app_unit("run_as = \"app\"\nrun_as_group = \"web\\nUser=root\"\n").expect_err("group");
+        assert!(
+            error.to_string().contains("[service].run_as_group"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_user_manager_unit_needs_no_run_as_and_gets_no_user_line() {
+        let unit = app_unit("user = true\n").expect("generate");
+        assert!(!unit.contains("User="), "{unit}");
     }
 
     #[test]

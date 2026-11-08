@@ -355,7 +355,7 @@ pub async fn usable_schema(psql: &Path, conn: &PgConn) -> Result<Option<String>,
 /// connection.
 #[must_use]
 pub fn list_command(archive: &Path) -> std::process::Command {
-    let mut command = std::process::Command::new("pg_restore");
+    let mut command = crate::offline("pg_restore");
     command.arg("--list").arg(archive);
     command
 }

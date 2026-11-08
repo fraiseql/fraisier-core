@@ -84,8 +84,10 @@ impl Launcher {
                 fraisier_core::child_env::scrub(command.as_std_mut());
                 // An adapter that connects to PostgreSQL reads these as defaults
                 // for whatever its DSN leaves unset; the launcher cannot tell which
-                // adapters do, so no local adapter inherits them.
-                fraisier_db::libpq::scrub_ambient(command.as_std_mut());
+                // adapters do, so no local adapter inherits them. Its TLS and GSS
+                // policy variables stay: fraisier never reads the adapter's DSN, so
+                // nothing checked that it pins them.
+                fraisier_db::libpq::scrub_gap_fillers(command.as_std_mut());
                 command.args(args).envs(envs);
                 Ok(command)
             }

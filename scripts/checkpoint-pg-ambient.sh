@@ -8,7 +8,12 @@
 # `PGSERVICE=nonexistent`), the built `fraisier` runs `db migrate` (confiture),
 # `backup`, `db restore --yes` and `db reset --yes` against a socket URL that
 # names only the database. Each must reach that database, and the probe
-# migration records the `search_path` the session saw.
+# migration records the `search_path` the session saw. `PGSSLMODE=verify-full`
+# is set too: a socket URL is exempt from the TLS policy check.
+#
+# Then over TCP (`localhost`): with that `PGSSLMODE` and a URL that does not set
+# `sslmode`, `db reset --yes` is refused, naming `?sslmode=`, and drops nothing;
+# with `?sslmode=disable` in the URL, `backup` runs.
 #
 # Uses a server the developer already has (no container, no host); the database
 # it creates is named `fraisier_t_<pid>_ambient` and dropped again.
@@ -85,10 +90,12 @@ EOF
 
 # The URL names only the database: host, port and user are libpq's defaults
 # (the Unix socket, the OS user) unless something fills them.
+DSN="postgresql:///$DB"
 hostile() {
-  env FRAISIER_T_AMBIENT_DSN="postgresql:///$DB" FRAISIER_CONFITURE_BIN="$CONFITURE" \
+  env FRAISIER_T_AMBIENT_DSN="$DSN" FRAISIER_CONFITURE_BIN="$CONFITURE" \
     PGPORT=1 PGHOSTADDR=192.0.2.1 PGUSER=nobody PGDATABASE=postgres \
     PGOPTIONS='-c search_path=nowhere' PGSERVICE=nonexistent PGCONNECT_TIMEOUT=3 \
+    PGSSLMODE=verify-full \
     "$FRAISIER" "$@" --config "$WORK/fraisier.toml" >"$WORK/out" 2>&1
 }
 step() {
@@ -115,6 +122,22 @@ step "db restore --yes" "SELECT count(*) FROM kept" "1" \
 step "db reset --yes" \
   "SELECT (to_regclass('public.kept') IS NULL)::text || '|' || db FROM probe" "true|$DB" \
   db reset --state-dir "$WORK/state" --yes
+
+say "over TCP, with an ambient PGSSLMODE=verify-full"
+super_psql -d "${SUPER_DSN%/*}/$DB" -c "CREATE TABLE tls_kept AS SELECT 1 AS id"
+DSN="postgresql://${USER}@localhost:5432/$DB"
+code=0
+hostile db reset --state-dir "$WORK/state" --yes || code=$?
+seen="$(probe "SELECT count(*) FROM tls_kept")"
+if [ "$code" -ne 0 ] && [ "$seen" = "1" ] && grep -q '?sslmode=' "$WORK/out"; then
+  pass "a TCP URL without sslmode is refused (exit $code), naming ?sslmode=, and nothing dropped"
+else
+  fail "TCP without sslmode: exit $code, tls_kept=$seen: $(head -c 400 "$WORK/out")"
+fi
+DSN="postgresql://${USER}@localhost:5432/$DB?sslmode=disable"
+rm -f "$WORK/tls.pgdump"
+step "backup over TCP with ?sslmode= in the URL" "SELECT count(*) FROM tls_kept" "1" \
+  backup --output "$WORK/tls.pgdump"
 
 echo
 echo "checkpoint-pg-ambient: $PASSED/$((PASSED + FAILED)) passed"

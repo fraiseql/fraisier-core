@@ -53,6 +53,21 @@ pub enum DbError {
         /// Why it cannot be passed on.
         reason: &'static str,
     },
+    /// The environment holds a TLS or GSS policy variable that fraisier does not
+    /// pass to its database tools, and the DSN, which connects over TCP, does not
+    /// set that keyword itself. Dropping the variable silently would weaken the
+    /// connection (`PGSSLMODE=verify-full` would become libpq's `prefer`).
+    #[error(
+        "the environment sets {variable}, which fraisier does not pass to its database \
+         tools, and the database DSN connects over TCP without `?{keyword}=`: add \
+         `?{keyword}=<value>` to the DSN, or unset {variable}"
+    )]
+    AmbientPolicy {
+        /// The ambient variable.
+        variable: &'static str,
+        /// The URL keyword that would pin it.
+        keyword: &'static str,
+    },
     /// The DSN has no database name, which these ops require.
     #[error("the database DSN does not name a database (expected postgres://…/<dbname>)")]
     MissingDatabase,
@@ -115,6 +130,32 @@ impl PgConn {
         uri::parse(dsn).map(|params| Self { params })
     }
 
+    /// Parse `dsn` as [`Self::parse`] does, then check it against the ambient
+    /// environment: a TLS or GSS policy variable (`PGSSLMODE`, …) that a TCP URL
+    /// does not pin is refused, because every database child loses it (see
+    /// [`libpq`]). Every production caller reads a DSN this way.
+    ///
+    /// # Errors
+    /// What [`Self::parse`] refuses, and [`DbError::AmbientPolicy`].
+    pub fn resolve(dsn: &str) -> Result<Self, DbError> {
+        Self::resolve_with(dsn, &|name| std::env::var_os(name))
+    }
+
+    /// [`Self::resolve`] against the environment `ambient` describes.
+    ///
+    /// # Errors
+    /// As [`Self::resolve`].
+    pub fn resolve_with(
+        dsn: &str,
+        ambient: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Result<Self, DbError> {
+        let conn = Self::parse(dsn)?;
+        match libpq::ambient_policy_problem(&conn, ambient) {
+            Some((variable, keyword)) => Err(DbError::AmbientPolicy { variable, keyword }),
+            None => Ok(conn),
+        }
+    }
+
     /// Whether the connection names more than one host, address or port: a
     /// libpq host list, which may reach a different server on each connection.
     #[must_use]
@@ -124,6 +165,23 @@ impl PgConn {
                 .get(key)
                 .is_some_and(|value| value.contains(','))
         })
+    }
+
+    /// Whether the connection goes over a Unix socket: no `hostaddr`, and no
+    /// host or every host a socket directory (`/…`) or abstract socket (`@…`).
+    #[must_use]
+    pub fn is_socket(&self) -> bool {
+        !self.params.contains_key("hostaddr")
+            && self.params.get("host").is_none_or(|hosts| {
+                hosts
+                    .split(',')
+                    .all(|host| host.starts_with('/') || host.starts_with('@'))
+            })
+    }
+
+    /// Whether the URL sets the libpq `keyword` itself.
+    fn pins(&self, keyword: &str) -> bool {
+        self.params.contains_key(keyword)
     }
 
     /// The target database name.
@@ -254,9 +312,18 @@ pub fn psql_command(conn: &PgConn, sql: &str) -> Command {
     command
 }
 
+/// A database tool that connects to nothing (`pg_restore --list`), with no
+/// libpq variable either: it still reads `PGCLIENTENCODING`.
+#[must_use]
+pub fn offline(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    libpq::scrub_ambient(&mut command);
+    command
+}
+
 /// A command running `program` against `conn`: the connection comes from
-/// [`PgConn::pg_env`] alone, with no ambient [`libpq::AMBIENT_GAP_FILLERS`]
-/// variable left to fill what the URL leaves unset.
+/// [`PgConn::pg_env`] alone, with no ambient libpq variable but
+/// [`libpq::ALLOWED`] left to fill what the URL leaves unset.
 #[must_use]
 pub fn connected(program: impl AsRef<std::ffi::OsStr>, conn: &PgConn) -> Command {
     let mut command = Command::new(program);
@@ -646,14 +713,70 @@ mod tests {
         assert_eq!(env["PGHOST"], "db.example.com");
     }
 
+    /// The ambient variables a database child still gets: certificate, key
+    /// and CRL paths, a password file, and settings that cannot redirect it.
+    const ALLOWED: [&str; 9] = [
+        "PGSSLROOTCERT",
+        "PGSSLCERT",
+        "PGSSLKEY",
+        "PGSSLCRL",
+        "PGSSLCRLDIR",
+        "PGPASSFILE",
+        "PGREQUIREAUTH",
+        "PGCONNECT_TIMEOUT",
+        "PGAPPNAME",
+    ];
+
+    fn removed_of(command: &Command) -> Vec<String> {
+        command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect()
+    }
+
     #[test]
-    fn tls_variables_are_left_for_the_policy_check() {
+    fn every_libpq_variable_but_the_allowlist_is_withheld() {
+        let conn = PgConn::parse("postgresql://alice@db.example.com/shop").expect("parses");
+        let removed = removed_of(&psql_command(&conn, "SELECT 1"));
+        for name in [
+            "PGSSLMODE",
+            "PGGSSENCMODE",
+            "PGCHANNELBINDING",
+            "PGKRBSRVNAME",
+            "PGSSLNEGOTIATION",
+            "PGMINPROTOCOLVERSION",
+            "PGSSLCOMPRESSION",
+            "PGLOCALEDIR",
+            "PGSERVICEFILE",
+        ] {
+            assert!(removed.iter().any(|key| key == name), "{name}: {removed:?}");
+        }
+    }
+
+    #[test]
+    fn the_allowlist_still_reaches_a_database_child() {
         let conn = PgConn::parse("postgresql://alice@db.example.com/shop").expect("parses");
         let command = psql_command(&conn, "SELECT 1");
-        for name in ["PGSSLMODE", "PGSSLROOTCERT", "PGPASSFILE"] {
+        for name in ALLOWED {
             assert!(
                 !command.get_envs().any(|(key, _)| key == name),
-                "{name} is not this check's to touch"
+                "{name} is on the allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn an_archive_listing_inherits_no_libpq_variable_either() {
+        let archive = Path::new("/backups/shop.pgdump");
+        for command in [
+            crate::tviews::list_command(archive),
+            crate::offline("pg_restore"),
+        ] {
+            let removed = removed_of(&command);
+            assert!(
+                removed.iter().any(|key| key == "PGCLIENTENCODING"),
+                "{removed:?}"
             );
         }
     }

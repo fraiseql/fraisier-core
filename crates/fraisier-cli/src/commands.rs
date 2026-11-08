@@ -2238,7 +2238,7 @@ pub(crate) fn resolve_pg_conn(config: &DeployConfig) -> Result<fraisier_db::PgCo
         )?;
     let dsn = std::env::var(&source)
         .with_context(|| format!("the configured database_url_env '{source}' is not set"))?;
-    fraisier_db::PgConn::parse(&dsn).context("parsing the database DSN")
+    fraisier_db::PgConn::resolve(&dsn).context("parsing the database DSN")
 }
 
 /// The identity an operator's restore-class command runs as: the app DSN, plus

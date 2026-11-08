@@ -114,8 +114,8 @@ impl RestoreIdentity {
         }
         let dsn = std::env::var(env)
             .map_err(|_| format!("the configured admin_url_env '{env}' is not set"))?;
-        let conn =
-            PgConn::parse(&dsn).map_err(|error| format!("invalid admin DSN in {env}: {error}"))?;
+        let conn = PgConn::resolve(&dsn)
+            .map_err(|error| format!("invalid admin DSN in {env}: {error}"))?;
         if conn.is_multi_host() {
             return Err(format!("the admin DSN in {env} {MULTI_HOST}"));
         }

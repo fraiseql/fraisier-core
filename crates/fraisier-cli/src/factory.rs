@@ -1337,7 +1337,7 @@ impl ConnectionBudget for PgConnectionBudget {
     async fn probe(&self, _ctx: &AdapterCtx) -> Result<BudgetSnapshot, String> {
         let dsn =
             std::env::var(&self.dsn_env).map_err(|_| format!("{} is not set", self.dsn_env))?;
-        let conn = fraisier_db::PgConn::parse(&dsn).map_err(|e| e.to_string())?;
+        let conn = fraisier_db::PgConn::resolve(&dsn).map_err(|e| e.to_string())?;
         let max_connections = Self::query_u32(&conn, "SHOW max_connections").await?;
         let current = Self::query_u32(&conn, "SELECT count(*) FROM pg_stat_activity").await?;
         Ok(BudgetSnapshot {

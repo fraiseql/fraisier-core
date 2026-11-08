@@ -80,27 +80,45 @@ that libpq ignores its variable, so the setting does not take effect. Run
 fraisier's database tools from PostgreSQL 18's client packages when a DSN relies
 on one.
 
-## A database child connects only where its URL says
+## What the URL decides
 
 libpq reads a `PG*` variable for every connection parameter a URL leaves unset.
 fraisier's own environment (an operator's shell, a unit's `Environment=`) can
-hold a `PGPORT`, `PGUSER` or `PGOPTIONS` meant for something else, and a child
-that inherited it would reach another server, as another role, or with another
-`search_path`, than the config names.
+hold a `PGPORT`, `PGUSER`, `PGOPTIONS` or `PGSSLMODE` meant for something else,
+and a child that inherited it would reach another server, as another role, with
+another `search_path` or under another TLS policy than the config names. So the
+URL alone decides.
 
-So every database child is started without the variables that pick a server, a
-role, a database or a session setting: `PGHOST`, `PGHOSTADDR`, `PGPORT`,
+**`psql`, `pg_dump`, `pg_restore` and `confiture`** start without any libpq
+variable except these, which cannot redirect a connection:
+`PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, `PGSSLCRL`, `PGSSLCRLDIR`,
+`PGPASSFILE`, `PGREQUIREAUTH`, `PGCONNECT_TIMEOUT` and `PGAPPNAME`. Then the
+URL's own values are set. That covers every `db` command, a backup, a restore,
+a refresh, a drill and a deploy's migration.
+
+**A TLS or GSS policy is never dropped silently.** If the environment sets
+`PGSSLMODE`, `PGSSLCERTMODE`, `PGSSLNEGOTIATION`, `PGSSLMINPROTOCOLVERSION`,
+`PGSSLMAXPROTOCOLVERSION`, `PGGSSENCMODE`, `PGCHANNELBINDING`, `PGKRBSRVNAME` or
+`PGGSSLIB`, and a URL that connects over TCP does not set that keyword, the
+command is refused before anything runs, naming the variable and the keyword to
+add (`?sslmode=verify-full`). Without the refusal, an exported
+`PGSSLMODE=verify-full` would become libpq's `prefer`, which checks no
+certificate. A Unix-socket URL is exempt: no `hostaddr`, and no host or every
+host a socket directory (`/…`) or abstract socket (`@…`). `fraisier doctor`
+reports the same refusal. Run it under the **unit's** environment as well
+(`systemctl show -p Environment <unit>`): a variable set only there fires only
+in webhook-started or scheduled runs.
+
+**IPC adapters** started locally lose only the variables that pick a server, a
+role, a database or a session setting (`PGHOST`, `PGHOSTADDR`, `PGPORT`,
 `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGOPTIONS`, `PGSERVICE`,
 `PGSERVICEFILE`, `PGSYSCONFDIR`, `PGTZ`, `PGDATESTYLE`, `PGGEQO`,
-`PGTARGETSESSIONATTRS`, `PGLOADBALANCEHOSTS`, `PGCLIENTENCODING` and
-`PGREQUIREPEER`. Then the URL's own values are set. The children are `psql`,
-`pg_dump` and `pg_restore` for every `db` command, a refresh and a backup;
-`confiture`; and every locally launched IPC adapter, since the launcher cannot
-tell which adapters connect to PostgreSQL. A variable an IPC adapter is
-configured with is set after the removal and still reaches it.
-
-`PGPASSFILE` and the TLS and GSS variables (`PGSSLMODE`, `PGSSLROOTCERT`, …) are
-kept: they authenticate or tighten a connection the URL already chose.
+`PGTARGETSESSIONATTRS`, `PGLOADBALANCEHOSTS`, `PGCLIENTENCODING`,
+`PGREQUIREPEER`). The launcher cannot tell which adapters connect to
+PostgreSQL. fraisier never reads an IPC adapter's URL, so it cannot check that
+the URL pins a TLS policy, and the policy variables still reach the adapter. A
+variable an IPC adapter is configured with is set after the removal and still
+reaches it.
 
 **What this does not cover.** The `command` migration adapter's script is the
 operator's own code and gets fraisier's environment as it is, with

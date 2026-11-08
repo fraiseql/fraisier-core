@@ -356,6 +356,27 @@ fn validate_deploy(cfg: &DeployConfig, report: &mut ValidationReport) {
     }
 }
 
+/// Refuse a URL with credentials in its authority (`user:pass@host`). The pull
+/// source hands it to `curl` on the host's command line — and, under `[hosts]`,
+/// inside the `ssh` command line — where any user on either machine can read
+/// it. The message never echoes the URL.
+fn refuse_url_credentials(report: &mut ValidationReport, path: &str, url: Option<&str>) {
+    let Some(url) = url else {
+        return;
+    };
+    let authority = url.split_once("://").map_or("", |(_, rest)| {
+        rest.split(['/', '?', '#']).next().unwrap_or("")
+    });
+    if authority.contains('@') {
+        report.error(
+            path,
+            "the pull source passes this URL to curl on a command line, so it must carry no \
+             credentials (user:password@); use a credential-free URL, such as a pre-signed \
+             path or a public release",
+        );
+    }
+}
+
 fn validate_artifact(cfg: &DeployConfig, report: &mut ValidationReport) {
     let Some(artifact) = &cfg.artifact else {
         report.error("artifact", "missing required [artifact] section");
@@ -383,6 +404,18 @@ fn validate_artifact(cfg: &DeployConfig, report: &mut ValidationReport) {
                         "the {source} source requires checksum_url (or an inline checksum) \
                          so the download can be sha256-verified before it is staged"
                     ),
+                );
+            }
+            if source == "pull" {
+                refuse_url_credentials(
+                    report,
+                    "artifact.release_url",
+                    artifact.release_url.as_deref(),
+                );
+                refuse_url_credentials(
+                    report,
+                    "artifact.checksum_url",
+                    artifact.checksum_url.as_deref(),
                 );
             }
         }

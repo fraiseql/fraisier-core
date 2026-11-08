@@ -66,7 +66,8 @@ impl Launcher {
 
     /// Build the [`Command`] that launches `program args`.
     ///
-    /// For [`Self::Local`] this is the adapter binary with `envs` applied; for
+    /// For [`Self::Local`] this is the adapter binary with `envs` applied and no
+    /// ambient [`fraisier_db::libpq::AMBIENT_GAP_FILLERS`] variable; for
     /// [`Self::Ssh`] it is `ssh` reaching the host named by `ctx` (with **no** env
     /// on the remote argv — secrets stay local).
     pub(crate) fn command(
@@ -81,6 +82,12 @@ impl Launcher {
             Self::Local => {
                 let mut command = Command::new(program);
                 fraisier_core::child_env::scrub(command.as_std_mut());
+                // An adapter that connects to PostgreSQL reads these as defaults
+                // for whatever its DSN leaves unset; the launcher cannot tell which
+                // adapters do, so no local adapter inherits them. Its TLS and GSS
+                // policy variables stay: fraisier never reads the adapter's DSN, so
+                // nothing checked that it pins them.
+                fraisier_db::libpq::scrub_gap_fillers(command.as_std_mut());
                 command.args(args).envs(envs);
                 Ok(command)
             }
@@ -318,7 +325,8 @@ mod tests {
     use super::{remote_command, shell_quote, Launcher, SshLauncher};
     use fraisier_core::adapter_axes::{AdapterCtx, HostId};
     use serde_json::json;
-    use std::ffi::OsString;
+    use std::collections::BTreeMap;
+    use std::ffi::{OsStr, OsString};
 
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
@@ -435,5 +443,49 @@ mod tests {
     #[test]
     fn local_launcher_is_the_default() {
         assert!(matches!(Launcher::default(), Launcher::Local));
+    }
+
+    fn launched_env(envs: &BTreeMap<OsString, OsString>) -> BTreeMap<String, Option<String>> {
+        let command = Launcher::Local
+            .command(
+                OsStr::new("fraisier-adapter-sqlx"),
+                &[],
+                envs,
+                None,
+                "apply",
+            )
+            .expect("local command");
+        command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_local_adapter_inherits_no_ambient_variable_that_picks_its_database() {
+        let env = launched_env(&BTreeMap::new());
+        for name in [
+            "PGHOST",
+            "PGPORT",
+            "PGUSER",
+            "PGPASSWORD",
+            "PGDATABASE",
+            "PGOPTIONS",
+        ] {
+            assert_eq!(env.get(name), Some(&None), "{name}: {env:?}");
+        }
+    }
+
+    #[test]
+    fn a_variable_the_adapter_is_configured_with_still_reaches_it() {
+        let configured = BTreeMap::from([(OsString::from("PGPORT"), OsString::from("6432"))]);
+        let env = launched_env(&configured);
+        assert_eq!(env.get("PGPORT"), Some(&Some("6432".to_owned())));
     }
 }

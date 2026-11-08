@@ -122,7 +122,7 @@ pub(crate) fn probe(config: &DeployConfig) -> Option<Arc<dyn DatabaseReadiness>>
 #[async_trait]
 impl DatabaseReadiness for PgReadiness {
     async fn unready(&self, live_dsn: &str) -> Result<Vec<String>, String> {
-        let conn = PgConn::parse(live_dsn).map_err(|error| error.to_string())?;
+        let conn = PgConn::resolve(live_dsn).map_err(|error| error.to_string())?;
         let observed = observe(&self.psql, &conn).await?;
         let unready: Vec<String> = assess(&self.requirements, &observed)
             .iter()

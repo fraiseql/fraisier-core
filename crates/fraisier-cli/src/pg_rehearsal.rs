@@ -44,7 +44,7 @@ impl PgRehearsalDb {
         seed: Seed<'_>,
         rebuild: bool,
     ) -> Result<restore::Throwaway, String> {
-        let live = PgConn::parse(live_dsn).map_err(|e| format!("invalid database DSN: {e}"))?;
+        let live = PgConn::resolve(live_dsn).map_err(|e| format!("invalid database DSN: {e}"))?;
         let identity = self.identity(live)?;
         restore::restore_throwaway(&Postgres, &identity, seed, rebuild)
             .await
@@ -87,7 +87,7 @@ impl RehearsalDb for PgRehearsalDb {
     }
 
     async fn teardown(&self, db: &ThrowawayDb) -> Result<(), String> {
-        let throwaway = PgConn::parse(&db.dsn).map_err(|e| e.to_string())?;
+        let throwaway = PgConn::resolve(&db.dsn).map_err(|e| e.to_string())?;
         let identity = self.identity(throwaway)?;
         restore::drop_throwaway(&Postgres, &identity, &db.name, &db.live).await
     }
@@ -126,13 +126,13 @@ impl DrillDb for PgRehearsalDb {
     }
 
     fn live_database(&self, live_dsn: &str) -> Result<String, String> {
-        PgConn::parse(live_dsn)
+        PgConn::resolve(live_dsn)
             .map(|live| live.database().to_owned())
             .map_err(|e| format!("invalid database DSN: {e}"))
     }
 
     async fn table_count(&self, db: &ThrowawayDb) -> Result<u64, String> {
-        let throwaway = PgConn::parse(&db.dsn).map_err(|e| e.to_string())?;
+        let throwaway = PgConn::resolve(&db.dsn).map_err(|e| e.to_string())?;
         let count = scalar(
             &throwaway,
             "SELECT count(*) FROM pg_catalog.pg_tables \
@@ -148,7 +148,7 @@ impl DrillDb for PgRehearsalDb {
 #[async_trait]
 impl crate::commands::DrillServer for PgRehearsalDb {
     async fn live_bytes(&self, live_dsn: &str) -> Result<u64, String> {
-        let live = PgConn::parse(live_dsn).map_err(|e| format!("invalid database DSN: {e}"))?;
+        let live = PgConn::resolve(live_dsn).map_err(|e| format!("invalid database DSN: {e}"))?;
         let size = scalar(&live, "SELECT pg_database_size(current_database())").await?;
         size.parse()
             .map_err(|_| format!("the database size was not a number: {size:?}"))

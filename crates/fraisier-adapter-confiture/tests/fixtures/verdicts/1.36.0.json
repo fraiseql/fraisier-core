@@ -1,0 +1,184 @@
+{
+  "ok": true,
+  "window_safe": false,
+  "summary": {
+    "errors": 0,
+    "warnings": 7,
+    "info": 0,
+    "migrations_checked": 9
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_RENAME_COLUMN",
+      "message": "readers reference the old column name during the lag window Multi-step fix: add the new column \u2192 dual-write \u2192 migrate readers \u2192 drop the old column.",
+      "migration": "tb_item",
+      "file": "20261107000002_rename.up.sql",
+      "line": null,
+      "actionable": "add the new column \u2192 dual-write \u2192 migrate readers \u2192 drop the old column",
+      "details": {
+        "operation": "RenameColumn"
+      }
+    },
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_CREATE_INDEX",
+      "message": "a non-concurrent index blocks writes; the lock propagates to replicas Multi-step fix: use CREATE INDEX CONCURRENTLY in its own non-transactional migration.",
+      "migration": "tb_item",
+      "file": "20261107000003_index.up.sql",
+      "line": null,
+      "actionable": "use CREATE INDEX CONCURRENTLY in its own non-transactional migration",
+      "details": {
+        "operation": "CreateIndex"
+      }
+    },
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_TRUNCATE",
+      "message": "the rows readers on the old version expect are removed Multi-step fix: stop reading the table \u2192 wait one release \u2192 truncate it.",
+      "migration": "tb_item",
+      "file": "20261107000004_truncate.up.sql",
+      "line": null,
+      "actionable": "stop reading the table \u2192 wait one release \u2192 truncate it",
+      "details": {
+        "operation": "Truncate"
+      }
+    },
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_DROP_OBJECT",
+      "message": "readers on the old version still reference the view Multi-step fix: stop using the view \u2192 wait one release \u2192 drop it.",
+      "migration": "v_item",
+      "file": "20261107000006_view_recreate.up.sql",
+      "line": null,
+      "actionable": "stop using the view \u2192 wait one release \u2192 drop it",
+      "details": {
+        "operation": "DropObject"
+      }
+    },
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_ADD_CONSTRAINT",
+      "message": "immediate validation locks and may reject existing rows Multi-step fix: ADD CONSTRAINT ... NOT VALID \u2192 backfill \u2192 VALIDATE CONSTRAINT later.",
+      "migration": "tb_item",
+      "file": "20261107000007_check.up.sql",
+      "line": null,
+      "actionable": "ADD CONSTRAINT ... NOT VALID \u2192 backfill \u2192 VALIDATE CONSTRAINT later",
+      "details": {
+        "operation": "AddConstraint"
+      }
+    },
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_ADD_CONSTRAINT",
+      "message": "immediate validation locks and may reject existing rows Multi-step fix: ADD CONSTRAINT ... NOT VALID \u2192 backfill \u2192 VALIDATE CONSTRAINT later.",
+      "migration": "tb_item",
+      "file": "20261107000008_check_swap.up.sql",
+      "line": null,
+      "actionable": "ADD CONSTRAINT ... NOT VALID \u2192 backfill \u2192 VALIDATE CONSTRAINT later",
+      "details": {
+        "operation": "AddConstraint"
+      }
+    },
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_DROP_TABLE",
+      "message": "readers on the old version still SELECT from the table Multi-step fix: stop reading the table \u2192 wait one release \u2192 drop it.",
+      "migration": "tb_item",
+      "file": "20261107000009_drop_table.up.sql",
+      "line": null,
+      "actionable": "stop reading the table \u2192 wait one release \u2192 drop it",
+      "details": {
+        "operation": "DropTable"
+      }
+    }
+  ],
+  "change_set": {
+    "contract_version": 1,
+    "changes": [
+      {
+        "kind": "create_table",
+        "object": "public.tb_item",
+        "migration": "20261107000001",
+        "tier": "additive",
+        "detail": "CREATE TABLE"
+      },
+      {
+        "kind": "rename_column",
+        "object": "public.tb_item.name",
+        "migration": "20261107000002",
+        "tier": "reversible",
+        "detail": "RENAME COLUMN name TO label \u2014 readers on the old name break until they are redeployed"
+      },
+      {
+        "kind": "create_index",
+        "object": "public.tb_item.ix_item_qty",
+        "migration": "20261107000003",
+        "tier": "lock_risky",
+        "detail": "CREATE INDEX \u2014 blocks writes"
+      },
+      {
+        "kind": "truncate",
+        "object": "public.tb_item",
+        "migration": "20261107000004",
+        "tier": "destructive",
+        "detail": "TRUNCATE"
+      },
+      {
+        "kind": "create_view",
+        "object": "public.v_item",
+        "migration": "20261107000005",
+        "tier": "additive",
+        "detail": "CREATE VIEW"
+      },
+      {
+        "kind": "drop_view",
+        "object": "public.v_item",
+        "migration": "20261107000006",
+        "tier": "destructive",
+        "detail": "DROP VIEW"
+      },
+      {
+        "kind": "create_view",
+        "object": "public.v_item",
+        "migration": "20261107000006",
+        "tier": "additive",
+        "detail": "CREATE VIEW"
+      },
+      {
+        "kind": "add_constraint",
+        "object": "public.tb_item.ck_qty",
+        "migration": "20261107000007",
+        "tier": "lock_risky",
+        "detail": "ADD CONSTRAINT"
+      },
+      {
+        "kind": "drop_constraint",
+        "object": "public.tb_item.ck_qty",
+        "migration": "20261107000008",
+        "tier": "destructive",
+        "detail": "DROP CONSTRAINT ck_qty"
+      },
+      {
+        "kind": "add_constraint",
+        "object": "public.tb_item.ck_qty",
+        "migration": "20261107000008",
+        "tier": "lock_risky",
+        "detail": "ADD CONSTRAINT"
+      },
+      {
+        "kind": "drop_table",
+        "object": "public.tb_item",
+        "migration": "20261107000009",
+        "tier": "irreversible",
+        "detail": "DROP TABLE"
+      }
+    ]
+  },
+  "scope": "all",
+  "command": "migrate preflight",
+  "parser": {
+    "pglast": "8.5",
+    "pg_major": 18
+  }
+}

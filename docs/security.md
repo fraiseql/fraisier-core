@@ -48,6 +48,103 @@ so keep secrets out of the stderr of anything fraisier runs. `AdapterError.stder
 also keeps its raw text on purpose: it is a structured field nothing renders today,
 and the output edge covers it if something ever does.
 
+## A database URL means what it means to libpq
+
+fraisier hands a connection to `psql`, `pg_dump` and `pg_restore` as `PG*`
+environment variables, never on argv. So it reads the URL first, with libpq's
+rules: every query parameter is a connection keyword and **overrides** the URI
+part (`postgresql:///app?host=/run/postgresql` names a socket directory), and
+components are percent-decoded with a `+` kept literal. Then each keyword goes
+out as the variable libpq 18 reads it from.
+
+A DSN that cannot be passed on that way is refused, naming the key and never its
+value:
+
+- a keyword libpq takes only from a connection string (`keepalives*`,
+  `tcp_user_timeout`, `fallback_application_name`, `sslpassword`, `replication`,
+  `scram_*`, `oauth_*`, `sslkeylogfile`), or an unknown one;
+- `service`, since a service-file entry can supply another host, role or
+  password than the DSN shows;
+- a `key=value` connection string;
+- an unencoded `@` in the user name or password. libpq splits at the first `@`
+  and a URL parser at the last, so one DSN would name two hosts. Encode it as
+  `%40`.
+
+A restore, `db refresh` and a drill also refuse a host list (`h1,h2`,
+`?host=a,b`, `?hostaddr=…,…`, `?port=1,2`), app or admin DSN: they must know
+which server they replace. Other commands accept one, as libpq does.
+
+**With a libpq older than 18** (Debian 12 ships 15), a newer keyword such as
+`sslcertmode`, `sslnegotiation` or `min_protocol_version` is accepted here, but
+that libpq ignores its variable, so the setting does not take effect. Run
+fraisier's database tools from PostgreSQL 18's client packages when a DSN relies
+on one.
+
+## What the URL decides
+
+libpq reads a `PG*` variable for every connection parameter a URL leaves unset.
+fraisier's own environment (an operator's shell, a unit's `Environment=`) can
+hold a `PGPORT`, `PGUSER`, `PGOPTIONS` or `PGSSLMODE` meant for something else,
+and a child that inherited it would reach another server, as another role, with
+another `search_path` or under another TLS policy than the config names. So the
+URL alone decides.
+
+**`psql`, `pg_dump`, `pg_restore` and `confiture`** start without any libpq
+variable except these, which cannot redirect a connection:
+`PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, `PGSSLCRL`, `PGSSLCRLDIR`,
+`PGPASSFILE`, `PGREQUIREAUTH`, `PGCONNECT_TIMEOUT` and `PGAPPNAME`. Then the
+URL's own values are set. That covers every `db` command, a backup, a restore,
+a refresh, a drill and a deploy's migration.
+
+**A TLS or GSS policy is never dropped silently.** If the environment sets
+`PGSSLMODE`, `PGSSLCERTMODE`, `PGSSLNEGOTIATION`, `PGSSLMINPROTOCOLVERSION`,
+`PGSSLMAXPROTOCOLVERSION`, `PGGSSENCMODE`, `PGCHANNELBINDING`, `PGKRBSRVNAME` or
+`PGGSSLIB`, and a URL that connects over TCP does not set that keyword, the
+command is refused before anything runs, naming the variable and the keyword to
+add (`?sslmode=verify-full`). Without the refusal, an exported
+`PGSSLMODE=verify-full` would become libpq's `prefer`, which checks no
+certificate. A Unix-socket URL is exempt: no `hostaddr`, and no host or every
+host a socket directory (`/…`) or abstract socket (`@…`). `fraisier doctor`
+reports the same refusal. Run it under the **unit's** environment as well
+(`systemctl show -p Environment <unit>`): a variable set only there fires only
+in webhook-started or scheduled runs.
+
+**IPC adapters** started locally lose only the variables that pick a server, a
+role, a database or a session setting (`PGHOST`, `PGHOSTADDR`, `PGPORT`,
+`PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGOPTIONS`, `PGSERVICE`,
+`PGSERVICEFILE`, `PGSYSCONFDIR`, `PGTZ`, `PGDATESTYLE`, `PGGEQO`,
+`PGTARGETSESSIONATTRS`, `PGLOADBALANCEHOSTS`, `PGCLIENTENCODING`,
+`PGREQUIREPEER`). The launcher cannot tell which adapters connect to
+PostgreSQL. fraisier never reads an IPC adapter's URL, so it cannot check that
+the URL pins a TLS policy, and the policy variables still reach the adapter. A
+variable an IPC adapter is configured with is set after the removal and still
+reaches it.
+
+**What this does not cover.** The `command` migration adapter's script is the
+operator's own code and gets fraisier's environment as it is, with
+`$DATABASE_URL` added; it decides what it reads.
+
+## Nothing secret on a command line
+
+A process's command line is readable by every user on its host (`ps`,
+`/proc/<pid>/cmdline`). Under `[hosts]`, a command for a remote host is the
+argument of a local `ssh`, and the remote shell runs it again, so it is
+readable on both machines.
+
+- **The ssh transport passes no environment.** `Transport::Ssh` refuses a
+  non-empty `envs` list rather than render it as `K=value` on the remote
+  command line; the error names the keys, never the values. Database
+  migrations, the one axis that needs a secret, run once on the orchestrator
+  and never over ssh.
+- **A pull URL carries no credentials.** The `pull` artifact source hands
+  `release_url` and `checksum_url` to `curl` on the host's command line, so
+  validation refuses a `user:password@` in either, without echoing the URL.
+
+**What this does not cover.** A token in a pull URL's *query*
+(`?token=…`) still reaches `curl`'s command line; fraisier cannot tell a
+token from any other parameter. Use a credential-free URL instead: a
+pre-signed path that expires, or a public release.
+
 ## Privileged operations: `systemctl` shell-out, not socket helpers
 
 Python fraisier shipped root-privileged Unix-socket helpers with `SO_PEERCRED`

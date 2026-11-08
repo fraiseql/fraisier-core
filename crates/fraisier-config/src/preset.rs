@@ -265,6 +265,7 @@ impl Overlay for MigrationSection {
             ),
             preflight_mode: prefer(self.preflight_mode, over.preflight_mode),
             preflight_backup_path: prefer(self.preflight_backup_path, over.preflight_backup_path),
+            allow_irreversible: prefer(self.allow_irreversible, over.allow_irreversible),
             settings,
         }
     }

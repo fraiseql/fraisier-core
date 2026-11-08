@@ -387,6 +387,13 @@ pub struct MigrationSection {
     /// absolute path is recommended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preflight_backup_path: Option<PathBuf>,
+    /// Apply pending migrations the adapter says no `down` can undo (none
+    /// written, or one that does nothing). Unset or `false`, a forward migrate
+    /// refuses them — and refuses when the adapter could not tell — because a
+    /// rollback past such a migration rewinds the ledger and leaves the schema.
+    /// Adapters that offer no such check are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_irreversible: Option<bool>,
     /// Adapter-specific settings (the `[migration.settings]` sub-table), passed
     /// through verbatim to `AdapterCtx.settings`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -394,6 +401,12 @@ pub struct MigrationSection {
 }
 
 impl MigrationSection {
+    /// Whether `allow_irreversible = true` is set.
+    #[must_use]
+    pub fn allows_irreversible(&self) -> bool {
+        self.allow_irreversible == Some(true)
+    }
+
     /// The effective preflight mode, folding the legacy `forward_compatible_lint`
     /// flag into [`PreflightMode`]: an explicit `preflight_mode` always wins;
     /// otherwise `forward_compatible_lint = false` is [`PreflightMode::Off`] and

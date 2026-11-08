@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-beta.15] - 2026-11-08
+
 ### Security
 
 - **An ambient `PG*` variable no longer fills what a database URL leaves
@@ -1468,7 +1470,8 @@ migration-safe rollback across one host or a fleet.
 - **GitHub Actions CI** that runs `cargo xtask ci`.
 
 [c197]: https://github.com/fraiseql/confiture/issues/197
-[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.14...HEAD
+[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.15...HEAD
+[1.0.0-beta.15]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.14...fraisier-v1.0.0-beta.15
 [1.0.0-beta.14]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.13...fraisier-v1.0.0-beta.14
 [1.0.0-beta.13]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.12...fraisier-v1.0.0-beta.13
 [1.0.0-beta.12]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.11...fraisier-v1.0.0-beta.12

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.15](https://github.com/fraiseql/fraisier-core/compare/fraisier-ipc-v1.0.0-beta.14...fraisier-ipc-v1.0.0-beta.15) - 2026-11-08
+
+### Fixed
+
+- *(adapters)* confiture resolves its DSNs; IPC keeps only the gap-filler scrub
+- *(adapters)* confiture and local IPC adapters inherit no ambient PG*
+
 ## [1.0.0-beta.13](https://github.com/fraiseql/fraisier-core/compare/fraisier-ipc-v1.0.0-beta.12...fraisier-ipc-v1.0.0-beta.13) - 2026-10-29
 
 ### Other

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.15](https://github.com/fraiseql/fraisier-core/compare/fraisier-scaffold-v1.0.0-beta.14...fraisier-scaffold-v1.0.0-beta.15) - 2026-11-08
+
+### Added
+
+- *(scaffold)* [**breaking**] require [service].run_as for the app unit, never root
+- *(scaffold)* gzip JSON in the generated nginx site, brotli opt-in
+
+### Fixed
+
+- *(scaffold)* render an app unit and site only for a config that serves
+
 ## [1.0.0-beta.14](https://github.com/fraiseql/fraisier-core/compare/fraisier-scaffold-v1.0.0-beta.13...fraisier-scaffold-v1.0.0-beta.14) - 2026-10-30
 
 ### Added

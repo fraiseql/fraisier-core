@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.15](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-confiture-v1.0.0-beta.14...fraisier-adapter-confiture-v1.0.0-beta.15) - 2026-11-08
+
+### Added
+
+- *(confiture)* report which pending migrations have no usable down
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into feat/confiture-1.45-reversibility
+- *(confiture)* pin 1.45.0 and record what moved with it
+
 ## [1.0.0-beta.13](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-confiture-v1.0.0-beta.12...fraisier-adapter-confiture-v1.0.0-beta.13) - 2026-10-29
 
 ### Other

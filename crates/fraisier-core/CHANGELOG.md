@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.15](https://github.com/fraiseql/fraisier-core/compare/fraisier-core-v1.0.0-beta.14...fraisier-core-v1.0.0-beta.15) - 2026-11-08
+
+### Added
+
+- *(cli)* add [migration].allow_irreversible and gate db migrate on it
+- *(core)* refuse a pending migration no down can undo
+- *(confiture)* report which pending migrations have no usable down
+
 ## [1.0.0-beta.13](https://github.com/fraiseql/fraisier-core/compare/fraisier-core-v1.0.0-beta.12...fraisier-core-v1.0.0-beta.13) - 2026-10-29
 
 ### Other

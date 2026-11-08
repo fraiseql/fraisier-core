@@ -1,0 +1,63 @@
+{
+  "ok": true,
+  "window_safe": false,
+  "reversible": false,
+  "summary": {
+    "errors": 0,
+    "warnings": 2,
+    "info": 0,
+    "migrations_checked": 2
+  },
+  "issues": [
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_DOWN_EMPTY",
+      "message": "Migration 20261107000002 (add_widgets) has a down() that does nothing: migrate down would record a rollback and undo nothing.",
+      "migration": "20261107000002",
+      "file": "20261107000002_add_widgets.py",
+      "line": null,
+      "actionable": "Write the down() that undoes the migration: migrate down, migrate down-to and migrate up --require-reversible refuse one that does nothing.",
+      "details": {}
+    },
+    {
+      "severity": "warning",
+      "code": "PFLIGHT_REPLICA_UNCLASSIFIED",
+      "message": "non-SQL (.py) migration: the replica forward-compatibility classifier cannot inspect it, so window-safety cannot be certified automatically; review manually",
+      "migration": "20261107000002",
+      "file": "20261107000002_add_widgets.py",
+      "line": null,
+      "actionable": "review the migration's DDL by hand for replica forward-compatibility, or express the schema change as a .up.sql so it can be classified",
+      "details": {
+        "operation": "NonSqlMigration"
+      }
+    }
+  ],
+  "change_set": {
+    "contract_version": 1,
+    "changes": [
+      {
+        "kind": "create_table",
+        "object": "public.base",
+        "migration": "20261107000001",
+        "tier": "additive",
+        "detail": "CREATE TABLE"
+      },
+      {
+        "kind": "python_migration",
+        "object": "20261107000002_add_widgets.py",
+        "migration": "20261107000002",
+        "detail": "non-SQL migration: confiture cannot read its DDL, so its changes are unclassified \u2014 review by hand"
+      }
+    ]
+  },
+  "scope": "pending",
+  "ledger": {
+    "table": "tb_confiture",
+    "exists": false
+  },
+  "command": "migrate preflight",
+  "parser": {
+    "pglast": "8.7",
+    "pg_major": 18
+  }
+}

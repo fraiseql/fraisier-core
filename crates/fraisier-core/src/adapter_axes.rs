@@ -1046,6 +1046,35 @@ pub struct PreflightReport {
         deserialize_with = "deserialize_lenient_change_set"
     )]
     pub change_set: Option<ChangeSet>,
+    /// Whether the adapter's `down` can undo each pending migration, when the
+    /// adapter advertises the [`REVERSIBILITY`] capability or says why it could
+    /// not tell. `None` means the adapter never offers this check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reversibility: Option<Reversibility>,
+}
+
+/// The capability an adapter advertises when its preflight names the pending
+/// migrations its `down` cannot undo ([`PreflightReport::reversibility`]).
+pub const REVERSIBILITY: &str = "reversibility";
+
+/// Whether `down` can undo the pending migrations, as the adapter judged it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Reversibility {
+    /// The adapter checked. `irreversible` names each pending migration with no
+    /// down that undoes it (none written, or one that does nothing); empty means
+    /// every pending migration has one.
+    Checked {
+        /// The migrations `down` cannot undo, in the adapter's order.
+        irreversible: Vec<String>,
+    },
+    /// The adapter could not check, and `reason` says why (an installed tool
+    /// older than the one that can).
+    Unchecked {
+        /// Why the check could not run, for the operator.
+        reason: String,
+    },
 }
 
 impl PreflightReport {
@@ -1074,6 +1103,14 @@ impl PreflightReport {
     #[must_use]
     pub const fn with_window_safe(mut self, window_safe: bool) -> Self {
         self.window_safe = Some(window_safe);
+        self
+    }
+
+    /// State whether `down` can undo the pending migrations (see
+    /// [`Reversibility`]).
+    #[must_use]
+    pub fn with_reversibility(mut self, reversibility: Reversibility) -> Self {
+        self.reversibility = Some(reversibility);
         self
     }
 
@@ -1692,10 +1729,38 @@ mod tests {
     use super::{
         AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, ChangeSet,
         ChangeSetUnavailable, MigrationAdapter, MigrationOutcome, PreflightIssue, PreflightReport,
-        Revision, RiskTier, SchemaChange, Severity, VerifyCheck, VerifyReport,
+        Reversibility, Revision, RiskTier, SchemaChange, Severity, VerifyCheck, VerifyReport,
         RISK_CONTRACT_VERSION,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn a_report_says_nothing_about_reversibility_until_told() {
+        let report = PreflightReport::new(true);
+        assert_eq!(report.reversibility, None);
+        let json = serde_json::to_value(&report).expect("serializes");
+        assert!(json.get("reversibility").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_reversibility_verdict_crosses_the_wire_intact() {
+        for verdict in [
+            Reversibility::Checked {
+                irreversible: vec!["002".to_owned()],
+            },
+            Reversibility::Checked {
+                irreversible: Vec::new(),
+            },
+            Reversibility::Unchecked {
+                reason: "confiture 1.36.0 is below 1.40.0".to_owned(),
+            },
+        ] {
+            let report = PreflightReport::new(true).with_reversibility(verdict.clone());
+            let json = serde_json::to_string(&report).expect("serializes");
+            let back: PreflightReport = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(back.reversibility, Some(verdict), "{json}");
+        }
+    }
 
     /// Serializes env-mutating tests so `set_var`/`var` don't race other tests.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2272,6 +2337,7 @@ mod tests {
                 migration: Some("20260804120050".to_owned()),
             }],
             window_safe: Some(true),
+            reversibility: None,
             change_set: Some(ChangeSet::new(vec![SchemaChange::new(
                 "drop_column",
                 "public.tb_user.legacy_flag",

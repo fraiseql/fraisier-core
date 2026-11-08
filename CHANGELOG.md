@@ -40,6 +40,56 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `PgConn`'s `Debug` no longer prints the password; it prints the redacted URL.
   `RestoreIdentity` and `Admin` derive `Debug` over it.
 
+### Added
+
+- **`[migration].allow_irreversible`** (default `false`). See the ⚠️ entry
+  under Changed: without it, a forward migrate now refuses a pending
+  migration no `down` can undo.
+- **The confiture adapter reports reversibility** (capability
+  `reversibility`, from confiture 1.40.0): the pending migrations with no
+  `.down.sql`, or a `.py` `down()` that does nothing
+  (`PFLIGHT_MISSING_DOWN`, `PFLIGHT_DOWN_EMPTY`). `PreflightReport` gains an
+  optional `reversibility` field; an adapter that does not report it is
+  unaffected.
+
+### Changed
+
+- ⚠️ **A DSN fraisier cannot hand on whole is refused** where it used to be
+  silently trimmed: a keyword with no `PG*` variable (`keepalives`,
+  `sslpassword`, …), an unknown keyword, `?service=`, a `key=value` string,
+  and an unencoded `@` in the user name or password. The error names the key,
+  never the value. Run `fraisier doctor` before upgrading: `validate` only
+  sees the variable's name. See `docs/security.md`.
+- ⚠️ **A restore, `db refresh` and a drill refuse a multi-host DSN** (app or
+  admin), before anything runs.
+- `fraisier_db::DbError` is now `#[non_exhaustive]` and gains
+  `UnsupportedKeyword`. `PgConn` gains `is_multi_host`.
+- `fraisier_db::refresh::RefreshServer` gains a required method,
+  `create_problem`, which a custom implementation must provide.
+- ⚠️ **A pending migration no `down` can undo now stops a deploy and `db
+  migrate`**, before anything changes, unless `[migration].allow_irreversible
+  = true`. Rolling back past such a migration rewinds confiture's ledger and
+  leaves its schema; confiture before 1.40.0 did exactly that for a `.py`
+  migration whose `down()` is `pass`. The refusal names each migration. With
+  a confiture older than 1.40.0 and pending migrations, the deploy is refused
+  too, because nothing can tell: upgrade confiture, or set the key. The
+  `command` and IPC adapters report no reversibility and are not affected;
+  `fraisier rollback` is never held behind it.
+- ⚠️ **The pinned confiture moves from 1.36.0 to 1.45.0**
+  (`tools/confiture-requirements.txt`). The exit-code table adds `DIFFER_411`
+  (exit 0), `VALID_010` (exit 5) and `CONFIG_016` (exit 5); no new class.
+  Two policy-gate verdicts loosen with it, so a `[policy]` that refused them
+  may now admit them:
+  - a view `DROP VIEW …; CREATE VIEW …` is `reversible`, not `destructive`;
+  - a same-name `CHECK` swap written as two statements is `lock_risky`, not
+    `destructive`.
+- **`fraisier doctor` warns below confiture 1.40.0** (was 1.35.0), naming
+  the `reversibility` capability it withholds there.
+- **Preflight findings are counted per migration.** Two blocking findings on
+  one migration read as one failing migration, each listed with its codes.
+  `db migrate --json`: `preflight_blocking` now counts migrations (and
+  findings that name none); the new `preflight_issues` counts findings.
+
 ### Fixed
 
 - **A database URL now reaches what it reaches under libpq** (#105).
@@ -71,20 +121,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   restore drill) skipped a TVIEW its role could not read. It now fails the
   check, naming the TVIEW and the `GRANT SELECT` that lets the role read it.
 
-### Changed
+### Known issues
 
-- ⚠️ **A DSN fraisier cannot hand on whole is refused** where it used to be
-  silently trimmed: a keyword with no `PG*` variable (`keepalives`,
-  `sslpassword`, …), an unknown keyword, `?service=`, a `key=value` string,
-  and an unencoded `@` in the user name or password. The error names the key,
-  never the value. Run `fraisier doctor` before upgrading: `validate` only
-  sees the variable's name. See `docs/security.md`.
-- ⚠️ **A restore, `db refresh` and a drill refuse a multi-host DSN** (app or
-  admin), before anything runs.
-- `fraisier_db::DbError` is now `#[non_exhaustive]` and gains
-  `UnsupportedKeyword`. `PgConn` gains `is_multi_host`.
-- `fraisier_db::refresh::RefreshServer` gains a required method,
-  `create_problem`, which a custom implementation must provide.
+- confiture 1.42.0 through 1.45.0 crash (`INTERNAL_ERROR`, "list index out of
+  range") classifying a one-statement constraint swap such as `ALTER TABLE t
+  DROP CONSTRAINT c, ADD CONSTRAINT c CHECK (x > 0);`. The preflight fails, so
+  the deploy stops. Write it as two statements.
 
 ## [1.0.0-beta.14] - 2026-10-30
 

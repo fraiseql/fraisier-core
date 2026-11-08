@@ -47,9 +47,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::adapter_axes::{
     AdapterCtx, AdapterDescription, AdapterError, ArtifactAdapter, HealthAdapter, HostId,
-    MigrationAdapter, Revision, ServiceAdapter, Severity, StagedArtifact,
+    MigrationAdapter, Revision, ServiceAdapter, StagedArtifact,
 };
 use crate::policy::{self, Baseline, Inspection, PolicyGate};
+use crate::preflight_verdict;
 use crate::readiness::{self, DatabaseReadiness};
 use crate::restore_rehearsal::{
     self, run_restore_rehearsal, BackupSource, RehearsalDb, RehearsalError, ThrowawayDb,
@@ -130,6 +131,8 @@ pub struct SingleHostDeploy {
     /// `down_to(this)` instead of `up`, and its compensation goes back `up`.
     rollback_to: Option<Revision>,
     forward_compatible_lint: bool,
+    /// Apply pending migrations no `down` can undo (`[migration].allow_irreversible`).
+    allow_irreversible: bool,
     /// The schema policy gate. Default (no `[policy]` section) leaves the tier
     /// gate switched off — single-host has no always-on baseline rule.
     policy: PolicyGate,
@@ -235,6 +238,7 @@ pub struct SingleHostDeployBuilder {
     target: Option<Revision>,
     rollback_to: Option<Revision>,
     forward_compatible_lint: bool,
+    allow_irreversible: bool,
     policy: PolicyGate,
     restore_rehearsal: Option<Arc<dyn RehearsalDb>>,
     backup_source: BackupSource,
@@ -257,6 +261,7 @@ impl SingleHostDeployBuilder {
             // Default on: forward-compat preflight runs whenever the adapter
             // advertises it, unless the operator opts out (PRD G11 / Decision 4).
             forward_compatible_lint: true,
+            allow_irreversible: false,
             policy: PolicyGate::default(),
             restore_rehearsal: None,
             backup_source: BackupSource::FreshDump,
@@ -301,6 +306,15 @@ impl SingleHostDeployBuilder {
     #[must_use]
     pub const fn forward_compatible_lint(mut self, enabled: bool) -> Self {
         self.forward_compatible_lint = enabled;
+        self
+    }
+
+    /// Apply pending migrations the adapter says no `down` can undo
+    /// (`[migration].allow_irreversible`, default `false`). Off, preflight
+    /// refuses them, and refuses when the adapter could not tell.
+    #[must_use]
+    pub const fn allow_irreversible(mut self, allow: bool) -> Self {
+        self.allow_irreversible = allow;
         self
     }
 
@@ -393,6 +407,7 @@ impl SingleHostDeployBuilder {
             target: self.target,
             rollback_to: self.rollback_to,
             forward_compatible_lint: self.forward_compatible_lint,
+            allow_irreversible: self.allow_irreversible,
             policy: self.policy,
             restore_rehearsal: self.restore_rehearsal,
             backup_source: self.backup_source,
@@ -431,6 +446,7 @@ struct DeployShared {
     target: Option<Revision>,
     rollback_to: Option<Revision>,
     forward_compatible_lint: bool,
+    allow_irreversible: bool,
     policy: PolicyGate,
     restore_rehearsal: Option<Arc<dyn RehearsalDb>>,
     backup_source: BackupSource,
@@ -511,6 +527,7 @@ impl DeployShared {
             target: deploy.target.clone(),
             rollback_to: deploy.rollback_to.clone(),
             forward_compatible_lint: deploy.forward_compatible_lint,
+            allow_irreversible: deploy.allow_irreversible,
             policy: deploy.policy.clone(),
             restore_rehearsal: deploy.restore_rehearsal.clone(),
             backup_source: deploy.backup_source.clone(),
@@ -585,6 +602,7 @@ impl DeployShared {
         let inspection = self.inspect(described).await?;
         self.run_policy_gate(&inspection).await?;
         Self::run_forward_compat_lint(&inspection)?;
+        self.run_reversibility_gate(&inspection)?;
         // The restore rehearsal proves a *forward* migrate applies; it is irrelevant
         // to a deliberate rollback (which migrates `down`), so skip it there.
         if let Some(db) = &self.restore_rehearsal {
@@ -636,6 +654,7 @@ impl DeployShared {
             .map_err(|e| Self::failed("preflight", &e))?;
         self.run_policy_gate(&inspection).await?;
         Self::run_forward_compat_lint(&inspection)?;
+        self.run_reversibility_gate(&inspection)?;
         restore_rehearsal::rehearse_on(self.migration.as_ref(), &self.ctx, throwaway)
             .await
             .map(|_applied| ())
@@ -714,28 +733,30 @@ impl DeployShared {
         let Some(report) = inspection.report.as_ref() else {
             return Ok(());
         };
-        let blocking: Vec<String> = report
-            .issues
-            .iter()
-            .filter(|issue| issue.severity == Severity::Error)
-            .map(|issue| {
-                let place = issue
-                    .migration
-                    .as_ref()
-                    .map_or_else(String::new, |migration| format!(" ({migration})"));
-                format!("{}{place}: {}", issue.code, issue.message)
+        preflight_verdict::lint_refusal(report).map_or(Ok(()), |message| {
+            Err(SagaError::StepFailed {
+                step: "preflight".to_owned(),
+                message,
             })
-            .collect();
-        if blocking.is_empty() {
+        })
+    }
+
+    /// Refuse pending migrations no `down` can undo, unless the operator allowed
+    /// them. A deliberate rollback is not held behind it: the report describes
+    /// the forward changes, which a rollback does not apply.
+    fn run_reversibility_gate(&self, inspection: &Inspection) -> Result<(), SagaError> {
+        if self.rollback_to.is_some() {
             return Ok(());
         }
-        Err(SagaError::StepFailed {
-            step: "preflight".to_owned(),
-            message: format!(
-                "forward-compatibility preflight found {} blocking issue(s): {}",
-                blocking.len(),
-                blocking.join("; ")
-            ),
+        preflight_verdict::reversibility_refusal(
+            inspection.report.as_ref(),
+            self.allow_irreversible,
+        )
+        .map_or(Ok(()), |message| {
+            Err(SagaError::StepFailed {
+                step: "preflight".to_owned(),
+                message,
+            })
         })
     }
 
@@ -996,8 +1017,8 @@ mod tests {
     use crate::adapter_axes::{
         AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, ArtifactAdapter,
         ArtifactRef, ChangeSet, HealthAdapter, HealthStatus, HostId, MigrationAdapter,
-        MigrationOutcome, PreflightIssue, PreflightReport, Revision, RiskTier, SchemaChange,
-        ServiceAdapter, ServiceStatus, Severity, StagedArtifact, VerifyReport,
+        MigrationOutcome, PreflightIssue, PreflightReport, Reversibility, Revision, RiskTier,
+        SchemaChange, ServiceAdapter, ServiceStatus, Severity, StagedArtifact, VerifyReport,
     };
     use crate::policy::{testing::FixedApproval, Policy, PolicyGate, REFUSED};
     use crate::restore_rehearsal::{BackupSource, RehearsalDb, RehearsalError, ThrowawayDb};
@@ -1135,6 +1156,8 @@ mod tests {
         /// makes the adapter advertise `risk_tier` — an adapter that claims to
         /// classify and emits nothing is its own (tested) failure mode.
         change_set: Option<ChangeSet>,
+        /// The reversibility verdict the preflight report carries.
+        reversibility: Option<Reversibility>,
         /// The `ctx.workdir` seen by each migration call, for asserting the
         /// migrate step runs from the staged release directory.
         seen_workdirs: Arc<Mutex<Vec<PathBuf>>>,
@@ -1155,6 +1178,7 @@ mod tests {
                 decline_targeted_up: false,
                 window_unsafe: false,
                 change_set: None,
+                reversibility: None,
                 seen_workdirs: Arc::new(Mutex::new(Vec::new())),
                 seen_dsns: Arc::new(Mutex::new(Vec::new())),
             }
@@ -1282,6 +1306,7 @@ mod tests {
                 report = report.with_change_set(changes);
             }
             report.window_safe = Some(!self.window_unsafe);
+            report.reversibility.clone_from(&self.reversibility);
             Ok(report)
         }
     }
@@ -2214,8 +2239,14 @@ mod tests {
         let SagaOutcome::RolledBack { reason, .. } = &outcome else {
             panic!("expected a refusal, got {outcome:?}");
         };
-        assert!(reason.contains("non_reversible (003)"), "{reason}");
-        assert!(reason.contains("migration 003 has no down"), "{reason}");
+        assert!(
+            reason.contains("1 pending migration(s) would fail"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("003: non_reversible: migration 003 has no down"),
+            "{reason}"
+        );
     }
 
     #[tokio::test]
@@ -2557,6 +2588,120 @@ mod tests {
             "got {outcome:?}"
         );
         assert_eq!(drain(&trail), vec!["describe", "preflight"]);
+    }
+
+    fn irreversible(trail: &Trail) -> FakeMigration {
+        FakeMigration {
+            reversibility: Some(Reversibility::Checked {
+                irreversible: vec!["003_add_index".to_owned()],
+            }),
+            ..FakeMigration::healthy(trail)
+        }
+    }
+
+    fn healthy_deploy(trail: &Trail, migration: FakeMigration) -> SingleHostDeploy {
+        deploy(
+            trail,
+            FakeArtifact {
+                trail: trail.clone(),
+                fail_stage: false,
+            },
+            migration,
+            FakeHealth {
+                trail: trail.clone(),
+                healthy: true,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn an_irreversible_pending_migration_stops_the_deploy_before_any_mutation() {
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let plan = healthy_deploy(&trail, irreversible(&trail));
+
+        let outcome = plan.run(store).await.expect("run");
+        let SagaOutcome::RolledBack {
+            failed_step,
+            reason,
+            ..
+        } = &outcome
+        else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert_eq!(failed_step, "preflight");
+        assert!(reason.contains("003_add_index"), "{reason}");
+        assert!(
+            reason.contains("[migration].allow_irreversible = true"),
+            "{reason}"
+        );
+        assert_eq!(drain(&trail), vec!["describe", "preflight"]);
+    }
+
+    #[tokio::test]
+    async fn allow_irreversible_applies_it() {
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let plan = SingleHostDeploy {
+            allow_irreversible: true,
+            ..healthy_deploy(&trail, irreversible(&trail))
+        };
+
+        let outcome = plan.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unchecked_verdict_stops_the_deploy_with_its_reason() {
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let migration = FakeMigration {
+            reversibility: Some(Reversibility::Unchecked {
+                reason: "confiture 1.36.0 is older than 1.40.0".to_owned(),
+            }),
+            ..FakeMigration::healthy(&trail)
+        };
+        let outcome = healthy_deploy(&trail, migration)
+            .run(store)
+            .await
+            .expect("run");
+        let SagaOutcome::RolledBack { reason, .. } = &outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert!(reason.contains("1.36.0 is older than 1.40.0"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_rollback_is_not_held_by_an_irreversible_pending_migration() {
+        let (_dir, store) = store();
+        let trail = Trail::default();
+        let plan = SingleHostDeploy {
+            rollback_to: Some(Revision::new("rev-old")),
+            ..healthy_deploy(&trail, irreversible(&trail))
+        };
+        let outcome = plan.run(store).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "got {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn the_deep_preflight_refuses_an_irreversible_migration_too() {
+        let (_dir, store) = store();
+        let run = rehearsed(
+            |t| FakeMigration {
+                reversibility: Some(Reversibility::Checked {
+                    irreversible: vec!["003_add_index".to_owned()],
+                }),
+                ..FakeMigration::deep(t, vec![add_nickname()])
+            },
+            |_| PolicyGate::default(),
+            BackupSource::FreshDump,
+            false,
+        );
+        let outcome = run.plan.run(store).await.expect("run");
+        let SagaOutcome::RolledBack { reason, .. } = &outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert!(reason.contains("003_add_index"), "{reason}");
     }
 
     /// A readiness probe that logs to the trail and answers `reasons`.

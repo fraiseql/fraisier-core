@@ -23,12 +23,13 @@ use crate::commands::CommandOutput;
 ///
 /// Tracks the highest floor in `fraisier-adapter-confiture`'s
 /// `CAPABILITY_FLOORS`, and is pinned to it by test. Today that is
-/// `pending_scope` at 1.35.0, the first release that accepts `--scope pending`:
-/// below it the policy gate judges applied migrations too. The window-safe
-/// verdict, the risk-tiered change-set and deep classification sit lower, on
-/// 0.44.0. A floor below the highest would certify a binary a deploy treats as
-/// less capable than the check says.
-const CONFITURE_FLOOR: (u32, u32) = (1, 35);
+/// `reversibility` at 1.40.0, the first release that reports a `.py` migration
+/// whose `down()` does nothing: below it a deploy with pending migrations is
+/// refused unless `[migration].allow_irreversible` is set. `pending_scope` sits
+/// on 1.35.0; the window-safe verdict, the risk-tiered change-set and deep
+/// classification on 0.44.0. A floor below the highest would certify a binary
+/// a deploy treats as less capable than the check says.
+const CONFITURE_FLOOR: (u32, u32) = (1, 40);
 
 /// A single doctor check outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,6 +291,9 @@ fn without(capability: &str) -> &'static str {
         "risk_tier" => "a configured `[policy]` classifies nothing",
         "deep_classification" => "a restore rehearsal classifies statically",
         "pending_scope" => "the policy gate judges applied migrations too",
+        "reversibility" => {
+            "a deploy with pending migrations is refused unless `allow_irreversible`"
+        }
         _ => "not available",
     }
 }
@@ -884,10 +888,15 @@ url = "http://127.0.0.1/health"
 
     #[test]
     fn below_the_floor_names_each_withheld_capability() {
-        let current = below_floor((1, 19));
-        assert!(current.contains("`pending_scope`"), "{current}");
-        assert!(current.contains("judges applied migrations"), "{current}");
-        assert!(!current.contains("`window_safe`"), "{current}");
+        let current = below_floor((1, 36));
+        assert!(current.contains("`reversibility`"), "{current}");
+        assert!(current.contains("unless `allow_irreversible`"), "{current}");
+        assert!(!current.contains("`pending_scope`"), "{current}");
+
+        let older = below_floor((1, 19));
+        assert!(older.contains("`pending_scope`"), "{older}");
+        assert!(older.contains("judges applied migrations"), "{older}");
+        assert!(!older.contains("`window_safe`"), "{older}");
 
         let ancient = below_floor((0, 43));
         for capability in [
@@ -895,6 +904,7 @@ url = "http://127.0.0.1/health"
             "risk_tier",
             "deep_classification",
             "pending_scope",
+            "reversibility",
         ] {
             assert!(ancient.contains(&format!("`{capability}`")), "{ancient}");
         }

@@ -156,6 +156,14 @@ impl RefreshServer for Server {
         Ok(None)
     }
 
+    async fn create_problem(
+        &self,
+        _maintenance: &PgConn,
+        _owner: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     async fn database_bytes(&self, _conn: &PgConn) -> Result<u64, String> {
         self.record("database_bytes".into());
         Ok(self.bytes)
@@ -373,11 +381,26 @@ fn refresh(
 fn refresh_opts(
     dir: &Path,
     config: &Path,
-    (execute, skip_if_locked): (bool, bool),
+    run: (bool, bool),
     server: &Server,
     units: &FakeUnits,
 ) -> CommandOutput {
+    refresh_env(dir, config, run, server, units, &[])
+}
+
+/// [`refresh_opts`] with `extra` variables set for the run.
+fn refresh_env(
+    dir: &Path,
+    config: &Path,
+    (execute, skip_if_locked): (bool, bool),
+    server: &Server,
+    units: &FakeUnits,
+    extra: &[(&str, &str)],
+) -> CommandOutput {
     let _guard = env_guard();
+    for (key, value) in extra {
+        std::env::set_var(key, value);
+    }
     std::env::set_var(
         DSN_ENV,
         "postgres://app:s3cret@db.internal/checkout_staging",
@@ -403,6 +426,9 @@ fn refresh_opts(
     .expect("runs");
     std::env::remove_var(DSN_ENV);
     std::env::remove_var(ADMIN_ENV);
+    for (key, _) in extra {
+        std::env::remove_var(key);
+    }
     out
 }
 
@@ -426,6 +452,26 @@ fn an_undeclared_production_key_is_refused_before_anything_runs() {
 }
 
 #[test]
+fn a_multi_host_admin_dsn_is_refused_before_any_unit_stops() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = config(dir.path(), Some(false), "true", SKIPPED);
+    let multi = "FRAISIER_REFRESH_RUN_ADMIN_MULTI_HOST";
+    let toml = std::fs::read_to_string(&path)
+        .expect("read")
+        .replace(ADMIN_ENV, multi);
+    std::fs::write(&path, toml).expect("write");
+    archive(dir.path(), "20261026T021500Z");
+    std::env::set_var(multi, "postgres://postgres:r00tpw@db1,db2/postgres");
+    let (server, units) = (Server::default(), units(dir.path()));
+    let out = refresh(dir.path(), &path, true, &server, &units);
+    std::env::remove_var(multi);
+    assert_eq!(out.exit_code, 1, "{}", out.pretty);
+    assert!(out.pretty.contains("more than one host"), "{}", out.pretty);
+    assert!(!server.dropped(), "{:?}", server.calls());
+    assert!(units.calls().is_empty(), "{:?}", units.calls());
+}
+
+#[test]
 fn a_config_whose_service_is_not_systemd_is_refused() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = config(dir.path(), Some(false), "true", SKIPPED);
@@ -440,6 +486,34 @@ fn a_config_whose_service_is_not_systemd_is_refused() {
     assert_eq!(out.exit_code, 1, "{}", out.pretty);
     assert!(out.pretty.contains("systemd"), "{}", out.pretty);
     assert!(units.calls().is_empty(), "{:?}", units.calls());
+}
+
+#[test]
+fn a_migration_tool_that_cannot_run_is_refused_before_any_unit_stops() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = config(dir.path(), Some(false), "true", SKIPPED);
+    let toml = std::fs::read_to_string(&path)
+        .expect("read")
+        .replace("adapter = \"command\"", "adapter = \"confiture\"");
+    std::fs::write(&path, toml).expect("write");
+    archive(dir.path(), "20261026T021500Z");
+    let (server, units) = (Server::default(), units(dir.path()));
+    let out = refresh_env(
+        dir.path(),
+        &path,
+        (true, false),
+        &server,
+        &units,
+        &[("FRAISIER_CONFITURE_BIN", "/nonexistent/confiture")],
+    );
+    assert_eq!(out.exit_code, 1, "{}", out.pretty);
+    assert!(out.pretty.contains("migration adapter"), "{}", out.pretty);
+    assert!(units.calls().is_empty(), "{:?}", units.calls());
+    assert!(
+        !server.calls().iter().any(|call| call.starts_with("drop")),
+        "{:?}",
+        server.calls()
+    );
 }
 
 #[test]

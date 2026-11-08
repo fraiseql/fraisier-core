@@ -146,6 +146,8 @@ struct Plan {
     flag_var: String,
     flag_gid: u32,
     warnings: Vec<String>,
+    /// The migration adapter, built and described before anything changes.
+    migration: crate::factory::ResolvedMigration,
 }
 
 /// [`db_refresh`] with its machinery supplied by the caller.
@@ -286,6 +288,10 @@ async fn prepare(
         Ok(identity) => identity,
         Err(error) => return Ok(Err(commands::db_config_error(&error))),
     };
+    let migration = match commands::ready_migration(config).await {
+        Ok(migration) => migration,
+        Err(problem) => return Ok(Err(refused(&problem))),
+    };
     if let Some(data_dir) = refresh.data_dir.as_deref() {
         let room = match machinery.server.database_bytes(identity.app()).await {
             Ok(bytes) => fraisier_db::restore::room_for_copy(bytes, data_dir),
@@ -321,6 +327,7 @@ async fn prepare(
         flag,
         flag_gid,
         warnings,
+        migration,
     }))
 }
 
@@ -495,7 +502,7 @@ async fn run_locked(
         // Anything else happened after the drop: the units stay stopped.
         Err(error) => return Err(Failure::at("restore", error.to_string())),
     };
-    let applied = migrate(config, state_dir)
+    let applied = migrate(&plan.migration, state_dir)
         .await
         .map_err(|error| Failure::at("migrate", format!("{error:#}")))?;
     let tables = machinery
@@ -636,8 +643,10 @@ async fn restart(units: &dyn Units, running: &[String], mut failure: Failure) ->
 /// Run the migrations forward on the refreshed database, as `db migrate` does:
 /// through the migration adapter, with the app DSN only, and record the
 /// revision in the ledger.
-async fn migrate(config: &DeployConfig, state_dir: &Path) -> Result<Vec<String>> {
-    let resolved = crate::factory::build_migration_only(config)?;
+async fn migrate(
+    resolved: &crate::factory::ResolvedMigration,
+    state_dir: &Path,
+) -> Result<Vec<String>> {
     let adapter = resolved.migration.as_ref();
     let outcome = adapter
         .up(&resolved.ctx, None)

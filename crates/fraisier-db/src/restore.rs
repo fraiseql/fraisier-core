@@ -91,13 +91,17 @@ impl RestoreIdentity {
     /// one is configured. A webhook-started operation never reads it.
     ///
     /// # Errors
-    /// The configured env var is unset, or its DSN does not parse. A configured
-    /// identity is never silently replaced by the app role.
+    /// The configured env var is unset, its DSN does not parse, or either DSN
+    /// names a host list (see [`PgConn::is_multi_host`]). A configured identity
+    /// is never silently replaced by the app role.
     pub fn from_env(
         app: PgConn,
         admin_env: Option<&str>,
         trigger: Trigger,
     ) -> Result<Self, String> {
+        if app.is_multi_host() {
+            return Err(format!("the app DSN {MULTI_HOST}"));
+        }
         let Some(env) = admin_env else {
             return Ok(Self::new(app, None, trigger));
         };
@@ -110,8 +114,11 @@ impl RestoreIdentity {
         }
         let dsn = std::env::var(env)
             .map_err(|_| format!("the configured admin_url_env '{env}' is not set"))?;
-        let conn =
-            PgConn::parse(&dsn).map_err(|error| format!("invalid admin DSN in {env}: {error}"))?;
+        let conn = PgConn::resolve(&dsn)
+            .map_err(|error| format!("invalid admin DSN in {env}: {error}"))?;
+        if conn.is_multi_host() {
+            return Err(format!("the admin DSN in {env} {MULTI_HOST}"));
+        }
         Ok(Self::new(
             app,
             Some(Admin {
@@ -143,6 +150,11 @@ impl RestoreIdentity {
             .with_database(database)
     }
 
+    /// The resolved admin identity, if one restores.
+    pub(crate) const fn admin(&self) -> Option<&Admin> {
+        self.admin.as_ref()
+    }
+
     /// The env var the pg_tviews refusal points at.
     fn admin_env(&self) -> Option<&str> {
         self.admin
@@ -151,6 +163,10 @@ impl RestoreIdentity {
             .or(self.withheld.as_deref())
     }
 }
+
+/// Why a restore-class operation refuses a libpq host list.
+const MULTI_HOST: &str = "names more than one host, address or port; a restore, refresh or \
+     drill must know which server it replaces, so name one";
 
 /// The database operations a restore needs. [`Postgres`] runs them for real.
 #[async_trait]
@@ -210,7 +226,8 @@ pub trait RestoreServer: Send + Sync {
     /// The rebuild was refused or failed.
     async fn rebuild(&self, conn: &PgConn, only_empty: bool) -> Result<Vec<Rebuilt>, String>;
 
-    /// The TVIEWs still empty over a populated view, as `schema.name`.
+    /// The TVIEWs still empty over a populated view, as `schema.name`, and
+    /// those the probe could not read, each with the GRANT that lets it.
     ///
     /// # Errors
     /// The probe failed.
@@ -222,7 +239,7 @@ pub trait RestoreServer: Send + Sync {
 pub struct TviewRebuild {
     /// What the rebuild filled.
     pub rebuilt: Vec<Rebuilt>,
-    /// What is still empty over a populated view afterwards.
+    /// What is still empty over a populated view afterwards, or unreadable.
     pub still_empty: Vec<String>,
 }
 
@@ -444,7 +461,7 @@ async fn fill_throwaway(
         } else {
             Err(format!(
                 "after the post-restore TVIEW rebuild, these TVIEWs are still empty over a \
-                 populated view: {}",
+                 populated view, or could not be read: {}",
                 rebuilt.still_empty.join(", ")
             ))
         }
@@ -641,9 +658,23 @@ impl RestoreServer for Postgres {
         let Some(schema) = tviews::usable_schema(psql, conn).await? else {
             return Ok(Vec::new());
         };
-        let found = tviews::find_empty(psql, conn, &schema).await?;
-        Ok(found.empty.iter().map(tviews::Tview::qualified).collect())
+        Ok(unfilled(&tviews::find_empty(psql, conn, &schema).await?))
     }
+}
+
+/// The TVIEWs a post-restore probe could not show to be filled: each empty
+/// one, and each it could not read, with the GRANT that lets it.
+fn unfilled(found: &tviews::Emptiness) -> Vec<String> {
+    found
+        .empty
+        .iter()
+        .map(tviews::Tview::qualified)
+        .chain(
+            found.unreadable.iter().map(|(tview, grant)| {
+                format!("{} (could not be read: {grant})", tview.qualified())
+            }),
+        )
+        .collect()
 }
 
 /// A unique, valid throwaway database name derived from `base` (≤ 63 chars,

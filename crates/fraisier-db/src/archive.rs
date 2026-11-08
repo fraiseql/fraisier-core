@@ -14,7 +14,6 @@
 //! size baseline.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::retention::Verdict;
@@ -282,8 +281,7 @@ pub async fn write_archive(
         source,
     })?;
 
-    let mut dump = Command::new(&tools.pg_dump);
-    dump.envs(conn.pg_env());
+    let mut dump = crate::connected(&tools.pg_dump, conn);
     dump.arg("-Fc").arg("-w").arg("-f").arg(partial.path());
     let outcome = crate::run(dump).await?;
     if !outcome.succeeded() {
@@ -342,7 +340,7 @@ pub async fn verify_archive(pg_restore: &Path, archive: &Path) -> Verdict {
     if !archive.is_file() {
         return Verdict::Unverifiable(format!("{} is not there to check", archive.display()));
     }
-    let mut list = Command::new(pg_restore);
+    let mut list = crate::offline(pg_restore);
     list.arg("--list").arg(archive);
     match crate::run(list).await {
         Ok(outcome) if outcome.succeeded() => Verdict::Valid,

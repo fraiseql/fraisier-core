@@ -34,6 +34,7 @@ use fraisier_saga::state_store::StateStore;
 use crate::adapter_axes::{AdapterCtx, MigrationAdapter, TrafficDirector, TrafficTarget};
 use crate::connection_budget::{self, BudgetVerdict, ConnectionBudget};
 use crate::policy::{self, Baseline, PolicyGate};
+use crate::preflight_verdict;
 use crate::readiness::{self, DatabaseReadiness};
 
 /// Operations on the blue/green fleets the flow drives.
@@ -96,6 +97,8 @@ struct BgShared {
     policy: PolicyGate,
     /// Optional database-readiness probe, run first in preflight.
     database_readiness: Option<Arc<dyn DatabaseReadiness>>,
+    /// Apply pending migrations no `down` can undo (`[migration].allow_irreversible`).
+    allow_irreversible: bool,
 }
 
 /// The mutable run state threaded to every step by the saga engine.
@@ -150,8 +153,10 @@ impl BgShared {
     }
 
     /// The headline gate: refuse the whole deploy if confiture cannot certify the
-    /// migration window-safe, or if the schema policy will not allow the pending
-    /// changes — **before** any instance or traffic change — and, if a probe is
+    /// migration window-safe, if the schema policy will not allow the pending
+    /// changes, or if a pending migration has no `down` that undoes it and the
+    /// operator did not allow that — **before** any instance or traffic change —
+    /// and, if a probe is
     /// configured, if doubling connections would exhaust the shared DB.
     ///
     /// One decision function answers both questions from one preflight report
@@ -178,6 +183,12 @@ impl BgShared {
             )
             .await
             .map_err(|reason| Self::failed("preflight", reason))?;
+        if let Some(reason) = preflight_verdict::reversibility_refusal(
+            inspection.report.as_ref(),
+            self.allow_irreversible,
+        ) {
+            return Err(Self::failed("preflight", reason));
+        }
         // The connection-budget edge: both fleets are live during the window.
         if let Some(budget) = &self.budget {
             let snapshot = budget
@@ -378,6 +389,7 @@ impl BlueGreenDeploy {
                 budget,
                 policy: params.policy,
                 database_readiness: None,
+                allow_irreversible: false,
             }),
         }
     }
@@ -388,6 +400,15 @@ impl BlueGreenDeploy {
     #[must_use]
     pub fn database_readiness(mut self, probe: Arc<dyn DatabaseReadiness>) -> Self {
         Arc::make_mut(&mut self.shared).database_readiness = Some(probe);
+        self
+    }
+
+    /// Apply pending migrations the adapter says no `down` can undo
+    /// (`[migration].allow_irreversible`, default `false`). Off, preflight
+    /// refuses them, and refuses when the adapter could not tell.
+    #[must_use]
+    pub fn allow_irreversible(mut self, allow: bool) -> Self {
+        Arc::make_mut(&mut self.shared).allow_irreversible = allow;
         self
     }
 
@@ -416,8 +437,8 @@ mod tests {
     use super::{BlueGreenDeploy, BlueGreenParams, FleetOps};
     use crate::adapter_axes::{
         AdapterCtx, AdapterDescription, AdapterError, ChangeSet, MigrationAdapter,
-        MigrationOutcome, PreflightReport, Revision, RiskTier, SchemaChange, SwapToken,
-        TrafficDirector, TrafficTarget, VerifyReport,
+        MigrationOutcome, PreflightReport, Reversibility, Revision, RiskTier, SchemaChange,
+        SwapToken, TrafficDirector, TrafficTarget, VerifyReport,
     };
     use crate::policy::{testing::FixedApproval, Policy, PolicyGate, REFUSED};
     use async_trait::async_trait;
@@ -672,6 +693,55 @@ mod tests {
             "one swap, to green"
         );
         assert!(fleet.log().contains(&"reap_blue".to_owned()), "blue reaped");
+    }
+
+    fn irreversible() -> Arc<FakeMigration> {
+        FakeMigration::reporting(
+            PreflightReport::new(true)
+                .with_window_safe(true)
+                .with_reversibility(Reversibility::Checked {
+                    irreversible: vec!["003_add_index".to_owned()],
+                }),
+            false,
+        )
+    }
+
+    #[tokio::test]
+    async fn an_irreversible_pending_migration_fails_preflight_before_green_is_provisioned() {
+        let fleet = FakeFleet::new(true, true);
+        let bg = BlueGreenDeploy::new(
+            params(),
+            irreversible(),
+            FakeTraffic::blue() as Arc<dyn TrafficDirector>,
+            Arc::clone(&fleet) as Arc<dyn FleetOps>,
+            None,
+        );
+        let outcome = bg.run(MemoryStateStore::new()).await.expect("run");
+        let reason = refusal(&outcome, "preflight");
+        assert!(reason.contains("003_add_index"), "{reason}");
+        assert!(
+            reason.contains("[migration].allow_irreversible = true"),
+            "{reason}"
+        );
+        assert!(
+            fleet.log().is_empty(),
+            "nothing provisioned: {:?}",
+            fleet.log()
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_irreversible_lets_blue_green_proceed() {
+        let bg = BlueGreenDeploy::new(
+            params(),
+            irreversible(),
+            FakeTraffic::blue() as Arc<dyn TrafficDirector>,
+            FakeFleet::new(true, true) as Arc<dyn FleetOps>,
+            None,
+        )
+        .allow_irreversible(true);
+        let outcome = bg.run(MemoryStateStore::new()).await.expect("run");
+        assert!(matches!(outcome, SagaOutcome::Committed), "{outcome:?}");
     }
 
     /// A readiness probe answering `reasons`.

@@ -1,0 +1,45 @@
+{
+  "ok": false,
+  "window_safe": true,
+  "reversible": false,
+  "summary": {
+    "errors": 1,
+    "warnings": 0,
+    "info": 0,
+    "migrations_checked": 1
+  },
+  "issues": [
+    {
+      "severity": "error",
+      "code": "PFLIGHT_MISSING_DOWN",
+      "message": "Migration 20261107000003 (add_gadgets) is not reversible: no matching .down.sql.",
+      "migration": "20261107000003",
+      "file": "20261107000003_add_gadgets.up.sql",
+      "line": null,
+      "actionable": "Add a matching .down.sql sibling, or mark the migration explicitly non-reversible.",
+      "details": {}
+    }
+  ],
+  "change_set": {
+    "contract_version": 1,
+    "changes": [
+      {
+        "kind": "create_table",
+        "object": "public.gadgets",
+        "migration": "20261107000003",
+        "tier": "additive",
+        "detail": "CREATE TABLE"
+      }
+    ]
+  },
+  "scope": "pending",
+  "ledger": {
+    "table": "tb_confiture",
+    "exists": false
+  },
+  "command": "migrate preflight",
+  "parser": {
+    "pglast": "8.7",
+    "pg_major": 18
+  }
+}

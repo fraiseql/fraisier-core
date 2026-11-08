@@ -118,8 +118,8 @@ use std::sync::OnceLock;
 use async_trait::async_trait;
 use fraisier_core::adapter_axes::{
     AdapterCtx, AdapterDescription, AdapterError, AdapterErrorKind, ChangeSet, MigrationAdapter,
-    MigrationOutcome, PreflightIssue, PreflightReport, Revision, SchemaChange, Severity,
-    VerifyCheck, VerifyReport,
+    MigrationOutcome, PreflightIssue, PreflightReport, Reversibility, Revision, SchemaChange,
+    Severity, VerifyCheck, VerifyReport, REVERSIBILITY,
 };
 use fraisier_core::policy::PENDING_SCOPE;
 use fraisier_core::restore_rehearsal::{AGAINST_DATABASE_URL_SECRET, DEEP_CLASSIFICATION};
@@ -237,6 +237,25 @@ const DEEP_CLASSIFICATION_MIN_CONFITURE: (u32, u32, u32) = (0, 44, 0);
 /// migration is pending. The captures are in `tests/fixtures/scope/`.
 const PENDING_SCOPE_MIN_CONFITURE: (u32, u32, u32) = (1, 35, 0);
 
+/// The first confiture whose `migrate preflight` names a `.py` migration whose
+/// `down()` does nothing (`PFLIGHT_DOWN_EMPTY`), and whose `migrate down-to`
+/// refuses to run one.
+///
+/// **Observed, not read off a changelog**, which said 1.41.0. On a `.py`
+/// migration with `def down(): pass`, 1.39.0 reports nothing, and its `migrate
+/// down-to` exits 0, deletes the ledger row and leaves the migration's table in
+/// place. 1.40.0 reports `PFLIGHT_DOWN_EMPTY` naming it, and its `down-to`
+/// refuses with `ROLLBACK_600`, exit 8. The captures are in
+/// `tests/fixtures/reversibility/`.
+const REVERSIBILITY_MIN_CONFITURE: (u32, u32, u32) = (1, 40, 0);
+
+/// The preflight codes that name a migration `migrate down` cannot undo
+/// because it has no down that does anything: none written, or a `.py`
+/// `down()` that does nothing. confiture's broader `reversible` verdict also
+/// counts migrations whose down runs but cannot bring data back; those are the
+/// policy gate's to judge, by tier.
+const NO_USABLE_DOWN: [&str; 2] = ["PFLIGHT_MISSING_DOWN", "PFLIGHT_DOWN_EMPTY"];
+
 /// Every version-gated capability this adapter has, with the confiture release
 /// it starts trusting for it. `None` means the capability is withheld from every
 /// version.
@@ -256,6 +275,7 @@ pub const CAPABILITY_FLOORS: &[CapabilityFloor] = &[
     (RISK_TIER_CAPABILITY, RISK_TIER_MIN_CONFITURE),
     (DEEP_CLASSIFICATION, Some(DEEP_CLASSIFICATION_MIN_CONFITURE)),
     (PENDING_SCOPE, Some(PENDING_SCOPE_MIN_CONFITURE)),
+    (REVERSIBILITY, Some(REVERSIBILITY_MIN_CONFITURE)),
 ];
 
 /// One row of [`CAPABILITY_FLOORS`]: the capability's advertised name, and the
@@ -342,8 +362,7 @@ impl ConfitureMigration {
         let output_path = temp_output_path(subcommand);
         let plan = plan(subcommand, ctx, extra, &output_path)?;
 
-        let mut command = tokio::process::Command::new(&self.program);
-        fraisier_core::child_env::scrub(command.as_std_mut());
+        let mut command = self.base_command();
         command
             .args(&plan.args)
             .env(CONFITURE_DSN_ENV, &plan.database_url)
@@ -370,6 +389,15 @@ impl ConfitureMigration {
             stderr,
             json,
         })
+    }
+
+    /// The `confiture` command before any argument: no withheld variable, and
+    /// no ambient libpq variable to fill what the injected DSN leaves unset.
+    fn base_command(&self) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.program);
+        fraisier_core::child_env::scrub(command.as_std_mut());
+        fraisier_db::libpq::scrub_ambient(command.as_std_mut());
+        command
     }
 
     /// Error for a failure to even spawn the `confiture` binary.
@@ -400,6 +428,7 @@ fn plan(
     let database_url = ctx
         .secret(DATABASE_URL_LOGICAL)
         .map_err(|err| err.with_adapter(ADAPTER_NAME))?;
+    resolved(&database_url, "the migration DSN")?;
 
     let mut args: Vec<OsString> = vec![OsString::from("migrate"), OsString::from(subcommand)];
     args.extend_from_slice(extra);
@@ -421,6 +450,7 @@ fn plan(
     let mut env = Vec::new();
     if subcommand == "preflight" {
         if let Ok(target) = ctx.secret(AGAINST_DATABASE_URL_SECRET) {
+            resolved(&target, "the deep-classification target")?;
             let (url, password) = split_password(&target)?;
             args.push(OsString::from("--against"));
             args.push(OsString::from(url));
@@ -435,6 +465,19 @@ fn plan(
         database_url,
         env,
     })
+}
+
+/// Refuse a DSN fraisier could not hand to a database child as it reads:
+/// confiture gets the text unchanged, but every child loses the ambient libpq
+/// variables, so a DSN [`fraisier_db::PgConn::resolve`] refuses would reach
+/// another place under confiture than under fraisier's own tools.
+fn resolved(dsn: &str, what: &str) -> Result<(), AdapterError> {
+    fraisier_db::PgConn::resolve(dsn)
+        .map(drop)
+        .map_err(|error| {
+            AdapterError::new(AdapterErrorKind::InvalidConfig, format!("{what}: {error}"))
+                .with_adapter(ADAPTER_NAME)
+        })
 }
 
 /// Split a `postgres://` URL into the URL without its password and the
@@ -1057,7 +1100,49 @@ fn capabilities_for(version: &str) -> Vec<String> {
     if version_at_or_above(version, PENDING_SCOPE_MIN_CONFITURE) {
         capabilities.push(PENDING_SCOPE.to_owned());
     }
+    if version_at_or_above(version, REVERSIBILITY_MIN_CONFITURE) {
+        capabilities.push(REVERSIBILITY.to_owned());
+    }
     capabilities
+}
+
+/// Whether `migrate down` can undo the pending migrations of the preflight
+/// report `json`, produced by the confiture at `version`.
+///
+/// From [`REVERSIBILITY_MIN_CONFITURE`], every migration a [`NO_USABLE_DOWN`]
+/// issue names. Below it an empty `down()` is invisible, so the check could not
+/// run unless the report judged no migration at all.
+fn reversibility_of(json: &Value, version: &str) -> Reversibility {
+    if !version_at_or_above(version, REVERSIBILITY_MIN_CONFITURE) {
+        let checked = json
+            .pointer("/summary/migrations_checked")
+            .and_then(Value::as_u64);
+        if checked != Some(0) {
+            let (major, minor, patch) = REVERSIBILITY_MIN_CONFITURE;
+            return Reversibility::Unchecked {
+                reason: format!(
+                    "confiture {version} is older than {major}.{minor}.{patch}, the first \
+                     release that reports a .py migration whose down() does nothing"
+                ),
+            };
+        }
+    }
+    let mut irreversible: Vec<String> = Vec::new();
+    for issue in json
+        .get("issues")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let code = issue.get("code").and_then(Value::as_str);
+        let migration = issue.get("migration").and_then(Value::as_str);
+        if let (Some(code), Some(migration)) = (code, migration) {
+            if NO_USABLE_DOWN.contains(&code) && !irreversible.iter().any(|m| m == migration) {
+                irreversible.push(migration.to_owned());
+            }
+        }
+    }
+    Reversibility::Checked { irreversible }
 }
 
 /// The `--scope` arguments for a preflight by the confiture at `version`.
@@ -1123,8 +1208,7 @@ fn version_triple(version: &str) -> Option<(u32, u32, u32)> {
 #[async_trait]
 impl MigrationAdapter for ConfitureMigration {
     async fn describe(&self) -> Result<AdapterDescription, AdapterError> {
-        let mut command = tokio::process::Command::new(&self.program);
-        fraisier_core::child_env::scrub(command.as_std_mut());
+        let mut command = self.base_command();
         let output = command
             .arg("--version")
             .output()
@@ -1231,12 +1315,9 @@ impl MigrationAdapter for ConfitureMigration {
     }
 
     async fn preflight(&self, ctx: &AdapterCtx) -> Result<PreflightReport, AdapterError> {
+        let version = self.installed_version().await?;
         let output = self
-            .run(
-                "preflight",
-                ctx,
-                &preflight_scope(&self.installed_version().await?),
-            )
+            .run("preflight", ctx, &preflight_scope(&version))
             .await?;
         // Same envelope rule as `verify`. An envelope would at least parse to
         // `ok = false` here (it carries a top-level `"ok"`), so this is not the
@@ -1246,7 +1327,9 @@ impl MigrationAdapter for ConfitureMigration {
             .json
             .as_ref()
             .filter(|json| !is_error_envelope(json))
-            .map(parse_preflight_report);
+            .map(|json| {
+                parse_preflight_report(json).with_reversibility(reversibility_of(json, &version))
+            });
         if let Some(report) = report {
             return Ok(report);
         }
@@ -1266,8 +1349,9 @@ mod tests {
         args_contain, capabilities_for, classify, error_code_of, is_error_envelope,
         parse_change_set, parse_current_revision, parse_down_to_outcome, parse_preflight_report,
         parse_up_outcome, parse_verify_report, parse_version, plan, reports_uninitialised,
-        subcommand_takes_migrations_dir, supports_risk_tier, version_at_or_above, version_triple,
-        ConfitureMigration, NotAReport, CONFITURE_DSN_ENV, RISK_TIER_MIN_CONFITURE,
+        reversibility_of, subcommand_takes_migrations_dir, supports_risk_tier, version_at_or_above,
+        version_triple, ConfitureMigration, NotAReport, Reversibility, CAPABILITY_FLOORS,
+        CONFITURE_DSN_ENV, REVERSIBILITY, RISK_TIER_MIN_CONFITURE,
     };
     use fraisier_core::adapter_axes::{
         AdapterCtx, AdapterErrorKind, ChangeSetUnavailable, PreflightReport, Revision, RiskTier,
@@ -2130,6 +2214,24 @@ mod tests {
     }
 
     #[test]
+    fn a_dsn_keyword_fraisier_cannot_pass_on_is_refused_before_confiture_runs() {
+        let ctx = ctx_with_secret("UNSET")
+            .with_resolved_secret(DATABASE_URL_SECRET, "postgres://app@db/shop?keepalives=1");
+        let error = plan("up", &ctx, &[], &PathBuf::from("/tmp/r.json")).expect_err("refused");
+        assert_eq!(error.kind, AdapterErrorKind::InvalidConfig, "{error:?}");
+        assert!(error.message.contains("keepalives"), "{}", error.message);
+    }
+
+    #[test]
+    fn confiture_loses_the_ambient_tls_policy_as_well() {
+        let command = ConfitureMigration::with_program("confiture").base_command();
+        assert!(command
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == "PGSSLMODE" && value.is_none()));
+    }
+
+    #[test]
     fn deep_preflight_passes_against_without_the_password() {
         let plan = plan(
             "preflight",
@@ -2148,6 +2250,27 @@ mod tests {
         );
         // The env DSN names the same throwaway, so pending resolves from its ledger.
         assert_eq!(plan.database_url, THROWAWAY_DSN);
+    }
+
+    #[test]
+    fn confiture_inherits_no_ambient_variable_that_would_fill_the_dsns_gaps() {
+        let command = ConfitureMigration::with_program("confiture").base_command();
+        let removed: Vec<String> = command
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for name in [
+            "PGHOST",
+            "PGPORT",
+            "PGUSER",
+            "PGPASSWORD",
+            "PGOPTIONS",
+            "PGSERVICE",
+        ] {
+            assert!(removed.iter().any(|key| key == name), "{name}: {removed:?}");
+        }
     }
 
     #[test]
@@ -2279,6 +2402,130 @@ mod tests {
                 "{version}"
             );
         }
+    }
+
+    /// A `tests/fixtures/reversibility/` capture.
+    fn reversibility_capture(name: &str) -> Value {
+        let bytes = match name {
+            "down-empty-1.36.0" => {
+                include_str!("../tests/fixtures/reversibility/down-empty-1.36.0.json")
+            }
+            "down-empty-1.39.0" => {
+                include_str!("../tests/fixtures/reversibility/down-empty-1.39.0.json")
+            }
+            "down-empty-1.40.0" => {
+                include_str!("../tests/fixtures/reversibility/down-empty-1.40.0.json")
+            }
+            "down-empty-1.45.0" => {
+                include_str!("../tests/fixtures/reversibility/down-empty-1.45.0.json")
+            }
+            "missing-down-1.45.0" => {
+                include_str!("../tests/fixtures/reversibility/missing-down-1.45.0.json")
+            }
+            other => panic!("no reversibility capture named {other}"),
+        };
+        serde_json::from_str(bytes).expect("a capture is JSON")
+    }
+
+    fn checked(irreversible: &[&str]) -> Reversibility {
+        Reversibility::Checked {
+            irreversible: irreversible.iter().map(|m| (*m).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn from_the_floor_an_empty_down_is_named() {
+        for version in ["1.40.0", "1.45.0"] {
+            let json = reversibility_capture(&format!("down-empty-{version}"));
+            assert_eq!(
+                reversibility_of(&json, version),
+                checked(&["20261107000002"]),
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_down_is_named_too() {
+        assert_eq!(
+            reversibility_of(&reversibility_capture("missing-down-1.45.0"), "1.45.0"),
+            checked(&["20261107000003"])
+        );
+    }
+
+    #[test]
+    fn migrations_that_all_have_a_down_are_checked_and_clean() {
+        let json: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/verdicts/1.45.0.json"))
+                .expect("json");
+        assert_eq!(reversibility_of(&json, "1.45.0"), checked(&[]));
+    }
+
+    #[test]
+    fn below_the_floor_the_check_could_not_run_and_says_why() {
+        for version in ["1.36.0", "1.39.0"] {
+            let json = reversibility_capture(&format!("down-empty-{version}"));
+            let Reversibility::Unchecked { reason } = reversibility_of(&json, version) else {
+                panic!("{version} cannot see an empty down()");
+            };
+            assert!(reason.contains(version), "{reason}");
+            assert!(reason.contains("1.40.0"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn below_the_floor_with_nothing_pending_there_is_nothing_to_undo() {
+        let json = serde_json::json!({
+            "ok": true,
+            "issues": [],
+            "summary": { "migrations_checked": 0 },
+            "scope": "pending"
+        });
+        assert_eq!(reversibility_of(&json, "1.36.0"), checked(&[]));
+    }
+
+    #[test]
+    fn the_reversibility_capability_starts_at_the_floor() {
+        assert!(!capabilities_for("1.39.0").contains(&REVERSIBILITY.to_owned()));
+        assert!(capabilities_for("1.40.0").contains(&REVERSIBILITY.to_owned()));
+        assert!(CAPABILITY_FLOORS
+            .iter()
+            .any(|(name, floor)| *name == REVERSIBILITY && *floor == Some((1, 40, 0))));
+    }
+
+    /// The worst tier per migration of a `tests/fixtures/verdicts/` capture.
+    fn verdict_tiers(json: &str, migration: &str) -> Vec<Option<RiskTier>> {
+        let json: Value = serde_json::from_str(json).expect("a capture is JSON");
+        parse_change_set(&json)
+            .expect("classified")
+            .changes
+            .into_iter()
+            .filter(|change| change.migration.as_deref() == Some(migration))
+            .map(|change| change.tier)
+            .collect()
+    }
+
+    #[test]
+    fn the_pin_move_loosens_a_view_recreate_and_a_check_swap() {
+        let old = include_str!("../tests/fixtures/verdicts/1.36.0.json");
+        let new = include_str!("../tests/fixtures/verdicts/1.45.0.json");
+        let (view, check) = ("20261107000006", "20261107000008");
+        assert_eq!(
+            verdict_tiers(old, view),
+            [Some(RiskTier::Destructive), Some(RiskTier::Additive)]
+        );
+        assert_eq!(
+            verdict_tiers(new, view),
+            [Some(RiskTier::Reversible), Some(RiskTier::Additive)]
+        );
+        assert_eq!(
+            verdict_tiers(old, check),
+            [Some(RiskTier::Destructive), Some(RiskTier::LockRisky)]
+        );
+        assert_eq!(
+            verdict_tiers(new, check),
+            [Some(RiskTier::LockRisky), Some(RiskTier::LockRisky)]
+        );
     }
 
     #[test]

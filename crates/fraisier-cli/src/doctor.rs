@@ -23,12 +23,13 @@ use crate::commands::CommandOutput;
 ///
 /// Tracks the highest floor in `fraisier-adapter-confiture`'s
 /// `CAPABILITY_FLOORS`, and is pinned to it by test. Today that is
-/// `pending_scope` at 1.35.0, the first release that accepts `--scope pending`:
-/// below it the policy gate judges applied migrations too. The window-safe
-/// verdict, the risk-tiered change-set and deep classification sit lower, on
-/// 0.44.0. A floor below the highest would certify a binary a deploy treats as
-/// less capable than the check says.
-const CONFITURE_FLOOR: (u32, u32) = (1, 35);
+/// `reversibility` at 1.40.0, the first release that reports a `.py` migration
+/// whose `down()` does nothing: below it a deploy with pending migrations is
+/// refused unless `[migration].allow_irreversible` is set. `pending_scope` sits
+/// on 1.35.0; the window-safe verdict, the risk-tiered change-set and deep
+/// classification on 0.44.0. A floor below the highest would certify a binary
+/// a deploy treats as less capable than the check says.
+const CONFITURE_FLOOR: (u32, u32) = (1, 40);
 
 /// A single doctor check outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,7 +198,7 @@ fn judge_admin(admin: Result<Identity, String>, app: Result<Identity, String>) -
 async fn identity_of(source: Option<&str>) -> Result<Identity, String> {
     let source = source.ok_or("[migration].database_url_env is not set")?;
     let dsn = std::env::var(source).map_err(|_| format!("${source} is not set"))?;
-    let conn = PgConn::parse(&dsn).map_err(|error| error.to_string())?;
+    let conn = PgConn::resolve(&dsn).map_err(|error| error.to_string())?;
     let stdout = tviews::query(Path::new("psql"), &conn, tviews::IDENTITY_SQL).await?;
     tviews::parse_identity(&stdout)
 }
@@ -290,6 +291,9 @@ fn without(capability: &str) -> &'static str {
         "risk_tier" => "a configured `[policy]` classifies nothing",
         "deep_classification" => "a restore rehearsal classifies statically",
         "pending_scope" => "the policy gate judges applied migrations too",
+        "reversibility" => {
+            "a deploy with pending migrations is refused unless `allow_irreversible`"
+        }
         _ => "not available",
     }
 }
@@ -392,7 +396,7 @@ async fn check_refresh_target(
     let Some(dsn) = std::env::var(source).ok().filter(|dsn| !dsn.is_empty()) else {
         return fail(format!("cannot read the marker: ${source} is not set"));
     };
-    let conn = match PgConn::parse(&dsn) {
+    let conn = match PgConn::resolve(&dsn) {
         Ok(conn) => conn,
         Err(error) => return fail(format!("cannot read the marker: invalid DSN: {error}")),
     };
@@ -429,7 +433,8 @@ async fn check_refresh_target(
 
 /// The databases carrying the throwaway marker on the server `dsn` names.
 fn list_throwaways(dsn: &str) -> Result<Vec<String>, String> {
-    let conn = fraisier_db::PgConn::parse(dsn).map_err(|e| format!("invalid database DSN: {e}"))?;
+    let conn =
+        fraisier_db::PgConn::resolve(dsn).map_err(|e| format!("invalid database DSN: {e}"))?;
     // `_` is a LIKE wildcard, so the marker's underscores are escaped.
     let pattern = fraisier_core::drill::THROWAWAY_MARKER.replace('_', "\\_");
     let mut query = fraisier_db::psql_command(
@@ -883,10 +888,15 @@ url = "http://127.0.0.1/health"
 
     #[test]
     fn below_the_floor_names_each_withheld_capability() {
-        let current = below_floor((1, 19));
-        assert!(current.contains("`pending_scope`"), "{current}");
-        assert!(current.contains("judges applied migrations"), "{current}");
-        assert!(!current.contains("`window_safe`"), "{current}");
+        let current = below_floor((1, 36));
+        assert!(current.contains("`reversibility`"), "{current}");
+        assert!(current.contains("unless `allow_irreversible`"), "{current}");
+        assert!(!current.contains("`pending_scope`"), "{current}");
+
+        let older = below_floor((1, 19));
+        assert!(older.contains("`pending_scope`"), "{older}");
+        assert!(older.contains("judges applied migrations"), "{older}");
+        assert!(!older.contains("`window_safe`"), "{older}");
 
         let ancient = below_floor((0, 43));
         for capability in [
@@ -894,6 +904,7 @@ url = "http://127.0.0.1/health"
             "risk_tier",
             "deep_classification",
             "pending_scope",
+            "reversibility",
         ] {
             assert!(ancient.contains(&format!("`{capability}`")), "{ancient}");
         }

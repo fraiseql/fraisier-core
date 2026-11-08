@@ -8,6 +8,35 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **An ambient `PG*` variable no longer fills what a database URL leaves
+  unset.** Every `psql`, `pg_dump` and `pg_restore` fraisier runs, `confiture`,
+  and every locally launched IPC adapter now start without `PGHOST`,
+  `PGHOSTADDR`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGOPTIONS`,
+  `PGSERVICE`, `PGSERVICEFILE`, `PGSYSCONFDIR`, `PGTZ`, `PGDATESTYLE`,
+  `PGGEQO`, `PGTARGETSESSIONATTRS`, `PGLOADBALANCEHOSTS`, `PGCLIENTENCODING`
+  and `PGREQUIREPEER`. Before, an exported `PGPORT` or `PGOPTIONS` sent them to
+  another server or into another session than the config named. See
+  `docs/security.md`.
+
+  **Upgrading:** a host whose database URL omits the password, the port or the
+  user and relied on an exported `PGPASSWORD`, `PGPORT` or `PGUSER` now
+  connects without them. Put them in the URL, or keep the password in a
+  `PGPASSFILE` (still read). Check the webhook unit's `Environment=` as well
+  as your shell.
+- ⚠️ **Only the URL decides where `psql`, `pg_dump`, `pg_restore` and
+  `confiture` connect.** They now start without *any* libpq variable but
+  `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, `PGSSLCRL`, `PGSSLCRLDIR`,
+  `PGPASSFILE`, `PGREQUIREAUTH`, `PGCONNECT_TIMEOUT` and `PGAPPNAME`. An
+  ambient TLS or GSS policy (`PGSSLMODE`, `PGGSSENCMODE`, `PGCHANNELBINDING`,
+  …) that a TCP URL does not pin is **refused** before anything runs, naming
+  the keyword to add (`?sslmode=verify-full`), rather than dropped to libpq's
+  `prefer`. Unix-socket URLs are exempt. Locally launched IPC adapters keep
+  their TLS policy variables, since fraisier never reads their URL.
+
+  **Upgrading:** move a TLS policy you export into the URL. `fraisier doctor`
+  reports the refusal; run it under the webhook and scheduled units'
+  environment too (`systemctl show -p Environment <unit>`), where a
+  `PGSSLMODE` fires only in the runs those units start.
 - **Nothing secret on an `ssh` command line.** The ssh transport refuses an
   environment for a remote command instead of rendering it as `K=value` on
   the command line, where any user on either host could read it. No built-in
@@ -17,6 +46,96 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `checksum_url` go to `curl` on a command line, so `fraisier validate` (and
   every command that validates) refuses `user:password@` in either. A token
   in the URL's query is not detected; see `docs/security.md`.
+- `PgConn`'s `Debug` no longer prints the password; it prints the redacted URL.
+  `RestoreIdentity` and `Admin` derive `Debug` over it.
+
+### Added
+
+- **`[migration].allow_irreversible`** (default `false`). See the ⚠️ entry
+  under Changed: without it, a forward migrate now refuses a pending
+  migration no `down` can undo.
+- **The confiture adapter reports reversibility** (capability
+  `reversibility`, from confiture 1.40.0): the pending migrations with no
+  `.down.sql`, or a `.py` `down()` that does nothing
+  (`PFLIGHT_MISSING_DOWN`, `PFLIGHT_DOWN_EMPTY`). `PreflightReport` gains an
+  optional `reversibility` field; an adapter that does not report it is
+  unaffected.
+
+### Changed
+
+- ⚠️ **A DSN fraisier cannot hand on whole is refused** where it used to be
+  silently trimmed: a keyword with no `PG*` variable (`keepalives`,
+  `sslpassword`, …), an unknown keyword, `?service=`, a `key=value` string,
+  and an unencoded `@` in the user name or password. The error names the key,
+  never the value. Run `fraisier doctor` before upgrading: `validate` only
+  sees the variable's name. See `docs/security.md`.
+- ⚠️ **A restore, `db refresh` and a drill refuse a multi-host DSN** (app or
+  admin), before anything runs.
+- `fraisier_db::DbError` is now `#[non_exhaustive]` and gains
+  `UnsupportedKeyword`. `PgConn` gains `is_multi_host`.
+- `fraisier_db::refresh::RefreshServer` gains a required method,
+  `create_problem`, which a custom implementation must provide.
+- ⚠️ **A pending migration no `down` can undo now stops a deploy and `db
+  migrate`**, before anything changes, unless `[migration].allow_irreversible
+  = true`. Rolling back past such a migration rewinds confiture's ledger and
+  leaves its schema; confiture before 1.40.0 did exactly that for a `.py`
+  migration whose `down()` is `pass`. The refusal names each migration. With
+  a confiture older than 1.40.0 and pending migrations, the deploy is refused
+  too, because nothing can tell: upgrade confiture, or set the key. The
+  `command` and IPC adapters report no reversibility and are not affected;
+  `fraisier rollback` is never held behind it.
+- ⚠️ **The pinned confiture moves from 1.36.0 to 1.45.0**
+  (`tools/confiture-requirements.txt`). The exit-code table adds `DIFFER_411`
+  (exit 0), `VALID_010` (exit 5) and `CONFIG_016` (exit 5); no new class.
+  Two policy-gate verdicts loosen with it, so a `[policy]` that refused them
+  may now admit them:
+  - a view `DROP VIEW …; CREATE VIEW …` is `reversible`, not `destructive`;
+  - a same-name `CHECK` swap written as two statements is `lock_risky`, not
+    `destructive`.
+- **`fraisier doctor` warns below confiture 1.40.0** (was 1.35.0), naming
+  the `reversibility` capability it withholds there.
+- **Preflight findings are counted per migration.** Two blocking findings on
+  one migration read as one failing migration, each listed with its codes.
+  `db migrate --json`: `preflight_blocking` now counts migrations (and
+  findings that name none); the new `preflight_issues` counts findings.
+
+### Fixed
+
+- **A database URL now reaches what it reaches under libpq** (#105).
+  `PgConn::parse` read only `?sslmode=` from the query and dropped every other
+  parameter, so `?host=/run/postgresql`, `?password=`, `?port=`, `?user=` and
+  `?dbname=` were ignored: the URI part or the compiled-in default applied
+  instead. Every libpq 18 keyword with an environment variable is now read,
+  and a query value overrides the URI part, as in libpq. A socket-directory
+  host (`postgres://u@%2Frun%2Fpostgresql/db`) now also renders back into a
+  URL that parses, and `with_database` replaces a `?dbname=` rather than
+  keeping it beside the new name.
+- **`fraisier db refresh` no longer drops a database it cannot create again.**
+  It dropped the target, then ran `CREATE DATABASE`; a role that owned the
+  target but lacked `CREATEDB`, or an admin that could not make the app role
+  the owner (`SET` on the role, PostgreSQL 16+), left no database and the
+  units stopped. The refresh now checks both before the drop and refuses,
+  naming the `ALTER ROLE … CREATEDB` or `GRANT <app> TO <admin>` that fixes
+  it. With `[database].admin_url_env`, it also refuses an admin DSN that
+  reaches another cluster than the app's. A failure after the drop now names
+  the recovery (`createdb -O <app> <db>`, `fraisier db mark-refresh-target`,
+  run again).
+- **`fraisier db reset` and `fraisier db refresh` check the migration tool
+  before destroying anything.** A reset used to drop every schema and only
+  then find that the migration adapter could not run (a missing `confiture`),
+  leaving an empty database; a refresh found out after the drop and restore.
+  Both now refuse first, with nothing changed.
+- **A restore no longer reports TVIEWs as filled when it could not read
+  them.** The probe after the post-restore rebuild (restore, refresh, the
+  restore drill) skipped a TVIEW its role could not read. It now fails the
+  check, naming the TVIEW and the `GRANT SELECT` that lets the role read it.
+
+### Known issues
+
+- confiture 1.42.0 through 1.45.0 crash (`INTERNAL_ERROR`, "list index out of
+  range") classifying a one-statement constraint swap such as `ALTER TABLE t
+  DROP CONSTRAINT c, ADD CONSTRAINT c CHECK (x > 0);`. The preflight fails, so
+  the deploy stops. Write it as two statements.
 
 ## [1.0.0-beta.14] - 2026-10-30
 

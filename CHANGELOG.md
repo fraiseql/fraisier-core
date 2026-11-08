@@ -6,6 +6,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **An ambient `PG*` variable no longer fills what a database URL leaves
+  unset.** Every `psql`, `pg_dump` and `pg_restore` fraisier runs, `confiture`,
+  and every locally launched IPC adapter now start without `PGHOST`,
+  `PGHOSTADDR`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGOPTIONS`,
+  `PGSERVICE`, `PGSERVICEFILE`, `PGSYSCONFDIR`, `PGTZ`, `PGDATESTYLE`,
+  `PGGEQO`, `PGTARGETSESSIONATTRS`, `PGLOADBALANCEHOSTS`, `PGCLIENTENCODING`
+  and `PGREQUIREPEER`. Before, an exported `PGPORT` or `PGOPTIONS` sent them to
+  another server or into another session than the config named. See
+  `docs/security.md`.
+
+  **Upgrading:** a host whose database URL omits the password, the port or the
+  user and relied on an exported `PGPASSWORD`, `PGPORT` or `PGUSER` now
+  connects without them. Put them in the URL, or keep the password in a
+  `PGPASSFILE` (still read). Check the webhook unit's `Environment=` as well
+  as your shell.
+
 ### Fixed
 
 - **`fraisier db refresh` no longer drops a database it cannot create again.**

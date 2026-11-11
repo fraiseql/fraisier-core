@@ -47,7 +47,7 @@ fraisier-ipc = { path = "../fraisier-ipc", version = "1.0.0-beta.15" }
 
 # In-process adapters selected by name from the config.
 fraisier-adapter-support = { path = "../fraisier-adapter-support", version = "1.0.0-beta.15" }
-fraisier-adapter-confiture = { path = "../fraisier-adapter-confiture", version = "1.0.0-beta.15" }
+fraisier-adapter-confiture = { path = "../fraisier-adapter-confiture", version = "1.0.0-beta.16" }
 fraisier-adapter-command = { path = "../fraisier-adapter-command", version = "1.0.0-beta.15" }
 fraisier-adapter-systemd = { path = "../fraisier-adapter-systemd", version = "1.0.0-beta.15" }
 fraisier-adapter-rc = { path = "../fraisier-adapter-rc", version = "1.0.0-beta.15" }

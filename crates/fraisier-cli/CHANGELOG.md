@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.16](https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.15...fraisier-v1.0.0-beta.16) - 2026-11-11
+
+### Other
+
+- updated the following local packages: fraisier-adapter-confiture
+
 ## [1.0.0-beta.15](https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.14...fraisier-v1.0.0-beta.15) - 2026-11-08
 
 ### Fixed

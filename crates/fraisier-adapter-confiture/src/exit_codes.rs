@@ -188,6 +188,9 @@ mod tests {
         (Some(5), None, ExitClass::InvalidConfig),
         (Some(5), Some("CONFIG_010"), ExitClass::InvalidConfig),
         (Some(5), Some("VALID_001"), ExitClass::InvalidConfig),
+        // confiture 1.48.0: `install-helpers` refuses a `confiture` schema on the
+        // role's search_path.
+        (Some(5), Some("CONFIG_017"), ExitClass::InvalidConfig),
         (Some(6), None, ExitClass::LockContention),
         (Some(6), Some("LOCK_1300"), ExitClass::LockContention),
         (Some(7), None, ExitClass::GitError),

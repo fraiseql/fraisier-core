@@ -6,6 +6,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The pinned confiture moves from 1.45.0 to 1.48.0**
+  (`tools/confiture-requirements.txt`; its other exact pins hold). The
+  exit-code table adds `CONFIG_017` (exit 5: `confiture install-helpers`
+  refuses a `confiture` schema on the role's `search_path`); no new class.
+  The adapter's runtime floors are unchanged, and it passes `--no-config`, so
+  1.48's `migration:` block changes do not reach it.
+
 ### Security
 
 - `cargo deny` ignores RUSTSEC-2026-0459 (the SQLite bundled by `libsqlite3-sys`

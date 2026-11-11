@@ -8,9 +8,18 @@
 all-features = true
 
 [advisories]
-# Check every dependency against the RustSec advisory database. No advisories are
-# ignored; a new one failing CI is a signal to upgrade, not to suppress.
-ignore = []
+# Check every dependency against the RustSec advisory database. A new advisory
+# failing CI is a signal to upgrade, not to suppress: an entry below is allowed only
+# when no upgrade exists yet, and carries the date to check again.
+ignore = [
+    # The SQLite that libsqlite3-sys < 0.39 bundles. sqlx-sqlite 0.9.0, the latest,
+    # caps libsqlite3-sys at < 0.38, so no upgrade exists. Only the opt-in
+    # `fraisier-saga/sqlite` state store links it; the released `fraisier` binary
+    # (default features, and `otel`) does not. Remove this entry once sqlx accepts
+    # libsqlite3-sys >= 0.39 (`cargo update -p libsqlite3-sys`).
+    # Re-check by 2026-12-11.
+    { id = "RUSTSEC-2026-0459", reason = "no upgrade until sqlx accepts libsqlite3-sys >= 0.39; opt-in sqlite feature only; re-check by 2026-12-11" },
+]
 
 [licenses]
 # Only permissive licenses compatible with redistributing under `MIT OR

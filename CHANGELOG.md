@@ -6,6 +6,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- `cargo deny` ignores RUSTSEC-2026-0459 (the SQLite bundled by `libsqlite3-sys`
+  < 0.39) until sqlx accepts the fixed release; sqlx-sqlite 0.9.0 caps it below
+  0.38. Only the opt-in `fraisier-saga/sqlite` state store links SQLite; the
+  released `fraisier` binary does not. The entry is to be checked again by 2026-12-11.
+
 ## [1.0.0-beta.15] - 2026-11-08
 
 ### Security

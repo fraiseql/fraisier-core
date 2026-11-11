@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.16](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-confiture-v1.0.0-beta.15...fraisier-adapter-confiture-v1.0.0-beta.16) - 2026-11-11
+
+### Other
+
+- *(confiture)* pin 1.48.0 and vendor CONFIG_017
+
 ## [1.0.0-beta.15](https://github.com/fraiseql/fraisier-core/compare/fraisier-adapter-confiture-v1.0.0-beta.14...fraisier-adapter-confiture-v1.0.0-beta.15) - 2026-11-08
 
 ### Added

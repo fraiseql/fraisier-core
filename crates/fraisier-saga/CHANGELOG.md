@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.16](https://github.com/fraiseql/fraisier-core/compare/fraisier-saga-v1.0.0-beta.15...fraisier-saga-v1.0.0-beta.16) - 2026-11-15
+
+### Fixed
+
+- *(saga)* a partial rollback keeps the error that started it ([#161](https://github.com/fraiseql/fraisier-core/pull/161))
+
 ## [1.0.0-beta.13](https://github.com/fraiseql/fraisier-core/compare/fraisier-saga-v1.0.0-beta.12...fraisier-saga-v1.0.0-beta.13) - 2026-10-29
 
 ### Fixed

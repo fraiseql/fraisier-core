@@ -105,7 +105,13 @@ pub enum SagaOutcome {
     /// A step failed and a *compensation* then failed; operator intervention is
     /// required (PRD §5.4).
     PartialRollback {
-        /// What went wrong during rollback.
+        /// The step whose forward action failed and started the rollback.
+        failed_step: String,
+        /// Why it failed, redacted: the cause the operator has to fix.
+        failure: String,
+        /// The whole account, redacted: the failure, then what the rollback could
+        /// not undo. The same string is persisted as
+        /// [`SagaState::PartialRollback`].
         reason: String,
     },
 }
@@ -231,13 +237,20 @@ impl<S: StateStore, R: Send> Saga<S, R> {
                 // its tool wrote to stderr, so credentials are stripped here,
                 // before the reason is either stored or returned, and both get the
                 // same string (#62).
+                // The forward error carries tool output too, and is the cause the
+                // operator acts on, so it is kept and redacted the same way (#161).
+                let failure = crate::redact::credentials(&error.to_string());
                 let reason = crate::redact::credentials(&format!(
-                    "compensation for '{}' failed: {comp_err}",
+                    "{failure}; then compensation for '{}' failed: {comp_err}",
                     step.name()
                 ));
                 self.transition(&to, &SagaState::PartialRollback(reason.clone()))
                     .await?;
-                return Ok(SagaOutcome::PartialRollback { reason });
+                return Ok(SagaOutcome::PartialRollback {
+                    failed_step: failed_step.to_owned(),
+                    failure,
+                    reason,
+                });
             }
             from = to;
         }

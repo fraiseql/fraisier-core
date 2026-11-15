@@ -322,6 +322,11 @@ expected_status = 200
             .is_some_and(|d| d.contains("health")),
         "rollback was triggered by the health step; json: {json}",
     );
+    assert_eq!(
+        json["failed_step"],
+        serde_json::json!("health"),
+        "the failed step is a field, not only prose; json: {json}",
+    );
 
     // The rollback drove the sqlx adapter's `down_to` over IPC back to revision 1...
     assert_eq!(

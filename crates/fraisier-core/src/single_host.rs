@@ -2785,9 +2785,21 @@ mod tests {
         );
 
         let outcome = plan.run(store).await.expect("run completes");
+        let SagaOutcome::PartialRollback {
+            failed_step,
+            failure,
+            reason,
+        } = &outcome
+        else {
+            panic!("a first-deploy rollback with no prior release is a PartialRollback, got {outcome:?}");
+        };
+        // The health check is why the deploy failed; "no revision to return to"
+        // is only what the rollback could not do. Both reach the operator (#161).
+        assert_eq!(failed_step, "health");
+        assert!(failure.contains("health"), "{failure}");
         assert!(
-            matches!(outcome, SagaOutcome::PartialRollback { .. }),
-            "a first-deploy rollback with no prior release is a PartialRollback, got {outcome:?}"
+            reason.starts_with(failure.as_str()),
+            "cause first: {reason}"
         );
     }
 

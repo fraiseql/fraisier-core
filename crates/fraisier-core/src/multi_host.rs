@@ -602,10 +602,12 @@ impl RolloutRuntime {
                 },
                 Some(detail),
             ) => SagaOutcome::PartialRollback {
+                failure: fraisier_saga::redact::credentials(&reason),
                 reason: format!(
                     "rollback after '{failed_step}' failed left a host unrecoverable: {detail} \
                          (original failure: {reason})"
                 ),
+                failed_step,
             },
             (other, _) => other,
         }
@@ -2114,13 +2116,21 @@ mod tests {
         let plan = deploy(&trail, &faults, RolloutStrategy::Rolling(1));
 
         let outcome = plan.run(store).await.expect("run completes");
-        let SagaOutcome::PartialRollback { reason } = &outcome else {
+        let SagaOutcome::PartialRollback {
+            failed_step,
+            failure,
+            reason,
+        } = &outcome
+        else {
             panic!("expected PartialRollback, got {outcome:?}");
         };
         assert!(
             reason.contains("web-2"),
             "the operator-facing reason names the stuck host: {reason}"
         );
+        // The cause, not only the casualty (#161): the batch that failed and why.
+        assert_eq!(failed_step, "rollout-2");
+        assert!(failure.contains("web-2"), "{failure}");
     }
 
     #[tokio::test]
@@ -2137,10 +2147,17 @@ mod tests {
         let plan = deploy(&trail, &faults, RolloutStrategy::Rolling(1));
 
         let outcome = plan.run(store).await.expect("run completes");
-        assert!(
-            matches!(&outcome, SagaOutcome::PartialRollback { .. }),
-            "a first-deploy rollback with no prior release is a PartialRollback, got {outcome:?}"
-        );
+        let SagaOutcome::PartialRollback {
+            failed_step,
+            failure,
+            ..
+        } = &outcome
+        else {
+            panic!("a first-deploy rollback with no prior release is a PartialRollback, got {outcome:?}");
+        };
+        // Why the deploy failed, not only that there was nothing to return to (#161).
+        assert_eq!(failed_step, "rollout-1");
+        assert!(failure.contains("web-1"), "{failure}");
         let trail = drain_trail(&trail);
         assert!(
             !trail.iter().any(|e| e == "drain:web-2"),

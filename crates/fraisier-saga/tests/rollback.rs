@@ -37,6 +37,8 @@ struct ScriptedStep {
     /// What the failed compensation reports. `None` is the generic message; a
     /// `Some` carries text the engine did not author, such as adapter stderr.
     compensate_message: Option<String>,
+    /// What the failed forward action reports; `None` is the generic message.
+    forward_message: Option<String>,
 }
 
 #[async_trait]
@@ -53,7 +55,10 @@ impl Step for ScriptedStep {
         if self.fail_forward {
             return Err(SagaError::StepFailed {
                 step: self.name.clone(),
-                message: "forced forward failure".to_owned(),
+                message: self
+                    .forward_message
+                    .clone()
+                    .unwrap_or_else(|| "forced forward failure".to_owned()),
             });
         }
         Ok(())
@@ -84,6 +89,7 @@ fn step(name: &str, trail: &Trail, fail_forward: bool, fail_compensate: bool) ->
         fail_forward,
         fail_compensate,
         compensate_message: None,
+        forward_message: None,
     })
 }
 
@@ -95,6 +101,19 @@ fn step_failing_compensation_with(name: &str, trail: &Trail, message: &str) -> B
         fail_forward: false,
         fail_compensate: true,
         compensate_message: Some(message.to_owned()),
+        forward_message: None,
+    })
+}
+
+/// A step whose forward action fails reporting `message`.
+fn step_failing_forward_with(name: &str, trail: &Trail, message: &str) -> Box<dyn Step> {
+    Box::new(ScriptedStep {
+        name: name.to_owned(),
+        trail: trail.clone(),
+        fail_forward: true,
+        fail_compensate: false,
+        compensate_message: None,
+        forward_message: Some(message.to_owned()),
     })
 }
 
@@ -197,7 +216,7 @@ async fn failed_compensation_yields_partial_rollback_with_diagnostics() {
         .with_step(step("restart", &trail, true, false)); // forward fails
 
     match saga.run().await.expect("run completes") {
-        SagaOutcome::PartialRollback { reason } => {
+        SagaOutcome::PartialRollback { reason, .. } => {
             assert!(
                 reason.contains("migrate"),
                 "names the unrecoverable step: {reason}"
@@ -248,7 +267,7 @@ async fn a_partial_rollback_reason_is_redacted_before_it_is_persisted() {
         .with_step(step("restart", &trail, true, false));
 
     let returned = match saga.run().await.expect("run completes") {
-        SagaOutcome::PartialRollback { reason } => reason,
+        SagaOutcome::PartialRollback { reason, .. } => reason,
         other => panic!("expected PartialRollback, got {other:?}"),
     };
 
@@ -272,5 +291,92 @@ async fn a_partial_rollback_reason_is_redacted_before_it_is_persisted() {
     assert_eq!(
         persisted, returned,
         "the persisted reason and the returned one must be the same string"
+    );
+}
+
+#[tokio::test]
+async fn a_partial_rollback_keeps_the_error_that_started_the_rollback() {
+    // The failed step is why the deploy rolled back; the compensation error only
+    // says what the rollback could not undo. Reporting the second alone sends the
+    // operator after the wrong cause (#161).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = FilesystemStateStore::new(dir.path()).expect("store");
+    let trail = Trail::default();
+
+    let saga = Saga::new(store.clone(), "checkout", "production")
+        .with_step(step("migrate", &trail, false, true))
+        .with_step(step_failing_forward_with(
+            "health",
+            &trail,
+            "connection refused on 127.0.0.1:8080",
+        ));
+
+    let SagaOutcome::PartialRollback {
+        failed_step,
+        failure,
+        reason,
+    } = saga.run().await.expect("run completes")
+    else {
+        panic!("expected PartialRollback");
+    };
+
+    assert_eq!(failed_step, "health");
+    assert!(
+        failure.contains("connection refused on 127.0.0.1:8080"),
+        "the failure is the failed step's own error: {failure}"
+    );
+    assert!(
+        reason.contains("health") && reason.contains("connection refused"),
+        "the reason names the cause: {reason}"
+    );
+    assert!(
+        reason.contains("compensation for 'migrate' failed"),
+        "and what the rollback could not undo: {reason}"
+    );
+
+    let SagaState::PartialRollback(persisted) = current_state(&store).await else {
+        panic!("expected a persisted PartialRollback state");
+    };
+    assert_eq!(
+        persisted, reason,
+        "the persisted reason is the returned one"
+    );
+}
+
+#[tokio::test]
+async fn the_original_error_is_redacted_before_it_is_kept() {
+    // The forward error carries adapter stderr just as the compensation error
+    // does, and now reaches the same state file and remote ledger (#62).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = FilesystemStateStore::new(dir.path()).expect("store");
+    let trail = Trail::default();
+
+    let saga = Saga::new(store.clone(), "checkout", "production")
+        .with_step(step("migrate", &trail, false, true))
+        .with_step(step_failing_forward_with(
+            "verify",
+            &trail,
+            "psql: connection to postgresql://checkout:hunter2@db.internal:5432/checkout failed",
+        ));
+
+    let SagaOutcome::PartialRollback {
+        failure, reason, ..
+    } = saga.run().await.expect("run completes")
+    else {
+        panic!("expected PartialRollback");
+    };
+
+    assert!(!failure.contains("hunter2"), "failure leaks: {failure}");
+    assert!(!reason.contains("hunter2"), "reason leaks: {reason}");
+    assert!(
+        failure.contains("db.internal"),
+        "the host survives: {failure}"
+    );
+    let SagaState::PartialRollback(persisted) = current_state(&store).await else {
+        panic!("expected a persisted PartialRollback state");
+    };
+    assert!(
+        !persisted.contains("hunter2"),
+        "persisted leaks: {persisted}"
     );
 }

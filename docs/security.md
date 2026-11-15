@@ -23,7 +23,7 @@ step; there are six boundaries, and they cover the steps nobody has written yet:
 | The CLI's output edge (`rendered`) | every command's text, its `--json` payload, its `--verbose` stderr JSON |
 | A rendered anyhow chain (`error_detail`) | the CLI's `error:` line, and the webhook's HTTP 500 body — which leaves the host without passing the output edge |
 | The notify sink (`emit_event`, `ExecHookNotifier`) | the hook's env var and stdin JSON, and the notifier's log event — which fires with no hook configured. At the **sink**, so it holds for every `FailurePayload` producer, this crate's and an embedder's alike |
-| `Saga::rollback` | the `PartialRollback` reason before it is persisted, and so `state.json`, `events.jsonl` and `sync push` |
+| `Saga::rollback` | the `PartialRollback` reason and the failed step's own error (`failure`) before either is persisted or returned, and so `state.json`, `events.jsonl` and `sync push` |
 | The IPC client's `data` fold | a remote adapter's stderr, which the fold puts into the message every sink renders |
 | `fraisier-self-upgrade`'s `download` | an artifact URL's basic-auth credentials in a fetch error, which reach a library consumer through `AbortedBeforeSwap` without passing the CLI edge |
 

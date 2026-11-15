@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.0.0-beta.16] - 2026-11-15
+
 ### Fixed
 
 - **A deploy that ends in `partial_rollback` says why it failed** (#161). The
@@ -1501,7 +1503,8 @@ migration-safe rollback across one host or a fleet.
 - **GitHub Actions CI** that runs `cargo xtask ci`.
 
 [c197]: https://github.com/fraiseql/confiture/issues/197
-[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.15...HEAD
+[Unreleased]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.16...HEAD
+[1.0.0-beta.16]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.15...fraisier-v1.0.0-beta.16
 [1.0.0-beta.15]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.14...fraisier-v1.0.0-beta.15
 [1.0.0-beta.14]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.13...fraisier-v1.0.0-beta.14
 [1.0.0-beta.13]: https://github.com/fraiseql/fraisier-core/compare/fraisier-v1.0.0-beta.12...fraisier-v1.0.0-beta.13

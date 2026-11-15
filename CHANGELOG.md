@@ -6,8 +6,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A deploy that ends in `partial_rollback` says why it failed** (#161). The
+  reason used to carry only the compensation error ("compensation for 'activate'
+  failed: …"), so a first deploy whose health check failed reported only that
+  there was no release to return to. The reason now starts with the failed step
+  and its own error, then what the rollback could not undo; the same text is
+  persisted. That error is redacted like the compensation error.
+
 ### Changed
 
+- **`SagaOutcome::PartialRollback` gains `failed_step` and `failure`**
+  (breaking for code that constructs or exhaustively matches the variant).
+  `reason` remains the full persisted account.
+- **`deploy`, `rollback`, multi-host and blue-green `--json` output gains
+  `failed_step` and `failure`** whenever a step failed, for both `rolled_back`
+  and `partial_rollback`; `outcome`, `detail` and the exit codes are unchanged.
 - **The pinned confiture moves from 1.45.0 to 1.48.0**
   (`tools/confiture-requirements.txt`; its other exact pins hold). The
   exit-code table adds `CONFIG_017` (exit 5: `confiture install-helpers`

@@ -1319,14 +1319,20 @@ pub(crate) async fn rollback(
 
     let outcome = plan.run(store).await?;
     let (exit_code, label, detail) = outcome_result(&outcome);
+    let mut json = outcome_json(&outcome);
+    for (key, value) in [
+        ("fraise", json!(fraise)),
+        ("environment", json!(environment)),
+        ("source", json!(source)),
+        ("target", json!(to)),
+        ("executed", json!(true)),
+    ] {
+        json[key] = value;
+    }
     Ok(CommandOutput {
         exit_code,
         pretty: format!("rollback of {fraise}/{environment} to {to} {label}{detail}\n"),
-        json: json!({
-            "fraise": fraise, "environment": environment,
-            "source": source, "target": to, "executed": true,
-            "outcome": label, "detail": detail.trim(),
-        }),
+        json,
     })
 }
 
@@ -1941,7 +1947,7 @@ async fn run_single_host(
         "deploy of {}/{} {label}{detail}",
         resolved.fraise, resolved.environment
     );
-    let mut json = json!({ "outcome": label, "detail": detail.trim() });
+    let mut json = outcome_json(&outcome);
     if !run.warnings.is_empty() {
         json["warnings"] = json!(run.warnings);
     }
@@ -2010,7 +2016,11 @@ async fn run_multi_host(
             CommandOutput {
                 exit_code,
                 pretty,
-                json: json!({ "outcome": label, "detail": detail.trim(), "multi_host": true }),
+                json: {
+                    let mut json = outcome_json(&outcome);
+                    json["multi_host"] = json!(true);
+                    json
+                },
             },
             metrics_warning,
         ),
@@ -2085,7 +2095,11 @@ async fn run_blue_green(
                     "blue-green deploy of {}/{} {label}{detail}\n",
                     resolved.fraise, resolved.environment
                 ),
-                json: json!({ "strategy": "blue-green", "outcome": label, "detail": detail.trim() }),
+                json: {
+                    let mut json = outcome_json(&outcome);
+                    json["strategy"] = json!("blue-green");
+                    json
+                },
             },
             metrics_warning,
         ),
@@ -3988,9 +4002,36 @@ fn outcome_result(outcome: &SagaOutcome) -> (i32, &'static str, String) {
             "rolled_back",
             format!(" (step '{failed_step}': {reason})"),
         ),
-        SagaOutcome::PartialRollback { reason } => (2, "partial_rollback", format!(" ({reason})")),
+        SagaOutcome::PartialRollback { reason, .. } => {
+            (2, "partial_rollback", format!(" ({reason})"))
+        }
         _ => (1, "unknown", String::new()),
     }
+}
+
+/// The `--json` fields every deploy path reports for `outcome`: `outcome` and
+/// `detail`, plus `failed_step` and `failure` whenever a step failed, so a
+/// consumer reads the cause without parsing `detail` (#161).
+fn outcome_json(outcome: &SagaOutcome) -> serde_json::Value {
+    let (_, label, detail) = outcome_result(outcome);
+    let mut json = json!({ "outcome": label, "detail": detail.trim() });
+    let cause = match outcome {
+        SagaOutcome::RolledBack {
+            failed_step,
+            reason,
+        } => Some((failed_step, reason)),
+        SagaOutcome::PartialRollback {
+            failed_step,
+            failure,
+            ..
+        } => Some((failed_step, failure)),
+        _ => None,
+    };
+    if let Some((failed_step, failure)) = cause {
+        json["failed_step"] = json!(failed_step);
+        json["failure"] = json!(failure);
+    }
+    json
 }
 
 /// The deploy metrics for `outcome`: committed, or rolled back fully or partly.
@@ -6666,6 +6707,46 @@ current_revision = "true"
     }
 
     #[test]
+    fn a_partial_rollback_reports_its_cause_in_json() {
+        // The step that failed and why are fields, not prose to parse (#161).
+        let outcome = SagaOutcome::PartialRollback {
+            failed_step: "health".to_owned(),
+            failure: "step 'health' failed: refused".to_owned(),
+            reason: "step 'health' failed: refused; then compensation for 'activate' \
+                     failed: no prior release"
+                .to_owned(),
+        };
+        let json = super::outcome_json(&outcome);
+        assert_eq!(json["outcome"], "partial_rollback");
+        assert_eq!(json["failed_step"], "health");
+        assert_eq!(json["failure"], "step 'health' failed: refused");
+        assert!(
+            json["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("refused") && d.contains("no prior release")),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn a_clean_rollback_reports_the_same_fields() {
+        let json = super::outcome_json(&SagaOutcome::RolledBack {
+            failed_step: "health".to_owned(),
+            reason: "step 'health' failed: refused".to_owned(),
+        });
+        assert_eq!(json["outcome"], "rolled_back");
+        assert_eq!(json["failed_step"], "health");
+        assert_eq!(json["failure"], "step 'health' failed: refused");
+    }
+
+    #[test]
+    fn a_committed_deploy_has_no_failure_fields() {
+        let json = super::outcome_json(&SagaOutcome::Committed);
+        assert_eq!(json["outcome"], "committed");
+        assert!(json.get("failed_step").is_none() && json.get("failure").is_none());
+    }
+
+    #[test]
     fn a_rolled_back_or_partly_rolled_back_deploy_says_so() {
         for outcome in [
             SagaOutcome::RolledBack {
@@ -6673,7 +6754,9 @@ current_revision = "true"
                 reason: "500".to_owned(),
             },
             SagaOutcome::PartialRollback {
-                reason: "restart failed".to_owned(),
+                failed_step: "health".to_owned(),
+                failure: "500".to_owned(),
+                reason: "500; then restart failed".to_owned(),
             },
         ] {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -7524,7 +7607,9 @@ current_revision = "true"
             "x",
             "prod",
             &SagaOutcome::PartialRollback {
-                reason: "boom".to_owned(),
+                failed_step: "health".to_owned(),
+                failure: "boom".to_owned(),
+                reason: "boom; then restart failed".to_owned(),
             },
         )
         .await;
